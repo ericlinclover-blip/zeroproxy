@@ -1,0 +1,71 @@
+"""ZeroProxy 面板入口。
+
+生产: systemd 启动 (见 systemd/zeroproxy.service)。面板进程仅监听本机回环
+(默认 127.0.0.1:9900), 对外由 nginx 在 8899 端口终结 TLS —— 域名命中真实
+Let's Encrypt 证书, 其余 SNI 回退自签 —— 再反向代理到面板 (见 nginx_config.py)。
+
+本地: ZP_HOME=... ZP_STATIC=... ZP_BIND_PORT=8899 python -m zeroproxy.main
+"""
+from __future__ import annotations
+
+import os
+
+import uvicorn
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+
+from . import __version__, config, routes
+
+
+def _static_dir() -> str:
+    candidates = [
+        os.environ.get("ZP_STATIC", ""),
+        os.path.join(config.home(), "static"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static"),
+    ]
+    for path in candidates:
+        if path and os.path.isdir(path):
+            return path
+    return candidates[2]
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(title="ZeroProxy", version=__version__, docs_url=None, redoc_url=None)
+    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+    app.include_router(routes.router)
+
+    static_dir = _static_dir()
+
+    @app.get("/", include_in_schema=False)
+    def index():
+        target = os.path.join(static_dir, "index.html")
+        if os.path.exists(target):
+            return FileResponse(target)
+        return JSONResponse(
+            {"name": "ZeroProxy", "version": __version__, "hint": "static/index.html 缺失"},
+            status_code=200,
+        )
+
+    if os.path.isdir(static_dir):
+        app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+    @app.get("/api/info", include_in_schema=False)
+    def info():
+        return {"name": "ZeroProxy", "version": __version__, "home": config.home()}
+
+    return app
+
+
+app = create_app()
+
+if __name__ == "__main__":
+    uvicorn.run(
+        app,
+        host=config.PANEL_BIND_HOST,
+        port=config.PANEL_BIND_PORT,
+        log_level="warning",
+        proxy_headers=True,               # 信任 nginx 传来的 X-Forwarded-Proto/For
+        forwarded_allow_ips="127.0.0.1",
+    )

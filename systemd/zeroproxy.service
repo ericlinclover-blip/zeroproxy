@@ -1,0 +1,16 @@
+[Unit]
+Description=ZeroProxy Panel (FastAPI; 仅回环 127.0.0.1:9900, 由 nginx 在 8899 终结 TLS 反代)
+After=network-online.target nginx.service xray.service hysteria2.service
+Wants=network-online.target
+
+[Service]
+Environment=ZP_HOME=/opt/zeroproxy
+Environment=ZP_PORT=8899
+WorkingDirectory=/opt/zeroproxy
+ExecStart=/opt/zeroproxy/venv/bin/python -m zeroproxy.main
+Restart=always
+RestartSec=2
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

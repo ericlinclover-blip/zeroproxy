@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行时状态 (含私钥/口令/证书, 绝不入库)
+data/
+panel/
+certs/
+hysteria/cert.pem
+hysteria/key.pem
+*.pem
+*.key
+
+# macOS
+.DS_Store
+
+# 本地临时文件
+work/

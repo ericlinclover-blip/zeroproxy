@@ -1,0 +1,14 @@
+[Unit]
+Description=ZeroProxy - Hysteria 2 (QUIC/UDP)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/hysteria server -c /opt/zeroproxy/hysteria/config.yaml
+WorkingDirectory=/opt/zeroproxy/hysteria
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

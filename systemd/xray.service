@@ -1,0 +1,14 @@
+[Unit]
+Description=ZeroProxy - Xray Core (VLESS Reality / VLESS WS / Trojan)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/xray run -c /opt/zeroproxy/xray/config.json
+WorkingDirectory=/opt/zeroproxy/xray
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

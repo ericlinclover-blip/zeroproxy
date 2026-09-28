@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZeroProxy · 极简代理面板</title>
+<style>
+:root {
+  --bg: #f5f5f7;
+  --card: #ffffff;
+  --text: #1d1d1f;
+  --sub: #6e6e73;
+  --border: rgba(0, 0, 0, 0.08);
+  --accent: #0071e3;
+  --accent-2: #0a84ff;
+  --ok: #30d158;
+  --warn: #ff9f0a;
+  --err: #ff453a;
+  --shadow: 0 6px 28px rgba(0, 0, 0, 0.06);
+  --radius: 18px;
+}
+[data-theme="dark"] {
+  --bg: #000000;
+  --card: #1c1c1e;
+  --text: #f5f5f7;
+  --sub: #98989d;
+  --border: rgba(255, 255, 255, 0.12);
+  --shadow: 0 6px 28px rgba(0, 0, 0, 0.55);
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Segoe UI", "Helvetica Neue", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  transition: background 0.25s, color 0.25s;
+}
+.wrap { max-width: 1080px; margin: 0 auto; padding: 28px 20px 60px; }
+.hidden { display: none !important; }
+
+/* ---------- 通用组件 ---------- */
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 22px 24px;
+}
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
+.badge {
+  display: inline-block; padding: 3px 10px; border-radius: 999px;
+  font-size: 12px; font-weight: 600; letter-spacing: 0.02em;
+}
+.badge.vless   { background: rgba(0, 113, 227, 0.14); color: var(--accent-2); }
+.badge.trojan  { background: rgba(48, 209, 88, 0.15); color: var(--ok); }
+.badge.hysteria{ background: rgba(255, 159, 10, 0.16); color: var(--warn); }
+.btn {
+  appearance: none; border: none; cursor: pointer;
+  border-radius: 999px; padding: 11px 22px;
+  font-size: 15px; font-weight: 500;
+  background: var(--accent); color: #fff;
+  transition: transform 0.12s, opacity 0.12s;
+}
+.btn:hover { transform: translateY(-1px); }
+.btn:active { transform: translateY(0); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+.btn.ghost { background: transparent; color: var(--accent-2); border: 1px solid var(--accent-2); padding: 8px 16px; font-size: 13px; }
+.btn.small { padding: 7px 14px; font-size: 13px; }
+.btn.danger { background: transparent; color: var(--err); border: 1px solid var(--err); }
+input {
+  width: 100%; padding: 13px 16px; border-radius: 12px;
+  border: 1px solid var(--border); background: transparent;
+  color: var(--text); font-size: 15px; outline: none;
+  transition: border 0.15s, box-shadow 0.15s;
+}
+input:focus { border-color: var(--accent-2); box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.2); }
+label { display: block; font-size: 13px; color: var(--sub); margin: 0 0 6px 4px; }
+.field { margin-bottom: 18px; }
+.dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+.dot.running, .dot.active { background: var(--ok); box-shadow: 0 0 0 3px rgba(48, 209, 88, 0.2); }
+.dot.failed, .dot.err { background: var(--err); }
+.dot.other { background: var(--warn); }
+.mono { font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 13px; }
+.muted { color: var(--sub); }
+code.inline { background: var(--border); padding: 2px 7px; border-radius: 6px; font-size: 12.5px; }
+
+/* ---------- 品牌区 ---------- */
+.brand { display: flex; align-items: center; justify-content: space-between; margin-bottom: 26px; }
+.logo { display: flex; align-items: center; gap: 10px; font-size: 20px; font-weight: 700; letter-spacing: -0.02em; }
+.logo .mark {
+  width: 30px; height: 30px; border-radius: 9px;
+  background: linear-gradient(135deg, #0a84ff, #5e5ce6);
+  display: grid; place-items: center; color: #fff; font-size: 15px; font-weight: 800;
+}
+.theme-btn {
+  border: 1px solid var(--border); background: var(--card); color: var(--text);
+  width: 38px; height: 38px; border-radius: 50%; cursor: pointer; font-size: 16px;
+}
+
+/* ---------- 部署视图 ---------- */
+.hero { text-align: center; margin: 34px 0 30px; }
+.hero h1 { font-size: 40px; letter-spacing: -0.03em; margin: 0 0 10px; }
+.hero h1 .grad { background: linear-gradient(90deg, #0a84ff, #bf5af2, #ff375f); -webkit-background-clip: text; background-clip: text; color: transparent; }
+.hero p { color: var(--sub); margin: 0; font-size: 15px; }
+.setup-card { max-width: 460px; margin: 0 auto; }
+.proto-row { display: flex; gap: 8px; flex-wrap: wrap; justify-content: center; margin: 22px 0; }
+.progress { margin-top: 18px; display: flex; flex-direction: column; gap: 8px; }
+.pstep { display: flex; align-items: flex-start; gap: 10px; font-size: 13.5px; }
+.pstep .ico { width: 18px; text-align: center; flex-shrink: 0; }
+.pstep .ico.ok { color: var(--ok); }
+.pstep .ico.bad { color: var(--err); }
+.pstep .detail { color: var(--sub); font-size: 12px; margin-left: 28px; word-break: break-all; }
+.err-box { color: var(--err); font-size: 13.5px; margin-top: 12px; }
+.linkline { display: flex; gap: 10px; align-items: center; }
+.linkline .val { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ---------- 仪表盘 ---------- */
+.head-card { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 16px; }
+.head-card .domain { font-size: 17px; font-weight: 600; }
+.head-card .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.section-title { font-size: 13px; font-weight: 600; color: var(--sub); text-transform: uppercase; letter-spacing: 0.08em; margin: 26px 0 12px; }
+.node-card .top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.node-card .name { font-weight: 600; font-size: 15.5px; display: flex; align-items: center; gap: 8px; }
+.node-card .meta { font-size: 13px; color: var(--sub); margin-bottom: 4px; }
+.node-card .addr { font-size: 13px; margin-bottom: 14px; }
+.node-card .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.note { font-size: 12px; color: var(--warn); margin-top: 8px; }
+.switch { position: relative; width: 40px; height: 24px; flex-shrink: 0; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.switch .slider {
+  position: absolute; inset: 0; border-radius: 999px; cursor: pointer;
+  background: var(--border); transition: 0.2s;
+}
+.switch .slider::before {
+  content: ""; position: absolute; width: 18px; height: 18px; border-radius: 50%;
+  left: 3px; top: 3px; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.3); transition: 0.2s;
+}
+.switch input:checked + .slider { background: var(--ok); }
+.switch input:checked + .slider::before { transform: translateX(16px); }
+
+/* ---------- 模态 ---------- */
+.modal-mask {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.55);
+  display: grid; place-items: center; z-index: 50; backdrop-filter: blur(4px);
+}
+.modal { background: var(--card); border-radius: 20px; padding: 28px; max-width: 400px; width: calc(100% - 40px); text-align: center; }
+.modal h3 { margin: 0 0 6px; font-size: 17px; }
+.modal img { width: 260px; height: 260px; border-radius: 12px; margin: 14px auto; display: block; background: #fff; }
+.modal .close-row { margin-top: 14px; }
+.toast {
+  position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%);
+  background: var(--card); color: var(--text); border: 1px solid var(--border);
+  padding: 10px 22px; border-radius: 999px; font-size: 13.5px; box-shadow: var(--shadow);
+  opacity: 0; pointer-events: none; transition: opacity 0.25s, transform 0.25s; z-index: 99;
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(-6px); }
+.footer { text-align: center; color: var(--sub); font-size: 12px; margin-top: 40px; }
+.bar { height: 6px; border-radius: 999px; background: var(--border); overflow: hidden; margin-top: 8px; }
+.bar > i { display: block; height: 100%; background: var(--ok); border-radius: 999px; }
+.kv { display: flex; justify-content: space-between; font-size: 13.5px; padding: 5px 0; }
+.kv .k { color: var(--sub); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="brand">
+    <div class="logo"><span class="mark">Z</span> ZeroProxy</div>
+    <button class="theme-btn" id="themeBtn" title="切换深浅色">◐</button>
+  </div>
+
+  <!-- ============ 视图 1: 初始化 ============ -->
+  <section id="view-setup" class="hidden">
+    <div class="hero">
+      <h1>0 配置 · <span class="grad">1 行部署</span></h1>
+      <p>只需三样东西, 节点 / 证书 / 订阅 全自动生成</p>
+    </div>
+    <div class="proto-row" id="protoRow"></div>
+    <div class="card setup-card">
+      <div class="field"><label>域名 (已解析到本机, 80/443 开放)</label>
+        <input id="in-domain" placeholder="proxy.example.com" spellcheck="false"></div>
+      <div class="field"><label>管理用户名</label>
+        <input id="in-user" placeholder="admin" spellcheck="false"></div>
+      <div class="field"><label>管理密码 (≥6 位, 同时用作 Trojan/Hysteria 2 凭据)</label>
+        <input id="in-pass" type="password" placeholder="••••••••"></div>
+      <button class="btn" id="btn-setup" style="width:100%">一键生成</button>
+      <div class="err-box hidden" id="setup-err"></div>
+      <div class="progress hidden" id="setup-progress"></div>
+    </div>
+  </section>
+
+  <!-- ============ 视图 2: 登录 ============ -->
+  <section id="view-login" class="hidden">
+    <div class="hero">
+      <h1>欢迎回来</h1>
+      <p>登录管理面板</p>
+    </div>
+    <div class="card setup-card">
+      <div class="field"><label>用户名</label><input id="login-user" spellcheck="false"></div>
+      <div class="field"><label>密码</label><input id="login-pass" type="password"></div>
+      <button class="btn" id="btn-login" style="width:100%">登录</button>
+      <div class="err-box hidden" id="login-err"></div>
+    </div>
+  </section>
+
+  <!-- ============ 视图 3: 仪表盘 ============ -->
+  <section id="view-dash" class="hidden">
+    <div class="card head-card">
+      <div>
+        <div class="domain" id="dash-domain">—</div>
+        <div class="muted" style="font-size:12.5px" id="dash-sub"></div>
+      </div>
+      <div class="actions">
+        <button class="btn ghost small" id="btn-apply">重新应用配置</button>
+        <button class="btn ghost small" id="btn-sub-copy">复制订阅</button>
+        <button class="btn ghost small danger" id="btn-logout">退出</button>
+      </div>
+    </div>
+
+    <div class="section-title">订阅</div>
+    <div class="card" style="margin-bottom:8px">
+      <div class="linkline">
+        <code class="inline mono val" id="sub-url">—</code>
+        <button class="btn ghost small" id="btn-sub-copy2">复制</button>
+        <button class="btn ghost small" id="btn-sub-qr">二维码</button>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:8px">
+        客户端 App 导入后自动保持更新 — 节点启停、配置修改即时生效, 链接永不变化。
+      </div>
+    </div>
+
+    <div class="section-title">节点 <span class="muted" style="text-transform:none;letter-spacing:0">(点击开关即时热更新, 无需重启客户端)</span></div>
+    <div class="grid" id="node-grid"></div>
+
+    <div class="section-title">证书 &amp; 系统</div>
+    <div class="grid" id="sys-grid"></div>
+  </section>
+
+  <div class="footer">ZeroProxy · VLESS Reality / VLESS WS / Trojan / Hysteria 2 · 单命令部署</div>
+</div>
+
+<!-- 二维码模态 -->
+<div class="modal-mask hidden" id="qr-mask">
+  <div class="modal">
+    <h3 id="qr-title">节点二维码</h3>
+    <div class="muted" style="font-size:12.5px" id="qr-sub">手机 App 扫码导入</div>
+    <img id="qr-img" alt="QR">
+    <div class="close-row"><button class="btn ghost" id="qr-close">关闭</button></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+const PROTO_BADGE = { "VLESS": "vless", "Trojan": "trojan", "Hysteria 2": "hysteria" };
+let dash = null;
+let refreshTimer = null;
+
+/* ---------------- 主题 ---------------- */
+function applyTheme(t) {
+  document.documentElement.dataset.theme = t;
+  localStorage.setItem("zp-theme", t);
+}
+(function initTheme() {
+  const saved = localStorage.getItem("zp-theme");
+  const prefer = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  applyTheme(saved || (prefer === "dark" ? "dark" : "light"));
+})();
+$("#themeBtn").onclick = () =>
+  applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
+
+/* ---------------- 工具 ---------------- */
+async function api(path, opts = {}) {
+  const res = await fetch(path, { credentials: "same-origin", ...opts });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+  return body;
+}
+function toast(msg) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(t._h);
+  t._h = setTimeout(() => t.classList.remove("show"), 2200);
+}
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast("已复制");
+  } catch (e) {
+    const ta = document.createElement("textarea");
+    ta.value = text; document.body.appendChild(ta);
+    ta.select(); document.execCommand("copy"); ta.remove();
+    toast("已复制");
+  }
+}
+const fmtUptime = (s) => {
+  if (!s) return "—";
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  return d ? `${d}天 ${h}小时` : h ? `${h}小时 ${m}分` : `${m}分钟`;
+};
+const STATE_TXT = { active: "运行中", running: "运行中", "dry-run": "本地开发", "not-installed": "未安装", failed: "异常", inactive: "已停止" };
+const stateClass = (s) => (["active", "running"].includes(s) ? "running" : ["failed", "err"].includes(s) ? "failed" : "other");
+
+/* ---------------- 视图路由 ---------------- */
+function show(id) {
+  ["view-setup", "view-login", "view-dash"].forEach((v) => $("#" + v).classList.add("hidden"));
+  $("#" + id).classList.remove("hidden");
+}
+
+/* ---------------- 初始化视图 ---------------- */
+$("#protoRow").innerHTML = [
+  ["vless", "VLESS Reality"], ["vless", "VLESS WS"], ["trojan", "Trojan TLS"], ["hysteria", "Hysteria 2"],
+].map(([c, n]) => `<span class="badge ${c}">${n}</span>`).join("");
+
+async function boot() {
+  try {
+    const st = await api("/api/status");
+    if (!st.configured) return show("view-setup");
+    if (st.authenticated) return loadDash();
+    show("view-login");
+  } catch (e) {
+    show("view-setup");
+  }
+}
+
+/* ---------------- 部署 ---------------- */
+$("#btn-setup").onclick = async () => {
+  const payload = {
+    domain: $("#in-domain").value.trim(),
+    username: $("#in-user").value.trim(),
+    password: $("#in-pass").value,
+  };
+  const errBox = $("#setup-err");
+  errBox.classList.add("hidden");
+  const prog = $("#setup-progress");
+  prog.classList.add("hidden");
+  prog.innerHTML = "";
+  const btn = $("#btn-setup");
+  btn.disabled = true;
+  btn.textContent = "部署中, 证书申请约需 30-60 秒…";
+  try {
+    const res = await api("/api/setup", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    renderSteps(res.steps || []);
+    prog.classList.remove("hidden");
+    btn.textContent = "完成 ✓";
+    setTimeout(() => { loadDash(); }, 900);
+  } catch (e) {
+    errBox.textContent = "部署失败: " + e.message;
+    errBox.classList.remove("hidden");
+    btn.disabled = false;
+    btn.textContent = "一键生成";
+  }
+};
+function renderSteps(steps) {
+  $("#setup-progress").innerHTML = steps
+    .map(
+      (s) => `<div class="pstep">
+        <span class="ico ${s.ok ? "ok" : "bad"}">${s.ok ? "✓" : "✗"}</span>
+        <span>${s.name} <span class="muted">(${s.ms}ms)</span></span>
+        <div class="detail">${escapeHtml(s.detail || "")}</div>
+      </div>`
+    )
+    .join("");
+}
+const escapeHtml = (s) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+/* ---------------- 登录 ---------------- */
+$("#btn-login").onclick = async () => {
+  try {
+    await api("/api/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: $("#login-user").value.trim(), password: $("#login-pass").value }),
+    });
+    loadDash();
+  } catch (e) {
+    const b = $("#login-err");
+    b.textContent = e.message;
+    b.classList.remove("hidden");
+  }
+};
+$("#btn-logout").onclick = async () => {
+  await api("/api/logout", { method: "POST" });
+  dash = null;
+  show("view-login");
+};
+
+/* ---------------- 仪表盘 ---------------- */
+async function loadDash() {
+  try {
+    dash = await api("/api/dashboard");
+    renderDash();
+    show("view-dash");
+  } catch (e) {
+    show("view-login");
+    return;
+  }
+  clearInterval(refreshTimer);
+  refreshTimer = setInterval(() => { if (dash) loadDash(true); }, 20000);
+}
+function renderDash(quiet) {
+  if (!dash) return;
+  $("#dash-domain").textContent = dash.domain;
+  $("#dash-sub").textContent = `面板 ${dash.panel_url} · 管理用户 ${dash.admin_user}`;
+  $("#sub-url").textContent = dash.subscription_url;
+  $("#btn-sub-copy").onclick = () => copyText(dash.subscription_url);
+  $("#btn-sub-copy2").onclick = () => copyText(dash.subscription_url);
+  $("#btn-sub-qr").onclick = () => openModal("订阅二维码", dash.subscription_url, dash.subscription_url);
+
+  /* 节点卡片 */
+  $("#node-grid").innerHTML = dash.nodes
+    .map(
+      (n) => `<div class="card node-card">
+        <div class="top">
+          <span class="name"><span class="badge ${PROTO_BADGE[n.protocol] || "vless"}">${n.protocol}</span> ${n.name}</span>
+          <label class="switch"><input type="checkbox" data-node="${n.id}" ${n.enabled ? "checked" : ""}><span class="slider"></span></label>
+        </div>
+        <div class="meta">${n.transport} · ${n.security}</div>
+        <div class="addr mono">${escapeHtml(n.host)}:${n.port} <span class="dot ${stateClass(n.service_state)}" title="${n.service}"></span> <span class="muted">${STATE_TXT[n.service_state] || n.service_state}</span></div>
+        ${n.note ? `<div class="note">${n.note}</div>` : ""}
+        <div class="actions">
+          ${n.share_link ? `<button class="btn ghost small" data-copy="${n.id}">复制链接</button><button class="btn ghost small" data-qr="${n.id}">二维码</button>` : `<span class="muted" style="font-size:12.5px">节点已关闭</span>`}
+        </div>
+      </div>`
+    )
+    .join("");
+
+  document.querySelectorAll("[data-node]").forEach((el) =>
+    (el.onchange = async () => {
+      el.disabled = true;
+      try {
+        dash = await api(`/api/nodes/${el.dataset.node}/toggle`, { method: "POST" });
+        renderDash(true);
+        toast("已热更新, 订阅内容已刷新");
+      } catch (e) {
+        el.disabled = false;
+        toast("操作失败: " + e.message);
+      }
+    })
+  );
+  document.querySelectorAll("[data-copy]").forEach((el) =>
+    (el.onclick = () => copyText(dash.nodes.find((n) => n.id === el.dataset.copy).share_link))
+  );
+  document.querySelectorAll("[data-qr]").forEach((el) => {
+    const n = dash.nodes.find((x) => x.id === el.dataset.qr);
+    el.onclick = () => openModal(`${n.name} 二维码`, n.share_link, n.qr_url + "?size=8");
+  });
+
+  /* 证书 + 系统卡片 */
+  const c = dash.cert;
+  const certName = c.type === "letsencrypt" ? "Let's Encrypt" : c.type === "selfsigned" ? "自签名证书" : "无证书";
+  const days = c.days_left;
+  const barPct = days > 90 ? 100 : days > 30 ? Math.round((days / 90) * 100) : Math.round((days / 30) * 100);
+  const barColor = days > 30 ? "var(--ok)" : days > 14 ? "var(--warn)" : "var(--err)";
+
+  const sys = dash.system;
+  const svcRow = (k, v) =>
+    `<div class="kv"><span class="k">${k}</span><span><span class="dot ${stateClass(v.state)}"></span> ${STATE_TXT[v.state] || v.state}${v.version ? " · " + escapeHtml(v.version) : ""}</span></div>`;
+
+  $("#sys-grid").innerHTML = `
+    <div class="card">
+      <div class="top" style="display:flex;justify-content:space-between;align-items:center">
+        <span class="badge ${c.type === "letsencrypt" ? "vless" : "hysteria"}">TLS 证书</span>
+        <button class="btn ghost small" id="btn-renew" ${c.type === "letsencrypt" ? "" : "disabled"}>续期</button>
+      </div>
+      <div class="kv" style="margin-top:10px"><span class="k">类型</span><span>${certName}</span></div>
+      <div class="kv"><span class="k">剩余有效期</span><span>${days} 天</span></div>
+      <div class="bar"><i style="width:${barPct}%;background:${barColor}"></i></div>
+      ${c.type === "selfsigned" ? '<div class="note">自签证书: 客户端已带 allowInsecure, 不影响使用</div>' : ""}
+    </div>
+    <div class="card">
+      ${svcRow("Xray 核心", sys.xray)}
+      ${svcRow("Hysteria 2", sys.hysteria2)}
+      <div class="kv"><span class="k">Nginx</span><span><span class="dot ${stateClass(sys.nginx.state)}"></span> ${STATE_TXT[sys.nginx.state] || sys.nginx.state}</span></div>
+      <div class="kv"><span class="k">服务器</span><span>${escapeHtml(sys.server.os)} · ${escapeHtml(sys.server.arch)} · 在线 ${fmtUptime(sys.server.uptime_s)}</span></div>
+      <div class="kv"><span class="k">端口跳跃</span><span>${dash.hysteria_hopping ? "已启用 (" + dash.hysteria_ports.join(" / ") + ")" : "未启用"}</span></div>
+    </div>`;
+  const renewBtn = $("#btn-renew");
+  if (renewBtn) renewBtn.onclick = async () => {
+    try {
+      const r = await api("/api/renew", { method: "POST" });
+      toast(r.ok ? "证书已续期" : r.detail);
+      if (r.ok) loadDash(true);
+    } catch (e) { toast("续期失败: " + e.message); }
+  };
+  if (!quiet) clearInterval(refreshTimer), (refreshTimer = setInterval(() => loadDash(true), 20000));
+}
+
+/* ---------------- 模态 ---------------- */
+function openModal(title, sub, imgUrl) {
+  $("#qr-title").textContent = title;
+  $("#qr-sub").textContent = sub;
+  $("#qr-img").src = imgUrl;
+  $("#qr-mask").classList.remove("hidden");
+}
+$("#qr-close").onclick = () => $("#qr-mask").classList.add("hidden");
+$("#qr-mask").onclick = (e) => { if (e.target.id === "qr-mask") $("#qr-mask").classList.add("hidden"); };
+$("#btn-apply").onclick = async () => {
+  const btn = $("#btn-apply");
+  btn.disabled = true; btn.textContent = "应用中…";
+  try {
+    dash = await api("/api/apply", { method: "POST" });
+    renderDash(true);
+    toast("配置已重新生成并热重载");
+  } catch (e) { toast("应用失败: " + e.message); }
+  btn.disabled = false; btn.textContent = "重新应用配置";
+};
+
+boot();
+</script>
+</body>
+</html>

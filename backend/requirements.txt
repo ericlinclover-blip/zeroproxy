@@ -1,0 +1,4 @@
+fastapi>=0.110
+uvicorn>=0.29
+qrcode[pil]>=7.4
+cryptography>=42.0
