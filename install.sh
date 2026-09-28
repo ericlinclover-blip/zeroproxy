@@ -125,6 +125,7 @@ if [ -f "$SCRIPT_DIR/backend/zeroproxy/main.py" ]; then
   cp -r "$SCRIPT_DIR/backend/static" "$ZP_HOME/static"
   cp "$SCRIPT_DIR/backend/requirements.txt" "$ZP_HOME/requirements.txt"
   cp "$SCRIPT_DIR"/systemd/*.service /etc/systemd/system/
+  [ -f "$SCRIPT_DIR/uninstall.sh" ] && cp "$SCRIPT_DIR/uninstall.sh" "$ZP_HOME/uninstall.sh"
 else
   # 远程安装: 下载仓库 tarball (需可访问 GitHub)
   ZP_REPO="${ZP_REPO:-owner/zeroproxy}"
@@ -154,8 +155,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=zeroproxy.local"
   -keyout "$ZP_HOME/hysteria/key.pem" -out "$ZP_HOME/hysteria/cert.pem" 2>/dev/null
 cat > "$ZP_HOME/hysteria/config.yaml" <<YAML
 # 占位配置, 面板完成部署后会被自动覆盖
-listen:
-  - "127.0.0.1:30001"
+listen: "127.0.0.1:30001"
 tls:
   cert: $ZP_HOME/hysteria/cert.pem
   key: $ZP_HOME/hysteria/key.pem
@@ -164,6 +164,16 @@ auth:
   password: "changeme"
 YAML
 chmod 600 "$ZP_HOME/hysteria/key.pem"
+
+# 引导令牌 (0600): 面板初始化时必须提供它, 防止公网暴露时被别人抢先完成部署。
+# 已经初始化过的机器 (存在 state.json) 不重新签发, 避免把令牌重新暴露出来。
+if [ ! -f "$ZP_HOME/data/state.json" ]; then
+  openssl rand -hex 16 > "$ZP_HOME/data/bootstrap_token"
+  chmod 600 "$ZP_HOME/data/bootstrap_token"
+  ZP_TOKEN="$(cat "$ZP_HOME/data/bootstrap_token")"
+else
+  ZP_TOKEN=""
+fi
 
 # 面板自身 HTTPS: 生成自签证书 (含服务器 IP/localhost 的 SAN)。
 # 浏览器首次访问会提示证书不受信任, 点「继续」即可; 目的是让面板登录/会话走 TLS。
@@ -227,21 +237,33 @@ if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active
   ufw allow "$PANEL_PORT/tcp" >/dev/null
   ufw allow 8443/tcp >/dev/null
   ufw allow 8444/tcp >/dev/null
+  ufw allow 8445/tcp >/dev/null          # VLESS XHTTP + Reality
   ufw allow 30001:32001/udp >/dev/null   # Hysteria 2 + 端口跳跃
-  ok "防火墙已放行 80/443/$PANEL_PORT/8443/8444/tcp, 30001-32001/udp"
+  ok "防火墙已放行 80/443/$PANEL_PORT/8443/8444/8445/tcp, 30001-32001/udp"
 else
-  warn "请确认防火墙/安全组放行: 80,443,$PANEL_PORT,8443,8444 (TCP) 与 30001,31001,32001 (UDP)"
+  warn "请确认防火墙/安全组放行: 80,443,$PANEL_PORT,8443,8444,8445 (TCP) 与 30001-32001 (UDP)"
 fi
 
 # ---------------- 10. 完成 ----------------
 echo
+if [ -n "$ZP_TOKEN" ]; then
+  PANEL_URL="https://${SERVER_IP}:$PANEL_PORT/?token=${ZP_TOKEN}"
+else
+  PANEL_URL="https://${SERVER_IP}:$PANEL_PORT/"
+fi
 ok "=============================================="
 ok "  ZeroProxy 部署完成!"
-ok "  面板地址:  https://${SERVER_IP}:$PANEL_PORT"
+ok "  面板地址:  $PANEL_URL"
 ok "  (引导阶段用自签证书, 浏览器首次提示不安全, 点「继续访问」)"
 ok "  打开链接 → 输入 域名/用户名/密码 → 一键生成"
 ok "  完成后请改用 https://<你的域名>:$PANEL_PORT 访问面板 (真实证书, 无警告)"
 ok "=============================================="
+if [ -n "$ZP_TOKEN" ]; then
+  echo "  ⚠ 上面的 ?token=... 是初始化引导令牌, 只可使用一次;"
+  echo "    请勿转发给他人 — 拿到它的人可以先完成初始化。"
+  echo "    令牌文件: $ZP_HOME/data/bootstrap_token (初始化成功后自动删除)"
+fi
 echo "  之后: 浏览器打开上面链接, 输入你的域名 (已 A 记录解析到本服务器),"
 echo "  管理用户名与密码, 点击「一键生成」, 即可得到全部节点 + 订阅 + 二维码。"
+echo "  卸载: bash $ZP_HOME/uninstall.sh  (或重新下载仓库里的 uninstall.sh)"
 echo

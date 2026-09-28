@@ -1,39 +1,59 @@
 """ZeroProxy API 路由。
 
-对应 Role.md 交付物 3/5 的设计:
-  - POST /api/setup  接收 Domain/User/Pass 三要素 → 生成全部配置 → 热加载 → 返回仪表盘
-  - 修改类接口 (节点开关 / 端口跳跃 / 重新应用 / 续期) 只改状态,
+设计要点:
+  - POST /api/setup  接收 Domain/User/Pass 三要素 (+ 引导令牌) → 生成全部配置
+    → 热加载 → 返回仪表盘。引导令牌来自 install.sh 打印的 URL, 防止面板在
+    公网暴露时被他人抢先完成初始化。
+  - 修改类接口 (节点开关 / 端口跳跃 / 高级设置 / 重新应用 / 续期) 只改状态,
     随后「重新生成配置 → reload nginx + restart xray/hysteria」。
     订阅 URL 恒定不变, 内容随节点启停变化, 客户端 App 自动拉取新内容。
+  - 所有读-改-写都包在 config.locked() 事务里, 避免并发端点互相覆盖状态。
 """
 from __future__ import annotations
 
 import hmac
 import io
+import ipaddress
+import json
+import os
 import re
 import shutil
+import socket
 import time
 
 import qrcode
 import qrcode.constants
 import qrcode.image.pil  # noqa: F401  (PIL 后端需显式导入)
-from cryptography.x509.oid import NameOID  # noqa: F401  (预留证书元信息)
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
-from . import config, crypto, hysteria_config, nginx_config, services, share_links, xray_config
-from .config import NODES, NODE_IDS, load_state, paths, save_state
+from . import (
+    config,
+    crypto,
+    hysteria_config,
+    nginx_config,
+    services,
+    share_links,
+    xray_config,
+)
+from .config import NODES, NODE_BY_ID, NODE_IDS, XRAY_NODE_IDS, load_state, paths, save_state
 
 router = APIRouter()
 
 SESSION_COOKIE = "zp_session"
-SESSION_TTL = 72 * 3600
+SESSION_TTL = config.SESSION_TTL
+
+#: 登录限流: 连续失败 3 次后开始封禁, 时长 2^n 秒, 上限 300s
+LOGIN_FREE_TRIES = 3
+LOGIN_MAX_BLOCK = 300
 
 _DOMAIN_RE = re.compile(
     r"^(?=.{4,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$"
 )
 _USER_RE = re.compile(r"^[A-Za-z0-9._-]{2,32}$")
+_SNI_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?)+$")
+_URL_RE = re.compile(r"^https?://[^\s\"'<>]+$")
 
 
 # ---------------------------------------------------------------- 基础工具
@@ -58,6 +78,24 @@ def _err(message: str, code: int = 400) -> JSONResponse:
     return JSONResponse({"error": message}, status_code=code)
 
 
+def _client_ip(request: Request) -> str:
+    """经 nginx 反代时取 X-Forwarded-For 首个地址 (面板只信任本机 nginx)。"""
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()[:64]
+    return (request.client.host if request.client else "unknown")[:64]
+
+
+def _is_ip(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return False
+
+
+# ---------------------------------------------------------------- 会话
+
 def _session_of(state: dict, request: Request) -> str | None:
     token = request.cookies.get(SESSION_COOKIE)
     if not token:
@@ -77,10 +115,17 @@ def _require_auth(state: dict, request: Request) -> bool:
 
 def _issue_session(state: dict, request: Request, response: Response) -> None:
     token = crypto.new_token(32)
-    state["sessions"][token] = {
+    sessions = state.setdefault("sessions", {})
+    now = int(time.time())
+    # 会话数上限: 超出时淘汰最早到期的一个 (防止令牌无限堆积)
+    if len(sessions) >= config.MAX_SESSIONS:
+        oldest = min(sessions, key=lambda t: sessions[t].get("expires", 0))
+        sessions.pop(oldest, None)
+    sessions[token] = {
         "username": state["admin"]["username"],
-        "created": int(time.time()),
-        "expires": int(time.time()) + SESSION_TTL,
+        "created": now,
+        "expires": now + SESSION_TTL,
+        "ip": _client_ip(request),
     }
     # 直连 https (含面板自签) 或经 https 反代 (X-Forwarded-Proto) 时启用 Secure 标记;
     # 若回退到明文 HTTP 访问则不启用 (否则 Cookie 会被浏览器丢弃)。
@@ -96,11 +141,43 @@ def _issue_session(state: dict, request: Request, response: Response) -> None:
     )
 
 
-def _clean_sessions(state: dict) -> None:
+def _clean_sessions(state: dict) -> int:
     now = time.time()
+    before = len(state.get("sessions", {}))
     state["sessions"] = {
         t: s for t, s in state.get("sessions", {}).items() if s.get("expires", 0) > now
     }
+    return before - len(state["sessions"])
+
+
+# ---------------------------------------------------------------- 登录限流
+
+def _login_blocked_for(state: dict, ip: str) -> int:
+    """返回剩余封禁秒数 (0 = 未封禁), 顺带清理过期记录。"""
+    now = time.time()
+    failures = state.setdefault("login_failures", {})
+    for key in [k for k, v in failures.items() if now - v.get("ts", 0) > 86400]:
+        failures.pop(key, None)
+    record = failures.get(ip)
+    if not record:
+        return 0
+    return max(0, int(record.get("until", 0) - now))
+
+
+def _login_failed(state: dict, ip: str) -> int:
+    failures = state.setdefault("login_failures", {})
+    record = failures.setdefault(ip, {"n": 0, "until": 0})
+    record["n"] = int(record.get("n", 0)) + 1
+    record["ts"] = int(time.time())
+    if record["n"] > LOGIN_FREE_TRIES:
+        block = min(2 ** (record["n"] - LOGIN_FREE_TRIES), LOGIN_MAX_BLOCK)
+        record["until"] = int(time.time()) + block
+        return block
+    return 0
+
+
+def _login_succeeded(state: dict, ip: str) -> None:
+    state.setdefault("login_failures", {}).pop(ip, None)
 
 
 # ---------------------------------------------------------------- 部署流程
@@ -109,13 +186,16 @@ class SetupIn(BaseModel):
     domain: str
     username: str
     password: str
+    token: str = ""
 
 
 def _gen_xray(state: dict, timeout: int = 0) -> tuple[bool, str]:
     xray_config.write_xray_config(state)
     count = len(xray_config.build_xray_config(state)["inbounds"])
-    if services.is_prod() and shutil.which("xray"):
-        ok, out = services.run(["xray", "-test", "-c", config.paths()["xray_config"]], timeout=60)
+    binary = services.bin_path("xray")
+    if binary:
+        # 只要有 xray 二进制就用它做真实校验 (生产环境 / 指定 ZP_XRAY_BIN 的开发环境)
+        ok, out = services.run([binary, "-test", "-c", paths()["xray_config"]], timeout=60)
         if not ok:
             return False, f"已生成但 xray -test 未通过: {' '.join(out.split())[:150]}"
         return True, f"已生成 ({count} 个入站, xray -test 通过)"
@@ -127,8 +207,9 @@ def _gen_nginx(state: dict, timeout: int = 0) -> tuple[bool, str]:
     detail = f"已写入 {actual}" if ok_etc else (
         f"无 /etc/nginx 权限 → 已存 {actual} (服务器上由 install.sh 部署)"
     )
-    if ok_etc and services.is_prod() and shutil.which("nginx"):
-        ok, out = services.run(["nginx", "-t"], timeout=30)
+    binary = services.bin_path("nginx")
+    if ok_etc and binary:
+        ok, out = services.run([binary, "-t"], timeout=30)
         tail = " ".join(out.split())[:120]
         if not ok:
             return False, f"nginx -t 未通过: {tail}"
@@ -138,6 +219,10 @@ def _gen_nginx(state: dict, timeout: int = 0) -> tuple[bool, str]:
 
 def _gen_hysteria(state: dict, timeout: int = 0) -> tuple[bool, str]:
     hysteria_config.write_hysteria_config(state)
+    if state["nodes"].get("hysteria2"):
+        cert, key = paths()["hysteria_cert"], paths()["hysteria_key"]
+        if not (os.path.exists(cert) and os.path.exists(key)):
+            return False, "已生成但证书缺失 (客户端将无法连接)"
     return True, "已生成"
 
 
@@ -156,7 +241,7 @@ def _restart_services(state: dict, timeout: int = 0) -> tuple[bool, str]:
         results.append(f"{name} {mark} {detail}")
 
     nodes = state.get("nodes", {})
-    if any(nodes.get(n) for n in ("vless-reality", "vless-ws", "trojan")):
+    if any(nodes.get(n) for n in XRAY_NODE_IDS):
         run("xray", services.restart_service, timeout or 90)
     if nodes.get("hysteria2"):
         run("hysteria2", services.restart_service, timeout or 90)
@@ -195,70 +280,69 @@ def setup(payload: SetupIn, request: Request):
     if len(password) < 6 or len(password) > 128:
         return _err("密码长度需 6-128 位")
 
-    state = load_state()
-    if state["configured"]:
-        return _err("已完成配置, 请使用「重新应用」更新", 409)
+    expected = config.bootstrap_token()
+    provided = (payload.token or request.headers.get("x-zp-token", "")).strip()
+    if expected and not hmac.compare_digest(provided, expected):
+        return _err("引导令牌无效: 请使用安装完成时终端打印的带 ?token= 的链接打开面板", 403)
 
-    steps = _steps_recorder()
+    with config.locked():
+        state = load_state()
+        if state["configured"]:
+            return _err("已完成配置, 请使用「重新应用」更新", 409)
 
-    def step_keys(state, t=0):
-        # 1. 密钥材料: VLESS UUID 派生 / Reality ed25519 密钥对 / 订阅令牌
-        r = state["reality"]
-        if not r["private_key"]:
-            r["private_key"], r["public_key"], r["short_id"] = crypto.new_reality_keys()
-        state["uuid"] = crypto.derive_uuid(username, password)
-        state["subscription_token"] = state["subscription_token"] or crypto.new_token()
-        state["admin"] = {"username": username, "password_hash": crypto.hash_password(password)}
-        return True, "UUID / Reality 密钥对 / 订阅令牌 就绪"
+        steps = _steps_recorder()
 
-    _add_step(steps, "生成密钥材料", step_keys, state)
-    if not steps[0]["ok"]:
-        return JSONResponse(
-            {"error": f"密钥生成失败: {steps[0]['detail']}", "steps": steps},
-            status_code=500,
-        )
+        def step_keys(state, t=0):
+            # 1. 密钥材料: VLESS UUID 派生 / Reality ed25519 密钥对 / 订阅令牌
+            r = state["reality"]
+            if not r["private_key"]:
+                r["private_key"], r["public_key"], r["short_id"] = crypto.new_reality_keys()
+            state["uuid"] = crypto.derive_uuid(username, password)
+            state["subscription_token"] = state["subscription_token"] or crypto.new_token()
+            state["admin"] = {"username": username, "password_hash": crypto.hash_password(password)}
+            return True, "UUID / Reality 密钥对 / 订阅令牌 就绪"
 
-    def step_state(state, t=0):
-        state.update(
-            {
-                "configured": True,
-                "domain": domain,
-                "trojan_password": password,
-                "hysteria_password": password,
-                "created_at": state["created_at"] or int(time.time()),
-            }
-        )
+        _add_step(steps, "生成密钥材料", step_keys, state)
+        if not steps[0]["ok"]:
+            return JSONResponse(
+                {"error": f"密钥生成失败: {steps[0]['detail']}", "steps": steps},
+                status_code=500,
+            )
+
+        def step_state(state, t=0):
+            state.update(
+                {
+                    "configured": True,
+                    "domain": domain,
+                    "trojan_password": password,
+                    "hysteria_password": password,
+                    "created_at": state["created_at"] or int(time.time()),
+                }
+            )
+            save_state(state)
+            return True, "已持久化"
+
+        _add_step(steps, "写入面板状态", step_state, state)
+        # 证书必须先生成: Trojan 入站 (xray) 与 443 (nginx) 都依赖证书文件,
+        # 若在申请证书前生成配置, Trojan 入站会因 cert_usable() 为假而被漏掉。
+        _add_step(steps, "申请 SSL 证书", _install_cert, state, timeout=360)
+        _add_step(steps, "生成 Hysteria 2 证书", lambda s, t: services.generate_hysteria_cert(s["domain"]), state)
+        _add_step(steps, "生成 Xray 配置", _gen_xray, state)
+        _add_step(steps, "生成 Nginx 配置", _gen_nginx, state)
+        _add_step(steps, "生成 Hysteria 2 配置", _gen_hysteria, state)
+        _add_step(steps, "启动/重载服务", _restart_services, state, timeout=180)
+
+        _clean_sessions(state)
+        config.audit(state, "setup", f"domain={domain}", actor=username)
         save_state(state)
-        return True, "已持久化"
-
-    _add_step(steps, "写入面板状态", step_state, state)
-    # 证书必须先生成: Trojan 入站 (xray) 与 443 (nginx) 都依赖证书文件,
-    # 若在申请证书前生成配置, Trojan 入站会因 cert_usable() 为假而被漏掉。
-    _add_step(steps, "申请 SSL 证书", _install_cert, state, timeout=360)
-    _add_step(steps, "生成 Hysteria 2 证书", lambda s, t: services.generate_hysteria_cert(s["domain"]), state)
-    _add_step(steps, "生成 Xray 配置", _gen_xray, state)
-    _add_step(steps, "生成 Nginx 配置", _gen_nginx, state)
-    _add_step(steps, "生成 Hysteria 2 配置", _gen_hysteria, state)
-    _add_step(steps, "启动/重载服务", _restart_services, state, timeout=180)
-
-    _clean_sessions(state)
-    save_state(state)
-    body = _dashboard_body(state, request)
-    body["steps"] = steps
-    response = JSONResponse(body)
-    _issue_session(state, request, response)
-    save_state(state)
+        body = _dashboard_body(state, request)
+        body["steps"] = steps
+        response = JSONResponse(body)
+        _issue_session(state, request, response)
+        save_state(state)
+        # 初始化完成后不再接受第二次 setup: 作废引导令牌
+        config.clear_bootstrap_token()
     return response
-
-
-def _is_ip(host: str) -> bool:
-    import ipaddress
-
-    try:
-        ipaddress.ip_address(host)
-        return True
-    except ValueError:
-        return False
 
 
 # ---------------------------------------------------------------- 认证
@@ -270,43 +354,85 @@ class LoginIn(BaseModel):
 
 @router.post("/api/login")
 def login(payload: LoginIn, request: Request):
-    state = load_state()
-    if not state["configured"]:
-        return _err("系统尚未初始化", 409)
-    if payload.username != state["admin"]["username"] or not crypto.verify_password(
-        payload.password, state["admin"]["password_hash"]
-    ):
-        return _err("用户名或密码错误", 401)
-    response = JSONResponse({"ok": True})
-    _issue_session(state, request, response)
-    save_state(state)
+    ip = _client_ip(request)
+    with config.locked():
+        state = load_state()
+        if not state["configured"]:
+            return _err("系统尚未初始化", 409)
+
+        wait = _login_blocked_for(state, ip)
+        if wait:
+            response = _err(f"登录尝试过多, 请 {wait} 秒后重试", 429)
+            response.headers["Retry-After"] = str(wait)
+            return response
+
+        if payload.username != state["admin"]["username"] or not crypto.verify_password(
+            payload.password, state["admin"]["password_hash"]
+        ):
+            block = _login_failed(state, ip)
+            config.audit(state, "login_failed", f"user={payload.username[:32]}", actor=ip)
+            save_state(state)
+            response = _err("用户名或密码错误", 401)
+            if block:
+                response.headers["Retry-After"] = str(block)
+            return response
+
+        _login_succeeded(state, ip)
+        _clean_sessions(state)
+        response = JSONResponse({"ok": True})
+        _issue_session(state, request, response)
+        config.audit(state, "login", actor=f"{payload.username}@{ip}")
+        save_state(state)
     return response
 
 
 @router.post("/api/logout")
 def logout(request: Request):
-    state = load_state()
-    token = _session_of(state, request)
-    if token:
-        state["sessions"].pop(token, None)
-        save_state(state)
+    with config.locked():
+        state = load_state()
+        token = _session_of(state, request)
+        if token:
+            state["sessions"].pop(token, None)
+            config.audit(state, "logout", actor=_client_ip(request))
+            save_state(state)
     response = JSONResponse({"ok": True})
+    response.delete_cookie(SESSION_COOKIE)
+    return response
+
+
+@router.post("/api/logout-all")
+def logout_all(request: Request):
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        count = len(state.get("sessions", {}))
+        state["sessions"] = {}
+        config.audit(state, "logout_all", f"cleared={count}", actor=_client_ip(request))
+        save_state(state)
+    response = JSONResponse({"ok": True, "cleared": count})
     response.delete_cookie(SESSION_COOKIE)
     return response
 
 
 # ---------------------------------------------------------------- 仪表盘
 
-def _node_view(state: dict) -> dict:
+def _port_for(state: dict, node_id: str) -> int:
+    """节点对外端口: vless-ws 固定走 nginx 443, 其余取配置端口。"""
+    if node_id == "vless-ws":
+        return 443
+    return state["ports"][NODE_BY_ID[node_id]["port_key"]]
+
+
+def _node_view(state: dict, traffic: dict | None) -> dict:
     nodes = state.get("nodes", {})
     links = share_links.share_links(state)
-    cert = state["cert"]
     states = {name: services.service_state(name) for name in ("xray", "hysteria2", "nginx")}
+    by_node = (traffic or {}).get("by_node", {})
     out = []
     for meta in NODES:
         nid = meta["id"]
         enabled = bool(nodes.get(nid, True))
-        link = links.get(nid, "")
         note = None
         if nid == "trojan" and enabled and not xray_config.cert_usable(state):
             note = "待证书: 证书未就绪, 入站未生效"
@@ -316,21 +442,15 @@ def _node_view(state: dict) -> dict:
                 "enabled": enabled,
                 "host": state["domain"],
                 "port": _port_for(state, nid),
+                "editable_port": nid != "vless-ws",
                 "service_state": states.get(meta["service"], "unknown"),
-                "share_link": link if enabled else None,
+                "share_link": links.get(nid) if enabled else None,
                 "note": note,
                 "qr_url": f"/api/nodes/{nid}/qr" if enabled else None,
+                "traffic": by_node.get(nid, {"uplink": 0, "downlink": 0}) if traffic else None,
             }
         )
     return out
-
-
-def _port_for(state: dict, nid: str) -> int:
-    """节点对外端口: vless-ws 固定走 nginx 443, 其余取配置端口。"""
-    if nid == "vless-ws":
-        return 443
-    source = {"vless-reality": "reality", "trojan": "trojan", "hysteria2": "hysteria"}[nid]
-    return state["ports"][source]
 
 
 def _cert_view(state: dict) -> dict:
@@ -351,21 +471,38 @@ def _system_view(state: dict) -> dict:
         },
         "nginx": {"state": services.service_state("nginx")},
         "server": services.server_info(),
+        "prod": services.is_prod(),
     }
 
 
-def _dashboard_body(state: dict, request: Request) -> dict:
-    p = paths()
+def _dashboard_body(state: dict, request: Request, traffic: dict | None = None) -> dict:
+    if traffic is None:
+        traffic = services.xray_stats(state)
+    sub = share_links.subscription_url(request, state)
     return {
         "configured": state["configured"],
         "domain": state["domain"],
         "admin_user": state["admin"]["username"],
         "panel_url": share_links.panel_base_url(request, state),
-        "subscription_url": share_links.subscription_url(request, state),
+        "subscription_url": sub,
+        "subscription_formats": {
+            "base64": sub,
+            "clash": f"{sub}?format=clash",
+            "singbox": f"{sub}?format=singbox",
+        },
         "cert": _cert_view(state),
-        "nodes": _node_view(state),
+        "nodes": _node_view(state, traffic),
         "hysteria_hopping": state.get("hysteria_hopping", False),
         "hysteria_ports": state.get("hysteria_ports", []),
+        "hysteria_masquerade": state.get("hysteria_masquerade", {}),
+        "reality": {
+            "server_name": state["reality"]["server_name"],
+            "dest": state["reality"]["dest"],
+        },
+        "xhttp": state.get("xhttp", {}),
+        "ports": state.get("ports", {}),
+        "traffic": traffic,
+        "audit": list(reversed(state.get("audit", [])))[:20],
         "system": _system_view(state),
     }
 
@@ -376,75 +513,330 @@ def status(request: Request):
     return {
         "configured": state["configured"],
         "authenticated": _require_auth(state, request),
+        # 前端据此提示「请用带 token 的链接打开」
+        "token_required": bool(config.bootstrap_token()) and not state["configured"],
     }
 
 
 @router.get("/api/dashboard")
 def dashboard(request: Request):
-    state = load_state()
-    if not _require_auth(state, request):
-        return _err("未登录", 401)
-    body = _dashboard_body(state, request)
-    body["steps"] = state.get("steps", [])
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        if _clean_sessions(state):
+            save_state(state)
+        body = _dashboard_body(state, request)
+        body["steps"] = state.get("steps", [])
     return body
 
 
-# ---------------------------------------------------------------- 配置修改 (自动化逻辑)
+# ---------------------------------------------------------------- 配置修改
 
 @router.post("/api/nodes/{node_id}/toggle")
 def toggle_node(node_id: str, request: Request):
     if node_id not in NODE_IDS:
         return _err("未知节点", 404)
-    state = load_state()
-    if not _require_auth(state, request):
-        return _err("未登录", 401)
-    state["nodes"][node_id] = not state["nodes"].get(node_id, True)
-    _reapply(state, request)
-    return _dashboard_body(state, request)
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        state["nodes"][node_id] = not state["nodes"].get(node_id, True)
+        config.audit(
+            state,
+            "toggle_node",
+            f"{node_id}={'on' if state['nodes'][node_id] else 'off'}",
+            actor=_client_ip(request),
+        )
+        steps = _reapply(state, request)
+        body = _dashboard_body(state, request)
+        body["steps"] = steps
+        return body
 
 
 @router.post("/api/hysteria/hopping")
 def toggle_hopping(request: Request):
-    state = load_state()
-    if not _require_auth(state, request):
-        return _err("未登录", 401)
-    state["hysteria_hopping"] = not state.get("hysteria_hopping", False)
-    _reapply(state, request)
-    return _dashboard_body(state, request)
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        state["hysteria_hopping"] = not state.get("hysteria_hopping", False)
+        config.audit(
+            state,
+            "toggle_hopping",
+            f"enabled={state['hysteria_hopping']}",
+            actor=_client_ip(request),
+        )
+        steps = _reapply(state, request)
+        body = _dashboard_body(state, request)
+        body["steps"] = steps
+        return body
+
+
+class SettingsIn(BaseModel):
+    reality_sni: str | None = None
+    masquerade_url: str | None = None
+    ports: dict[str, int] | None = None
+
+
+@router.post("/api/settings")
+def update_settings(payload: SettingsIn, request: Request):
+    """高级设置: Reality 伪装 SNI / Hysteria 伪装站点 / 节点端口。"""
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+
+        if payload.reality_sni is not None:
+            if not _SNI_RE.match(payload.reality_sni.strip().lower()):
+                return _err("伪装 SNI 需为合法域名 (示例: www.microsoft.com)")
+
+        if payload.masquerade_url is not None:
+            url = payload.masquerade_url.strip()
+            if url and not _URL_RE.match(url):
+                return _err("伪装站点需为 http(s) URL (示例: https://www.microsoft.com/)")
+
+        new_ports: dict[str, int] = {}
+        if payload.ports:
+            for node_id, port in payload.ports.items():
+                if node_id not in NODE_IDS or node_id == "vless-ws":
+                    return _err(f"节点 {node_id} 不支持改端口")
+                if not isinstance(port, int) or not (1 <= port <= 65535):
+                    return _err(f"端口非法: {port}")
+                new_ports[NODE_BY_ID[node_id]["port_key"]] = port
+
+        # 端口冲突检查 (只检查真正要变化的端口; 面板自身端口由 nginx 占用属正常)
+        for key, port in new_ports.items():
+            if port == state["ports"].get(key):
+                continue
+            proto = "udp" if key == "hysteria" else "tcp"
+            if not services.port_available(port, proto):
+                return _err(f"端口 {port}/{proto} 已被占用, 请换一个")
+
+        changed = []
+        if payload.reality_sni is not None:
+            sni = payload.reality_sni.strip().lower()
+            state["reality"]["server_name"] = sni
+            state["reality"]["dest"] = f"{sni}:443"
+            changed.append(f"sni={sni}")
+
+        if payload.masquerade_url is not None:
+            url = payload.masquerade_url.strip()
+            state["hysteria_masquerade"]["enabled"] = bool(url)
+            state["hysteria_masquerade"]["url"] = url
+            changed.append(f"masquerade={url or 'off'}")
+
+        for key, port in new_ports.items():
+            if port != state["ports"].get(key):
+                state["ports"][key] = port
+                changed.append(f"{key}={port}")
+        # 端口跳跃的端口集合跟随主端口平移 (保持 3 个连续区间的间隔)
+        if "hysteria" in new_ports and state.get("hysteria_hopping"):
+            base = new_ports["hysteria"]
+            state["hysteria_ports"] = [base, base + 1000, base + 2000]
+
+        if not changed:
+            return _err("没有需要修改的内容")
+
+        config.audit(state, "settings", ", ".join(changed), actor=_client_ip(request))
+        steps = _reapply(state, request)
+        body = _dashboard_body(state, request)
+        body["steps"] = steps
+        return body
 
 
 @router.post("/api/apply")
 def apply(request: Request):
-    state = load_state()
-    if not _require_auth(state, request):
-        return _err("未登录", 401)
-    steps = _reapply(state, request)
-    body = _dashboard_body(state, request)
-    body["steps"] = steps
-    return body
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        config.audit(state, "apply", actor=_client_ip(request))
+        steps = _reapply(state, request)
+        body = _dashboard_body(state, request)
+        body["steps"] = steps
+        return body
 
 
 @router.post("/api/renew")
 def renew(request: Request):
-    state = load_state()
-    if not _require_auth(state, request):
-        return _err("未登录", 401)
-    ok, detail = services.renew_cert(state)
-    if ok:
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        ok, detail = services.renew_cert(state)
+        config.audit(state, "renew_cert", detail, actor=_client_ip(request))
         save_state(state)
     return {"ok": ok, "detail": detail}
+
+
+# ---------------------------------------------------------------- 诊断 / 自愈
+
+def _check_tcp(hostport: str, label: str) -> tuple[bool, str]:
+    host, _, port = hostport.partition(":")
+    try:
+        with socket.create_connection((host, int(port or 443)), timeout=5):
+            return True, f"{label} 可连接"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{label} 连接失败: {exc}"
+
+
+def _diagnose(state: dict) -> list[dict]:
+    """逐项自检 (只读), 修复动作交给 /api/repair。"""
+    checks: list[dict] = []
+
+    def add(name: str, ok: bool, detail: str, fixable: bool = False) -> None:
+        checks.append({"name": name, "ok": bool(ok), "detail": detail, "fixable": fixable})
+
+    prod = services.is_prod()
+
+    # 1. 服务状态
+    for service, label in (("xray", "Xray 核心"), ("hysteria2", "Hysteria 2"), ("nginx", "Nginx")):
+        st = services.service_state(service)
+        if not prod:
+            add(label, True, f"{st} (本地开发环境, 跳过服务检查)")
+        else:
+            add(label, st in ("active", "running"), f"systemd 状态: {st}", fixable=True)
+
+    # 2. 配置合法性
+    config_file = paths()["xray_config"]
+    if not os.path.exists(config_file):
+        add("Xray 配置", False, "配置文件不存在", fixable=True)
+    else:
+        ok, detail = services.xray_config_test()
+        add("Xray 配置", ok, "xray -test 通过" if ok else f"xray -test 失败: {detail}", fixable=True)
+
+    # 3. 入站与节点开关一致
+    try:
+        with open(config_file, "r", encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        tags = {i.get("tag") for i in cfg.get("inbounds", [])}
+        want = {
+            nid
+            for nid in XRAY_NODE_IDS
+            if state["nodes"].get(nid) and (nid != "trojan" or xray_config.cert_usable(state))
+        }
+        missing = want - tags
+        add(
+            "入站与节点开关一致",
+            not missing,
+            "一致" if not missing else f"缺少入站: {', '.join(sorted(missing))}",
+            fixable=True,
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        add("入站与节点开关一致", False, f"读取配置失败: {exc}", fixable=True)
+
+    # 4. 证书
+    cert = state["cert"]
+    if cert["type"] == "none":
+        add("TLS 证书", False, "尚未申请证书 (Trojan / WS 节点不可用)", fixable=True)
+    else:
+        days = max(0, int((cert["not_after"] - time.time()) // 86400)) if cert["not_after"] else 0
+        exists = bool(cert["cert_file"]) and os.path.exists(cert["cert_file"])
+        add(
+            "TLS 证书",
+            exists and days > 7,
+            f"{cert['type']} · 剩余 {days} 天 · {'文件存在' if exists else '文件缺失'}",
+            fixable=True,
+        )
+
+    # 5. 端口占用
+    if prod:
+        busy = []
+        for key, proto in (("reality", "tcp"), ("xhttp", "tcp"), ("trojan", "tcp"), ("hysteria", "udp")):
+            port = state["ports"].get(key)
+            if port and not services.port_available(port, proto):
+                busy.append(f"{port}/{proto}")
+        add("端口占用", not busy, "无冲突" if not busy else f"被占用: {', '.join(busy)}")
+
+    # 6. 伪装目标可达性 (Reality / Trojan fallback 依赖它)
+    ok, detail = _check_tcp(state["reality"]["dest"], f"Reality dest {state['reality']['dest']}")
+    add("伪装目标可达性", ok, detail)
+
+    return checks
+
+
+@router.get("/api/diagnose")
+def diagnose(request: Request):
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        checks = _diagnose(state)
+    return {
+        "ok": all(c["ok"] for c in checks),
+        "checks": checks,
+        "summary": f"{sum(1 for c in checks if c['ok'])}/{len(checks)} 项通过",
+    }
+
+
+@router.post("/api/repair")
+def repair(request: Request):
+    """一键自愈: 重新生成全部配置 → 校验 → 重启服务 → 复检。"""
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        config.audit(state, "repair", actor=_client_ip(request))
+        steps = _reapply(state, request)
+        checks = _diagnose(state)
+    return {"ok": all(c["ok"] for c in checks), "steps": steps, "checks": checks}
+
+
+@router.get("/api/traffic")
+def traffic(request: Request):
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        stats = services.xray_stats(state)
+    if not stats:
+        return {"available": False, "detail": "统计不可用 (需要 Xray 已运行)"}
+    return stats
+
+
+@router.get("/api/logs/{service}")
+def logs(service: str, request: Request, lines: int = 40):
+    if service not in ("xray", "hysteria2", "nginx", "zeroproxy"):
+        return _err("未知服务", 404)
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+    return {"service": service, "log": services.journal_tail(service, max(5, min(int(lines), 200)))}
 
 
 # ---------------------------------------------------------------- 订阅 / 二维码
 
 @router.get("/sub/{token}")
-def subscribe(token: str, request: Request):
+def subscribe(token: str, request: Request, format: str = "base64"):
     state = load_state()
     if not state["configured"] or not hmac.compare_digest(
         token, state.get("subscription_token", "")
     ):
         return _err("无效订阅", 404)
-    return Response(share_links.subscription_b64(state), media_type="text/plain; charset=utf-8")
+    body, media_type = share_links.subscription_body(state, format)
+    headers = {
+        # 客户端按此周期自动刷新订阅 (小时), 节点启停/端口变更自动同步
+        "profile-update-interval": "12",
+        "cache-control": "no-store",
+    }
+    userinfo = share_links.subscription_userinfo(services.xray_stats(state))
+    if userinfo:
+        headers["subscription-userinfo"] = userinfo
+    if format.lower() in ("clash", "mihomo", "yaml", "yml"):
+        headers["content-disposition"] = 'attachment; filename="zeroproxy.yaml"'
+    return Response(body, media_type=media_type, headers=headers)
+
+
+def _qr_png(data: str, size: int = 8) -> Response:
+    size = max(2, min(int(size), 20))
+    qc = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=size, border=2)
+    qc.add_data(data)
+    img = qc.make_image(image_factory=qrcode.image.pil.PilImage)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return Response(buf.getvalue(), media_type="image/png", headers={"cache-control": "no-store"})
 
 
 @router.get("/api/nodes/{node_id}/qr")
@@ -457,10 +849,16 @@ def qr(node_id: str, request: Request, size: int = 8):
     link = share_links.share_links(state).get(node_id, "")
     if not link:
         return _err("节点不可用", 409)
-    size = max(2, min(size, 20))
-    qc = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=size, border=2)
-    qc.add_data(link)
-    img = qc.make_image(image_factory=qrcode.image.pil.PilImage)
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return Response(buf.getvalue(), media_type="image/png")
+    return _qr_png(link, size)
+
+
+@router.get("/api/subscription/qr")
+def subscription_qr(request: Request, size: int = 8, format: str = "base64"):
+    """订阅二维码 (前端卡片上的「二维码」按钮; 之前误把 URL 当图片地址)。"""
+    state = load_state()
+    if not _require_auth(state, request):
+        return _err("未登录", 401)
+    url = share_links.subscription_url(request, state)
+    if (format or "base64").lower() != "base64":
+        url = f"{url}?format={format}"
+    return _qr_png(url, size)

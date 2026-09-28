@@ -6,9 +6,11 @@
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import platform
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -28,6 +30,21 @@ SERVICES = {
     "hysteria2": "hysteria",
     "nginx": "nginx",
 }
+
+#: 需要统计流量的 Xray 入站 tag (api 入站本身不计入用户流量)
+TRAFFIC_TAGS = ("vless-reality", "vless-xhttp", "vless-ws", "trojan")
+
+
+def bin_path(name: str) -> str | None:
+    """二进制路径。
+
+    默认取 PATH 中的命令; 可用 ZP_XRAY_BIN / ZP_HYSTERIA_BIN / ZP_NGINX_BIN
+    指定绝对路径 (自定义安装位置, 或在 macOS 上做真实二进制验证)。
+    """
+    override = os.environ.get(f"ZP_{name.upper()}_BIN", "").strip()
+    if override:
+        return override if os.path.exists(override) else None
+    return shutil.which(SERVICES.get(name, name))
 
 
 def is_prod() -> bool:
@@ -50,7 +67,7 @@ def service_state(name: str) -> str:
     """active / failed / inactive / unavailable / dry-run。"""
     if not is_prod():
         return "dry-run"
-    if shutil.which(SERVICES.get(name, name)) is None:
+    if bin_path(name) is None:
         return "not-installed"
     ok, out = run(["systemctl", "is-active", name], timeout=15)
     state = out.strip().splitlines()[0] if out.strip() else "unknown"
@@ -77,9 +94,10 @@ def reload_service(name: str, timeout: int = 60) -> tuple[bool, str]:
 
 def service_version(name: str) -> str:
     binary = SERVICES.get(name, name)
-    if shutil.which(binary) is None:
+    path = bin_path(name)
+    if path is None:
         return ""
-    ok, out = run([binary, "version"], timeout=15)
+    ok, out = run([path, "version"], timeout=15)
     if not ok:
         return ""
     first = out.strip().splitlines()[0] if out.strip() else ""
@@ -186,6 +204,9 @@ def install_cert(host: str) -> tuple[bool, str, dict]:
                 "--non-interactive",
                 "--agree-tos",
                 "--register-unsafely-without-email",
+                # 重复执行 /api/apply 时: 已有证书且未临近过期则复用, 需要时自动扩展域名
+                "--keep-until-expiring",
+                "--expand",
             ],
             timeout=300,
         )
@@ -242,3 +263,83 @@ def _cert_not_after(cert_file: str) -> int:
         return int(cert.not_valid_after_utc.timestamp())
     except Exception:  # noqa: BLE001
         return 0
+
+
+# ---------------------------------------------------------------- 流量统计
+
+def xray_stats(state: dict) -> Optional[dict]:
+    """通过本机 Stats API 读取流量统计。
+
+    返回 {"uplink", "downlink", "total", "by_node"} (字节); 未安装 xray /
+    非生产环境 / API 不可达时返回 None, 调用方应展示「不可用」。
+    """
+    binary = bin_path("xray")
+    if binary is None:
+        return None
+    addr = f"127.0.0.1:{state['ports'].get('api', 10085)}"
+    ok, out = run(
+        [binary, "api", "statsquery", f"--server={addr}", "-pattern", ""], timeout=20
+    )
+    if not ok:
+        return None
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+
+    by_node: dict[str, dict] = {tag: {"uplink": 0, "downlink": 0} for tag in TRAFFIC_TAGS}
+    uplink = downlink = 0
+    for item in data.get("stat", []):
+        name = item.get("name", "")
+        parts = name.split(">>>")
+        # 形如 inbound>>>vless-reality>>>traffic>>>uplink
+        if len(parts) != 4 or parts[0] != "inbound":
+            continue
+        tag, direction = parts[1], parts[3]
+        if tag not in by_node or direction not in ("uplink", "downlink"):
+            continue
+        value = int(item.get("value", 0) or 0)
+        by_node[tag][direction] += value
+        if direction == "uplink":
+            uplink += value
+        else:
+            downlink += value
+    return {
+        "uplink": uplink,
+        "downlink": downlink,
+        "total": uplink + downlink,
+        "by_node": by_node,
+        "available": True,
+    }
+
+
+# ---------------------------------------------------------------- 自检 / 诊断
+
+def port_available(port: int, proto: str = "tcp") -> bool:
+    """端口是否空闲 (用绑定探测, 不依赖 lsof/ss)。"""
+    family = socket.AF_INET
+    sock_type = socket.SOCK_STREAM if proto == "tcp" else socket.SOCK_DGRAM
+    with socket.socket(family, sock_type) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("127.0.0.1", int(port)))
+        except OSError:
+            return False
+    return True
+
+
+def journal_tail(name: str, lines: int = 40) -> str:
+    """服务日志尾部 (仅 Linux/systemd)。"""
+    if not is_prod() or shutil.which("journalctl") is None:
+        return "非生产环境, 无 journalctl"
+    ok, out = run(["journalctl", "-u", name, "-n", str(int(lines)), "--no-pager"], timeout=20)
+    return out if ok else f"读取失败: {out[:200]}"
+
+
+def xray_config_test() -> tuple[bool, str]:
+    """生产环境下用 `xray -test` 校验现网配置。"""
+    binary = bin_path("xray")
+    if binary is None:
+        return True, "跳过 (未安装 xray)"
+    ok, out = run([binary, "-test", "-c", paths()["xray_config"]], timeout=60)
+    return ok, " ".join(out.split())[:200]

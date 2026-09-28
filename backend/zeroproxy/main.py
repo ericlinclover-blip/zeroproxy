@@ -12,11 +12,25 @@ import os
 
 import uvicorn
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__, config, routes
+
+#: 安全响应头。前端是单文件内联 CSS/JS, 因此 CSP 必须允许 'unsafe-inline';
+#: 其余指令仍然收紧 (禁止外域脚本/框架嵌入/跨站引用)。
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Content-Security-Policy": (
+        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+        "script-src 'self' 'unsafe-inline'; connect-src 'self'; form-action 'self'; "
+        "base-uri 'none'; frame-ancestors 'none'"
+    ),
+}
 
 
 def _static_dir() -> str:
@@ -33,7 +47,15 @@ def _static_dir() -> str:
 
 def create_app() -> FastAPI:
     app = FastAPI(title="ZeroProxy", version=__version__, docs_url=None, redoc_url=None)
-    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+    @app.middleware("http")
+    async def security_headers(request, call_next):
+        """统一附加安全响应头 (面板是同源单页应用, 不需要开放 CORS)。"""
+        response = await call_next(request)
+        for key, value in SECURITY_HEADERS.items():
+            response.headers.setdefault(key, value)
+        return response
+
     app.include_router(routes.router)
 
     static_dir = _static_dir()

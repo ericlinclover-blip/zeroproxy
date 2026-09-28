@@ -1,0 +1,159 @@
+# ZeroProxy 竞品与技术调研
+
+> 调研时间: **2026-09-28** · 方法: GitHub API 实测取数 + 上游源码逐条核对 + 真实二进制端到端验证
+> 取数口径: 星标/活跃度来自 GitHub REST API `/repos/{owner}/{repo}` 实时返回, 非二手文章转述。
+> 结论先行: 现有生态里**没有第二个产品**把「0 配置 + 1 行部署」当成核心目标。竞品全是多用户
+> 商业面板 (要数据库、要建用户、要域名证书、要向导), 本项目占据的是一个真实存在的空位。
+
+---
+
+## 1. 竞品全景
+
+| 项目 | ★ | 语言 | 许可 | 最近推送 | 定位 |
+|---|---:|---|---|---|---|
+| [MHSanaei/3x-ui](https://github.com/MHSanaei/3x-ui) | 47,067 | Go | GPL-3.0 | 2026-09-28 | 事实标准: 多协议多用户面板 |
+| [XTLS/Xray-core](https://github.com/XTLS/Xray-core) | 41,818 | Go | MPL-2.0 | 2026-09-27 | 内核 (Reality/Vision/XHTTP 发源地) |
+| [SagerNet/sing-box](https://github.com/SagerNet/sing-box) | 38,368 | Go | GPL-3.0+附加 | 2026-09-28 | 通用内核 + 出站协议最全 |
+| [MetaCubeX/mihomo](https://github.com/MetaCubeX/mihomo) | 34,470 | Go | MIT | 2026-09-27 | Clash.Meta 内核, 客户端解析基准 |
+| [233boy/v2ray](https://github.com/233boy/v2ray) | 29,679 | Shell | GPL-3.0 | 2026-01-15 | 一键脚本 (无面板) |
+| [apernet/hysteria](https://github.com/apernet/hysteria) | 22,577 | Go | MIT | 2026-09-27 | QUIC 内核, 弱网 + 端口跳跃 |
+| [vaxilu/x-ui](https://github.com/vaxilu/x-ui) | 19,093 | JS/Go | GPL-3.0 | **2024-08-19** | 3x-ui 的前身, 已实质停更 |
+| [tindy2013/subconverter](https://github.com/tindy2013/subconverter) | 17,079 | C++ | GPL-3.0 | 2026-07-09 | 订阅格式转换器 |
+| [sub-store-org/Sub-Store](https://github.com/sub-store-org/Sub-Store) | 10,560 | JS | AGPL-3.0 | 2026-09-28 | 高级订阅管理器 |
+| [hiddify/Hiddify-Manager](https://github.com/hiddify/Hiddify-Manager) | 9,304 | Python | GPL-3.0 | 2026-09-26 | 多用户反审查面板, 20+ 协议 |
+| [Gozargah/Marzban](https://github.com/Gozargah/Marzban) | 7,398 | Python | AGPL-3.0 | 2026-06-08 | API 优先的 Xray 面板 |
+| [remnawave/panel](https://github.com/remnawave/panel) | 5,137 | TypeScript | AGPL-3.0 | 2026-09-12 | 新一代订阅制面板 |
+| [cedar2025/Xboard](https://github.com/cedar2025/Xboard) | 4,737 | PHP | MIT | 2026-08-29 | v2board 活跃分支 |
+| [v2board/v2board](https://github.com/v2board/v2board) | 5,062 | PHP | MIT | **2024-03-19** | 商业化计费面板, 已停更 |
+
+> 注: `MetaCubeX/mihomo` 的 GitHub 描述字段被污染 (显示成一句星铁 Pydantic 模型文案), 语言字段也
+> 误报为 Python。真实身份是 Go 写的 Clash.Meta 内核。这是 GitHub 侧元数据问题, 星标数真实。
+
+---
+
+## 2. 分类剖析
+
+### 2.1 多用户商业面板: 3x-ui / Hiddify / Marzban / Remnawave / Xboard
+
+这一类是生态主体, 星标最高, 但它们的**共同成本结构**正是本项目的切入点:
+
+1. **必有数据库**: 3x-ui 用 SQLite, Marzban 用 SQLAlchemy, Remnawave 用 PostgreSQL。部署后第一件事是迁移。
+2. **必有多用户模型**: 用户名/密码/配额/到期时间/流量重置日。哪怕只有自己一个人用, 也要走一遍。
+3. **必有部署向导**: 装完要登面板 → 改默认口令 → 配域名 → 申请证书 → 建入站 → 配 SNI 域名 → 才能拿到订阅链接。
+   其中「证书」是最容易卡住的一步, 需要域名解析已生效 + 80 端口可达。
+4. **大量选项**: 3x-ui 的入站面板有几十个字段。对追求"现在就通"的人, 这是**认知税**。
+
+结论: 它们的「一键」只覆盖**安装**, 不覆盖**配置**。这正是本项目「0 配置」要抢的位。
+
+### 2.2 订阅转换: subconverter / Sub-Store
+
+- `subconverter` (C++): 把一种订阅转成另一种。部署需自建服务 + 上传配置, 是独立组件。
+- `Sub-Store` (JS): 功能最强 (脚本化重写、节点筛选), 但活在客户端/云端, 需要 Node 运行时。
+
+它们解决的是「**已有节点, 想换格式**」; 本项目解决的是「**还没有节点**」。本项目把三种订阅格式
+**内建在面板里** (见 §4), 不走外部转换器, 少一个部署单元。
+
+### 2.3 一键脚本: 233boy/v2ray
+
+纯 Shell, 无面板, `bash <(curl ...)` 装完直接给链接。它最接近「1 行部署」, 但:
+
+- 无面板、无流量统计、无可视化、改配置要重新跑菜单。
+- 只覆盖单一内核 (Xray), 没有 Hysteria/端口跳跃。
+
+本项目的野心正是: **保留脚本的"1 行", 补上面板的"看得见"**。
+
+### 2.4 内核实测 (`2026-09-28` 真实二进制)
+
+本项目直接调用上游内核, 因此内核行为即契约。下载并实跑验证:
+
+| 内核 | 版本 | 用途 |
+|---|---|---|
+| Xray-core | 26.3.27 | Reality / XHTTP / WS / Trojan / Stats API |
+| Hysteria | v2.12.3 | QUIC 节点 + 端口跳跃 |
+| mihomo | v1.19.31 | 校验 Clash 订阅可被真实客户端解析 |
+| sing-box | 1.14.2 | 校验 sing-box 订阅可被真实客户端解析 |
+
+---
+
+## 3. 一手证据: 本项目采信的上游事实
+
+以下每条都从上游源码或真实二进制中得到, 并已在 `scripts/verify.py` 里端到端复现。这些是"新闻稿
+式文章"不会写、但会让面板直接启动失败的东西。
+
+| # | 事实 | 证据 | 影响 |
+|---|---|---|---|
+| 1 | Xray 26.x TLS 证书字段是 `certificateFile` / `keyFile`; `certificate` / `key` 已变为 **PEM 内容数组** | `infra/conf/transport_security.go` `TLSCertConfig` | 用旧字段名会导致 Xray 拒绝启动 |
+| 2 | `sniffing.destOverride` 合法值仅 `http` / `tls` / `quic` / `fakedns` | Xray 配置校验 | 写 `dns` 直接报配置错误 |
+| 3 | Stats API 的路由规则 `outboundTag` 必须指向 **API 入站的 tag** (本项目为 `api`) | `infra/conf/api.go` `APIConfig{Tag,Listen,Services}` | 指 `direct` 则统计读数为空 |
+| 4 | Hysteria 服务端口令是**整串比较** | `extras/auth/password.go` `auth == a.Password` | 决定订阅链接怎么写 |
+| 5 | 端口跳跃判定: 端口串含 `-` 或 `,` 即视为跳跃端口 | `app/cmd/client.go` `isPortHoppingPort` | `mport` 参数必须与多端口监听一致 |
+| 6 | Hysteria 伪装支持 `type: proxy` + `url` / `rewriteHost` / `xForwarded` / `insecure` | `app/cmd/server.go` `serverConfigMasqueradeProxy` | 非代理流量可反代到真实网站 |
+| 7 | sing-box 1.13+ 移除入站 legacy 字段 `sniff: true` | 1.14.2 实测 `check PASS/FAIL` | 旧模板会导致订阅校验失败 |
+| 8 | Clash 的 `ws-opts.headers` 必须是 **map**, 不是字符串 | mihomo `-t` 实测 | 手写序列化会产出非法 YAML |
+
+### 3.1 一个反直觉的口令陷阱
+
+Xray 的 VLESS/Trojan 用 `user:pass@` 是 **HTTP Basic 风格的 URI 语法糖**; 但 Hysteria2 的
+`hy2://` URI 里, 客户端会把 `user:pass` **整串**当作 auth 发给服务端, 而服务端做的是整串比较
+(见证据 #4/#5)。因此生成 Hysteria2 链接时**只能写密码, 不能写 `user:pass`**, 否则认证必然失败。
+这一点在 `backend/zeroproxy/share_links.py` 中已固化, 并由真实客户端解析测试守护。
+
+---
+
+## 4. 本项目的技术取舍 (吸收了什么, 拒绝什么)
+
+**吸收自竞品**:
+
+| 能力 | 来源参考 | 本项目实现 |
+|---|---|---|
+| VLESS + Vision + Reality 主力节点 | 3x-ui / Xray 社区默认推荐 | 默认节点, 免证书, 端口 8443 |
+| VLESS + XHTTP + Reality | Xray 25+ 新传输 | 新增节点, 端口 8445 (特征最接近普通 HTTP) |
+| Hysteria2 + 端口跳跃 | Hiddify / hysteria 官方 `mport` | UDP 30001 + 跳跃段 31001/32001 |
+| Clash / sing-box / 通用 三格式订阅 | subconverter / Sub-Store | 内建生成, 无外部转换器 |
+| 流量统计 (Stats API) | 3x-ui / Marzban | gRPC StatsService, 每节点上下行 |
+| 订阅链接恒定 | 3x-ui `subId` / Sub-Store | 状态驱动, URL 永不随配置变更而变 |
+| 证书自动续期 | 通用 | certbot `--keep-until-expiring --expand` |
+
+**刻意拒绝** (为了守住「0 配置」):
+
+| 不做 | 理由 |
+|---|---|
+| 数据库 | 状态是一个 `data/state.json`, 无迁移、无依赖 |
+| 多用户 / 配额 / 计费 | 目标是个人与小团队; 引入即成商业面板复杂度 |
+| 强制域名 + 证书 | Reality 免证书是默认主力, 证书只在 WS/Trojan 分支可选 |
+| 安装后配置向导 | 首次访问用引导令牌一键生成全部 5 个可用节点 |
+| 外部订阅转换器 | 三格式内建, 少一个部署单元和故障点 |
+
+**安全模型对标**: 竞品多为"安装即监听公网 + 默认口令"。本项目改为: 面板仅 127.0.0.1 回环,
+由 nginx 终结 TLS; 首次初始化需一次性引导令牌 (`data/bootstrap_token`, 0600, 用后即删),
+登录带 `2^n` 秒递增封禁, 并下发 CSP / X-Frame-Options / nosniff 等安全响应头。
+
+---
+
+## 5. 差距与后续路线 (诚实清单)
+
+本项目**当前不如**竞品的地方:
+
+1. **无多用户/配额** — 3x-ui / Marzban / Remnawave 的主战场, 本项目不覆盖 (定位差异, 非缺陷)。
+2. **无节点健康/延迟探测** — 竞品能显示每个节点的握手延迟。可考虑接入 Xray
+   `observatory` 或简单 TCP 握手计时。
+3. **无分流规则模板** — Clash 订阅未带 rule-set / proxy-group 自定义。Sub-Store 在此更强。
+4. **无备份/恢复** — 建议加 `state.json` 导入导出。
+5. **无 Docker 交付** — 目前是 Shell 一行部署, 未提供镜像。
+6. **GeoIP/GeoData 未自动更新** — 需要时可加定时拉取。
+7. **IPv6 未专门处理** — 双栈环境需手动确认。
+
+其中 2 / 4 / 6 是**投入产出比最高**的下一步。
+
+---
+
+## 6. 引用
+
+- GitHub REST API `GET /repos/{owner}/{repo}` — 星标/语言/许可/推送时间, 取数于 2026-09-28。
+- Xray-core 源码: `infra/conf/transport_security.go`, `infra/conf/api.go`,
+  `transport/internet/splithttp/config.go` (版本 26.3.27)。
+- Hysteria 源码: `app/cmd/client.go` (`isPortHoppingPort`, `fillServerAddr`),
+  `app/cmd/server.go` (`serverConfigMasquerade*`), `extras/auth/password.go` (v2.12.3)。
+- 端到端复现: 见仓库 `scripts/verify.py` (真实内核 30/30) 与 `backend/tests/`。
+
+原始取数结果保存在开发机的 `/tmp/zp-bin/competitors.json` (临时文件, 不入库)。

@@ -3,14 +3,28 @@
 所有可变参数集中保存在 $ZP_HOME/data/state.json (权限 0600)。
 「修改配置 → 重新生成 → 热重载」闭环完全由这份状态驱动，
 订阅 URL 恒定不变 (见 README「自动化逻辑」一节)。
+
+并发模型: 面板是单进程 (uvicorn) + 线程池执行同步端点, 因此 `locked()`
+同时提供进程内互斥 (threading) 与跨进程互斥 (fcntl.flock); 读-改-写事务
+一律走 `locked()`, 避免并发端点互相覆盖状态。写盘走「临时文件 + fsync +
+rename」原子替换, 断电/崩溃不会留下半个 JSON。
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import os
 import threading
 import time
+
+try:  # POSIX (Linux/macOS); 其他平台退化为纯进程内锁
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
+
+#: state.json 结构版本 — 新增字段时 +1, `_merge` 会自动补齐缺失键
+STATE_VERSION = 2
 
 DEFAULT_HOME = "/opt/zeroproxy"
 #: 面板对外端口 (nginx 监听, 默认 8899) — 用于生成订阅/面板链接
@@ -21,6 +35,10 @@ PANEL_BIND_PORT = int(os.environ.get("ZP_BIND_PORT", "9900"))
 
 LOCK = threading.RLock()
 
+#: 会话默认有效期 (72h) / 允许同时在线的会话数上限
+SESSION_TTL = 72 * 3600
+MAX_SESSIONS = 8
+
 #: Reality 默认伪装的 SNI 目标 (技术文档 §7.6.3: 知名度高、TLS1.3、x25519 key_share)
 DEFAULT_REALITY_DEST = "www.microsoft.com:443"
 DEFAULT_REALITY_SNI = "www.microsoft.com"
@@ -28,16 +46,33 @@ DEFAULT_REALITY_SNI = "www.microsoft.com"
 #: WebSocket 传输路径 (nginx 反代 + 客户端 path 参数共用)
 WS_PATH = "/ws/zeroproxy"
 
+#: XHTTP 传输路径 (技术文档 §9) — VLESS + XHTTP + Reality, 免证书且流量特征更接近普通 HTTP
+XHTTP_PATH = "/xhttp-zeroproxy"
+
+#: Hysteria 2 伪装目标 (非代理流量会被反代到这里, 技术文档 §4.3)
+DEFAULT_MASQUERADE = "https://www.microsoft.com/"
+
 #: 节点元数据 — id 与 state["nodes"] 的键一致
 NODES = [
     {
         "id": "vless-reality",
         "name": "VLESS Reality",
         "protocol": "VLESS",
-        "transport": "TCP",
+        "transport": "TCP + Vision",
         "security": "XTLS-Reality (无证书)",
         "service": "xray",
+        "port_key": "reality",
         "desc": "反封锁最强组合, 免证书, 推荐主力节点",
+    },
+    {
+        "id": "vless-xhttp",
+        "name": "VLESS XHTTP Reality",
+        "protocol": "VLESS",
+        "transport": "XHTTP",
+        "security": "XTLS-Reality (无证书)",
+        "service": "xray",
+        "port_key": "xhttp",
+        "desc": "新一代 HTTP 形态传输, 特征最接近普通网站 (需 Xray 25+)",
     },
     {
         "id": "vless-ws",
@@ -46,7 +81,8 @@ NODES = [
         "transport": "WebSocket",
         "security": "TLS 1.3 (Let's Encrypt)",
         "service": "xray",
-        "desc": "nginx 443 反代, 浏览器/全平台兼容",
+        "port_key": "ws",
+        "desc": "nginx 443 反代, 浏览器/全平台兼容 (可挂 CDN)",
     },
     {
         "id": "trojan",
@@ -55,6 +91,7 @@ NODES = [
         "transport": "TCP",
         "security": "TLS 1.3 完美 HTTPS 伪装",
         "service": "xray",
+        "port_key": "trojan",
         "desc": "协议层即 HTTPS, 流量整形抗 DPI",
     },
     {
@@ -64,32 +101,42 @@ NODES = [
         "transport": "QUIC/UDP",
         "security": "ChaCha20-Poly1305",
         "service": "hysteria2",
+        "port_key": "hysteria",
         "desc": "弱网最优, 支持端口跳跃抗封锁",
     },
 ]
 NODE_IDS = [n["id"] for n in NODES]
+NODE_BY_ID = {n["id"]: n for n in NODES}
+#: 由 Xray 承载的节点 (用于判断是否需要重启 xray)
+XRAY_NODE_IDS = ("vless-reality", "vless-xhttp", "vless-ws", "trojan")
 
 DEFAULTS: dict = {
-    "version": 1,
+    "version": STATE_VERSION,
     "configured": False,
     "domain": "",
     "admin": {"username": "", "password_hash": ""},
     # 由 用户名+密码 确定性派生的 VLESS UUID (同一凭据始终得到同一 UUID)
     "uuid": "",
     "reality": {
-        "private_key": "",   # base64(32B ed25519 seed)
-        "public_key": "",    # base64(32B 公钥)
+        "private_key": "",   # base64url(32B ed25519 seed)
+        "public_key": "",    # base64url(32B 公钥)
         "short_id": "",      # hex, 客户端 sid
         "dest": DEFAULT_REALITY_DEST,
         "server_name": DEFAULT_REALITY_SNI,
     },
+    # XHTTP 传输参数 (技术文档 §9): mode=auto 由两端协商
+    "xhttp": {"path": XHTTP_PATH, "mode": "auto", "host": ""},
     "trojan_password": "",
     "hysteria_password": "",
+    # Hysteria 2 伪装: 非代理流量反向代理到该站点 (技术文档 §4.3)
+    "hysteria_masquerade": {"enabled": True, "url": DEFAULT_MASQUERADE},
     "ports": {
         "reality": 8443,        # Xray Reality 直连
+        "xhttp": 8445,          # Xray XHTTP + Reality 直连
         "ws_internal": 6000,    # Xray WS 入站 (仅 127.0.0.1, nginx 终结 TLS)
         "trojan": 8444,         # Xray Trojan (复用同一证书)
         "hysteria": 30001,      # Hysteria 2 (UDP)
+        "api": 10085,           # Xray Stats API (仅 127.0.0.1)
     },
     "hysteria_hopping": True,   # 端口跳跃 (技术文档 附录 C)
     "hysteria_ports": [30001, 31001, 32001],
@@ -103,6 +150,10 @@ DEFAULTS: dict = {
     },
     "subscription_token": "",
     "sessions": {},
+    # 登录失败限流: ip -> {"n": 连续失败次数, "until": 解封时间戳}
+    "login_failures": {},
+    # 审计日志 (最近 200 条)
+    "audit": [],
     "created_at": 0,
     "updated_at": 0,
     "steps": [],
@@ -119,6 +170,9 @@ def paths() -> dict:
         "home": h,
         "data_dir": f"{h}/data",
         "state": f"{h}/data/state.json",
+        "lock": f"{h}/data/state.lock",
+        # install.sh 生成的一次性引导令牌 (0600): 只有拿到它的人能完成初始化
+        "bootstrap_token": f"{h}/data/bootstrap_token",
         "xray_dir": f"{h}/xray",
         "xray_config": f"{h}/xray/config.json",
         "hysteria_dir": f"{h}/hysteria",
@@ -153,6 +207,71 @@ def _merge(base: dict, extra: dict) -> None:
             base[key] = value
 
 
+# ---------------------------------------------------------------- 引导令牌
+
+def bootstrap_token() -> str:
+    """初始化引导令牌。
+
+    优先级: 环境变量 ZP_BOOTSTRAP_TOKEN > $ZP_HOME/data/bootstrap_token。
+    两者都不存在时返回空串 — 本地开发 (dev.sh) 允许无令牌初始化;
+    生产环境由 install.sh 必定写入该文件, 从而关闭「谁先打开面板谁就能
+    抢注管理员」的时间窗。
+    """
+    env = os.environ.get("ZP_BOOTSTRAP_TOKEN", "").strip()
+    if env:
+        return env
+    try:
+        with open(paths()["bootstrap_token"], "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def write_bootstrap_token(token: str) -> None:
+    """写入引导令牌 (0600)。"""
+    _ensure_dirs()
+    path = paths()["bootstrap_token"]
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(token.strip() + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def clear_bootstrap_token() -> None:
+    """作废引导令牌 (初始化成功后调用, 防止重放)。"""
+    try:
+        os.remove(paths()["bootstrap_token"])
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- 状态读写
+
+@contextlib.contextmanager
+def locked():
+    """读-改-写事务互斥锁。
+
+    进程内 threading.RLock (可重入, 允许嵌套), 进程间 fcntl.flock。
+    锁文件独立于 state.json, 避免 rename 让锁失效。「读 → 改 → 写」应整体
+    包在 `with locked():` 内。
+    """
+    with LOCK:
+        if fcntl is None:
+            yield
+            return
+        _ensure_dirs()
+        fd = os.open(paths()["lock"], os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
+
 def load_state() -> dict:
     with LOCK:
         _ensure_dirs()
@@ -164,19 +283,33 @@ def load_state() -> dict:
                     _merge(state, json.load(fh))
             except (json.JSONDecodeError, OSError):
                 pass
+        # 结构升级: 缺失键由 _merge 自动补齐, 这里统一标注版本号
+        state["version"] = STATE_VERSION
         return state
 
 
 def save_state(state: dict) -> None:
     with LOCK:
         _ensure_dirs()
+        state["version"] = STATE_VERSION
         state["updated_at"] = int(time.time())
         path = paths()["state"]
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(state, fh, ensure_ascii=False, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, path)
         try:
             os.chmod(path, 0o600)
         except OSError:
             pass
+
+
+def audit(state: dict, action: str, detail: str = "", actor: str = "") -> None:
+    """追加一条审计记录 (仅改内存态, 由调用方决定何时 save_state)。"""
+    entries = state.setdefault("audit", [])
+    entries.append(
+        {"ts": int(time.time()), "action": action, "detail": detail[:200], "actor": actor[:64]}
+    )
+    del entries[:-200]  # 只保留最近 200 条

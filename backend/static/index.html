@@ -112,6 +112,7 @@ code.inline { background: var(--border); padding: 2px 7px; border-radius: 6px; f
 .pstep .ico.bad { color: var(--err); }
 .pstep .detail { color: var(--sub); font-size: 12px; margin-left: 28px; word-break: break-all; }
 .err-box { color: var(--err); font-size: 13.5px; margin-top: 12px; }
+.hint-box { color: var(--warn); font-size: 13px; margin-top: 12px; line-height: 1.5; }
 .linkline { display: flex; gap: 10px; align-items: center; }
 .linkline .val { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
@@ -139,6 +140,27 @@ code.inline { background: var(--border); padding: 2px 7px; border-radius: 6px; f
 .switch input:checked + .slider { background: var(--ok); }
 .switch input:checked + .slider::before { transform: translateX(16px); }
 
+/* ---------- 订阅格式 ---------- */
+.fmt-row { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-top: 1px solid var(--border); }
+.fmt-row:first-of-type { border-top: none; }
+.fmt-row .tag { width: 86px; flex-shrink: 0; font-size: 13px; font-weight: 600; }
+.fmt-row .val { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--sub); }
+.fmt-row .tip { font-size: 12px; color: var(--sub); }
+
+/* ---------- 诊断 / 流量 ---------- */
+.check { display: flex; gap: 10px; align-items: flex-start; padding: 7px 0; font-size: 13.5px; border-top: 1px solid var(--border); }
+.check:first-child { border-top: none; }
+.check .ico { width: 18px; text-align: center; flex-shrink: 0; }
+.check .ico.ok { color: var(--ok); }
+.check .ico.bad { color: var(--err); }
+.check .name { font-weight: 600; flex-shrink: 0; }
+.check .detail { color: var(--sub); font-size: 12.5px; }
+.traffic-row { display: flex; align-items: center; gap: 10px; font-size: 13px; padding: 6px 0; }
+.traffic-row .k { width: 150px; flex-shrink: 0; color: var(--sub); }
+.traffic-row .bar { flex: 1; }
+.adv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 14px; }
+.adv-grid .field { margin-bottom: 0; }
+
 /* ---------- 模态 ---------- */
 .modal-mask {
   position: fixed; inset: 0; background: rgba(0, 0, 0, 0.55);
@@ -158,8 +180,9 @@ code.inline { background: var(--border); padding: 2px 7px; border-radius: 6px; f
 .footer { text-align: center; color: var(--sub); font-size: 12px; margin-top: 40px; }
 .bar { height: 6px; border-radius: 999px; background: var(--border); overflow: hidden; margin-top: 8px; }
 .bar > i { display: block; height: 100%; background: var(--ok); border-radius: 999px; }
-.kv { display: flex; justify-content: space-between; font-size: 13.5px; padding: 5px 0; }
-.kv .k { color: var(--sub); }
+.kv { display: flex; justify-content: space-between; font-size: 13.5px; padding: 5px 0; gap: 12px; }
+.kv .k { color: var(--sub); flex-shrink: 0; }
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 </style>
 </head>
 <body>
@@ -174,17 +197,21 @@ code.inline { background: var(--border); padding: 2px 7px; border-radius: 6px; f
   <section id="view-setup" class="hidden">
     <div class="hero">
       <h1>0 配置 · <span class="grad">1 行部署</span></h1>
-      <p>只需三样东西, 节点 / 证书 / 订阅 全自动生成</p>
+      <p>输入域名与管理员账号, 其余全部自动完成</p>
     </div>
     <div class="proto-row" id="protoRow"></div>
     <div class="card setup-card">
-      <div class="field"><label>域名 (已解析到本机, 80/443 开放)</label>
+      <div class="field">
+        <label>域名 (已解析到本服务器)</label>
         <input id="in-domain" placeholder="proxy.example.com" spellcheck="false"></div>
-      <div class="field"><label>管理用户名</label>
+      <div class="field">
+        <label>管理用户名</label>
         <input id="in-user" placeholder="admin" spellcheck="false"></div>
-      <div class="field"><label>管理密码 (≥6 位, 同时用作 Trojan/Hysteria 2 凭据)</label>
+      <div class="field">
+        <label>管理密码 (同时作为代理口令)</label>
         <input id="in-pass" type="password" placeholder="••••••••"></div>
       <button class="btn" id="btn-setup" style="width:100%">一键生成</button>
+      <div class="hint-box hidden" id="setup-hint"></div>
       <div class="err-box hidden" id="setup-err"></div>
       <div class="progress hidden" id="setup-progress"></div>
     </div>
@@ -192,10 +219,7 @@ code.inline { background: var(--border); padding: 2px 7px; border-radius: 6px; f
 
   <!-- ============ 视图 2: 登录 ============ -->
   <section id="view-login" class="hidden">
-    <div class="hero">
-      <h1>欢迎回来</h1>
-      <p>登录管理面板</p>
-    </div>
+    <div class="hero"><h1>登录面板</h1><p>ZeroProxy 已初始化</p></div>
     <div class="card setup-card">
       <div class="field"><label>用户名</label><input id="login-user" spellcheck="false"></div>
       <div class="field"><label>密码</label><input id="login-pass" type="password"></div>
@@ -213,51 +237,95 @@ code.inline { background: var(--border); padding: 2px 7px; border-radius: 6px; f
       </div>
       <div class="actions">
         <button class="btn ghost small" id="btn-apply">重新应用配置</button>
-        <button class="btn ghost small" id="btn-sub-copy">复制订阅</button>
+        <button class="btn ghost small" id="btn-diag">一键诊断</button>
         <button class="btn ghost small danger" id="btn-logout">退出</button>
       </div>
     </div>
 
     <div class="section-title">订阅</div>
-    <div class="card" style="margin-bottom:8px">
-      <div class="linkline">
-        <code class="inline mono val" id="sub-url">—</code>
-        <button class="btn ghost small" id="btn-sub-copy2">复制</button>
-        <button class="btn ghost small" id="btn-sub-qr">二维码</button>
+    <div class="card">
+      <div class="fmt-row">
+        <span class="tag">Base64</span>
+        <code class="inline mono val" id="sub-base64">—</code>
+        <button class="btn ghost small" data-copy-fmt="base64">复制</button>
+        <button class="btn ghost small" data-qr-fmt="base64">二维码</button>
+      </div>
+      <div class="fmt-row">
+        <span class="tag">Clash</span>
+        <code class="inline mono val" id="sub-clash">—</code>
+        <button class="btn ghost small" data-copy-fmt="clash">复制</button>
+        <button class="btn ghost small" data-qr-fmt="clash">二维码</button>
+      </div>
+      <div class="fmt-row">
+        <span class="tag">sing-box</span>
+        <code class="inline mono val" id="sub-singbox">—</code>
+        <button class="btn ghost small" data-copy-fmt="singbox">复制</button>
+        <button class="btn ghost small" data-qr-fmt="singbox">二维码</button>
       </div>
       <div class="muted" style="font-size:12px;margin-top:8px">
-        客户端 App 导入后自动保持更新 — 节点启停、配置修改即时生效, 链接永不变化。
+        三个地址指向同一份订阅内容; 节点启停 / 端口变更 / 伪装设置都会自动同步, 客户端无需重新导入。
       </div>
     </div>
 
-    <div class="section-title">节点 <span class="muted" style="text-transform:none;letter-spacing:0">(点击开关即时热更新, 无需重启客户端)</span></div>
+    <div class="section-title">节点</div>
     <div class="grid" id="node-grid"></div>
 
-    <div class="section-title">证书 &amp; 系统</div>
+    <div class="section-title">流量</div>
+    <div class="card" id="traffic-card"></div>
+
+    <div class="section-title">高级设置</div>
+    <div class="card">
+      <div class="adv-grid">
+        <div class="field">
+          <label>Reality 伪装 SNI</label>
+          <input id="adv-sni" placeholder="www.microsoft.com" spellcheck="false"></div>
+        <div class="field">
+          <label>Hysteria 2 伪装站点 (留空关闭)</label>
+          <input id="adv-masq" placeholder="https://www.microsoft.com/" spellcheck="false"></div>
+      </div>
+      <label style="margin-top:16px">对外端口</label>
+      <div class="adv-grid" id="port-grid"></div>
+      <div class="row" style="margin-top:16px">
+        <button class="btn small" id="btn-save-adv">保存并应用</button>
+        <span class="muted" style="font-size:12.5px">改动会重新生成配置并热重载, 订阅内容自动更新</span>
+      </div>
+    </div>
+
+    <div class="section-title">诊断</div>
+    <div class="card" id="diag-card">
+      <div class="muted" style="font-size:13px">点击右上角「一键诊断」检查服务状态、配置合法性、证书与端口。</div>
+      <div id="diag-list" style="margin-top:10px"></div>
+      <div class="row hidden" id="diag-actions" style="margin-top:14px">
+        <button class="btn small" id="btn-repair">一键修复 (重新生成 + 重启)</button>
+      </div>
+    </div>
+
+    <div class="section-title">系统</div>
     <div class="grid" id="sys-grid"></div>
+    <div class="card" style="margin-top:16px">
+      <div class="kv"><span class="k">操作记录</span><span class="muted" style="font-size:12.5px" id="audit-tail">—</span></div>
+    </div>
   </section>
 
-  <div class="footer">ZeroProxy · VLESS Reality / VLESS WS / Trojan / Hysteria 2 · 单命令部署</div>
+  <div class="footer">ZeroProxy · 0 配置, 1 行部署</div>
 </div>
 
-<!-- 二维码模态 -->
 <div class="modal-mask hidden" id="qr-mask">
   <div class="modal">
-    <h3 id="qr-title">节点二维码</h3>
+    <h3 id="qr-title">二维码</h3>
     <div class="muted" style="font-size:12.5px" id="qr-sub">手机 App 扫码导入</div>
     <img id="qr-img" alt="QR">
     <div class="close-row"><button class="btn ghost" id="qr-close">关闭</button></div>
   </div>
 </div>
-
 <div class="toast" id="toast"></div>
 
 <script>
-"use strict";
 const $ = (s) => document.querySelector(s);
-const PROTO_BADGE = { "VLESS": "vless", "Trojan": "trojan", "Hysteria 2": "hysteria" };
-let dash = null;
-let refreshTimer = null;
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const escAttr = esc;
+const PROTO_BADGE = { VLESS: "vless", Trojan: "trojan", "Hysteria 2": "hysteria" };
+let dash = null, refreshTimer = null, bootstrapToken = "";
 
 /* ---------------- 主题 ---------------- */
 function applyTheme(t) {
@@ -266,8 +334,7 @@ function applyTheme(t) {
 }
 (function initTheme() {
   const saved = localStorage.getItem("zp-theme");
-  const prefer = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-  applyTheme(saved || (prefer === "dark" ? "dark" : "light"));
+  applyTheme(saved || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"));
 })();
 $("#themeBtn").onclick = () =>
   applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
@@ -284,7 +351,7 @@ function toast(msg) {
   t.textContent = msg;
   t.classList.add("show");
   clearTimeout(t._h);
-  t._h = setTimeout(() => t.classList.remove("show"), 2200);
+  t._h = setTimeout(() => t.classList.remove("show"), 2400);
 }
 async function copyText(text) {
   try {
@@ -297,11 +364,20 @@ async function copyText(text) {
     toast("已复制");
   }
 }
+const fmtBytes = (n) => {
+  n = Number(n) || 0;
+  if (n < 1024) return n + " B";
+  const units = ["KB", "MB", "GB", "TB", "PB"];
+  let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < units.length - 1);
+  return n.toFixed(n >= 100 ? 0 : 1) + " " + units[i];
+};
 const fmtUptime = (s) => {
   if (!s) return "—";
   const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
   return d ? `${d}天 ${h}小时` : h ? `${h}小时 ${m}分` : `${m}分钟`;
 };
+const fmtTime = (ts) => (ts ? new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false }) : "—");
 const STATE_TXT = { active: "运行中", running: "运行中", "dry-run": "本地开发", "not-installed": "未安装", failed: "异常", inactive: "已停止" };
 const stateClass = (s) => (["active", "running"].includes(s) ? "running" : ["failed", "err"].includes(s) ? "failed" : "other");
 
@@ -311,15 +387,27 @@ function show(id) {
   $("#" + id).classList.remove("hidden");
 }
 
-/* ---------------- 初始化视图 ---------------- */
 $("#protoRow").innerHTML = [
-  ["vless", "VLESS Reality"], ["vless", "VLESS WS"], ["trojan", "Trojan TLS"], ["hysteria", "Hysteria 2"],
+  ["vless", "VLESS Reality"], ["vless", "VLESS XHTTP"], ["vless", "VLESS WS"],
+  ["trojan", "Trojan TLS"], ["hysteria", "Hysteria 2"],
 ].map(([c, n]) => `<span class="badge ${c}">${n}</span>`).join("");
 
 async function boot() {
+  // 引导令牌来自 install.sh 打印的链接 (?token=...), 初始化时必须带上
+  const params = new URLSearchParams(location.search);
+  bootstrapToken = params.get("token") || "";
+  if (bootstrapToken) history.replaceState(null, "", location.pathname);
   try {
     const st = await api("/api/status");
-    if (!st.configured) return show("view-setup");
+    if (!st.configured) {
+      show("view-setup");
+      if (st.token_required && !bootstrapToken) {
+        const hint = $("#setup-hint");
+        hint.textContent = "本面板已启用引导令牌保护。请使用安装完成时终端打印的、带 ?token= 的链接打开本页, 否则无法完成初始化。";
+        hint.classList.remove("hidden");
+      }
+      return;
+    }
     if (st.authenticated) return loadDash();
     show("view-login");
   } catch (e) {
@@ -333,6 +421,7 @@ $("#btn-setup").onclick = async () => {
     domain: $("#in-domain").value.trim(),
     username: $("#in-user").value.trim(),
     password: $("#in-pass").value,
+    token: bootstrapToken,
   };
   const errBox = $("#setup-err");
   errBox.classList.add("hidden");
@@ -348,7 +437,7 @@ $("#btn-setup").onclick = async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
-    renderSteps(res.steps || []);
+    renderSteps(res.steps || [], prog);
     prog.classList.remove("hidden");
     btn.textContent = "完成 ✓";
     setTimeout(() => { loadDash(); }, 900);
@@ -359,21 +448,21 @@ $("#btn-setup").onclick = async () => {
     btn.textContent = "一键生成";
   }
 };
-function renderSteps(steps) {
-  $("#setup-progress").innerHTML = steps
+function renderSteps(steps, container) {
+  (container || $("#setup-progress")).innerHTML = steps
     .map(
       (s) => `<div class="pstep">
         <span class="ico ${s.ok ? "ok" : "bad"}">${s.ok ? "✓" : "✗"}</span>
-        <span>${s.name} <span class="muted">(${s.ms}ms)</span></span>
-        <div class="detail">${escapeHtml(s.detail || "")}</div>
-      </div>`
+        <span>${esc(s.name)} <span class="muted">(${s.ms}ms)</span></span>
+        <div class="detail">${esc(s.detail || "")}</div></div>`
     )
     .join("");
 }
-const escapeHtml = (s) => s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
 /* ---------------- 登录 ---------------- */
 $("#btn-login").onclick = async () => {
+  const errBox = $("#login-err");
+  errBox.classList.add("hidden");
   try {
     await api("/api/login", {
       method: "POST",
@@ -382,11 +471,12 @@ $("#btn-login").onclick = async () => {
     });
     loadDash();
   } catch (e) {
-    const b = $("#login-err");
-    b.textContent = e.message;
-    b.classList.remove("hidden");
+    errBox.textContent = e.message;
+    errBox.classList.remove("hidden");
   }
 };
+$("#in-pass").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#btn-setup").click(); });
+$("#login-pass").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#btn-login").click(); });
 $("#btn-logout").onclick = async () => {
   await api("/api/logout", { method: "POST" });
   dash = null;
@@ -394,10 +484,10 @@ $("#btn-logout").onclick = async () => {
 };
 
 /* ---------------- 仪表盘 ---------------- */
-async function loadDash() {
+async function loadDash(quiet) {
   try {
     dash = await api("/api/dashboard");
-    renderDash();
+    renderDash(quiet);
     show("view-dash");
   } catch (e) {
     show("view-login");
@@ -406,31 +496,41 @@ async function loadDash() {
   clearInterval(refreshTimer);
   refreshTimer = setInterval(() => { if (dash) loadDash(true); }, 20000);
 }
+
 function renderDash(quiet) {
   if (!dash) return;
   $("#dash-domain").textContent = dash.domain;
   $("#dash-sub").textContent = `面板 ${dash.panel_url} · 管理用户 ${dash.admin_user}`;
-  $("#sub-url").textContent = dash.subscription_url;
-  $("#btn-sub-copy").onclick = () => copyText(dash.subscription_url);
-  $("#btn-sub-copy2").onclick = () => copyText(dash.subscription_url);
-  $("#btn-sub-qr").onclick = () => openModal("订阅二维码", dash.subscription_url, dash.subscription_url);
+
+  /* 订阅三种格式 */
+  ["base64", "clash", "singbox"].forEach((fmt) => {
+    $("#sub-" + fmt).textContent = dash.subscription_formats[fmt];
+  });
 
   /* 节点卡片 */
   $("#node-grid").innerHTML = dash.nodes
-    .map(
-      (n) => `<div class="card node-card">
+    .map((n) => {
+      const traffic = n.traffic
+        ? `<div class="muted" style="font-size:12.5px;margin-top:6px">↑ ${fmtBytes(n.traffic.uplink)} · ↓ ${fmtBytes(n.traffic.downlink)}</div>`
+        : "";
+      return `<div class="card node-card">
         <div class="top">
-          <span class="name"><span class="badge ${PROTO_BADGE[n.protocol] || "vless"}">${n.protocol}</span> ${n.name}</span>
-          <label class="switch"><input type="checkbox" data-node="${n.id}" ${n.enabled ? "checked" : ""}><span class="slider"></span></label>
+          <span class="name"><span class="badge ${PROTO_BADGE[n.protocol] || "vless"}">${esc(n.protocol)}</span> ${esc(n.name)}</span>
+          <label class="switch"><input type="checkbox" data-node="${escAttr(n.id)}" ${n.enabled ? "checked" : ""}><span class="slider"></span></label>
         </div>
-        <div class="meta">${n.transport} · ${n.security}</div>
-        <div class="addr mono">${escapeHtml(n.host)}:${n.port} <span class="dot ${stateClass(n.service_state)}" title="${n.service}"></span> <span class="muted">${STATE_TXT[n.service_state] || n.service_state}</span></div>
-        ${n.note ? `<div class="note">${n.note}</div>` : ""}
-        <div class="actions">
-          ${n.share_link ? `<button class="btn ghost small" data-copy="${n.id}">复制链接</button><button class="btn ghost small" data-qr="${n.id}">二维码</button>` : `<span class="muted" style="font-size:12.5px">节点已关闭</span>`}
+        <div class="meta">${esc(n.transport)} · ${esc(n.security)}</div>
+        <div class="addr mono">${esc(n.host)}:${n.port} <span class="dot ${stateClass(n.service_state)}" title="${escAttr(n.service)}"></span> <span class="muted">${STATE_TXT[n.service_state] || esc(n.service_state)}</span></div>
+        <div class="muted" style="font-size:12.5px">${esc(n.desc || "")}</div>
+        ${traffic}
+        ${n.note ? `<div class="note">${esc(n.note)}</div>` : ""}
+        <div class="actions" style="margin-top:12px">
+          ${n.share_link
+            ? `<button class="btn ghost small" data-copy="${escAttr(n.id)}">复制链接</button>
+               <button class="btn ghost small" data-qr="${escAttr(n.id)}">二维码</button>`
+            : `<span class="muted" style="font-size:12.5px">节点已关闭</span>`}
         </div>
-      </div>`
-    )
+      </div>`;
+    })
     .join("");
 
   document.querySelectorAll("[data-node]").forEach((el) =>
@@ -451,19 +551,116 @@ function renderDash(quiet) {
   );
   document.querySelectorAll("[data-qr]").forEach((el) => {
     const n = dash.nodes.find((x) => x.id === el.dataset.qr);
-    el.onclick = () => openModal(`${n.name} 二维码`, n.share_link, n.qr_url + "?size=8");
+    el.onclick = () => openModal(`${n.name} 二维码`, n.share_link, `${n.qr_url}?size=8`);
   });
+  document.querySelectorAll("[data-copy-fmt]").forEach((el) =>
+    (el.onclick = () => copyText(dash.subscription_formats[el.dataset.copyFmt]))
+  );
+  document.querySelectorAll("[data-qr-fmt]").forEach((el) =>
+    (el.onclick = () =>
+      openModal(
+        "订阅二维码",
+        dash.subscription_formats[el.dataset.qrFmt],
+        `/api/subscription/qr?size=8&format=${encodeURIComponent(el.dataset.qrFmt)}`
+      ))
+  );
 
-  /* 证书 + 系统卡片 */
-  const c = dash.cert;
+  renderTraffic(dash.traffic);
+  renderAdvanced(dash);
+  renderSystem(dash);
+  renderAudit(dash.audit);
+  if (!quiet) { $("#diag-list").innerHTML = ""; $("#diag-actions").classList.add("hidden"); }
+}
+
+function renderTraffic(traffic) {
+  const card = $("#traffic-card");
+  if (!traffic || traffic.available === false || !dash.traffic) {
+    card.innerHTML = `<div class="muted" style="font-size:13px">统计不可用: 需要 Xray 运行中 (生产环境部署完成后自动显示)。</div>`;
+    return;
+  }
+  const total = Math.max(1, traffic.total);
+  const rows = dash.nodes
+    .filter((n) => n.traffic)
+    .map((n) => {
+      const sum = (n.traffic.uplink || 0) + (n.traffic.downlink || 0);
+      return `<div class="traffic-row">
+        <span class="k">${esc(n.name)}</span>
+        <span class="bar"><i style="width:${Math.round((sum / total) * 100)}%"></i></span>
+        <span class="muted" style="width:120px;text-align:right">↑${fmtBytes(n.traffic.uplink)} ↓${fmtBytes(n.traffic.downlink)}</span>
+      </div>`;
+    })
+    .join("");
+  card.innerHTML =
+    `<div class="row" style="justify-content:space-between">
+       <span>总上行 <b>${fmtBytes(traffic.uplink)}</b></span>
+       <span>总下行 <b>${fmtBytes(traffic.downlink)}</b></span>
+       <span class="muted">合计 ${fmtBytes(traffic.total)}</span>
+     </div>
+     <div class="bar" style="margin-top:10px"><i style="width:100%"></i></div>
+     <div style="margin-top:14px">${rows}</div>`;
+}
+
+function renderAdvanced(d) {
+  $("#adv-sni").value = d.reality.server_name || "";
+  $("#adv-masq").value = (d.hysteria_masquerade && d.hysteria_masquerade.url) || "";
+  $("#port-grid").innerHTML = d.nodes
+    .filter((n) => n.editable_port)
+    .map(
+      (n) => `<div class="field">
+        <label>${esc(n.name)}</label>
+        <input class="mono" data-port-node="${escAttr(n.id)}" value="${n.port}" inputmode="numeric">
+      </div>`
+    )
+    .join("");
+  $("#btn-save-adv").onclick = saveAdvanced;
+}
+
+async function saveAdvanced() {
+  const btn = $("#btn-save-adv");
+  const ports = {};
+  document.querySelectorAll("[data-port-node]").forEach((el) => {
+    const value = parseInt(el.value, 10);
+    const nodeId = el.dataset.portNode;
+    const current = (dash.nodes.find((n) => n.id === nodeId) || {}).port;
+    if (!Number.isNaN(value) && value !== current) ports[nodeId] = value;
+  });
+  const payload = {
+    reality_sni: $("#adv-sni").value.trim(),
+    masquerade_url: $("#adv-masq").value.trim(),
+  };
+  if (Object.keys(ports).length) payload.ports = ports;
+  if (payload.reality_sni === dash.reality.server_name
+      && payload.masquerade_url === ((dash.hysteria_masquerade || {}).url || "")
+      && !payload.ports) {
+    toast("没有需要修改的内容");
+    return;
+  }
+  btn.disabled = true;
+  btn.textContent = "应用中…";
+  try {
+    dash = await api("/api/settings", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    renderDash(true);
+    toast("设置已应用, 订阅内容已刷新");
+  } catch (e) {
+    toast("保存失败: " + e.message);
+  }
+  btn.disabled = false;
+  btn.textContent = "保存并应用";
+}
+
+function renderSystem(d) {
+  const c = d.cert;
   const certName = c.type === "letsencrypt" ? "Let's Encrypt" : c.type === "selfsigned" ? "自签名证书" : "无证书";
   const days = c.days_left;
   const barPct = days > 90 ? 100 : days > 30 ? Math.round((days / 90) * 100) : Math.round((days / 30) * 100);
   const barColor = days > 30 ? "var(--ok)" : days > 14 ? "var(--warn)" : "var(--err)";
-
-  const sys = dash.system;
+  const sys = d.system;
   const svcRow = (k, v) =>
-    `<div class="kv"><span class="k">${k}</span><span><span class="dot ${stateClass(v.state)}"></span> ${STATE_TXT[v.state] || v.state}${v.version ? " · " + escapeHtml(v.version) : ""}</span></div>`;
+    `<div class="kv"><span class="k">${esc(k)}</span><span><span class="dot ${stateClass(v.state)}"></span> ${STATE_TXT[v.state] || esc(v.state)}${v.version ? " · " + esc(v.version) : ""}</span></div>`;
 
   $("#sys-grid").innerHTML = `
     <div class="card">
@@ -479,9 +676,10 @@ function renderDash(quiet) {
     <div class="card">
       ${svcRow("Xray 核心", sys.xray)}
       ${svcRow("Hysteria 2", sys.hysteria2)}
-      <div class="kv"><span class="k">Nginx</span><span><span class="dot ${stateClass(sys.nginx.state)}"></span> ${STATE_TXT[sys.nginx.state] || sys.nginx.state}</span></div>
-      <div class="kv"><span class="k">服务器</span><span>${escapeHtml(sys.server.os)} · ${escapeHtml(sys.server.arch)} · 在线 ${fmtUptime(sys.server.uptime_s)}</span></div>
-      <div class="kv"><span class="k">端口跳跃</span><span>${dash.hysteria_hopping ? "已启用 (" + dash.hysteria_ports.join(" / ") + ")" : "未启用"}</span></div>
+      <div class="kv"><span class="k">Nginx</span><span><span class="dot ${stateClass(sys.nginx.state)}"></span> ${STATE_TXT[sys.nginx.state] || esc(sys.nginx.state)}</span></div>
+      <div class="kv"><span class="k">服务器</span><span>${esc(sys.server.os)} · ${esc(sys.server.arch)} · 在线 ${fmtUptime(sys.server.uptime_s)}</span></div>
+      <div class="kv"><span class="k">端口跳跃</span><span>${d.hysteria_hopping ? "已启用 (" + d.hysteria_ports.join(" / ") + ")" : "未启用"}</span></div>
+      <div class="kv"><span class="k">面板版本</span><span>v${esc(sys.server.panel_version)}</span></div>
     </div>`;
   const renewBtn = $("#btn-renew");
   if (renewBtn) renewBtn.onclick = async () => {
@@ -491,18 +689,73 @@ function renderDash(quiet) {
       if (r.ok) loadDash(true);
     } catch (e) { toast("续期失败: " + e.message); }
   };
-  if (!quiet) clearInterval(refreshTimer), (refreshTimer = setInterval(() => loadDash(true), 20000));
 }
 
-/* ---------------- 模态 ---------------- */
-function openModal(title, sub, imgUrl) {
-  $("#qr-title").textContent = title;
-  $("#qr-sub").textContent = sub;
-  $("#qr-img").src = imgUrl;
-  $("#qr-mask").classList.remove("hidden");
+function renderAudit(entries) {
+  const el = $("#audit-tail");
+  if (!entries || !entries.length) { el.textContent = "—"; return; }
+  el.textContent = entries
+    .slice(0, 4)
+    .map((e) => `${fmtTime(e.ts)} ${e.action}${e.detail ? " (" + e.detail + ")" : ""}`)
+    .join("  |  ");
 }
-$("#qr-close").onclick = () => $("#qr-mask").classList.add("hidden");
-$("#qr-mask").onclick = (e) => { if (e.target.id === "qr-mask") $("#qr-mask").classList.add("hidden"); };
+
+/* ---------------- 诊断 / 修复 ---------------- */
+$("#btn-diag").onclick = async () => {
+  const btn = $("#btn-diag");
+  btn.disabled = true;
+  btn.textContent = "诊断中…";
+  try {
+    const res = await api("/api/diagnose");
+    renderChecks(res);
+  } catch (e) {
+    toast("诊断失败: " + e.message);
+  }
+  btn.disabled = false;
+  btn.textContent = "一键诊断";
+};
+function renderChecks(res) {
+  $("#diag-list").innerHTML =
+    `<div class="muted" style="font-size:12.5px;margin-bottom:6px">${esc(res.summary)}</div>` +
+    (res.checks || [])
+      .map(
+        (c) => `<div class="check">
+          <span class="ico ${c.ok ? "ok" : "bad"}">${c.ok ? "✓" : "✗"}</span>
+          <span class="name">${esc(c.name)}</span>
+          <span class="detail">${esc(c.detail)}</span></div>`
+      )
+      .join("");
+  $("#diag-actions").classList.toggle("hidden", !!res.ok);
+}
+$("#btn-repair").onclick = async () => {
+  const btn = $("#btn-repair");
+  btn.disabled = true;
+  btn.textContent = "修复中…";
+  try {
+    const res = await api("/api/repair", { method: "POST" });
+    renderSteps(res.steps || [], $("#diag-list"));
+    const detail = document.createElement("div");
+    detail.style.marginTop = "12px";
+    detail.innerHTML =
+      `<div class="muted" style="font-size:12.5px">修复后复检: ${esc(res.checks ? res.checks.filter((c) => c.ok).length + "/" + res.checks.length : "—")} 项通过</div>` +
+      (res.checks || [])
+        .map(
+          (c) => `<div class="check"><span class="ico ${c.ok ? "ok" : "bad"}">${c.ok ? "✓" : "✗"}</span>
+            <span class="name">${esc(c.name)}</span><span class="detail">${esc(c.detail)}</span></div>`
+        )
+        .join("");
+    $("#diag-list").appendChild(detail);
+    $("#diag-actions").classList.add("hidden");
+    toast(res.ok ? "修复完成, 全部检查通过" : "已重新生成配置, 仍有项目需要人工检查");
+    loadDash(true);
+  } catch (e) {
+    toast("修复失败: " + e.message);
+  }
+  btn.disabled = false;
+  btn.textContent = "一键修复 (重新生成 + 重启)";
+};
+
+/* ---------------- 重新应用 ---------------- */
 $("#btn-apply").onclick = async () => {
   const btn = $("#btn-apply");
   btn.disabled = true; btn.textContent = "应用中…";
@@ -513,6 +766,16 @@ $("#btn-apply").onclick = async () => {
   } catch (e) { toast("应用失败: " + e.message); }
   btn.disabled = false; btn.textContent = "重新应用配置";
 };
+
+/* ---------------- 模态 ---------------- */
+function openModal(title, sub, imgUrl) {
+  $("#qr-title").textContent = title;
+  $("#qr-sub").textContent = sub;
+  $("#qr-img").src = imgUrl;
+  $("#qr-mask").classList.remove("hidden");
+}
+$("#qr-close").onclick = () => $("#qr-mask").classList.add("hidden");
+$("#qr-mask").onclick = (e) => { if (e.target.id === "qr-mask") $("#qr-mask").classList.add("hidden"); };
 
 boot();
 </script>
