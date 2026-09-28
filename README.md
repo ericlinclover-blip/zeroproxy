@@ -493,6 +493,11 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
    (备份 → 换代码 → 按 `state.json` 重新落地三份配置 → 重载服务 → 复查端口监听),
    `data/update.json` 记 success, 旧代码 + `state.json` 备份保留最近 5 份;
    面板「程序更新 → 一键更新」走 systemd 瞬时单元, 面板自身重启不打断升级。
+   v2.3.11 又连升一次 (v2.3.10 → v2.3.11): 8 步全绿 (备份 → 下载 → 装代码 → 同步依赖 →
+   重载 systemd 单元 → 按 `state.json` 重新落地 xray/nginx/hysteria 配置 → 重启面板 →
+   面板就绪), `update.json` 里 `plan` / `current` / `steps` 三个字段齐全;
+   升级后 4 个 TCP 节点用真实 Xray 客户端实测 `http=200`、出口 IP = 服务器 IP,
+   hysteria2 同样出口一致 (这一轮踩到的"脚本覆盖自己"见第 11 条)。
 3. **根因一: Reality 密钥用错曲线**。`crypto.new_reality_keys()` 从第一版起用 Ed25519 生成,
    而 REALITY 只认 X25519 → 服务端私钥与订阅下发的 `pbk` 对不上, 每次握手都被判为
    "收到真证书 (疑似 MITM)", 客户端回落到伪装站点。证据链: `xray x25519 -i <服务器私钥>`
