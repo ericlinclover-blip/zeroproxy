@@ -729,3 +729,186 @@ def test_geodata_guard_self_heals_missing_cert(client, configured, home):
     assert fixed is True and "自检未通过" in detail
     assert "trojan" not in cfg_path.read_text()          # 入站被摘掉, 核心先起来
     assert services.run([xray, "-test", "-c", str(cfg_path)])[0] is True
+
+
+# ---------------------------------------------------------------- 一键更新
+
+def test_update_endpoints_require_auth(client, home):
+    assert client.get("/api/update").status_code == 401
+    assert client.post("/api/update").status_code == 401
+
+
+def test_update_status_reports_version(client, configured, monkeypatch):
+    from zeroproxy import __version__, update
+
+    monkeypatch.setattr(update, "_CACHE", {"at": 0.0, "body": None})
+    monkeypatch.setattr(update, "remote_version", lambda timeout=8: (True, "9.9.9", "test-mirror"))
+    body = client.get("/api/update").json()
+    assert body["current"] == __version__
+    assert body["latest"] == "9.9.9"
+    assert body["check_ok"] is True
+    assert body["update_available"] is True
+    assert body["prod"] is False and body["can_update"] is False
+    assert body["running"] is False
+
+
+def test_update_status_survives_unreachable_mirrors(client, configured, monkeypatch):
+    from zeroproxy import update
+
+    monkeypatch.setattr(update, "_CACHE", {"at": 0.0, "body": None})
+    monkeypatch.setattr(update, "remote_version", lambda timeout=8: (False, "", "离线"))
+    body = client.get("/api/update").json()
+    assert body["check_ok"] is False and body["update_available"] is False
+    assert "离线" in body["check_error"]
+
+
+def test_update_start_refused_outside_production(client, configured):
+    """本地开发环境没有 systemd / 面板目录布局, 不允许在面板里触发升级。"""
+    resp = client.post("/api/update")
+    assert resp.status_code == 409
+    assert "本地开发环境" in resp.json()["error"]
+
+
+def test_update_start_refused_without_script(client, configured, monkeypatch):
+    """生产环境但 upgrade.sh 还没装机 (老版本装的): 给出可执行的下一步, 而不是报 500。"""
+    from zeroproxy import services
+
+    monkeypatch.setattr(services, "is_prod", lambda: True)
+    resp = client.post("/api/update")
+    assert resp.status_code == 409
+    assert "未找到升级脚本" in resp.json()["error"]
+
+
+def test_update_start_writes_queued_status(client, configured, home, monkeypatch):
+    """触发升级会先把 queued 状态落盘, 面板重启后也能读到"升级在跑"。"""
+    from zeroproxy import services, update
+
+    monkeypatch.setattr(services, "is_prod", lambda: True)
+    script = home / "upgrade.sh"
+    script.write_text("#!/usr/bin/env bash\nexit 0\n")
+    monkeypatch.setattr(update.shutil, "which", lambda name: None)  # 走 start_new_session 兜底
+    ok, detail = update.start(trigger="panel")
+    assert ok is True, detail
+    status = json.loads((home / "data" / "update.json").read_text())
+    assert status["state"] in ("queued", "running")
+    assert status["trigger"] == "panel"
+    assert status["from"] == update.current_version()
+
+
+def test_version_compare_helpers():
+    from zeroproxy import update
+
+    assert update.parse_version("v2.3.10-beta") == (2, 3, 10)
+    assert update.parse_version("2.3") == (2, 3)
+    assert update.parse_version("") == (0,)
+    assert update.is_newer("2.4.0", "2.3.0") is True
+    assert update.is_newer("2.3.0", "2.3.0") is False
+    assert update.is_newer("v2.2", "2.3.0") is False
+
+
+# ---------------------------------------------------------------- 配置落地闭环
+
+def test_apply_verify_listeners_skips_in_dev(client, configured):
+    from zeroproxy import apply
+
+    ok, detail = apply.verify_listeners(config.load_state())
+    assert ok is True and "跳过" in detail
+
+
+def test_apply_gen_nginx_is_hard_failure_without_etc_write(client, configured, home, monkeypatch):
+    """生产环境写不进 /etc/nginx 必须算失败 —— 否则「全绿但 443 不监听」。"""
+    from zeroproxy import apply, nginx_config, services
+
+    monkeypatch.setattr(services, "is_prod", lambda: True)
+    monkeypatch.setattr(nginx_config, "write_nginx_conf", lambda state: (False, str(home / "nginx")))
+    ok, detail = apply.gen_nginx(config.load_state())
+    assert ok is False and "无法写入" in detail
+
+
+def test_apply_reapply_persists_steps(client, configured, home):
+    from zeroproxy import apply
+
+    state = config.load_state()
+    steps = apply.reapply(state)
+    assert [s["name"] for s in steps] == [
+        "重新生成 Xray 配置",
+        "重新生成 Nginx 配置",
+        "重新生成 Hysteria 2 配置",
+        "重载服务 (nginx/xray/hysteria2)",
+        "验证端口监听",
+    ]
+    assert all(s["ok"] for s in steps), steps
+    assert config.load_state()["steps"] == steps       # 落盘 → 仪表盘顶部告警
+    assert (home / "xray" / "config.json").is_file()
+
+
+def test_apply_cli_reports_failure_as_nonzero(configured, home, monkeypatch, capsys):
+    from zeroproxy import apply, nginx_config, services
+
+    assert apply._main([]) == 0
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["ok"] is True
+
+    monkeypatch.setattr(services, "is_prod", lambda: True)
+    monkeypatch.setattr(apply, "_tcp_open", lambda port, timeout=0.6: True)      # 别真等 12s 轮询
+    monkeypatch.setattr(services, "udp_port_listening", lambda port: True)
+    monkeypatch.setattr(nginx_config, "write_nginx_conf", lambda state: (False, str(home / "nginx")))
+    assert apply._main(["--quiet"]) == 1
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["ok"] is False
+    assert any(not s["ok"] for s in payload["steps"])
+    assert any(s["name"] == "重新生成 Nginx 配置" and not s["ok"] for s in payload["steps"])
+
+
+def test_apply_cli_refuses_before_setup(home):
+    from zeroproxy import apply
+
+    assert apply._main([]) == 2
+
+
+# ---------------------------------------------------------------- 升级脚本 / 文档
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _bash_syntax_ok(path: str) -> bool:
+    import shutil
+    import subprocess
+
+    if not shutil.which("bash"):
+        return True
+    return subprocess.run(["bash", "-n", path], capture_output=True).returncode == 0
+
+
+def test_upgrade_script_shipped_and_valid():
+    """一键升级脚本必须随仓库发布, 且升级后按 state.json 重新落地配置。"""
+    path = os.path.join(REPO_ROOT, "upgrade.sh")
+    assert os.path.isfile(path)
+    text = open(path, encoding="utf-8").read()
+    assert "python\" -m zeroproxy.apply" in text or "-m zeroproxy.apply" in text
+    assert "ZP_CHECK_ONLY" in text and "rollback" in text
+    assert _bash_syntax_ok(path)
+
+
+def test_install_script_never_resets_configured_deployment():
+    """install.sh 重跑时不能把已初始化的部署打回占位配置 (否则 5 个节点全不通)。"""
+    path = os.path.join(REPO_ROOT, "install.sh")
+    text = open(path, encoding="utf-8").read()
+    assert "PANEL_INITIALIZED" in text
+    assert 'cp "$SRC_DIR/upgrade.sh" "$ZP_HOME/upgrade.sh"' in text
+    assert "-m zeroproxy.apply" in text
+    assert _bash_syntax_ok(path)
+
+
+def test_upgrade_sim_harness_is_valid():
+    """一键升级的回归演练脚本 (macOS/Linux 都能跑, 不需要 root/systemd)。"""
+    path = os.path.join(REPO_ROOT, "scripts", "upgrade_sim.sh")
+    assert os.path.isfile(path)
+    assert _bash_syntax_ok(path)
+
+
+def test_readme_documents_one_line_upgrade():
+    text = open(os.path.join(REPO_ROOT, "README.md"), encoding="utf-8").read()
+    assert "upgrade.sh | bash" in text
+    assert "一键更新" in text
+    assert "/api/update" in text

@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>ZeroProxy · 极简代理面板</title>
+<!-- 内联图标: 避免浏览器请求 /favicon.ico 造成 404 (面板无外部资源依赖) -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230a84ff'/%3E%3Ctext x='32' y='44' font-family='-apple-system,Segoe UI,sans-serif' font-size='38' font-weight='700' fill='%23fff' text-anchor='middle'%3EZ%3C/text%3E%3C/svg%3E">
 <style>
 :root {
   --bg: #f5f5f7;
@@ -112,6 +114,23 @@ code.inline { background: var(--border); padding: 2px 7px; border-radius: 6px; f
 .pstep .ico.bad { color: var(--err); }
 .pstep .detail { color: var(--sub); font-size: 12px; margin-left: 28px; word-break: break-all; }
 .err-box { color: var(--err); font-size: 13.5px; margin-top: 12px; }
+.banner {
+  display: flex; gap: 10px; align-items: flex-start;
+  border-radius: 14px; padding: 12px 14px; font-size: 13px; line-height: 1.5;
+  border: 1px solid var(--border);
+}
+.banner.bad   { background: rgba(255, 69, 58, 0.10); border-color: rgba(255, 69, 58, 0.35); color: var(--text); }
+.banner.good  { background: rgba(48, 209, 88, 0.10); border-color: rgba(48, 209, 88, 0.30); color: var(--text); }
+.banner.info  { background: rgba(0, 113, 227, 0.08); border-color: rgba(0, 113, 227, 0.25); color: var(--text); }
+.banner .ico { flex-shrink: 0; }
+.banner.bad .ico { color: var(--err); }
+.banner.good .ico { color: var(--ok); }
+.banner.info .ico { color: var(--accent-2); }
+.log-box {
+  margin-top: 10px; padding: 10px 12px; border-radius: 12px; background: rgba(127, 127, 127, 0.10);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; line-height: 1.55;
+  color: var(--sub); white-space: pre-wrap; word-break: break-all; max-height: 190px; overflow: auto;
+}
 .hint-box { color: var(--warn); font-size: 13px; margin-top: 12px; line-height: 1.5; }
 .linkline { display: flex; gap: 10px; align-items: center; }
 .linkline .val { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -246,9 +265,12 @@ code.inline { background: var(--border); padding: 2px 7px; border-radius: 6px; f
         <button class="btn ghost small" id="btn-apply">重新应用配置</button>
         <button class="btn ghost small" id="btn-probe">节点测速</button>
         <button class="btn ghost small" id="btn-diag">一键诊断</button>
+        <button class="btn ghost small" id="btn-update">检查更新</button>
         <button class="btn ghost small danger" id="btn-logout">退出</button>
       </div>
     </div>
+
+    <div id="dash-banner" class="hidden" style="margin-bottom:16px"></div>
 
     <div class="section-title">订阅</div>
     <div class="card">
@@ -336,6 +358,20 @@ code.inline { background: var(--border); padding: 2px 7px; border-radius: 6px; f
     <div class="card" style="margin-top:16px">
       <div class="kv"><span class="k">操作记录</span><span class="muted" style="font-size:12.5px" id="audit-tail">—</span></div>
     </div>
+
+    <div class="section-title">程序更新</div>
+    <div class="card" id="update-card">
+      <div class="row" style="justify-content:space-between">
+        <span style="font-weight:600;font-size:13.5px">面板版本</span>
+        <span class="muted" style="font-size:12.5px" id="update-status-line">—</span>
+      </div>
+      <div id="update-body" style="margin-top:10px"></div>
+      <div class="row" style="margin-top:14px">
+        <button class="btn ghost small" id="btn-update-check">检查更新</button>
+        <button class="btn small hidden" id="btn-update-run">一键更新</button>
+        <span class="muted" style="font-size:12px" id="update-hint">升级只替换程序代码, 密钥 / 订阅令牌 / 节点配置全部保留</span>
+      </div>
+    </div>
   </section>
 
   <div class="footer">ZeroProxy · 0 配置, 1 行部署</div>
@@ -357,6 +393,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const escAttr = esc;
 const PROTO_BADGE = { VLESS: "vless", Trojan: "trojan", "Hysteria 2": "hysteria" };
 let dash = null, refreshTimer = null, bootstrapToken = "", probeData = null, probeRan = false;
+let updateInfo = null, updateTimer = null, updatePollFailures = 0;
 
 /* ---------------- 主题 ---------------- */
 function applyTheme(t) {
@@ -470,8 +507,19 @@ $("#btn-setup").onclick = async () => {
     });
     renderSteps(res.steps || [], prog);
     prog.classList.remove("hidden");
-    btn.textContent = "完成 ✓";
-    setTimeout(() => { loadDash(); }, 900);
+    const failed = (res.steps || []).filter((s) => !s.ok);
+    if (res.ok === false || failed.length) {
+      // 不再假装成功: 失败步骤留在页面上, 让用户先看到再进面板
+      btn.textContent = "完成 (有步骤失败)";
+      errBox.textContent =
+        `有 ${failed.length} 步失败: ${failed[0].name} — ${failed[0].detail}` +
+        "\n面板已进入仪表盘, 可用「一键诊断」/「一键修复」重试。";
+      errBox.classList.remove("hidden");
+      toast(`部署完成但有 ${failed.length} 步失败`);
+    } else {
+      btn.textContent = "完成 ✓";
+    }
+    setTimeout(() => { loadDash(); }, 1400);
   } catch (e) {
     errBox.textContent = "部署失败: " + e.message;
     errBox.classList.remove("hidden");
@@ -558,7 +606,35 @@ function renderDash(quiet) {
   renderAdvanced(dash);
   renderSystem(dash);
   renderAudit(dash.audit);
+  renderDashboardBanner();
+  if (!updateInfo) loadUpdate(false);
   if (!quiet) { $("#diag-list").innerHTML = ""; $("#diag-actions").classList.add("hidden"); }
+}
+
+/* ---------------- 失败告警横幅 ----------------
+ * 初始化 / 重新应用留下的步骤结果会落盘, 这里把失败项直接顶到仪表盘顶部,
+ * 避免出现"服务全是运行中, 但节点其实不通"的假绿。 */
+function renderBanner(el, kind, title, detail) {
+  if (!el) return;
+  if (!title) { el.classList.add("hidden"); el.innerHTML = ""; return; }
+  el.innerHTML = `<div class="banner ${kind}">
+      <span class="ico">${kind === "bad" ? "✗" : kind === "good" ? "✓" : "i"}</span>
+      <span><b>${esc(title)}</b>${detail ? `<br><span class="muted">${esc(detail)}</span>` : ""}</span>
+    </div>`;
+  el.classList.remove("hidden");
+}
+
+function renderDashboardBanner() {
+  const steps = (dash && dash.steps) || [];
+  const failed = steps.filter((s) => !s.ok);
+  if (!failed.length) return renderBanner($("#dash-banner"), "bad", "");
+  const first = failed[0];
+  renderBanner(
+    $("#dash-banner"),
+    "bad",
+    `上次配置落地有 ${failed.length} 步失败, 节点可能不可用`,
+    `${first.name}: ${first.detail} —— 点右上角「一键诊断」查看, 或点「一键修复」重试`
+  );
 }
 
 /* ---------------- 节点卡片 + 测速 ---------------- */
@@ -975,9 +1051,163 @@ $("#btn-apply").onclick = async () => {
   try {
     dash = await api("/api/apply", { method: "POST" });
     renderDash(true);
-    toast("配置已重新生成并热重载");
+    const failed = (dash.steps || []).filter((s) => !s.ok);
+    toast(failed.length ? `已重载, 但 ${failed.length} 步失败: ${failed[0].name}` : "配置已重新生成并热重载");
   } catch (e) { toast("应用失败: " + e.message); }
   btn.disabled = false; btn.textContent = "重新应用配置";
+};
+
+/* ---------------- 一键更新 ----------------
+ * 升级由服务器上的 upgrade.sh 完成; 面板只负责按按钮 + 回读进度。
+ * 面板进程会在升级过程中重启, 因此轮询要能容忍请求失败。 */
+async function loadUpdate(force) {
+  try {
+    const path = force ? "/api/update?force=1" : "/api/update";
+    updateInfo = await api(path);
+  } catch (e) {
+    return; // 未登录 / 升级中, 静默处理
+  }
+  renderUpdate();
+  if (updateInfo.running && !updateTimer) startUpdatePolling();
+}
+
+function renderUpdate() {
+  const u = updateInfo || {};
+  const last = u.last || {};
+  const cur = u.current || "—";
+  const latest = u.latest || "";
+  const badge =
+    u.check_ok === false
+      ? `<span class="badge hysteria">检查失败</span>`
+      : u.update_available
+        ? `<span class="badge trojan">有新版本 v${esc(latest)}</span>`
+        : `<span class="badge vless">已是最新</span>`;
+  $("#update-status-line").innerHTML =
+    `${badge} <span class="muted">当前 v${esc(cur)}${latest ? " · 最新 v" + esc(latest) : ""}` +
+    `${u.checked_at ? " · " + esc(fmtTime(u.checked_at)) + " 检查" : ""}</span>`;
+
+  const lines = [];
+  if (u.check_ok === false) {
+    lines.push(
+      `<div class="banner info"><span class="ico">i</span><span>无法访问远端版本源 (${esc(
+        String(u.check_error || "").slice(0, 120)
+      )})。<br><span class="muted">面板本身仍可用; 需要升级时可在服务器上执行 README 里的一键升级命令。</span></span></div>`
+    );
+  }
+  if (last.state) {
+    const map = { queued: "info", running: "info", success: "good", failed: "bad" };
+    const title = {
+      queued: "升级任务已排队",
+      running: "正在升级…",
+      success: `升级完成: v${last.from || "?"} → v${last.to || u.current || "?"}`,
+      failed: "上次升级失败",
+    }[last.state] || `状态: ${last.state}`;
+    const detail = [
+      last.message || "",
+      last.finished_at ? `结束于 ${fmtTime(last.finished_at)}` : last.started_at ? `开始于 ${fmtTime(last.started_at)}` : "",
+      `触发方式: ${last.trigger === "panel" ? "面板按钮" : "命令行"}`,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    lines.push(
+      `<div class="banner ${map[last.state] || "info"}"><span class="ico">${
+        last.state === "success" ? "✓" : last.state === "failed" ? "✗" : "i"
+      }</span><span><b>${esc(title)}</b>${detail ? `<br><span class="muted">${esc(detail)}</span>` : ""}</span></div>`
+    );
+  }
+  if ((last.steps || []).length) {
+    lines.push(
+      `<div style="margin-top:10px">${(last.steps || [])
+        .map(
+          (s) => `<div class="check"><span class="ico ${s.ok ? "ok" : "bad"}">${s.ok ? "✓" : "✗"}</span>
+            <span class="name">${esc(s.name || "")}</span><span class="detail">${esc(s.detail || "")}</span></div>`
+        )
+        .join("")}</div>`
+    );
+  }
+  if (u.running || last.state === "running") {
+    $("#update-hint").textContent = "升级进行中: 面板重启后本页会自动回到正常状态";
+  } else if (!u.can_update) {
+    $("#update-hint").textContent = u.prod
+      ? "服务器上还没有 upgrade.sh — 先执行 README 里的一键升级命令装好它, 之后就能在面板里一键更新"
+      : "本地开发环境不支持面板内升级, 请在服务器上运行 upgrade.sh";
+  } else {
+    $("#update-hint").textContent = "升级只替换程序代码, 密钥 / 订阅令牌 / 节点配置全部保留";
+  }
+  if (u.log_tail) lines.push(`<div class="log-box">${esc(u.log_tail)}</div>`);
+  $("#update-body").innerHTML = lines.join("");
+
+  const runBtn = $("#btn-update-run");
+  const topBtn = $("#btn-update");
+  runBtn.classList.toggle("hidden", !u.update_available || !u.can_update || !!u.running);
+  runBtn.disabled = !!u.running;
+  runBtn.textContent = u.running ? "升级中…" : `一键更新到 v${latest}`;
+  topBtn.textContent = u.running ? "升级中…" : u.update_available ? `一键更新 v${latest}` : "检查更新";
+}
+
+function startUpdatePolling() {
+  clearInterval(updateTimer);
+  updatePollFailures = 0;
+  updateTimer = setInterval(async () => {
+    try {
+      updateInfo = await api("/api/update");
+      updatePollFailures = 0;
+      renderUpdate();
+      if (!updateInfo.running && updateInfo.last && updateInfo.last.state === "success") {
+        clearInterval(updateTimer); updateTimer = null;
+        if (updateInfo.last.to && updateInfo.last.to !== updateInfo.current) {
+          toast("升级完成, 正在刷新页面…");
+          setTimeout(() => location.reload(), 1500);
+        } else {
+          toast("升级完成");
+          loadDash(true);
+        }
+      } else if (!updateInfo.running && updateInfo.last && updateInfo.last.state === "failed") {
+        clearInterval(updateTimer); updateTimer = null;
+        toast("升级失败, 详情见「程序更新」卡片");
+        loadDash(true);
+      }
+    } catch (e) {
+      // 允许失败: 升级过程中面板会重启, 这里静默重试
+      updatePollFailures += 1;
+      if (updatePollFailures > 60) { clearInterval(updateTimer); updateTimer = null; }
+    }
+  }, 2500);
+}
+
+async function doUpdate() {
+  const btn = $("#btn-update-run");
+  btn.disabled = true;
+  btn.textContent = "启动中…";
+  try {
+    const res = await api("/api/update", { method: "POST" });
+    toast(res.detail || "升级已开始");
+    updateInfo = res.status || updateInfo;
+    startUpdatePolling();
+    renderUpdate();
+  } catch (e) {
+    toast("无法开始升级: " + e.message);
+    btn.disabled = false;
+    loadUpdate(true);
+  }
+}
+
+$("#btn-update-check").onclick = async () => {
+  const btn = $("#btn-update-check");
+  btn.disabled = true; btn.textContent = "检查中…";
+  await loadUpdate(true);
+  btn.disabled = false; btn.textContent = "检查更新";
+  if (updateInfo && updateInfo.check_ok === false) toast("检查失败: 无法访问远端版本源");
+  else if (updateInfo && updateInfo.update_available) toast(`发现新版本 v${updateInfo.latest}`);
+  else toast("已是最新版本");
+};
+$("#btn-update-run").onclick = () => {
+  if (!confirm("升级会替换程序代码并重启面板 (密钥与配置保留), 现在开始?")) return;
+  doUpdate();
+};
+$("#btn-update").onclick = () => {
+  if (updateInfo && updateInfo.update_available && updateInfo.can_update && !updateInfo.running) doUpdate();
+  else $("#btn-update-check").click();
 };
 
 /* ---------------- 模态 ---------------- */

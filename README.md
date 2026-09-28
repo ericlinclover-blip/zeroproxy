@@ -31,6 +31,17 @@ sudo bash install.sh
 → 点「一键生成」→ 得到 5 个节点、三种格式的订阅链接与二维码。
 之后改用 `https://<你的域名>:8899`, 即为 **Let's Encrypt 真实可信证书**。
 
+### 升级 (已经部署过)
+
+面板右上角有「程序更新 → 一键更新」; 命令行等价的一条命令:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/upgrade.sh | bash
+```
+
+升级只替换程序代码, `data/state.json`(密钥 / 口令 / 订阅令牌 / 节点开关) 原样保留,
+订阅地址不变, 客户端不用重新导入。
+
 ---
 
 ## 1. 能力总览
@@ -38,6 +49,8 @@ sudo bash install.sh
 | 能力 | 说明 |
 |---|---|
 | **一条命令部署** | `install.sh` 自动完成 BBR、依赖、Xray/Hysteria 2 二进制、venv、nginx 引导配置、systemd、防火墙 |
+| **一键更新** | 面板「程序更新」按钮, 或服务器上 `upgrade.sh` 一条命令: 自动备份代码与 `state.json` → 替换 → 按现有 `state.json` 重新落地配置 → 失败自动回滚; 面板内更新由 systemd 瞬时单元托管, 面板自身重启不会打断升级 |
+| **配置落地可验证** | 每次应用配置都用真实二进制校验 (`xray -test` / `nginx -t`) 并**复查端口是否真的在监听**; 任一步失败会在面板顶部标红, 不再出现「服务全绿但节点全不通」 |
 | **5 个节点** | VLESS Reality (TCP+Vision)、VLESS XHTTP Reality、VLESS WebSocket、Trojan TLS、Hysteria 2 (QUIC+端口跳跃) |
 | **3 种订阅格式** | 同一订阅地址 `?format=` 切换: Base64 通用 / Clash(mihomo) YAML / sing-box JSON |
 | **3 档分流模板** | 智能分流 (国内直连+广告拦截) / 全局代理 / 全部直连; 面板一键切换或 `?rules=` 单客户端覆盖, 切换不重启服务 |
@@ -51,7 +64,7 @@ sudo bash install.sh
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 52 项 + `scripts/verify.py` (74 项) + `scripts/browser_check.cjs` (27 项), 全部用真实二进制 / 真实浏览器 |
+| **可回归验证** | `pytest` 68 项 (66 passed + 2 skipped) + `scripts/verify.py` (74 项) + `scripts/browser_check.cjs` (32 项) + `scripts/upgrade_sim.sh` (13 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 
 竞品与技术调研见 `docs/RESEARCH.md`。
 
@@ -62,6 +75,7 @@ sudo bash install.sh
 ```
 zeroproxy/
 ├── install.sh                     # 一键部署 (BBR / 依赖 / 二进制 / venv / nginx 引导 / systemd / ufw / 引导令牌)
+├── upgrade.sh                     # 一键升级 (备份 → 换代码 → 按 state.json 重新落地配置 → 失败回滚)
 ├── uninstall.sh                   # 一键卸载 (停服务 / 清单元 / 删 nginx 配置 / 回收 ufw / 可选保留数据)
 ├── dev.sh                         # 本地开发启动 (macOS 可跑, 无 systemd 自动 dry-run)
 ├── backend/
@@ -76,14 +90,17 @@ zeroproxy/
 │       ├── geodata.py             # GeoIP/GeoSite 下载与校验 + 分流规则 (硬前置: 数据缺失不下发) + 启动前自愈 CLI
 │       ├── nginx_config.py        # Nginx 生成 (ACME + 443 WS 反代 + 伪装主页 + 8899 面板 TLS)
 │       ├── hysteria_config.py     # Hysteria 2 配置生成 (端口跳跃 + masquerade 伪装)
+│       ├── apply.py               # 配置落地闭环 (生成 → xray -test / nginx -t → 重载 → 复查端口监听), 面板与 upgrade.sh 共用
+│       ├── update.py              # 面板自更新 (远端版本检查 + 触发 upgrade.sh + 回读升级进度)
 │       ├── services.py            # systemctl / certbot / 自签证书 / 流量统计 / 节点握手探测 / 诊断
 │       ├── share_links.py         # 单节点链接 + Base64 / Clash / sing-box 订阅 + 三档分流模板
-│       └── routes.py              # API: setup / login / dashboard / settings / diagnose / probe / backup / sub / qr
+│       └── routes.py              # API: setup / login / dashboard / settings / diagnose / probe / backup / sub / qr / update
 ├── docs/
 │   └── RESEARCH.md                # 竞品与技术调研 (含上游源码一手证据)
 ├── scripts/
 │   ├── verify.py                  # 端到端验证: 真实二进制跑通配置生成 / 订阅解析 / 探测 / 备份 / GeoIP
-│   └── browser_check.cjs          # 真实浏览器 (Playwright) UI 验证与截图
+│   ├── browser_check.cjs          # 真实浏览器 (Playwright) UI 验证与截图
+│   └── upgrade_sim.sh             # 一键升级演练: 真跑 upgrade.sh (桩掉 root/systemd), 覆盖成功与回滚两条路径
 ├── static/
 │   └── index.html                 # Apple 风格单文件 UI (零构建, 深浅色, 无 CDN)
 └── systemd/
@@ -281,7 +298,9 @@ state.json (唯一事实来源, schema v3, 旧版本自动升级)
 - **仪表盘卡片**: 订阅三种格式 (各自复制 / 二维码)、5 张节点卡 (协议徽标 / 传输 / 加密 / 状态灯 /
   开关 / 单节点流量 / **握手延迟徽标** / 复制链接 / 二维码)、流量总览与节点占比、
   高级设置 (Reality SNI / Hysteria 伪装站点 / 各节点端口 / **GeoIP 分流开关与数据更新**)、
-  诊断与一键修复、证书与系统状态 (**含备份下载与恢复**)、操作审计。
+  诊断与一键修复、证书与系统状态 (**含备份下载与恢复**)、**程序更新 (版本 / 一键更新 / 进度日志)**、操作审计。
+- **失败不装成功**: 「一键生成」「保存并应用」「一键修复」的每一步失败都会顶到仪表盘顶部标红
+  (含具体原因), 而不是只弹一句「完成」。
 
 ---
 
@@ -302,6 +321,8 @@ state.json (唯一事实来源, schema v3, 旧版本自动升级)
 | POST | `/api/restore` | 会话 | 从备份恢复并热重载 (校验和/必填字段/版本三重校验) |
 | POST | `/api/apply` | 会话 | 重新生成全部配置并热重载 |
 | POST | `/api/renew` | 会话 | `certbot renew` + reload nginx |
+| GET | `/api/update` | 会话 | 当前版本 / 远端最新版本 (600s 缓存, `?force=1` 强刷) / 上次升级进度与日志尾部 |
+| POST | `/api/update` | 会话 | 一键更新: 后台拉起 `upgrade.sh` (systemd 瞬时单元, 面板重启不打断); 已有任务或本地开发环境返回 409 |
 | GET | `/api/diagnose` / POST `/api/repair` | 会话 | 自检 / 一键自愈 |
 | GET | `/api/traffic` | 会话 | 流量统计 (Stats API) |
 | GET | `/api/logs/{service}` | 会话 | 服务日志尾部 (journalctl) |
@@ -348,6 +369,10 @@ python3 scripts/verify.py
 
 # 真实浏览器 UI 验证 (Playwright; 需 node + playwright)
 ZP_NODE_PATH=/path/to/node_modules node scripts/browser_check.cjs
+
+# 一键升级演练: 造一台"已部署的假机器", 用桩二进制真跑 upgrade.sh
+# (不需要 root / systemd; 覆盖正常升级 + 下载失败自动回滚两条路径)
+ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 ```
 
 开发环境可用 `ZP_XRAY_BIN` / `ZP_HYSTERIA_BIN` / `ZP_NGINX_BIN` 指定二进制绝对路径
@@ -359,7 +384,9 @@ ZP_NODE_PATH=/path/to/node_modules node scripts/browser_check.cjs
 
 在 macOS (Apple Silicon, Python 3.14) 上实测通过:
 
-- `python -m pytest tests -q` → **50 passed, 2 skipped** (带 `ZP_XRAY_BIN` 时 **52 passed**, 约 10 秒)。
+- `python -m pytest tests -q` → **66 passed, 2 skipped** (带 `ZP_XRAY_BIN` 时 **68 passed**, 约 15 秒);
+  含 `/api/update` 鉴权与版本比较、`apply` 的"写不进 /etc/nginx 即失败"语义、CLI 退出码、以及
+  `install.sh` 重跑不覆盖已初始化配置 / `upgrade.sh` 随包发布的回归断言。
 - `scripts/verify.py` (Xray 26.3.27 + Hysteria 2.12.3 + mihomo 1.19.31 + sing-box 1.14.2) → **74/74 项通过**:
   setup 8 步全绿 / 三种订阅格式可被真实客户端解析 / 三档分流模板分别被 `mihomo -t` 与
   `sing-box check` 通过 / **用真实 sing-box 实跑** 5 份订阅 (通用 + 1.14+ 写法 × 智能/全局/直连) 全部启动成功,
@@ -369,9 +396,14 @@ ZP_NODE_PATH=/path/to/node_modules node scripts/browser_check.cjs
   **启动期自愈闭环**: 配置带 geo 规则 + 数据文件消失 → 原样启动被 Xray 拒绝 (复现) → `geodata guard`
   重新生成 (已移除 geo 规则) → 再自检通过 / 备份-恢复往返一致且篡改被拒 /
   5 个节点握手探测全部成功 (Reality TLS 136ms, 出口 RTT 54ms)。
-- `scripts/browser_check.cjs` → **27/27 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
+- `scripts/browser_check.cjs` → **32/32 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
   二维码出图、诊断 8/8、节点测速结果落到卡片、GeoIP 开关与状态、**分流模板选择器 (切换 → 订阅内容
-  真的变化 → 切回)**、备份下载; 无 console 错误、无失败请求。
+  真的变化 → 切回)**、备份下载、**程序更新卡片 (版本行 / 检查更新 / 非生产环境隐藏一键更新)**;
+  无 console 错误、无失败请求。
+- `scripts/upgrade_sim.sh` → **13/13 项通过**: 在模拟的"已部署机器"上真跑 `upgrade.sh` ——
+  备份 → 换代码 → 按 `state.json` 重新落地配置 (把占位配置修回真实配置) → 写 `update.json` /
+  `update.log`; 并覆盖失败路径: 下载失败时非 0 退出、代码自动回滚到升级前版本、状态记为 failed、
+  现有部署与 `state.json` 的密钥 / 订阅令牌一字未动。
 - API 边界: 无令牌 setup 403、重复 setup 409、非法域名 / 弱密码 / 非法用户名 400、
   无 Cookie dashboard 401、错密码 401 且第 4 次起 429、错误订阅令牌 404、未知节点 404、
   备份/探测/GeoIP 接口未登录一律 401、备份校验和不匹配 400。
@@ -390,14 +422,41 @@ systemd 单元中的生效 (单元文件已写入该变量, 但只在 Linux 上�
 # 查看服务日志
 journalctl -u xray -n 50 --no-pager         # 也可用面板 GET /api/logs/xray
 
-# 升级 / 重装面板 (install.sh 可重复执行, 不会动 data/ 里的密钥与订阅令牌)
+# 一键升级 (推荐; 面板「程序更新 → 一键更新」等价)
+#   只换程序代码, state.json / 密钥 / 订阅令牌 / 节点开关原样保留, 订阅地址不变
+#   升级前自动备份代码与 state.json, 任一步失败自动回滚
+curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/upgrade.sh | bash
+
+# 指定分支 / tag, 或改用 fork / 镜像仓库 (默认 main)
+ZP_REPO=your-name/zeroproxy ZP_REF=main bash -c "$(curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/upgrade.sh)"
+
+# 顺带把 Xray / Hysteria 2 二进制升到最新版 (默认不动)
+ZP_UPDATE_CORE=1 bash /opt/zeroproxy/upgrade.sh
+
+# 只看版本, 不做任何改动
+ZP_CHECK_ONLY=1 bash /opt/zeroproxy/upgrade.sh
+
+# 已经 clone 了仓库: 直接跑本地脚本
+sudo bash upgrade.sh
+
+# 升级后的进度与日志 (面板「程序更新」卡片读同一份文件)
+cat /opt/zeroproxy/data/update.json
+tail -n 40 /opt/zeroproxy/data/update.log
+
+# 重装 / 修复整机环境 (install.sh 可重复执行: 已初始化时不会再动 data/ 里的配置,
+# 而是按 state.json 重新落地一次配置; 首次部署才写占位配置)
 curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/install.sh | bash
 
 # 指定 Xray 版本 (回退), 或指定面板分支 / tag
 XRAY_VERSION=24.11.30 ZP_REF=main bash -c "$(curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/install.sh)"
 
-# 只更新面板代码 (已经 clone 了仓库时)
-sudo bash install.sh
+# 万一升级后有问题: 手动回滚到上一份代码与 state.json
+# (备份目录保留最近 5 份 —— 成功与失败各留一份回滚点; 步骤失败时脚本还会自动回滚一次)
+BK="$(ls -1dt /opt/zeroproxy/data/backups/code-* 2>/dev/null | head -1)"
+rm -rf /opt/zeroproxy/zeroproxy /opt/zeroproxy/static
+cp -r "$BK/zeroproxy" /opt/zeroproxy/zeroproxy && cp -r "$BK/static" /opt/zeroproxy/static
+cp -f "$BK/state.json" /opt/zeroproxy/data/state.json
+systemctl restart xray hysteria2 nginx zeroproxy
 
 # 备份 / 恢复 (两种方式任选)
 #   1) 面板「系统 → 下载备份」得到 JSON (带校验和, 换机可一键还原)
@@ -441,6 +500,14 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
   点「一键诊断」看具体哪一项不过, 再点「一键修复」。
 - **换服务器怎么迁移?** 新机跑 `install.sh` → 打开面板 → 「系统 → 从备份恢复」→ 选旧机的备份
   JSON, 密钥、订阅令牌、节点开关全部原样回来。
+- **面板加了新功能, 怎么升级?** 面板「程序更新 → 一键更新」, 或服务器上
+  `curl -fsSL .../upgrade.sh | bash`。升级只换程序代码, 配置与订阅地址不变, 客户端不用重新导入;
+  升级前自动备份代码与 `state.json`, 失败自动回滚, 进度与日志写进 `data/update.json` / `data/update.log`。
+- **为什么升级完节点还是不通?** 升级只负责「把新代码装上去, 再按 `state.json` 重新落地配置」。
+  如果 `state.json` 本身是错的 (比如域名没解析), 升级不会替你修好 —— 点「一键诊断」看是哪一项,
+  或直接看升级卡片里的失败步骤; 必要时重新走一次「一键生成」。
+- **面板卡片一直显示「有步骤失败」?** 那是配置落地真的没成功 (写不进 `/etc/nginx`、`xray -test`
+  不过、端口没起来都会这样报)。展开卡片或看 `data/update.log` 的具体原因, 修掉后点「重新应用配置」。
 
 ---
 
@@ -457,4 +524,9 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 - 分流模板是三档预设 (智能/全局/直连), 暂不支持用户自定义规则集; `?rules=` 只能选这三档。
 - 面向 sing-box ≥1.14 的 `?format=singbox-next` 是**手选格式**: 面板无法识别客户端版本,
   默认格式 (`download_detour`) 才能同时兼容 1.13 与 1.14。等 1.16 发布 (该字段移除) 后默认值会切到新版写法。
-- 尚未内置: 核心二进制自动更新、用户自定义分流规则、多域名与多证书、多用户与配额。
+- 尚未内置: 用户自定义分流规则、多域名与多证书、多用户与配额。(核心二进制升级已可选:
+  面板「程序更新」只换面板代码, 需要连 Xray / Hysteria 2 一起升级时用 `ZP_UPDATE_CORE=1`)。
+- 面板内「一键更新」依赖 `systemd-run` 把升级脚本放到独立单元里跑; 极老系统没有它时会退化为
+  直接后台执行 (面板重启可能打断升级), 这种情况下建议改用命令行 `upgrade.sh`。
+- 升级脚本按 `ZP_HOME`(默认 `/opt/zeroproxy`) 布局工作, 只覆盖 `zeroproxy/` `static/`
+  `requirements.txt` `systemd/*.service` 与 `upgrade.sh`, 不碰 `data/`、`certs/`、`geo/`。

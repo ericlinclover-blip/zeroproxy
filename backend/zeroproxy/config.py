@@ -210,6 +210,11 @@ def paths() -> dict:
         "nginx_home": f"{h}/nginx/zeroproxy.conf",
         "nginx_dir": f"{h}/nginx",
         "www": f"{h}/www",
+        # 一键升级: 升级脚本自身、进度文件与备份目录
+        "upgrade_script": f"{h}/upgrade.sh",
+        "update_status": f"{h}/data/update.json",
+        "update_log": f"{h}/data/update.log",
+        "backup_dir": f"{h}/data/backups",
     }
 
 

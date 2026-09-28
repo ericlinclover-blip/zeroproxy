@@ -32,13 +32,13 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from . import (
+    apply,
     config,
     crypto,
     geodata,
-    hysteria_config,
-    nginx_config,
     services,
     share_links,
+    update,
     xray_config,
 )
 from .config import (
@@ -208,84 +208,47 @@ class SetupIn(BaseModel):
     token: str = ""
 
 
-def _gen_xray(state: dict, timeout: int = 0) -> tuple[bool, str]:
-    xray_config.write_xray_config(state)
-    count = len(xray_config.build_xray_config(state)["inbounds"])
-    binary = services.bin_path("xray")
-    if binary:
-        # 只要有 xray 二进制就用它做真实校验 (生产环境 / 指定 ZP_XRAY_BIN 的开发环境)
-        ok, out = services.run(
-            [binary, "-test", "-c", paths()["xray_config"]],
-            timeout=60,
-            env=services.xray_env(),
-        )
-        if not ok:
-            return False, f"已生成但 xray -test 未通过: {' '.join(out.split())[:150]}"
-        return True, f"已生成 ({count} 个入站, xray -test 通过)"
-    return True, f"已生成 ({count} 个入站)"
-
-
-def _gen_nginx(state: dict, timeout: int = 0) -> tuple[bool, str]:
-    ok_etc, actual = nginx_config.write_nginx_conf(state)
-    detail = f"已写入 {actual}" if ok_etc else (
-        f"无 /etc/nginx 权限 → 已存 {actual} (服务器上由 install.sh 部署)"
-    )
-    binary = services.bin_path("nginx")
-    if ok_etc and binary:
-        ok, out = services.run([binary, "-t"], timeout=30)
-        tail = " ".join(out.split())[:120]
-        if not ok:
-            return False, f"nginx -t 未通过: {tail}"
-        detail += " (nginx -t 通过)"
-    return True, detail
-
-
-def _gen_hysteria(state: dict, timeout: int = 0) -> tuple[bool, str]:
-    hysteria_config.write_hysteria_config(state)
-    if state["nodes"].get("hysteria2"):
-        cert, key = paths()["hysteria_cert"], paths()["hysteria_key"]
-        if not (os.path.exists(cert) and os.path.exists(key)):
-            return False, "已生成但证书缺失 (客户端将无法连接)"
-    return True, "已生成"
-
-
 def _install_cert(state: dict, timeout: int = 0) -> tuple[bool, str]:
     ok, detail, cert_state = services.install_cert(state["domain"])
     state["cert"] = cert_state
     return ok, detail
 
 
-def _restart_services(state: dict, timeout: int = 0) -> tuple[bool, str]:
-    results = []
+def _ensure_cert(state: dict, timeout: int = 0) -> tuple[bool, str]:
+    """申请证书前的兜底: 先放一张自签证书, 让 nginx -t 一定过。
 
-    def run(name: str, fn, timeout: int) -> None:
-        ok, detail = fn(timeout)
-        mark = "✓" if ok else ("↷" if "跳过" in detail else "✗")
-        results.append(f"{name} {mark} {detail}")
+    `install_cert` 是在 nginx 80 端口 ACME 校验就绪之后才跑的, 而那份 nginx
+    配置本身又引用证书文件 —— 没有这步会陷入「证书要 nginx, nginx 要证书」。
+    """
+    p = paths()
+    cert = state.get("cert") or {}
+    if cert.get("cert_file") and os.path.exists(cert["cert_file"]):
+        return True, "已有证书文件可用"
+    ok, detail = services.generate_self_signed(state["domain"], p["cert_file"], p["cert_key"])
+    if ok:
+        state["cert"] = {
+            "type": "selfsigned",
+            "issuer": "ZeroProxy 自签",
+            "cert_file": p["cert_file"],
+            "key_file": p["cert_key"],
+            "not_after": int(time.time()) + 3650 * 86400,
+        }
+    return ok, detail
 
-    nodes = state.get("nodes", {})
-    if any(nodes.get(n) for n in XRAY_NODE_IDS):
-        run("xray", services.restart_service, timeout or 90)
-    if nodes.get("hysteria2"):
-        run("hysteria2", services.restart_service, timeout or 90)
-    run("nginx", services.reload_service, timeout or 60)
-    if not results:
-        return True, "无需操作"
-    all_skipped = all("↷" in r for r in results)
-    failed = any("✗" in r for r in results)
-    return (all_skipped or not failed), "; ".join(results)
+
+def _reload_nginx(state: dict, timeout: int = 0) -> tuple[bool, str]:
+    """让刚落盘的 nginx 配置生效 (80 端口 ACME 校验路径)。"""
+    ok, detail = services.reload_service("nginx", timeout or 60)
+    if not ok and "跳过" not in detail:
+        return False, f"nginx 重载失败: {detail}"
+    if not ok:  # 本地开发 (无 systemctl): 不算失败
+        return True, detail
+    return True, "已重载 (80 端口 ACME 校验路径已就绪)"
 
 
 def _reapply(state: dict, request: Request | None = None) -> list[dict]:
-    """修改配置后的热更新闭环: 重新生成 → 写盘 → 重载服务。"""
-    steps = _steps_recorder()
-    _add_step(steps, "重新生成 Xray 配置", _gen_xray, state)
-    _add_step(steps, "重新生成 Nginx 配置", _gen_nginx, state)
-    _add_step(steps, "重新生成 Hysteria 2 配置", _gen_hysteria, state)
-    _add_step(steps, "重载服务 (nginx/xray/hysteria2)", _restart_services, state, timeout=180)
-    state["steps"] = steps
-    save_state(state)
-    return steps
+    """修改配置后的热更新闭环 (实现见 zeroproxy.apply, 与 upgrade.sh 共用)。"""
+    return apply.reapply(state)
 
 
 @router.post("/api/setup")
@@ -346,20 +309,37 @@ def setup(payload: SetupIn, request: Request):
             return True, "已持久化"
 
         _add_step(steps, "写入面板状态", step_state, state)
-        # 证书必须先生成: Trojan 入站 (xray) 与 443 (nginx) 都依赖证书文件,
-        # 若在申请证书前生成配置, Trojan 入站会因 cert_usable() 为假而被漏掉。
-        _add_step(steps, "申请 SSL 证书", _install_cert, state, timeout=360)
+        # 顺序很关键: 先把 nginx 的 80 端口 ACME 校验路径挂起来, certbot 才可能
+        # 通过 webroot 验证拿到 Let's Encrypt 证书; 拿到后再生成引用真实证书的
+        # nginx / xray (Trojan) 配置。反过来做只会永远退回自签证书。
         _add_step(steps, "生成 Hysteria 2 证书", lambda s, t: services.generate_hysteria_cert(s["domain"]), state)
-        _add_step(steps, "生成 Xray 配置", _gen_xray, state)
-        _add_step(steps, "生成 Nginx 配置", _gen_nginx, state)
-        _add_step(steps, "生成 Hysteria 2 配置", _gen_hysteria, state)
-        _add_step(steps, "启动/重载服务", _restart_services, state, timeout=180)
+        _add_step(steps, "预置自签证书 (引导 nginx)", _ensure_cert, state)
+        _add_step(steps, "生成 Nginx 配置 (80 ACME + 面板)", apply.gen_nginx, state)
+        _add_step(steps, "重载 Nginx", _reload_nginx, state)
+        _add_step(steps, "申请 SSL 证书", _install_cert, state, timeout=360)
+        _add_step(steps, "生成 Xray 配置", apply.gen_xray, state)
+        _add_step(steps, "生成 Nginx 配置 (真实证书)", apply.gen_nginx, state)
+        _add_step(steps, "生成 Hysteria 2 配置", apply.gen_hysteria, state)
+        _add_step(steps, "启动/重载服务", apply.restart_services, state, timeout=180)
+        _add_step(steps, "验证端口监听", apply.verify_listeners, state, timeout=12)
 
         _clean_sessions(state)
-        config.audit(state, "setup", f"domain={domain}", actor=username)
+        failed = apply.failures(steps)
+        config.audit(
+            state,
+            "setup",
+            f"domain={domain}" + (f" · {len(failed)} 步失败: {failed[0]['name']}" if failed else ""),
+            actor=username,
+        )
+        state["steps"] = steps
         save_state(state)
         body = _dashboard_body(state, request)
         body["steps"] = steps
+        # 步骤结果不回吞: 前端据此显示红色告警, 而不是"全绿但节点不通"
+        body["ok"] = not failed
+        body["warning"] = (
+            f"{failed[0]['name']}: {failed[0]['detail']}" if failed else ""
+        )
         response = JSONResponse(body)
         _issue_session(state, request, response)
         save_state(state)
@@ -727,7 +707,7 @@ def update_settings(payload: SettingsIn, request: Request):
 
 
 @router.post("/api/apply")
-def apply(request: Request):
+def apply_endpoint(request: Request):
     with config.locked():
         state = load_state()
         if not _require_auth(state, request):
@@ -892,6 +872,33 @@ def traffic(request: Request):
     if not stats:
         return {"available": False, "detail": "统计不可用 (需要 Xray 已运行)"}
     return stats
+
+
+# ---------------------------------------------------------------- 程序更新
+
+@router.get("/api/update")
+def update_status(request: Request, force: int = 0):
+    """查看当前版本 / 远端最新版本 / 上次升级进度 (只读)。"""
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+    return update.status(force=bool(force))
+
+
+@router.post("/api/update")
+def update_start(request: Request):
+    """一键更新: 后台拉起 upgrade.sh, 面板会随之重启。"""
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        ok, detail = update.start(trigger="panel")
+        config.audit(state, "update", detail[:190], actor=_client_ip(request))
+        save_state(state)
+    if not ok:
+        return _err(detail, 409)
+    return {"ok": True, "detail": detail, "status": update.status()}
 
 
 @router.get("/api/logs/{service}")

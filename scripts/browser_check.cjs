@@ -190,6 +190,16 @@ async function main() {
     check("恢复入口存在", (await page.locator("#btn-restore").count()) === 1
       && (await page.locator("#restore-file").count()) === 1);
 
+    console.log("\n[3d] 程序更新");
+    check("程序更新卡片存在", (await page.locator("#update-card").count()) === 1);
+    const updLine = (await page.locator("#update-status-line").innerText()).trim();
+    check("版本行显示当前版本", /当前 v\d/.test(updLine), updLine.replace(/\n/g, " ").slice(0, 60));
+    const updHint = (await page.locator("#update-hint").innerText()).trim();
+    check("本地开发环境明确提示不可面板内升级", /本地开发环境/.test(updHint), updHint.slice(0, 60));
+    check("检查更新按钮存在", (await page.locator("#btn-update-check").count()) === 1);
+    check("非生产环境不显示一键更新按钮",
+      await page.locator("#btn-update-run").isHidden());
+
     await page.screenshot({ path: path.join(SHOT_DIR, "dashboard-light.png"), fullPage: true });
     await page.click("#themeBtn");
     await page.waitForTimeout(400);

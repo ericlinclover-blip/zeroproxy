@@ -199,6 +199,11 @@ cp -r "$SRC_DIR/backend/static" "$ZP_HOME/static"
 cp "$SRC_DIR/backend/requirements.txt" "$ZP_HOME/requirements.txt"
 rm -rf "$ZP_HOME/zeroproxy/__pycache__" "$ZP_HOME/zeroproxy"/*/__pycache__
 cp "$SRC_DIR"/systemd/*.service /etc/systemd/system/
+# 一键升级脚本: 随代码装到面板目录, 供「程序更新」按钮与命令行共用
+if [ -f "$SRC_DIR/upgrade.sh" ]; then
+  cp "$SRC_DIR/upgrade.sh" "$ZP_HOME/upgrade.sh"
+  chmod +x "$ZP_HOME/upgrade.sh"
+fi
 if [ -f "$SRC_DIR/uninstall.sh" ]; then
   cp "$SRC_DIR/uninstall.sh" "$ZP_HOME/uninstall.sh"
 fi
@@ -237,13 +242,23 @@ if [ "$GEO_OK" != "1" ]; then
   warn "GeoIP 数据下载失败 — 不影响核心功能, 可稍后在面板里重试"
 fi
 
-# ---------------- 7. 占位配置 (面板 setup 之前服务可先启动) ----------------
-cat > "$ZP_HOME/xray/config.json" <<'JSON'
+# ---------------- 7. 初始配置 ----------------
+# 首次部署: 写占位配置, 让 xray/hysteria 在面板 setup 之前也能正常启动。
+# 已经初始化过的机器 (存在 data/state.json) 绝不能走这一步 —— 覆写会把已经生成的
+# Reality 密钥 / 端口 / 订阅令牌打回占位状态, 结果是「服务全绿但 5 个节点全不通」。
+PANEL_INITIALIZED=0
+[ -f "$ZP_HOME/data/state.json" ] && PANEL_INITIALIZED=1
+
+if [ "$PANEL_INITIALIZED" = "1" ]; then
+  info "检测到已初始化的部署, 保留现有密钥与节点配置 (稍后按 state.json 重新落地)"
+else
+  info "首次部署: 写入占位配置 (面板完成 setup 后自动覆盖) ..."
+  cat > "$ZP_HOME/xray/config.json" <<'JSON'
 {"log": {"loglevel": "warning"}, "inbounds": [], "outbounds": [{"protocol": "freedom"}]}
 JSON
-openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=zeroproxy.local" \
-  -keyout "$ZP_HOME/hysteria/key.pem" -out "$ZP_HOME/hysteria/cert.pem" 2>/dev/null
-cat > "$ZP_HOME/hysteria/config.yaml" <<YAML
+  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=zeroproxy.local" \
+    -keyout "$ZP_HOME/hysteria/key.pem" -out "$ZP_HOME/hysteria/cert.pem" 2>/dev/null
+  cat > "$ZP_HOME/hysteria/config.yaml" <<YAML
 # 占位配置, 面板完成部署后会被自动覆盖
 listen: "127.0.0.1:30001"
 tls:
@@ -253,7 +268,8 @@ auth:
   type: password
   password: "changeme"
 YAML
-chmod 600 "$ZP_HOME/hysteria/key.pem"
+  chmod 600 "$ZP_HOME/hysteria/key.pem"
+fi
 
 # 引导令牌 (0600): 面板初始化时必须提供它, 防止公网暴露时被别人抢先完成部署。
 # 已经初始化过的机器 (存在 state.json) 不重新签发, 避免把令牌重新暴露出来。
@@ -269,19 +285,26 @@ fi
 # 浏览器首次访问会提示证书不受信任, 点「继续」即可; 目的是让面板登录/会话走 TLS。
 SERVER_IP="$(curl -4 -fsSL --max-time 10 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || true)"
 SERVER_IP="${SERVER_IP:-127.0.0.1}"
-info "生成面板自签证书 (CN=zeroproxy-panel, IP=$SERVER_IP) ..."
 mkdir -p "$ZP_HOME/panel"
-if ! openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=zeroproxy-panel" \
-      -addext "subjectAltName=IP:${SERVER_IP},IP:127.0.0.1,DNS:localhost" \
-      -keyout "$ZP_HOME/panel/key.pem" -out "$ZP_HOME/panel/cert.pem" 2>/dev/null; then
-  # 老版本 openssl 不支持 -addext 时的兜底
-  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=zeroproxy-panel" \
-    -keyout "$ZP_HOME/panel/key.pem" -out "$ZP_HOME/panel/cert.pem" 2>/dev/null
+if [ -f "$ZP_HOME/panel/cert.pem" ] && [ -f "$ZP_HOME/panel/key.pem" ]; then
+  info "面板自签证书已存在, 保留 ($ZP_HOME/panel/cert.pem)"
+else
+  info "生成面板自签证书 (CN=zeroproxy-panel, IP=$SERVER_IP) ..."
+  if ! openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=zeroproxy-panel" \
+        -addext "subjectAltName=IP:${SERVER_IP},IP:127.0.0.1,DNS:localhost" \
+        -keyout "$ZP_HOME/panel/key.pem" -out "$ZP_HOME/panel/cert.pem" 2>/dev/null; then
+    # 老版本 openssl 不支持 -addext 时的兜底
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -subj "/CN=zeroproxy-panel" \
+      -keyout "$ZP_HOME/panel/key.pem" -out "$ZP_HOME/panel/cert.pem" 2>/dev/null
+  fi
+  chmod 600 "$ZP_HOME/panel/key.pem"
 fi
-chmod 600 "$ZP_HOME/panel/key.pem"
 
 # 面板对外由 nginx 在 $PANEL_PORT 终结 TLS 并反代到本机面板进程。
-# 这里是引导配置 (用自签证书); 面板完成 setup 后会重新生成, 改用真实证书。
+# 这里只是引导配置 (用自签证书); 面板完成 setup 后会重新生成, 改用真实证书。
+if [ "$PANEL_INITIALIZED" = "1" ]; then
+  info "已初始化部署: 保留面板现有的 nginx 配置 (稍后由 zeroproxy.apply 重新落地)"
+else
 NGINX_PANEL_BIND="${ZP_BIND_PORT:-9900}"
 info "配置 nginx 面板反向代理 (:$PANEL_PORT → 127.0.0.1:$NGINX_PANEL_BIND) ..."
 cat > /etc/nginx/conf.d/zeroproxy.conf <<NGINX
@@ -313,10 +336,23 @@ if nginx -t >/dev/null 2>&1; then
 else
   warn "nginx 引导配置校验失败, 请检查 /etc/nginx/conf.d/zeroproxy.conf"
 fi
+fi
 
 # ---------------- 8. systemd ----------------
 systemctl daemon-reload
 systemctl enable xray hysteria2 zeroproxy
+if [ "$PANEL_INITIALIZED" = "1" ]; then
+  # 已初始化: 按 state.json 重新生成 xray / nginx / hysteria 配置并热重载,
+  # 顺带校验端口真的在监听 (避免"服务活着但节点不通")。
+  APPLY_LOG="$ZP_HOME/data/install-apply.log"
+  info "按现有 state.json 重新落地配置并热重载 ..."
+  if env ZP_HOME="$ZP_HOME" PYTHONPATH="$ZP_HOME" "$ZP_HOME/venv/bin/python" -m zeroproxy.apply --quiet >>"$APPLY_LOG" 2>&1; then
+    ok "配置已重新落地 (密钥 / 节点 / 订阅令牌均未改动)"
+  else
+    warn "重新落地有步骤失败 — 打开面板「程序更新」或点「一键诊断」查看; 日志: $APPLY_LOG"
+    tail -n 5 "$APPLY_LOG" 2>/dev/null | sed 's/^/    /' >&2 || true
+  fi
+fi
 systemctl restart xray hysteria2 zeroproxy || true
 systemctl enable certbot.timer 2>/dev/null || true
 
