@@ -454,6 +454,33 @@ def open_firewall_port(port: int, proto: str = "tcp") -> str:
     return f"ufw 放行 {target} 失败: {' '.join(out.split())[:80]}"
 
 
+def open_firewall_ports(ports: list[int], proto: str = "tcp") -> str:
+    """尽力放行一组端口 (仅 ufw), 返回给用户看的说明。
+
+    用于端口跳跃: 它是 3 个互不相邻的 UDP 端口, 放行连续区间会顺带把中间
+    2000 个端口一起打开, 所以逐个放行。ufw 不可用时同样只是"请自己放行",
+    不让这一步变成失败 (云端安全组本来就不受面板控制)。
+    """
+    targets = [f"{int(p)}/{proto}" for p in sorted({int(p) for p in ports})]
+    if not targets:
+        return "没有需要放行的端口"
+    listed = " / ".join(targets)
+    ufw = shutil.which("ufw")
+    if not ufw:
+        return f"本机没有 ufw; 请确认云安全组已放行 {listed}"
+    ok, status = run([ufw, "status"], timeout=10)
+    if not ok or "Status: active" not in status:
+        return f"ufw 未启用; 请确认云安全组已放行 {listed}"
+    failed = []
+    for target in targets:
+        ok, out = run([ufw, "allow", target], timeout=15)
+        if not ok:
+            failed.append(f"{target} ({' '.join(out.split())[:60]})")
+    if failed:
+        return "放行失败: " + "; ".join(failed)
+    return f"ufw 已放行 {listed}"
+
+
 def journal_tail(name: str, lines: int = 40) -> str:
     """服务日志尾部 (仅 Linux/systemd)。"""
     if not is_prod() or shutil.which("journalctl") is None:

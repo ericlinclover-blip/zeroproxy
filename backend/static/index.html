@@ -696,6 +696,12 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
       </div>
       <label style="margin-top:16px">对外端口</label>
       <div class="adv-grid" id="port-grid"></div>
+      <div class="row" style="margin-top:14px;align-items:flex-start;gap:10px">
+        <label class="chk" title="同时监听 3 个 UDP 端口, 封锁其中一个不影响使用">
+          <input type="checkbox" id="adv-hopping"> Hysteria 2 端口跳跃
+        </label>
+        <span class="muted" style="font-size:12px" id="adv-hopping-note">—</span>
+      </div>
       <div class="row" style="margin-top:16px">
         <button class="btn small" id="btn-save-adv">保存并应用</button>
         <span class="muted" style="font-size:12.5px">改动会重新生成配置并热重载, 订阅内容自动更新</span>
@@ -844,6 +850,69 @@ function toast(msg) {
   clearTimeout(t._h);
   t._h = setTimeout(() => t.classList.remove("show"), 2400);
 }
+
+/* ---------------- 重渲染时的"草稿保护" ----------------
+ * 仪表盘每 20s 自动刷新一次, 而刷新是整块重画 DOM 的 (节点表 / 高级设置 /
+ * 链式代理全是 innerHTML)。没有这层保护时, 用户正在填的 SNI、端口、配对码
+ * 会在下一次刷新被服务器值覆盖 —— 填到一半的内容几分钟后自己变回去。
+ * 这里在重渲染前把"正在编辑的输入"记下来, 重渲染后原样放回 (含光标位置),
+ * 直到用户提交为止。 */
+const DRAFT_KEY_ATTRS = ["data-port-node", "data-node", "data-chain-toggle"];
+
+function inputKey(el) {
+  if (el.id) return "#" + el.id;
+  for (const attr of DRAFT_KEY_ATTRS) {
+    const value = el.getAttribute(attr);
+    if (value) return `[${attr}="${value}"]`;
+  }
+  return "";
+}
+
+//: 只保护"打字"类控件: 开关 / 勾选框是即时生效的, 交给服务器状态回灌才不会
+//: 出现"界面显示开着、后端其实没开"。
+function isDraftInput(el) {
+  if (el.tagName === "TEXTAREA") return true;
+  return ["text", "number", "url", "search", "tel", "email", "password"].includes(el.type);
+}
+
+function snapshotDraftInputs() {
+  const drafts = [];
+  document.querySelectorAll("#view-dash input, #view-dash textarea").forEach((el) => {
+    if (!isDraftInput(el)) return;
+    const focused = document.activeElement === el;
+    if (!focused && el.dataset.draft !== "1") return;
+    const key = inputKey(el);
+    if (!key) return;
+    let start = null, end = null;
+    try { start = el.selectionStart; end = el.selectionEnd; } catch (e) { /* 不支持选区的类型 */ }
+    drafts.push({ key, value: el.value, focused, start, end });
+  });
+  return drafts;
+}
+
+function restoreDraftInputs(drafts) {
+  drafts.forEach((d) => {
+    const el = document.querySelector(d.key);
+    if (!el || !isDraftInput(el)) return;
+    if (el.value !== d.value) el.value = d.value;
+    el.dataset.draft = "1";          // 还没提交 → 下次刷新继续保护
+    if (d.focused) {
+      el.focus();
+      try { if (d.start != null) el.setSelectionRange(d.start, d.end); } catch (e) { /* 忽略 */ }
+    }
+  });
+}
+
+document.addEventListener("input", (e) => {
+  const el = e.target;
+  if (el && el.dataset && isDraftInput(el)) el.dataset.draft = "1";
+});
+
+//: 提交成功后放行: 之后服务器值可以直接回灌 (含后端做的规范化, 如 SNI 转小写)
+function clearDraft(selector) {
+  document.querySelectorAll(selector).forEach((el) => delete el.dataset.draft);
+}
+
 async function copyText(text) {
   try {
     await navigator.clipboard.writeText(text);
@@ -1071,6 +1140,8 @@ async function loadDash(quiet) {
 function renderDash(quiet) {
   if (!dash) return;
   revealBlocks();   // 先挂入场动画, 万一后面某块渲染抛错也不会留下"整页透明"
+  // 重渲染会重建节点表 / 高级设置 / 链式代理的 DOM: 先把用户正在填的输入存下来
+  const drafts = snapshotDraftInputs();
   $("#dash-domain").textContent = dash.domain;
   $("#dash-sub").textContent = `面板 ${dash.panel_url} · 管理用户 ${dash.admin_user}`;
 
@@ -1108,6 +1179,7 @@ function renderDash(quiet) {
   renderDashboardBanner();
   if (!updateInfo) loadUpdate(false);
   if (!quiet) { $("#diag-list").innerHTML = ""; $("#diag-actions").classList.add("hidden"); }
+  restoreDraftInputs(drafts);
 }
 
 /* 首次进入仪表盘时, 各区块按 40ms 逐个淡入 (只在第一次跑;
@@ -1636,15 +1708,36 @@ function renderRate() {
 function renderAdvanced(d) {
   $("#adv-sni").value = d.reality.server_name || "";
   $("#adv-masq").value = (d.hysteria_masquerade && d.hysteria_masquerade.url) || "";
-  $("#port-grid").innerHTML = d.nodes
-    .filter((n) => n.editable_port)
-    .map(
-      (n) => `<div class="field">
+  // 端口这一格只在"节点集合变了"时重建 DOM: 每 20s 整块重画会把正在输入的数字
+  // 连同光标一起冲掉 (草稿保护能救回值, 但没必要每次都重画)
+  const portNodes = d.nodes.filter((n) => n.editable_port);
+  const grid = $("#port-grid");
+  const signature = portNodes.map((n) => `${n.id}`).join(",");
+  if (grid.dataset.signature !== signature) {
+    grid.dataset.signature = signature;
+    grid.innerHTML = portNodes
+      .map(
+        (n) => `<div class="field">
         <label>${esc(n.name)}</label>
-        <input class="mono" data-port-node="${escAttr(n.id)}" value="${n.port}" inputmode="numeric">
+        <input class="mono" data-port-node="${escAttr(n.id)}" inputmode="numeric">
       </div>`
-    )
-    .join("");
+      )
+      .join("");
+  }
+  portNodes.forEach((n) => {
+    const input = grid.querySelector(`[data-port-node="${n.id}"]`);
+    if (input && input.value !== String(n.port) && input.dataset.draft !== "1") input.value = n.port;
+  });
+  const hop = $("#adv-hopping");
+  if (hop) {
+    hop.checked = !!d.hysteria_hopping;
+    hop.onchange = () =>
+      applyAction("POST", "/api/hysteria/hopping", undefined, null);
+    const ports = (d.hysteria_ports || []).join(" / ");
+    $("#adv-hopping-note").textContent = d.hysteria_hopping
+      ? `${ports} · 同时监听 3 个 UDP 端口, 封锁单个端口不影响使用 (仅 Linux 生效)`
+      : "关闭后只监听主端口 (同一端口被反复封锁时再打开)";
+  }
   $("#btn-save-adv").onclick = saveAdvanced;
   renderRouting(d);
   renderGeo(d);
@@ -1759,6 +1852,8 @@ async function saveAdvanced() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
+    // 提交成功 → 解除草稿保护, 让服务器值 (含后端规范化, 如 SNI 转小写) 正常回灌
+    clearDraft("#adv-sni, #adv-masq, [data-port-node]");
     renderDash(true);
     toast("设置已应用, 订阅内容已刷新");
   } catch (e) {
@@ -2039,8 +2134,9 @@ function chainEntryCard(d, e) {
   </div>`;
 }
 
-/* 链式接口统一入口: 回来后用服务器返回的完整仪表盘数据整体重渲染 */
-async function chainApply(method, path, payload, btn, busyText) {
+/* 改动类接口的统一入口 (端口跳跃 / 链式代理): 回来后用服务器返回的完整仪表盘
+ * 数据整体重渲染, 并把落地的步骤结果转成提示 */
+async function applyAction(method, path, payload, btn, busyText) {
   const original = btn ? btn.textContent : "";
   if (btn) { btn.disabled = true; if (busyText) btn.textContent = busyText; }
   try {
@@ -2055,6 +2151,7 @@ async function chainApply(method, path, payload, btn, busyText) {
     toast(failed.length ? `已应用, 但有 ${failed.length} 步告警: ${failed[0].name}` : "已应用, 订阅内容已刷新");
   } catch (e) {
     toast("操作失败: " + e.message);
+    renderDash(true);   // 失败时按最后一次拿到的状态回灌, 别把界面留在"看起来改成功了"的样子
   }
   // 控件可能已经被整体重渲染掉, 只有还留在页面上时才恢复
   if (btn && document.body.contains(btn)) {
@@ -2066,7 +2163,7 @@ async function chainApply(method, path, payload, btn, busyText) {
 function bindChainExit(ex) {
   if (!ex.enabled) {
     const btn = $("#btn-chain-exit-gen");
-    if (btn) btn.onclick = () => chainApply("POST", "/api/chain/exit", {
+    if (btn) btn.onclick = () => applyAction("POST", "/api/chain/exit", {
       action: "generate",
       port: parseInt($("#chain-exit-port").value, 10) || undefined,
       label: $("#chain-exit-label").value.trim(),
@@ -2090,7 +2187,7 @@ function bindChainExit(ex) {
       okLabel: "重新生成 (旧的作废)",
       html: `<div class="qr-sub" style="text-align:left">已经连上本机的入口服务器会<b>立刻断链</b>,
         需要拿新配对码重新连接一次。<br>本机自己的订阅凭据 / 节点 / 客户端配置完全不受影响。</div>`,
-      onOk: () => chainApply("POST", "/api/chain/exit", { action: "rotate" }, $("#btn-chain-exit-rotate"), "生成中…"),
+      onOk: () => applyAction("POST", "/api/chain/exit", { action: "rotate" }, $("#btn-chain-exit-rotate"), "生成中…"),
     });
   $("#btn-chain-exit-off").onclick = () =>
     openConfirm({
@@ -2098,7 +2195,7 @@ function bindChainExit(ex) {
       okLabel: "关闭 (配对码作废)",
       html: `<div class="qr-sub" style="text-align:left">本机的落地入站会下线, 配对码同时作废;
         已连接的入口服务器那条链会不通。<br>随时可以再点「生成配对码」重新开启 (端口与凭据会重新生成)。</div>`,
-      onOk: () => chainApply("POST", "/api/chain/exit", { action: "disable" }, $("#btn-chain-exit-off"), "关闭中…"),
+      onOk: () => applyAction("POST", "/api/chain/exit", { action: "disable" }, $("#btn-chain-exit-off"), "关闭中…"),
     });
 }
 
@@ -2166,18 +2263,18 @@ function bindChainPeer() {
 function bindChainEntries(entries) {
   document.querySelectorAll("[data-chain-toggle]").forEach((el) =>
     (el.onchange = () =>
-      chainApply("POST", `/api/chain/entries/${el.dataset.chainToggle}`, { enabled: el.checked }, null))
+      applyAction("POST", `/api/chain/entries/${el.dataset.chainToggle}`, { enabled: el.checked }, null))
   );
   document.querySelectorAll("[data-chain-probe]").forEach((el) =>
     (el.onclick = () =>
-      chainApply("POST", `/api/chain/entries/${el.dataset.chainProbe}/probe`, {}, el, "测速中…"))
+      applyAction("POST", `/api/chain/entries/${el.dataset.chainProbe}/probe`, {}, el, "测速中…"))
   );
   document.querySelectorAll("[data-chain-default]").forEach((el) =>
     (el.onclick = () => {
       const on = el.dataset.on !== "1";
       const entry = entries.find((e) => e.id === el.dataset.chainDefault) || {};
       const doIt = () =>
-        chainApply("POST", `/api/chain/entries/${el.dataset.chainDefault}`, { default_out: on }, el);
+        applyAction("POST", `/api/chain/entries/${el.dataset.chainDefault}`, { default_out: on }, el);
       if (!on) return doIt();
       openConfirm({
         title: `把「${entry.label || entry.host}」设为默认出口?`,
@@ -2197,7 +2294,7 @@ function bindChainEntries(entries) {
         okLabel: "断开并删除",
         html: `<div class="qr-sub" style="text-align:left">本机的链式入站 / 出站 / 路由规则都会删掉,
           订阅里这个节点同时消失。<br>落地端服务器上的凭据不受影响 (需要时重新贴一次配对码即可)。</div>`,
-        onOk: () => chainApply("DELETE", `/api/chain/entries/${el.dataset.chainDel}`, undefined, el, "断开中…"),
+        onOk: () => applyAction("DELETE", `/api/chain/entries/${el.dataset.chainDel}`, undefined, el, "断开中…"),
       });
     })
   );

@@ -305,6 +305,35 @@ def main() -> int:
                 record(f"xray 监听 {port}/tcp", port_open(port))
             stats = client.get("/api/traffic").json()
             record("面板读取流量统计 (Stats API)", stats.get("available") is True, str(stats)[:110])
+
+            # 「关掉节点」必须真的把端口关掉。这里手动重启内核, 等价于生产里
+            # systemd 那一步 —— 旧版本在"节点全关/只剩镜像"时压根不重启服务,
+            # 于是面板显示已停用, 端口却还开着。
+            client.post("/api/nodes/vless-reality/toggle")
+            check = subprocess.run(
+                [xray_bin, "-test", "-c", str(home / "xray" / "config.json")],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            record(
+                "停用后配置仍通过 xray -test",
+                check.returncode == 0,
+                (check.stdout + check.stderr).strip().splitlines()[-1],
+            )
+            proc.terminate()
+            proc.wait(timeout=10)
+            proc = subprocess.Popen(  # 模拟 systemctl restart xray
+                [xray_bin, "run", "-c", str(home / "xray" / "config.json")],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            time.sleep(3)
+            record("停用的 Reality 端口 8443 真的关闭", not port_open(8443))
+            record("仍在启用的 XHTTP 端口 8445 照常监听", port_open(8445))
+
+            client.post("/api/nodes/vless-reality/toggle")   # 还原成全部启用
         finally:
             proc.terminate()
             proc.wait(timeout=10)

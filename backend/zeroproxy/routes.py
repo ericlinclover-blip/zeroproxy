@@ -70,6 +70,9 @@ RESTORE_MAX_BYTES = 4 * 1024 * 1024
 LOGIN_FREE_TRIES = 3
 LOGIN_MAX_BLOCK = 300
 
+#: 端口跳跃的偏移量 (主端口 +0/+1000/+2000, 见 config.DEFAULTS["hysteria_ports"])
+HOP_OFFSETS = (0, 1000, 2000)
+
 _DOMAIN_RE = re.compile(
     r"^(?=.{4,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$"
 )
@@ -114,6 +117,15 @@ def _is_ip(host: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _hopping_ports(base: int) -> list[int]:
+    """端口跳跃的端口集合 —— 始终跟着当前主端口走 (带 1000 间隔的三个区间)。
+
+    主端口被改过之后必须重新对齐: 否则「节点卡显示 40001」而 Hysteria 实际
+    监听的还是上一轮的 30001/31001/32001, 端口校验也会误报。
+    """
+    return [p for p in (base + offset for offset in HOP_OFFSETS) if 1 <= p <= 65535] or [base]
 
 
 # ---------------------------------------------------------------- 会话
@@ -679,13 +691,27 @@ def toggle_hopping(request: Request):
         if not _require_auth(state, request):
             return _err("未登录", 401)
         state["hysteria_hopping"] = not state.get("hysteria_hopping", False)
+        if state["hysteria_hopping"]:
+            # 打开跳跃时按当前主端口重排区间: 主端口被改过之后, 旧的跳跃区间
+            # 会让面板显示的端口与实际监听的端口对不上
+            state["hysteria_ports"] = _hopping_ports(int(state["ports"]["hysteria"]))
         config.audit(
             state,
             "toggle_hopping",
-            f"enabled={state['hysteria_hopping']}",
+            f"enabled={state['hysteria_hopping']}"
+            + (f" ports={state['hysteria_ports']}" if state["hysteria_hopping"] else ""),
             actor=_client_ip(request),
         )
         steps = _reapply(state, request)
+        if state["hysteria_hopping"]:
+            steps.append(
+                {
+                    "name": "放行端口跳跃区间",
+                    "ok": True,
+                    "detail": services.open_firewall_ports(state["hysteria_ports"], "udp"),
+                    "ms": 0,
+                }
+            )
         body = _dashboard_body(state, request)
         body["steps"] = steps
         return body
@@ -760,14 +786,15 @@ def update_settings(payload: SettingsIn, request: Request):
             state.setdefault("routing", {})["template"] = new_template
             changed.append(f"template={new_template}")
 
+        moved_ports: list[tuple[str, int]] = []
         for key, port in new_ports.items():
             if port != state["ports"].get(key):
                 state["ports"][key] = port
+                moved_ports.append((key, port))
                 changed.append(f"{key}={port}")
         # 端口跳跃的端口集合跟随主端口平移 (保持 3 个连续区间的间隔)
         if "hysteria" in new_ports and state.get("hysteria_hopping"):
-            base = new_ports["hysteria"]
-            state["hysteria_ports"] = [base, base + 1000, base + 2000]
+            state["hysteria_ports"] = _hopping_ports(new_ports["hysteria"])
 
         # GeoIP 分流开关
         geo = state.setdefault("geodata", {})
@@ -807,6 +834,18 @@ def update_settings(payload: SettingsIn, request: Request):
             body["steps"] = steps
             return body
         steps = _reapply(state, request)
+        # 改过端口就得让防火墙跟上: install.sh 只按默认端口写了那几条放行规则,
+        # 换了端口而 ufw 还挡着的话, 端口在本机是听的、面板全绿, 外面却连不上。
+        for key, port in moved_ports:
+            if key == "hysteria" and state.get("hysteria_hopping"):
+                name, detail = (
+                    "放行 Hysteria 2 端口 + 跳跃区间",
+                    services.open_firewall_ports(state["hysteria_ports"], "udp"),
+                )
+            else:
+                proto = "udp" if key == "hysteria" else "tcp"
+                name, detail = f"放行新端口 {port}/{proto}", services.open_firewall_port(port, proto)
+            steps.append({"name": name, "ok": True, "detail": detail, "ms": 0})
         body = _dashboard_body(state, request)
         body["steps"] = steps
         return body
@@ -1388,8 +1427,12 @@ def probe(request: Request, force: int = 0, deep: int = 0):
     want_deep = bool(deep)
     now = time.time()
     ttl = 20 if want_deep else 3
-    key = "deep" if want_deep else "fast"
+    # 缓存不能跨状态变更: 刚关掉一个节点就点测速, 命中 20s 内的旧结果会显示
+    # "这个节点还在" —— 用 updated_at 当指纹, 任何写操作都会让旧结果立即作废。
+    key = f"{'deep' if want_deep else 'fast'}:{int(state.get('updated_at') or 0)}"
     with _PROBE_LOCK:
+        for stale in [k for k in _PROBE_CACHE if k != key]:
+            _PROBE_CACHE.pop(stale, None)
         entry = _PROBE_CACHE.get(key)
         if entry and not force and now - entry["at"] < ttl:
             return entry["body"]

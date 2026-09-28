@@ -358,6 +358,40 @@ def test_unknown_node_404(client, configured):
     assert client.post("/api/nodes/nope/toggle").status_code == 404
 
 
+def test_toggle_hopping_realigns_ports_after_a_port_change(client, configured, monkeypatch):
+    """回归: 主端口改过之后再打开端口跳跃, 跳跃区间必须跟着主端口走 ——
+    否则面板显示 40002, Hysteria 实际监听的还是上一轮的 40001/41001/42001。"""
+    from zeroproxy import services
+
+    monkeypatch.setattr(services, "port_available", lambda port, proto="tcp": True)
+    # 先关掉跳跃, 趁它关着改主端口 (关着时不会重排区间)
+    assert client.post("/api/hysteria/hopping").json()["hysteria_hopping"] is False
+    assert client.post("/api/settings", json={"ports": {"hysteria2": 40001}}).status_code == 200
+    assert client.post("/api/settings", json={"ports": {"hysteria2": 40002}}).status_code == 200
+    assert config.load_state()["hysteria_ports"] == [30001, 31001, 32001]
+
+    body = client.post("/api/hysteria/hopping").json()
+    assert body["hysteria_hopping"] is True
+    assert body["hysteria_ports"] == [40002, 41002, 42002]
+    assert config.load_state()["ports"]["hysteria"] == 40002
+
+
+def test_settings_port_change_also_opens_the_firewall(client, configured, monkeypatch):
+    """换了端口就要让 ufw 跟上 (install.sh 只放行默认端口), 并把这一步写进结果清单。"""
+    from zeroproxy import services
+
+    opened: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        services,
+        "open_firewall_port",
+        lambda port, proto="tcp": opened.append((int(port), proto)) or f"ufw 已放行 {port}/{proto}",
+    )
+    body = client.post("/api/settings", json={"ports": {"trojan": 9443}}).json()
+    assert opened == [(9443, "tcp")]
+    step = [s for s in body["steps"] if s["name"] == "放行新端口 9443/tcp"]
+    assert step and step[0]["ok"] is True, body["steps"]
+
+
 def test_settings_update_sni_and_port(client, configured, home):
     response = client.post(
         "/api/settings", json={"reality_sni": "www.cloudflare.com", "ports": {"trojan": 9443}}
@@ -1355,6 +1389,107 @@ def test_apply_verify_listeners_skips_in_dev(client, configured):
 
     ok, detail = apply.verify_listeners(config.load_state())
     assert ok is True and "跳过" in detail
+
+
+def _fake_listener_probe(monkeypatch, tcp_ports, udp_ports=()):
+    """把"端口是否在监听"换成固定答案, 好离线验证端口校验的两个方向。"""
+    from zeroproxy import apply, services
+
+    monkeypatch.setattr(services, "is_prod", lambda: True)
+    monkeypatch.setattr(apply, "_tcp_open", lambda port, timeout=0.6: int(port) in set(tcp_ports))
+    monkeypatch.setattr(services, "udp_port_listening", lambda port: int(port) in set(udp_ports))
+
+
+def test_restart_services_restarts_even_when_all_nodes_are_off(client, configured, monkeypatch):
+    """回归: 「关掉节点」曾经只改磁盘上的配置 —— 旧判据是"还有没有节点开着",
+    全部停用时直接跳过重启, 于是运行中的进程照旧在旧端口上服务 (面板显示已关闭,
+    端口其实还开着)。装了服务, 运行态就必须跟着新配置收敛。"""
+    from zeroproxy import apply, services
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(services, "is_prod", lambda: True)
+    monkeypatch.setattr(services, "bin_path", lambda name: f"/usr/local/bin/{name}")
+    monkeypatch.setattr(
+        services, "run", lambda cmd, timeout=120, env=None: (calls.append(list(cmd)), (True, "ok"))[1]
+    )
+
+    state = config.load_state()
+    for node_id in state["nodes"]:
+        state["nodes"][node_id] = False
+
+    ok, detail = apply.restart_services(state, timeout=90)
+    assert ok is True, detail
+    assert ["systemctl", "restart", "xray"] in calls, detail
+    assert ["systemctl", "restart", "hysteria2"] in calls, detail
+    assert ["systemctl", "reload", "nginx"] in calls
+
+
+def test_restart_services_skips_services_that_are_not_installed(client, configured, monkeypatch):
+    """没装的服务不要硬重启 —— 那只会多一条无意义的失败步骤。"""
+    from zeroproxy import apply, services
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(services, "is_prod", lambda: True)
+    monkeypatch.setattr(services, "bin_path", lambda name: None)
+    monkeypatch.setattr(services, "service_state", lambda name: "not-installed")
+    monkeypatch.setattr(
+        services, "run", lambda cmd, timeout=120, env=None: (calls.append(list(cmd)), (True, "ok"))[1]
+    )
+
+    state = config.load_state()
+    for node_id in state["nodes"]:
+        state["nodes"][node_id] = False
+
+    ok, detail = apply.restart_services(state, timeout=90)
+    assert ok is True, detail
+    assert not any(cmd[:2] == ["systemctl", "restart"] for cmd in calls), calls
+    assert ["systemctl", "reload", "nginx"] in calls
+
+
+def test_verify_listeners_flags_a_disabled_node_that_still_listens(client, configured, monkeypatch):
+    """反向校验: 已停用的节点端口必须真的关掉 —— 只查"该开的开了"抓不到
+    「面板显示已关闭、端口其实还开着」。"""
+    from zeroproxy import apply
+
+    state = config.load_state()
+    state["nodes"]["vless-reality"] = False
+    # 8443 (刚停用的 Reality) 还在监听 → 必须报失败
+    _fake_listener_probe(monkeypatch, {8443, 8445, 8444, 6000, 443}, {30001, 31001, 32001})
+
+    ok, detail = apply.verify_listeners(state, timeout=0.01)
+    assert ok is False, detail
+    assert "8443" in detail and "已停用却仍在监听" in detail, detail
+
+
+def test_verify_listeners_accepts_a_converged_state(client, configured, monkeypatch):
+    from zeroproxy import apply
+
+    state = config.load_state()
+    state["nodes"]["vless-reality"] = False
+    state["nodes"]["hysteria2"] = False
+    _fake_listener_probe(monkeypatch, {8445, 8444, 6000, 443})
+
+    ok, detail = apply.verify_listeners(state, timeout=0.01)
+    assert ok is True, detail
+    assert "已停用端口已关闭" in detail, detail
+    assert "8443" in detail   # 明确列出被确认关闭的端口
+
+
+def test_verify_listeners_checks_every_hopping_port(client, configured, monkeypatch):
+    """端口跳跃是 3 个 UDP 端口: 只验主端口会漏掉"跳跃端口没起来"的半残状态。"""
+    from zeroproxy import apply
+
+    state = config.load_state()
+    state["hysteria_ports"] = [40001, 41001, 42001]
+    _fake_listener_probe(monkeypatch, {8443, 8445, 8444, 6000, 443}, {40001})
+
+    ok, detail = apply.verify_listeners(state, timeout=0.01)
+    assert ok is False, detail
+    assert "41001" in detail and "42001" in detail, detail
+
+    _fake_listener_probe(monkeypatch, {8443, 8445, 8444, 6000, 443}, {40001, 41001, 42001})
+    ok, detail = apply.verify_listeners(state, timeout=0.01)
+    assert ok is True, detail
 
 
 def test_apply_gen_nginx_is_hard_failure_without_etc_write(client, configured, home, monkeypatch):

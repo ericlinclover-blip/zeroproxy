@@ -66,7 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 117 项 (112 passed + 5 skipped; 带 `ZP_XRAY_BIN` 时 117 全通过) + `scripts/verify.py` (74 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (81 项) + `scripts/upgrade_sim.sh` (21 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 124 项 (119 passed + 5 skipped; 带 `ZP_XRAY_BIN` 时 124 全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (88 项) + `scripts/upgrade_sim.sh` (21 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 | **看得懂的界面 (v2.6.0)** | 控制台布局: 左侧锚点导航 (带计数角标 + 滚动高亮) + 顶部指标条 (健康节点 / 落地出口 IP / 平均延迟 + 迷你折线 / 运行时长) + 节点密集表格 (名称 / 地址状态 / **握手延迟条** / **上下行双轨** / 开关与复制) + **流量卡 (双弧圆环 + 实时速率曲线 + 逐节点双色流量条)** + 链式链路拓扑 (你的设备 → 本机入口 → 落地端) + 程序更新闭环; 动效全部走 `transform`/自绘 rAF 并受 `prefers-reduced-motion` 约束 |
 
@@ -394,6 +394,40 @@ state.json (唯一事实来源, schema v4, 旧版本自动升级)
    两条都补了回归断言 (`test_update_start_reply_is_local_only` /
    `test_update_launch_does_not_wait_for_the_unit`), 一旦有人把远端检查或同步等待塞回去, 测试立刻炸。
 
+### 8.3 v2.6.5: 「关闭节点」真正关端口 + 端口一处改、处处跟
+
+这一轮过了一遍"点下去之后, 服务真的按面板显示的样子在跑吗?"。发现几个"面板说的"和"内核
+实际做的"对不上的地方:
+
+1. **「关闭节点」只改了磁盘上的配置, 端口还开着 (真 bug)。** `apply.restart_services()`
+   原来的判据是"还有没有节点开着" —— 全是 `False` 时直接跳过重启。于是把 Reality 关掉、
+   或把 xray 节点全关掉时, 运行中的进程照旧在旧端口上服务: 面板显示"已停用", 端口其实还
+   开着。现在判据换成"这台机器上**装了**这个服务就按新配置收敛"(装了二进制或 systemd 里
+   已经跑着), 停用到"零入站"也会真重启一次 (xray 接受零入站配置, 已实测)。
+2. **端口校验只会往一个方向看。** 以前只查"该监听的起来了", 查不出"该关的没关"。现在
+   `verify_listeners()` 反向也查: 已停用的 Reality / XHTTP / Trojan / WS 以及已断开的链路
+   端口必须真的不再监听, 否则报红并写清楚是哪个端口 (只查 TCP —— Hysteria 2 停用后会绑定
+   回环, UDP 分不出回环与公网, 不在此判)。
+3. **端口跳跃区间会跟着主端口漂移。** 改过 Hysteria 主端口后再打开跳跃, 区间还停在上一轮
+   的 `+0/+1000/+2000`, 面板显示的端口和实际监听的对不上。现在开关与端口变更都会按当前主
+   端口重排区间; 端口校验也会逐一验证**每一个**跳跃端口 (以前只验主端口, 漏掉"主端口起来了、
+   跳跃端口没起来"的半残状态)。
+4. **面板里没有端口跳跃开关。** 高级设置补上"Hysteria 2 端口跳跃"复选框, 并显示当前 3 个
+   UDP 端口; 打开时顺带 `ufw allow` 这三个端口 (逐个放行, 不会把中间 2000 个端口一起打开)。
+5. **改端口后防火墙没跟上。** `install.sh` 只按默认端口写了放行规则, 换了端口而 ufw 还挡着
+   的话, 本机在听、面板全绿, 外面却连不上。现在 `/api/settings` 改端口后会追加一条"放行新
+   端口"步骤 (Hysteria 开跳跃时放行主端口 + 区间)。
+6. **20 秒自动刷新会吞掉正在填的内容。** 仪表盘整块重画 DOM, 用户填到一半的 SNI / 端口 /
+   配对码会在下一次刷新被服务器值覆盖。现在重渲染前先快照"正在编辑的输入"(含光标位置),
+   重渲染后原样放回, 直到提交为止; 端口那一格还改成只在节点集合变化时才重建 DOM。
+7. **探测结果缓存会跨状态变更。** 刚关掉一个节点就点测速, 3~20 秒内的旧缓存会显示"这个节点
+   还在"。缓存键现在带上 `updated_at`, 任何写操作都会让旧探测结果立即作废。
+
+每一条都补了回归断言 (`tests/test_panel.py` 的 `test_restart_services_restarts_even_when_all_nodes_are_off` /
+`test_verify_listeners_flags_a_disabled_node_that_still_listens` / `test_verify_listeners_checks_every_hopping_port` /
+`test_toggle_hopping_realigns_ports_after_a_port_change` / `test_settings_port_change_also_opens_the_firewall`
+等, `scripts/verify.py` 里"停用后端口真的关闭", `scripts/browser_check.cjs` 里草稿保护与跳跃开关)。
+
 ---
 
 ## 9. API
@@ -466,7 +500,9 @@ ZP_MIHOMO_BIN=/path/to/mihomo ZP_SINGBOX_BIN=/path/to/sing-box \
 python3 scripts/verify.py
 
 # 真实浏览器 UI 验证 (Playwright; 需 node + playwright)
-ZP_NODE_PATH=/path/to/node_modules node scripts/browser_check.cjs
+# ZP_CHROME_PATH 可选: 指定 Chromium 可执行文件 (Playwright 自带的浏览器版本对不上缓存时用)
+ZP_NODE_PATH=/path/to/node_modules \
+ZP_CHROME_PATH="/path/to/Chromium" node scripts/browser_check.cjs
 
 # 一键升级演练: 造一台"已部署的假机器", 用桩二进制真跑 upgrade.sh
 # (不需要 root / systemd; 覆盖正常升级 + 下载失败自动回滚两条路径)
@@ -482,7 +518,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 
 在 macOS (Apple Silicon, Python 3.14) 上实测通过:
 
-- `python -m pytest tests -q` → **112 passed, 5 skipped** (带 `ZP_XRAY_BIN` 时 **117 passed**, 约 30 秒);
+- `python -m pytest tests -q` → **119 passed, 5 skipped** (带 `ZP_XRAY_BIN` 时 **124 passed**, 约 30 秒);
   含 `/api/update` 鉴权与版本比较、`apply` 的"写不进 /etc/nginx 即失败"语义、CLI 退出码、以及
   `install.sh` 重跑不覆盖已初始化配置 / `upgrade.sh` 随包发布 / 自签证书可补签 Let's Encrypt /
   `systemctl` 参数顺序的回归断言 / Reality 密钥必须是成对的 X25519 (Ed25519 必须判无效) /
@@ -490,18 +526,22 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   深度体检客户端在自签场景下不发已被 Xray 26 移除的 `allowInsecure` (改用 `pinnedPeerCertSha256`) /
   深度体检必须把 SOCKS5 回复读满 (只读 4 字节会让 TLS 报 `WRONG_VERSION_NUMBER`) /
   服务版本探测要跳过 Hysteria 2 的块字符 banner (否则面板挂一串花屏方块)。
+  端口一致性另有 7 项 (v2.6.5): 节点全关也要重启服务 / 没装的服务不硬重启 / 已停用却仍在
+  监听的端口要报红 / 端口跳跃的 3 个端口逐一验证 / 改主端口后再开跳跃区间跟着走 / 改端口
+  自动放行 ufw。
   链式代理另有 21 项 (`tests/test_chain.py`): 配对码往返与 8 类坏码的中文报错 /
   落地端生成-轮换-关闭与端口冲突 / **探测不通必须拦一下 (400 + needs_force), 只有 `force=1` 才硬加** /
   环境不支持探测 (无 xray 二进制) 时不该拦住用户 / 拒绝"配对码指向本机自己"与重复添加 /
   入站与出站/路由规则落在生成配置里、订阅三种格式都带上它、默认出口会把 4 个主力入站整体改道、
   停用即从订阅与配置里消失、删除后 `share_links` 里也没有 / 链路诊断与流量标签。
   **升级脚本必须从临时副本启动** (脚本会在运行中覆盖自己, 就地执行会被 bash 读出语法错)。
-- `scripts/verify.py` (Xray 26.3.27 + Hysteria 2.12.3 + mihomo 1.19.31 + sing-box 1.14.2) → **74/74 项通过**:
+- `scripts/verify.py` (Xray 26.3.27 + Hysteria 2.12.3 + mihomo 1.19.31 + sing-box 1.14.2) → **77/77 项通过**:
   setup 8 步全绿 / 三种订阅格式可被真实客户端解析 / 三档分流模板分别被 `mihomo -t` 与
   `sing-box check` 通过 / **用真实 sing-box 实跑** 5 份订阅 (通用 + 1.14+ 写法 × 智能/全局/直连) 全部启动成功,
   并留下反例: 去掉 `download_detour` 即 `FATAL` / Xray 真实监听 8443, 8445, 8444, 10085 /
   面板成功读取 Stats API / Hysteria 真实启动并监听 UDP 30001 / 8 项自检全过 / 一键修复 4 步完成 /
   GeoIP 分流规则被真实 Xray 接受 / 反向证明缺数据或缺 `XRAY_LOCATION_ASSET` 时 Xray 拒绝启动 /
+  **停用 Reality 后配置仍通过 `xray -test`、重启内核后 8443 真的关闭、仍在用的 8445 照常监听** /
   **启动期自愈闭环**: 配置带 geo 规则 + 数据文件消失 → 原样启动被 Xray 拒绝 (复现) → `geodata guard`
   重新生成 (已移除 geo 规则) → 再自检通过 / 备份-恢复往返一致且篡改被拒 /
   5 个节点握手探测全部成功 (Reality TLS 136ms, 出口 RTT 54ms)。
@@ -510,9 +550,11 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   出站指向落地端 `127.0.0.1:8666`; 客户端拿中转端凭据连进去, **真的从落地端出网并读回出口 IP**;
   反向用例: 把落地端的专用 UUID 换掉 (等价于配对码被轮换) 后同一条链立刻读不到 IP —— 证明确实是
   链路上的每一跳在起作用, 而不是"随便走哪条路都能出网"。
-- `scripts/browser_check.cjs` → **81/81 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
+- `scripts/browser_check.cjs` → **88/88 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
   诊断 8/8、节点测速结果落到卡片、GeoIP 开关与状态、**分流模板选择器 (切换 → 订阅内容
   真的变化 → 切回)**、备份下载、**程序更新卡片 (版本行 / 检查更新 / 非生产环境隐藏一键更新)**、
+  **自动刷新不吞草稿 (正在编辑的 SNI / 端口在重渲染后原样保留、光标不丢、放弃后回到服务器值) /
+  Hysteria 2 端口跳跃开关 (在位、关掉写入状态、重开后区间跟着主端口)**、
   **二维码弹窗 (走 SVG 缩放不糊 / 图案完整落在卡片内 / 长链接省略号截断而不顶破卡片 /
   复制·保存·关闭三个按钮 / 节点卡片副标题是人话不是长链接 / Esc 可关闭)**、
   **初始化→域名面板交接 (跳转卡片 / 立即前往 / 留在本页回到仪表盘 / 登录页预填用户名并聚焦密码框 /
@@ -526,7 +568,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   设为默认出口的确认与标记 / 测速失败如实标红 / 断开后卡片与订阅节点一起消失)**;
   无 console 错误、无失败请求。
   **v2.5.0 → v2.6.0 的两次界面改版 (Bento → 控制台侧栏 + 密集表格 + 流量可视化) 都只动布局与样式,
-  这 81 条断言一条没改**: 节点表格从磁贴换成五列 grid 行、延迟与流量改成条形/双轨、
+  这 81 条断言 (当时总数) 一条没改**: 节点表格从磁贴换成五列 grid 行、延迟与流量改成条形/双轨、
   流量卡整块重写成圆环 + 速率曲线之后, 仍然 81/81 全绿 —— 改版守住的是 id / class 契约。
 - `scripts/upgrade_sim.sh` → **21/21 项通过**: 在模拟的"已部署机器"上真跑 `upgrade.sh` ——
   备份 → 换代码 → 按 `state.json` 重新落地配置 (把占位配置修回真实配置) → 写 `update.json` /
@@ -849,7 +891,7 @@ GeoIP 分流 (广告拦截 / 私有地址防护) 的优先级高于默认出口,
 
 1. **不改 id / class 契约**: `#node-grid .node-card`、`.switch`、`.ping`、`#diag-list .check`、
    `#diag-list .muted`、`#update-body .ustep`、`#update-body .bar + .muted`、`#chain-*` …
-   这些都是 `scripts/browser_check.cjs` 的断言锚点。改版只动布局与样式, 81 项断言一条没改。
+   这些都是 `scripts/browser_check.cjs` 的断言锚点。改版只动布局与样式, 当时的 81 项断言一条没改。
 2. **不新增网络请求**: 指标条的四个数字全部由已拉到的 `/api/dashboard` + `/api/probe` 算出来。
 3. **开发环境不误报**: 指标条右上角的状态药丸把 `dry-run` (本地开发) 显示成黄色提示,
    只有 `failed` / `inactive` 才算"服务异常" —— 免得开发机上满屏红色。

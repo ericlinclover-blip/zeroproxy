@@ -10,7 +10,9 @@
     后算成功;
   * `xray -test` / `nginx -t` 不过 → 失败;
   * 服务重启失败 → 失败;
-  * 重启后端口没监听 → 失败 (verify 步骤, 带短暂重试)。
+  * 重启后端口没监听 → 失败 (verify 步骤, 带短暂重试);
+  * **反向同样成立**: 已经停用的节点/链路, 对应端口必须真的不再监听 ——
+    「关掉节点」只改磁盘配置而不重启服务时, 端口照样开着, 面板却显示已关闭。
 
 任何一步失败都会原样出现在返回的 steps 里, 面板据此显示红色告警。
 """
@@ -145,10 +147,24 @@ def restart_services(state: dict, timeout: int = 0) -> tuple[bool, str]:
         mark = "✓" if ok else ("↷" if "跳过" in detail else "✗")
         results.append(f"{name} {mark} {detail}")
 
+    def installed(name: str) -> bool:
+        """该服务是否"在本机存在" (装了二进制, 或 systemd 里已经跑着)。
+
+        存在就必须按新配置收敛 —— 哪怕节点已经全部停用; 不存在就没必要去重启
+        一个不存在的单元 (那只会多一条无意义的失败步骤)。
+        """
+        if services.bin_path(name) is not None:
+            return True
+        return services.service_state(name) in ("active", "running")
+
     nodes = state.get("nodes", {})
-    if any(nodes.get(n) for n in XRAY_NODE_IDS):
+    # 关键: 判据不能是"还有没有节点开着"。全部停用时也要重启一次, 否则变更只落在
+    # 磁盘上 (config.json 里入站没了), 运行中的进程照旧在旧端口上服务 ——
+    # 面板显示"已停用", 端口其实还开着。重启到"零入站配置"是安全的 (xray -test
+    # 与真实启动都验证过), Hysteria 2 同理 (停用时 listen 收敛到 127.0.0.1)。
+    if any(nodes.get(n) for n in XRAY_NODE_IDS) or installed("xray"):
         run("xray", services.restart_service, timeout or 90)
-    if nodes.get("hysteria2"):
+    if nodes.get("hysteria2") or installed("hysteria2"):
         run("hysteria2", services.restart_service, timeout or 90)
     run("nginx", services.reload_service, timeout or 60)
     if not results:
@@ -176,7 +192,13 @@ def _wanted_ports(state: dict) -> list[tuple[int, str, str]]:
     if nodes.get("vless-ws") and ports.get("ws_internal"):
         want.append((int(ports["ws_internal"]), "tcp", "VLESS WebSocket (回环)"))
     if nodes.get("hysteria2") and ports.get("hysteria"):
-        want.append((int(ports["hysteria"]), "udp", "Hysteria 2"))
+        # 端口跳跃开着时是 3 个 UDP 端口一起监听, 也要一起验 (只验主端口会漏掉
+        # "主端口起来了、跳跃端口没起来"这种半残状态)。
+        if state.get("hysteria_hopping"):
+            for hop_port in state.get("hysteria_ports") or []:
+                want.append((int(hop_port), "udp", f"Hysteria 2 (跳跃 {hop_port})"))
+        else:
+            want.append((int(ports["hysteria"]), "udp", "Hysteria 2"))
     # 链式代理的两端都是真实对外端口, 同样要验证真的起来了
     chain_cfg = state.get("chain") or {}
     exit_cfg = chain_cfg.get("exit") or {}
@@ -190,15 +212,59 @@ def _wanted_ports(state: dict) -> list[tuple[int, str, str]]:
     return want
 
 
+def _ports_that_must_be_closed(state: dict) -> list[tuple[int, str, str]]:
+    """落地后应当**不再**监听的对外 TCP 端口 (节点停用 / 证书缺失 / 链路断开)。
+
+    和 `_wanted_ports` 是同一枚硬币的两面: 只检查"该开的开了", 就发现不了
+    「面板显示已关闭、端口其实还开着」—— 那正是"停用不生效"的表现。
+
+    只检查 TCP: Hysteria 2 停用后仍会绑定 127.0.0.1 (平滑重启的中间态),
+    UDP 端口有没有在监听无法区分回环与公网, 因此不在这里判。
+    """
+    ports = state.get("ports", {})
+    nodes = state.get("nodes", {})
+    out: list[tuple[int, str, str]] = []
+    if not nodes.get("vless-reality") and ports.get("reality"):
+        out.append((int(ports["reality"]), "tcp", "VLESS Reality"))
+    if not nodes.get("vless-xhttp") and ports.get("xhttp"):
+        out.append((int(ports["xhttp"]), "tcp", "VLESS XHTTP"))
+    if ports.get("trojan") and not (nodes.get("trojan") and xray_config.cert_usable(state)):
+        out.append((int(ports["trojan"]), "tcp", "Trojan"))
+    if not nodes.get("vless-ws") and ports.get("ws_internal"):
+        out.append((int(ports["ws_internal"]), "tcp", "VLESS WebSocket (回环)"))
+    chain_cfg = state.get("chain") or {}
+    exit_cfg = chain_cfg.get("exit") or {}
+    # 只在"确实开过落地端"时才要求它关闭: 从没生成过凭据时这个端口本来就没被用过,
+    # 别人占着也不该算到我们头上
+    if exit_cfg.get("uuid") and not exit_cfg.get("enabled"):
+        out.append((int(exit_cfg["port"]), "tcp", "链式落地端入站"))
+    for entry in chain_cfg.get("entries") or []:
+        if entry.get("local_port") and not entry.get("enabled", True):
+            out.append(
+                (
+                    int(entry["local_port"]),
+                    "tcp",
+                    f"链式中转入站 ({entry.get('label') or entry.get('id')})",
+                )
+            )
+    return out
+
+
 def verify_listeners(state: dict, timeout: int = 0) -> tuple[bool, str]:
-    """重启后确认端口真的起来了 —— 这是「服务活着但节点不通」的照妖镜。"""
+    """重启后确认端口状态真的和新配置一致 —— 「服务活着但节点不通」的照妖镜。
+
+    两个方向都要查: 该监听的端口必须真的在监听; 已停用的节点/链路对应的端口
+    必须真的关掉了 (否则"关闭节点"只是改了文件, 端口还开着)。
+    """
     if not services.is_prod():
         return True, "跳过 (本地开发)"
     want = _wanted_ports(state)
-    if not want:
+    want_ports = {port for port, _, _ in want}
+    # 同一个端口既在"该开"里就不算"该关" (例如 Reality 与已停用的 Trojan 换了端口)
+    closed = [item for item in _ports_that_must_be_closed(state) if item[0] not in want_ports]
+    if not want and not closed:
         return True, "没有启用的节点"
     deadline = time.time() + (timeout or 8)
-    missing: list[str] = []
     while True:
         missing = []
         for port, proto, label in want:
@@ -208,12 +274,26 @@ def verify_listeners(state: dict, timeout: int = 0) -> tuple[bool, str]:
                 alive = services.udp_port_listening(port) is True
             if not alive:
                 missing.append(f"{label} {port}/{proto}")
-        if not missing or time.time() >= deadline:
+        still_open = [f"{label} {port}/tcp" for port, _, label in closed if _tcp_open(port)]
+        if (not missing and not still_open) or time.time() >= deadline:
             break
         time.sleep(0.6)
+    problems: list[str] = []
     if missing:
-        return False, "以下端口未监听: " + ", ".join(missing)
-    return True, f"{len(want)} 个端口全部在监听"
+        problems.append("以下端口未监听: " + ", ".join(missing))
+    if still_open:
+        problems.append(
+            "以下端口已停用却仍在监听 (内核没按新配置重启, 或被其它进程占用): "
+            + ", ".join(still_open)
+        )
+    if problems:
+        return False, "; ".join(problems)
+    detail = f"{len(want)} 个端口全部在监听"
+    if closed:
+        detail += "; 已停用端口已关闭: " + ", ".join(
+            f"{port}/{proto}" for port, proto, _ in closed
+        )
+    return True, detail
 
 
 # ---------------------------------------------------------------- 对外入口

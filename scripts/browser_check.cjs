@@ -11,6 +11,13 @@
  *   ZP_NODE=/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node \
  *   ZP_NODE_PATH=/Applications/ChatGPT.app/Contents/Resources/cua_node/lib/node_modules \
  *   node scripts/browser_check.cjs
+ *
+ * 可选环境变量:
+ *   ZP_CHROME_PATH  指定 Chromium 可执行文件 (Playwright 期望的浏览器版本与本地
+ *                   缓存 (如 chromium_headless_shell-1200 vs chromium-1243) 对不上时用)
+ *   ZP_PYTHON       起面板用的解释器 (默认 python3)
+ *   ZP_CHECK_PORT   面板监听端口 (默认 8899)
+ *   ZP_SHOT_DIR     截图目录 (默认 work/browser-check)
  */
 const path = require("path");
 const fs = require("fs");
@@ -238,6 +245,47 @@ async function main() {
     );
     const subSmart = await (await page.request.get(`${base}${subPath}?format=clash`)).text();
     check("切回 smart 后恢复国内直连规则", subSmart.includes("GEOSITE,cn"), "");
+
+    console.log("\n[3c-2] 自动刷新不吞掉正在填的内容");
+    // 仪表盘每 20s 整块重画 DOM (节点表 / 高级设置 / 链式代理都是 innerHTML):
+    // 以前会把用户填到一半的 SNI / 端口 / 配对码覆盖回服务器值。
+    await page.fill("#adv-sni", "cdn.example.net");
+    await page.focus("#adv-sni");
+    await page.evaluate(() => renderDash(true));      // 等价于一次 20s 自动刷新
+    check("轮询后正在编辑的 SNI 还在", (await page.inputValue("#adv-sni")) === "cdn.example.net",
+      await page.inputValue("#adv-sni"));
+    check("重画后光标仍停在输入框里",
+      (await page.evaluate(() => document.activeElement.id)) === "adv-sni", "");
+    await page.fill("[data-port-node='trojan']", "9443");
+    await page.evaluate(() => renderDash(true));
+    check("轮询后正在填的端口还在",
+      (await page.inputValue("[data-port-node='trojan']")) === "9443",
+      await page.inputValue("[data-port-node='trojan']"));
+    // 收尾: 解除草稿保护 → 回到服务器值, 不影响后面的检查
+    await page.evaluate(() => {
+      clearDraft("#adv-sni, [data-port-node]");
+      if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+      renderDash(true);
+    });
+    check("放弃未提交的修改后回到服务器值",
+      (await page.inputValue("#adv-sni")) === "www.cloudflare.com"
+      && (await page.inputValue("[data-port-node='trojan']")) === "8444",
+      `${await page.inputValue("#adv-sni")} / ${await page.inputValue("[data-port-node='trojan']")}`);
+
+    console.log("\n[3c-3] Hysteria 2 端口跳跃开关");
+    const hopBefore = await page.evaluate(() => ({ on: dash.hysteria_hopping, ports: dash.hysteria_ports }));
+    check("端口跳跃开关在位并写明当前区间",
+      (await page.locator("#adv-hopping").count()) === 1
+      && (await page.locator("#adv-hopping-note").innerText()).includes(String(hopBefore.ports[0])),
+      await page.locator("#adv-hopping-note").innerText());
+    await page.click("#adv-hopping");
+    await page.waitForFunction(() => dash && dash.hysteria_hopping === false, { timeout: 30000 });
+    check("关掉端口跳跃可写入状态", await page.evaluate(() => dash.hysteria_hopping) === false, "");
+    await page.click("#adv-hopping");
+    await page.waitForFunction(() => dash && dash.hysteria_hopping === true, { timeout: 30000 });
+    const hopAfter = await page.evaluate(() => dash.hysteria_ports);
+    check("重新打开后区间跟着主端口走",
+      hopAfter.length === 3 && hopAfter[0] === 30001 && hopAfter[2] === 32001, hopAfter.join(" / "));
 
     const backup = await page.request.get(`${base}/api/backup`);
     const backupBody = await backup.json();
