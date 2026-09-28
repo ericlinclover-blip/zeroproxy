@@ -64,7 +64,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 93 项 (89 passed + 4 skipped; 带 `ZP_XRAY_BIN` 时 93 全通过) + `scripts/verify.py` (74 项) + `scripts/browser_check.cjs` (48 项) + `scripts/upgrade_sim.sh` (13 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 93 项 (89 passed + 4 skipped; 带 `ZP_XRAY_BIN` 时 93 全通过) + `scripts/verify.py` (74 项) + `scripts/browser_check.cjs` (50 项) + `scripts/upgrade_sim.sh` (13 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 
 竞品与技术调研见 `docs/RESEARCH.md`。
 
@@ -426,13 +426,14 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   **启动期自愈闭环**: 配置带 geo 规则 + 数据文件消失 → 原样启动被 Xray 拒绝 (复现) → `geodata guard`
   重新生成 (已移除 geo 规则) → 再自检通过 / 备份-恢复往返一致且篡改被拒 /
   5 个节点握手探测全部成功 (Reality TLS 136ms, 出口 RTT 54ms)。
-- `scripts/browser_check.cjs` → **48/48 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
+- `scripts/browser_check.cjs` → **50/50 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
   诊断 8/8、节点测速结果落到卡片、GeoIP 开关与状态、**分流模板选择器 (切换 → 订阅内容
   真的变化 → 切回)**、备份下载、**程序更新卡片 (版本行 / 检查更新 / 非生产环境隐藏一键更新)**、
   **二维码弹窗 (走 SVG 缩放不糊 / 图案完整落在卡片内 / 长链接省略号截断而不顶破卡片 /
   复制·保存·关闭三个按钮 / 节点卡片副标题是人话不是长链接 / Esc 可关闭)**、
   **初始化→域名面板交接 (跳转卡片 / 立即前往 / 留在本页回到仪表盘 / 登录页预填用户名并聚焦密码框 /
-  用户名不留在地址栏 / 用刚设置的凭据可登录)**;
+  用户名不留在地址栏 / 用刚设置的凭据可登录 / 用 IP 访问时的「切到域名面板」横幅, 且证书不是真证书时
+  自动改成功告警语气)**;
   无 console 错误、无失败请求。
 - `scripts/upgrade_sim.sh` → **13/13 项通过**: 在模拟的"已部署机器"上真跑 `upgrade.sh` ——
   备份 → 换代码 → 按 `state.json` 重新落地配置 (把占位配置修回真实配置) → 写 `update.json` /

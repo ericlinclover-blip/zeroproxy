@@ -273,6 +273,27 @@ async function main() {
       (await page.locator("#setup-done.hidden").count()) === 1
       && (await page.locator("#view-dash:not(.hidden)").count()) === 1, "");
 
+    // 「你正在用 IP 访问」横幅只在生产显示, 本地把 prod 标记临时打开来验证文案与语气
+    const ipBanner = await page.evaluate(() => {
+      const prev = { prod: dash.system.prod, cert: dash.cert.type };
+      const el = document.querySelector("#dash-banner");
+      const cls = () => ((el.querySelector(".banner") || {}).className || "");
+      dash.system.prod = true;
+      dash.cert.type = "letsencrypt";
+      renderDashboardBanner();
+      const info = { cls: cls(), hasBtn: /切到域名面板/.test(el.innerHTML), url: dash.panel_url };
+      dash.cert.type = "self-signed";
+      renderDashboardBanner();
+      const selfSigned = cls();
+      dash.system.prod = prev.prod;
+      dash.cert.type = prev.cert;
+      renderDashboardBanner();
+      return { ...info, selfSigned, restored: el.classList.contains("hidden") };
+    });
+    check("用 IP 访问时提示切到域名面板", ipBanner.cls.includes("info") && ipBanner.hasBtn, ipBanner.url);
+    check("证书不是真证书时改成告警语气",
+      ipBanner.selfSigned.includes("bad") && ipBanner.restored, ipBanner.selfSigned);
+
     await page.click("#btn-logout");
     await page.waitForSelector("#view-login:not(.hidden)", { timeout: 15000 });
     await page.goto(`${base}/?user=admin`, { waitUntil: "domcontentloaded" });
