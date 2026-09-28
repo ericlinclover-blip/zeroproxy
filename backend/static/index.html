@@ -837,11 +837,71 @@ $("#themeBtn").onclick = () =>
   applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
 
 /* ---------------- 工具 ---------------- */
+//: 改配置会重启 xray / hysteria2。如果这个浏览器正好是"走本机这条链路"上网的
+//: (很常见: 装完就用自己的节点), 重启会把自己那条隧道一起断掉 —— 请求以"连接中断"
+//: 告终, 但面板其实已经把活干完了。所以两类失败必须分开:
+//:   业务失败 → 有 HTTP 状态码 + 中文 error, 照实报给用户;
+//:   连接中断 → fetch 抛错 / 502 / 504, 属于"重启内核的副作用", 该自动重连。
 async function api(path, opts = {}) {
-  const res = await fetch(path, { credentials: "same-origin", ...opts });
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+  let res;
+  try {
+    res = await fetch(path, { credentials: "same-origin", ...opts });
+  } catch (err) {
+    const e = new Error("与面板的连接中断 (重启内核时会短暂断开)");
+    e.dropped = true;
+    throw e;
+  }
+  const body = await res.json().catch(() => null);
+  if (!res.ok) {
+    const e = new Error((body && body.error) || `HTTP ${res.status}`);
+    e.status = res.status;
+    // 502/504 = 上游(面板)正在重启, 和"网络断了"同样处理
+    e.dropped = res.status === 502 || res.status === 504;
+    e.body = body || {};
+    throw e;
+  }
+  if (body === null) throw new Error("面板返回了无法解析的内容");
   return body;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 面板重启时自己的连接是先断再通的: 轮询 /api/status 直到拿到答复。
+ *  返回 true=在线且已登录, false=在线但登录已失效, null=一直连不上 (纯网络问题)。 */
+async function sessionState(tries = 6, delay = 1200) {
+  for (let i = 0; i < tries; i++) {
+    try {
+      const st = await api("/api/status");   // 只有 200 会走到这里
+      return !!st.authenticated;
+    } catch (e) { /* 还没回来 / 面板 5xx: 继续等, 不当成"掉登录" */ }
+    if (i < tries - 1) await sleep(delay);
+  }
+  return null;
+}
+
+/** 重连期间的状态提示: 复用顶部那颗状态药丸, 不整页重画 (草稿与按钮状态都还在)。 */
+function markDisconnected(msg) {
+  const st = $("#dash-state");
+  if (!st) return;
+  st.className = "pill warn";
+  st.innerHTML = `<span class="dot other"></span>${msg || "连接中断, 正在重连…"}`;
+}
+
+/** 重启内核会掐断"走本机链路上网"的浏览器请求 —— 但面板那边已经把活干完了。
+ *  这里等连接回来、用 /api/dashboard 对齐真实状态, 并回答"界面变了没有":
+ *  true=变了 (操作确实生效), false=没变 (没生效/本就是空操作), null=一直没连上。 */
+async function syncAfterDrop(before, tries = 10, delay = 1200) {
+  for (let i = 0; i < tries; i++) {
+    await sleep(delay);
+    try {
+      dash = await api("/api/dashboard");
+      renderDash(true);
+      show("view-dash");
+      return JSON.stringify(dash) !== before;
+    } catch (e) { /* 隧道/面板还没回来, 继续等 */ }
+  }
+  markDisconnected("连接中断 — 稍后会自动重试, 期间状态可能不是最新的");
+  return null;
 }
 function toast(msg) {
   const t = $("#toast");
@@ -986,7 +1046,17 @@ async function boot() {
     show("view-login");
     if (presetUser) $("#login-pass").focus();
   } catch (e) {
-    show("view-setup");
+    // /api/status 都连不上 = 面板或内核正在重启 (改配置后的正常现象), 别急着把人
+    // 扔到"初始化"页 —— 先重试, 拿到答复再决定是回仪表盘还是真去登录。
+    markDisconnected();
+    const alive = await sessionState(8, 1500);
+    if (alive) return loadDash();
+    show("view-login");
+    if (alive === null) {
+      const hint = $("#login-hint");
+      hint.textContent = "面板暂时连不上 (可能正在重启内核)。稍等几秒刷新本页即可, 不需要重新初始化。";
+      hint.classList.remove("hidden");
+    }
   }
 }
 
@@ -1133,7 +1203,17 @@ async function loadDash(quiet) {
     renderDash(quiet);
     show("view-dash");
   } catch (e) {
-    show("view-login");
+    // 只有"面板明确说未登录"才回登录页。连接中断 (内核/面板重启, 浏览器又正好
+    // 走本机链路时必然发生) 不该把人踢出去 —— 否则点一次「生成配对码」就跳登录。
+    if (!e.dropped && e.status === 401) {
+      show("view-login");
+      return;
+    }
+    markDisconnected();
+    if (!quiet) toast("连接中断, 正在重连…");
+    const alive = await sessionState();
+    if (alive === false) { show("view-login"); return; }   // 真的掉登录了
+    setTimeout(() => { if (dash && !opBusy) loadDash(true); else if (!dash) boot(); }, 1200);
     return;
   }
   clearInterval(refreshTimer);
@@ -2164,6 +2244,7 @@ function chainEntryCard(d, e) {
  * 数据整体重渲染, 并把落地的步骤结果转成提示 */
 async function applyAction(method, path, payload, btn, busyText) {
   const original = btn ? btn.textContent : "";
+  const before = dash ? JSON.stringify(dash) : "";   // 用于"断线后其实已经生效"的比对
   if (btn) { btn.disabled = true; if (busyText) btn.textContent = busyText; }
   opBusy += 1;
   try {
@@ -2177,8 +2258,16 @@ async function applyAction(method, path, payload, btn, busyText) {
     const failed = (dash.steps || []).filter((s) => !s.ok);
     toast(failed.length ? `已应用, 但有 ${failed.length} 步告警: ${failed[0].name}` : "已应用, 订阅内容已刷新");
   } catch (e) {
-    toast("操作失败: " + e.message);
-    renderDash(true);   // 失败时按最后一次拿到的状态回灌, 别把界面留在"看起来改成功了"的样子
+    if (e.dropped) {
+      // 面板其实已经把活干完了, 断的只是"浏览器 → 本机链路 → 面板"这条路
+      markDisconnected("重启内核中, 正在确认结果…");
+      const changed = await syncAfterDrop(before);
+      if (changed === true) toast("已应用 (重启内核时连接短暂中断, 已自动恢复)");
+      else if (changed === false) toast("连接已恢复, 但界面没有变化 —— 需要的话请再点一次");
+    } else {
+      toast("操作失败: " + e.message);
+      renderDash(true);   // 失败时按最后一次拿到的状态回灌, 别把界面留在"看起来改成功了"的样子
+    }
   } finally {
     opBusy -= 1;
   }
@@ -2244,14 +2333,26 @@ async function connectChain(force) {
   };
   btn.disabled = true;
   btn.textContent = force ? "强制连接中…" : "连接并测试中…";
+  const before = dash ? JSON.stringify(dash) : "";
   opBusy += 1;
   try {
-    const res = await fetch("/api/chain/entries", {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
+    let res;
+    try {
+      res = await fetch("/api/chain/entries", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+    } catch (err) {
+      // 连接中断: 落地本身可能已经写好了 (新增入站要重启 xray, 正好掐断自己这条路)
+      markDisconnected("重启内核中, 正在确认结果…");
+      const changed = await syncAfterDrop(before);
+      if (changed === true) toast("已添加 (重启内核时连接短暂中断, 已自动恢复)");
+      else if (changed === false) toast("连接已恢复, 但没看到新节点 —— 请再点一次「连接并测试」");
+      if (document.body.contains(btn)) { btn.disabled = false; btn.textContent = "连接并测试"; }
+      return;
+    }
     const body = await res.json().catch(() => ({}));
     if (!res.ok) {
       const detail = body.error || `HTTP ${res.status}`;

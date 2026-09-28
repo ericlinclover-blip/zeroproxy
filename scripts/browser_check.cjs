@@ -647,6 +647,45 @@ async function main() {
     console.log("\n[4] 控制台与请求");
     check("无 console 错误", consoleErrors.length === 0, consoleErrors.slice(0, 3).join(" | "));
     check("无失败请求", failedRequests.length === 0, failedRequests.slice(0, 3).join(" | "));
+
+    console.log("\n[3g] 断线不跳登录 (改配置要重启内核, 会掐断走本机链路的浏览器)");
+    // 面板重启内核时, "走本机这条链路"的浏览器会先断再通; 之前这里任何一次
+    // /api/dashboard 失败都会把人踢回登录页 —— 点一次「生成配对码」就跳登录。
+    let droppedOnce = 0;
+    await page.route("**/api/dashboard", (route) => {
+      if (droppedOnce++ === 0) return route.abort("connectionreset");
+      return route.continue();
+    });
+    await page.evaluate(() => loadDash(true));
+    const duringDrop = await page.evaluate(() => ({
+      dash: !document.querySelector("#view-dash").classList.contains("hidden"),
+      login: !document.querySelector("#view-login").classList.contains("hidden"),
+      pill: (document.querySelector("#dash-state") || {}).textContent || "",
+    }));
+    check("连接中断时不跳登录页", duringDrop.dash && !duringDrop.login, `dash=${duringDrop.dash} login=${duringDrop.login}`);
+    check("断线期间给出「正在重连」提示", /重连/.test(duringDrop.pill), duringDrop.pill.trim());
+    await page.unroute("**/api/dashboard");
+    await page.waitForTimeout(2600);
+    const afterDrop = await page.evaluate(() => ({
+      dash: !document.querySelector("#view-dash").classList.contains("hidden"),
+      pill: (document.querySelector("#dash-state") || {}).textContent || "",
+      cards: document.querySelectorAll("#node-grid .node-card").length,
+    }));
+    check("重连后仪表盘自动恢复", afterDrop.dash && afterDrop.cards === 5 && !/重连/.test(afterDrop.pill), afterDrop.pill.trim());
+
+    await page.route("**/api/dashboard", (route) =>
+      route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({ error: "未登录" }) })
+    );
+    await page.evaluate(() => loadDash(true));
+    await page.waitForTimeout(300);
+    check(
+      "真正的 401 才回登录页",
+      await page.evaluate(() => !document.querySelector("#view-login").classList.contains("hidden")),
+      ""
+    );
+    await page.unroute("**/api/dashboard");
+    await page.goto(base);
+    await page.waitForSelector("#view-dash:not(.hidden)", { timeout: 20000 });
   } finally {
     if (browser) await browser.close();
     server.kill("SIGTERM");
