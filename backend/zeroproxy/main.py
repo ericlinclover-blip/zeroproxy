@@ -28,16 +28,25 @@ GEODATA_AUTO_ENV = "ZP_GEODATA_AUTO"
 
 
 def _geodata_once() -> None:
-    """一次自动更新: 过期才下载; 数据变化则重启 Xray 使其生效。"""
+    """一次自动更新: 过期才下载; 数据变化则重启 Xray 使其生效。
+
+    与面板上的「下载 / 更新」按钮共用 geodata.UPDATE_LOCK: 手动下载在跑时就
+    不抢 (否则两条路径同时写 geo 目录); 失败原因照旧写进 state, 卡片上能看见。
+    """
     with config.locked():
         state = config.load_state()
         if not state.get("configured") or not geodata.wants_update(state):
             return
-    ok, detail = geodata.auto_tick(state)
+    if not geodata.UPDATE_LOCK.acquire(blocking=False):
+        return
+    try:
+        ok, detail = geodata.auto_tick(state)
+    finally:
+        geodata.UPDATE_LOCK.release()
     with config.locked():
         fresh = config.load_state()
-        if ok or detail == "数据无变化":
-            fresh["geodata"] = state["geodata"]
+        # 只并回这次下载真的写过的字段 (用户在下载期间改的开关不能被旧快照覆盖)
+        geodata.merge_result(fresh, state, ok)
         config.audit(fresh, "geodata_auto", detail[:190], actor="scheduler")
         config.save_state(fresh)
     if ok:

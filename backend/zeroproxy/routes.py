@@ -286,6 +286,7 @@ def _job_snapshot(job: dict) -> dict:
     end = job.get("finished_at")
     return {
         "id": job["id"],
+        "kind": job.get("kind", "apply"),      # 前端据此改文案 (下载 GeoIP / 应用配置)
         "state": job["state"],
         "index": int(job.get("index") or 0),
         "total": int(job.get("total") or len(apply.STEP_NAMES)),
@@ -301,6 +302,62 @@ def _job_update(job_id: str, **fields) -> None:
         job = _APPLY_JOBS.get(job_id)
         if job is not None:
             job.update(fields)
+
+
+def _new_job(
+    request: Request | None, total: int, current: str, kind: str = "apply"
+) -> tuple[str, dict]:
+    """登记一个后台任务, 返回 (id, 快照)。所有长耗时闭环共用这张表。"""
+    with _APPLY_JOBS_LOCK:
+        job_id = str(next(_APPLY_SEQ))
+        job = {
+            "id": job_id,
+            "kind": kind,
+            "state": "running",
+            "index": 0,
+            "total": total,
+            "current": current,
+            "steps": [],
+            "error": "",
+            "started_at": time.time(),
+            "finished_at": None,
+            # 只有发起这个任务的会话能查它的进度 (会话令牌本身就是面板的凭据)
+            "token": (request.cookies.get(SESSION_COOKIE) if request is not None else "") or "",
+        }
+        _APPLY_JOBS[job_id] = job
+        return job_id, job
+
+
+def _finish_job(job_id: str, steps: list[dict], error: str = "") -> None:
+    with _APPLY_JOBS_LOCK:
+        job = _APPLY_JOBS.get(job_id)
+        if job is not None:
+            job.update(
+                state="failed" if error else "done",
+                steps=steps,
+                error=error,
+                finished_at=time.time(),
+                index=job.get("index") or job.get("total") or 1,
+            )
+        stale = sorted(_APPLY_JOBS, key=lambda k: _APPLY_JOBS[k]["started_at"])[:-_APPLY_JOB_KEEP]
+        for key in stale:
+            _APPLY_JOBS.pop(key, None)
+
+
+def _running_job(request: Request | None, kind: str | None = None) -> dict | None:
+    """这个会话正在跑的任务。`kind` 用来区分"改配置"与"下载 GeoIP 数据" ——
+    点 GeoIP 按钮时不能把正在跑的改配置任务当成自己的 (那会变成"下载被跳过")。
+    """
+    token = (request.cookies.get(SESSION_COOKIE) if request is not None else "") or ""
+    with _APPLY_JOBS_LOCK:
+        for job in _APPLY_JOBS.values():
+            if (
+                job.get("state") == "running"
+                and job.get("token") == token
+                and (kind is None or job.get("kind", "apply") == kind)
+            ):
+                return _job_snapshot(job)
+    return None
 
 
 def _run_apply_job(job_id: str, after=None) -> None:
@@ -320,19 +377,7 @@ def _run_apply_job(job_id: str, after=None) -> None:
                 steps.extend(after())
     except Exception as exc:  # noqa: BLE001 — 后台任务不能把异常吞成"静默失败"
         error = f"{type(exc).__name__}: {exc}"
-    with _APPLY_JOBS_LOCK:
-        job = _APPLY_JOBS.get(job_id)
-        if job is not None:
-            job.update(
-                state="failed" if error else "done",
-                steps=steps,
-                error=error,
-                finished_at=time.time(),
-                index=job.get("index") or job.get("total") or len(apply.STEP_NAMES),
-            )
-        stale = sorted(_APPLY_JOBS, key=lambda k: _APPLY_JOBS[k]["started_at"])[:-_APPLY_JOB_KEEP]
-        for key in stale:
-            _APPLY_JOBS.pop(key, None)
+    _finish_job(job_id, steps, error)
 
 
 def _reapply_job(
@@ -348,22 +393,7 @@ def _reapply_job(
         if after is not None:
             steps.extend(after())
         return steps, None
-    with _APPLY_JOBS_LOCK:
-        job_id = str(next(_APPLY_SEQ))
-        job = {
-            "id": job_id,
-            "state": "running",
-            "index": 0,
-            "total": len(apply.STEP_NAMES),
-            "current": apply.STEP_NAMES[0],
-            "steps": [],
-            "error": "",
-            "started_at": time.time(),
-            "finished_at": None,
-            # 只有发起这个任务的会话能查它的进度 (会话令牌本身就是面板的凭据)
-            "token": (request.cookies.get(SESSION_COOKIE) if request is not None else "") or "",
-        }
-        _APPLY_JOBS[job_id] = job
+    job_id, job = _new_job(request, len(apply.STEP_NAMES), apply.STEP_NAMES[0])
     # 先把这次改动落盘再放任务: 后台线程是从磁盘读最新 state 的 (load_state),
     # 不先存的话这次改的节点开关 / 链式条目就白改了。
     save_state(state)
@@ -1456,17 +1486,24 @@ def _diagnose(state: dict) -> list[dict]:
     geo = geodata.status(state)
     rules_text = json.dumps(cfg.get("routing", {}).get("rules", []), ensure_ascii=False)
     rules_use_geo = ("geoip:" in rules_text) or ("geosite:" in rules_text)
+    # 上次下载为什么失败 —— 数据没到位时这是用户唯一能拿到的线索, 别让他只能反复点按钮
+    geo_err = f" · 上次更新失败: {geo['last_error'][:90]}" if geo.get("last_error") else ""
     if rules_use_geo and not geodata.present():
-        add("GeoIP 数据", False, "配置里有 geo 分流规则但数据文件缺失 — Xray 将无法启动", fixable=True)
+        add(
+            "GeoIP 数据",
+            False,
+            f"配置里有 geo 分流规则但数据文件缺失 — Xray 将无法启动{geo_err}",
+            fixable=True,
+        )
     elif not geo["enabled"]:
-        add("GeoIP 数据", True, "未启用分流 (下载数据后可开启私有地址防护/广告拦截)")
+        add("GeoIP 数据", True, f"未启用分流 (下载数据后可开启私有地址防护/广告拦截){geo_err}")
     else:
         age = geo["age_days"]
         add(
             "GeoIP 数据",
             geo["active"] and (age <= 30 or age < 0),
             f"{geo['source'] or '未知来源'} · {age} 天前更新 · "
-            f"{'已启用分流' if geo['active'] else '数据缺失, 规则未下发'}",
+            f"{'已启用分流' if geo['active'] else '数据缺失, 规则未下发'}{geo_err}",
         )
 
     # 4. 证书
@@ -1781,29 +1818,75 @@ async def restore(request: Request):
 
 # ---------------------------------------------------------------- GeoIP 数据
 
-#: 同一时间只允许一个下载任务 (几十 MB, 不做并发)
-_GEO_UPDATE_LOCK = threading.Lock()
+#: 同一时间只允许一个下载任务 (几十 MB, 不做并发); 与后台自动更新线程共用
+#: 同一把锁 (定义在 geodata, 避免两条路径同时改写 geo 目录与 state 快照)
+_GEO_UPDATE_LOCK = geodata.UPDATE_LOCK
 
 
-@router.post("/api/geodata/update")
-def geodata_update(request: Request):
-    """下载/刷新 GeoIP + GeoSite 数据, 然后重新生成配置并热重载。"""
-    with config.locked():
-        state = load_state()
-        if not _require_auth(state, request):
-            return _err("未登录", 401)
+def _geo_steps(detail: str) -> list[dict]:
+    """GeoIP 下载这一步本身, 塞进落地步骤列表里 (和改配置共用同一套展示)。"""
+    return [{"name": "下载并校验 GeoIP 数据", "ok": True, "detail": detail, "ms": 0}]
 
-    if not _GEO_UPDATE_LOCK.acquire(blocking=False):
-        return _err("已有更新任务在进行中", 409)
+
+def _run_geo_job(job_id: str, actor: str) -> None:
+    """后台线程: 下载 → 校验 → 重新落地配置, 全程把进度写进任务表。
+
+    为什么不能同步等: 28 MB 从镜像拉下来, 国内线路可能几十秒到几分钟; 而且
+    数据变了要重启 Xray —— 走本机链路访问面板的浏览器会把这条请求掐断, 用户
+    看到的就是"点了半天没反应, 然后好像失败了"。改成立刻回执 + 轮询后, 进度
+    是一直可见的, 请求也早就返回了 (和 v2.6.9 改配置那条闭环同一个理由)。
+    """
+    steps: list[dict] = []
+    error = ""
+    dl_total = len(geodata.SOURCES) + 1               # 两个文件 + 一次校验
+    total = dl_total + len(apply.STEP_NAMES)
     try:
-        ok, detail, _info = geodata.update(state)
+        with config.locked():
+            state = load_state()
+        ok, detail, _info = geodata.update(
+            state,
+            progress=lambda index, _total, name: _job_update(
+                job_id, index=index, total=total, current=name
+            ),
+        )
+        with config.locked():
+            fresh = load_state()
+            # 下载在锁外跑了好一会儿, 期间用户可能改过开关 —— 只并回下载写过的字段
+            geodata.merge_result(fresh, state, ok)
+            config.audit(
+                fresh,
+                "geodata_update" if ok else "geodata_update_failed",
+                detail[:190],
+                actor=actor,
+            )
+            if ok:
+                steps = _geo_steps(detail) + apply.reapply(
+                    fresh,
+                    progress=lambda index, _total, name: _job_update(
+                        job_id, index=dl_total + index + 1, total=total, current=name
+                    ),
+                )
+            else:
+                steps = _geo_steps(detail)
+                steps[0]["ok"] = False
+                error = detail
+            # 步骤要在 save_state 之前写进去: reapply 内部存过一次, 这里覆盖成完整清单
+            fresh["steps"] = steps
+            save_state(fresh)
+    except Exception as exc:  # noqa: BLE001 — 后台任务不能把异常吞成"静默失败"
+        error = f"{type(exc).__name__}: {exc}"
+        steps = steps or [{"name": "下载并校验 GeoIP 数据", "ok": False, "detail": error, "ms": 0}]
     finally:
         _GEO_UPDATE_LOCK.release()
+    _finish_job(job_id, steps, error)
 
+
+def _geodata_update_sync(state: dict, request: Request) -> dict:
+    """同步落地 (ZP_APPLY_ASYNC=0, 测试 / 本地排查用) —— 行为与以前一致。"""
+    ok, detail, _info = geodata.update(state)
     with config.locked():
         fresh = load_state()
-        if ok:
-            fresh["geodata"] = state["geodata"]
+        geodata.merge_result(fresh, state, ok)
         config.audit(
             fresh,
             "geodata_update" if ok else "geodata_update_failed",
@@ -1816,6 +1899,54 @@ def geodata_update(request: Request):
             body["steps"] = _reapply(fresh, request)
     body["ok"] = ok
     body["detail"] = detail
+    return body
+
+
+@router.post("/api/geodata/update")
+def geodata_update(request: Request):
+    """下载/刷新 GeoIP + GeoSite 数据, 然后重新生成配置并热重载。"""
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        if _apply_async_enabled():
+            running = _running_job(request, kind="geodata")
+            if running is not None:
+                # 已经在跑就直接把那个任务还给前端, 让它接着轮询同一个进度条,
+                # 而不是弹一句"已有任务在进行中"让用户再猜一次
+                body = _dashboard_body(state, request)
+                body["ok"] = True
+                body["detail"] = "已有更新任务在进行中"
+                body["steps"] = []
+                body["job"] = running
+                return body
+
+    if not _GEO_UPDATE_LOCK.acquire(blocking=False):
+        return _err("已有更新任务在进行中", 409)
+    if not _apply_async_enabled():
+        try:
+            return _geodata_update_sync(state, request)
+        finally:
+            _GEO_UPDATE_LOCK.release()
+
+    total = len(geodata.SOURCES) + 1 + len(apply.STEP_NAMES)
+    job_id, job = _new_job(request, total, "准备下载", kind="geodata")
+    # 任务线程负责在结束时释放 _GEO_UPDATE_LOCK (下载不能占着配置锁)
+    try:
+        threading.Thread(
+            target=_run_geo_job,
+            args=(job_id, _client_ip(request)),
+            name=f"zp-geo-{job_id}",
+            daemon=True,
+        ).start()
+    except Exception:
+        _GEO_UPDATE_LOCK.release()   # 线程没起来就别把锁留着 (否则再也下不了)
+        raise
+    body = _dashboard_body(state, request)
+    body["ok"] = True
+    body["detail"] = "已开始下载"
+    body["steps"] = []
+    body["job"] = _job_snapshot(job)
     return body
 
 

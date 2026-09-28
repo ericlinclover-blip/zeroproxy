@@ -729,6 +729,8 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
         <button class="btn ghost small" id="btn-geo-update">下载 / 更新 GeoIP 数据</button>
         <span class="muted" style="font-size:12px">数据源 Loyalsoldier/v2ray-rules-dat, 每 7 天自动更新</span>
       </div>
+      <!-- 上次下载的结论: 失败原因要一直留在卡片上, 不能只在 2 秒的 toast 里说一遍 -->
+      <div class="err-box hidden" id="geo-note" style="margin-top:10px"></div>
     </section>
 
     <section class="card reveal" id="chain-intro">
@@ -947,13 +949,17 @@ function renderApplyStrip(st) {
   const running = st.state === "running";
   const stepFails = ((st.steps || []).filter((s) => !s.ok)).length;
   const bad = !running && (st.state === "failed" || !!st.error || stepFails > 0);
+  // GeoIP 下载和"改配置落地"共用这条进度条, 文案要跟着任务类型走
+  const geo = st.kind === "geodata";
   const total = st.total || 6;
   const index = Math.max(1, Math.min(st.index || 1, total));
   const pct = Math.round((index / total) * 100);
   const secs = ((st.elapsed_ms || 0) / 1000).toFixed(1);
   const title = bad
-    ? st.error ? "配置落地失败" : `配置已应用, 但有 ${stepFails} 步告警`
-    : running ? "正在应用配置" : "配置已应用";
+    ? st.error ? (geo ? "GeoIP 数据更新失败" : "配置落地失败")
+      : geo ? `GeoIP 数据已更新, 但有 ${stepFails} 步告警` : `配置已应用, 但有 ${stepFails} 步告警`
+    : running ? (geo ? "正在下载 GeoIP 数据" : "正在应用配置")
+      : geo ? "GeoIP 数据已更新并生效" : "配置已应用";
   box.classList.remove("hidden");
   box.innerHTML = `<div class="banner ${bad ? "bad" : running ? "info" : "good"}">
     <span class="ico">${bad ? "✗" : running ? "⟳" : "✓"}</span>
@@ -1983,6 +1989,14 @@ function renderGeo(d) {
   else if (g.active) text = `${g.age_days >= 0 ? g.age_days + " 天前更新" : "已就绪"} · 分流已启用`;
   else text = `${g.age_days >= 0 ? g.age_days + " 天前更新" : "已就绪"} · 分流已关闭`;
   $("#geo-status").textContent = text;
+  // 上次为什么没下下来 —— 以前只在 toast 里闪 2.4 秒, 用户回头再看就只剩
+  // "数据未下载"这几个字, 完全不知道是镜像不可达还是校验没过
+  const note = $("#geo-note");
+  if (note) {
+    const why = String(g.last_error || "");
+    note.textContent = why ? `上次更新失败: ${why}` : "";
+    note.classList.toggle("hidden", !why);
+  }
 
   const save = async (payload, revert) => {
     try {
@@ -2013,7 +2027,19 @@ function renderGeo(d) {
       const res = await api("/api/geodata/update", { method: "POST" });
       dash = res;
       renderDash(true);
-      toast(res.ok ? "GeoIP 数据已更新并生效" : "更新失败: " + String(res.detail || "").slice(0, 90));
+      // 下载 + 校验 + 重新落地是后台任务 (真机上十几秒到几分钟), 这里等它跑完,
+      // 期间顶部的进度条会显示"第几步 / 在做什么 / 已用多久"
+      await awaitJob(res);
+      const job = lastApplyJob;
+      const bad = !res.ok || (job && (job.state === "failed" || job.error));
+      if (bad) {
+        const stepFail = job && (job.steps || []).find((s) => !s.ok);
+        const why = (job && (job.error || (stepFail && stepFail.detail))) || res.detail || "";
+        toast("更新失败: " + String(why).slice(0, 120));
+      } else {
+        toast("GeoIP 数据已更新并生效");
+      }
+      await loadDash(true);   // 重新拉一次: 卡片要把数据状态 / 失败原因显示出来
     } catch (e) {
       toast("更新失败: " + e.message);
     }

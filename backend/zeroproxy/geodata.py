@@ -23,11 +23,17 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 
 from .config import GEODATA_TTL, paths
+
+#: 同一时间只允许一个下载任务 (几十 MB 的下载 + 校验, 不做并发)。
+#: 面板的「下载 / 更新」按钮与后台自动更新线程共用这一把锁 —— 否则两条路径
+#: 会同时往 geo 目录里写, 而它们各自持有的 state 快照又是旧的那一份。
+UPDATE_LOCK = threading.Lock()
 
 #: 每个数据文件的候选下载源 (按顺序回退)。
 #: jsdelivr 的 @release 指向仓库的 release 分支, 内容与 Release 资产一致。
@@ -46,6 +52,14 @@ SOURCES: dict[str, list[str]] = {
 
 #: 体积下限 — 低于此值说明下载到了错误页面 (404 HTML / 镜像限流提示)
 MIN_BYTES = {"geoip.dat": 1_000_000, "geosite.dat": 1_000_000}
+
+#: 单个下载源的超时 (连接 + 单次读取)。以前是 120s —— 三个源依次超时、两个文件
+#: 就是最坏 ~12 分钟, 面板上只有一句"下载中…", 用户看到的就是"点了没反应"。
+SOURCE_TIMEOUT = 30
+
+#: 一次更新的总时间上限: 下载加速到国内线路可能很慢, 但不能无限等。
+#: 超时后放弃剩余源并如实报错 (现有数据保持不变)。
+UPDATE_DEADLINE = 180
 
 #: 校验用的最小配置片段所引用的规则 (必须同时覆盖两个数据文件)
 PROBE_RULES = [
@@ -126,8 +140,27 @@ def status(state: dict) -> dict:
         "updated_at": updated,
         "age_days": int((time.time() - updated) // 86400) if updated else -1,
         "source": geo.get("source", ""),
+        # 上次尝试的结果 —— 卡片上要能说出"为什么没数据", 不能只显示"数据未下载"
+        "last_attempt": int(geo.get("last_attempt", 0) or 0),
+        "last_error": str(geo.get("last_error", "") or ""),
         "files": files,
     }
+
+
+def merge_result(target: dict, source: dict, ok: bool) -> None:
+    """把一次更新的结果并回**最新**的 state。
+
+    下载跑在配置锁外 (28 MB, 不能把整个面板卡住), 期间用户可能改了开关 ——
+    那些字段属于用户操作, 不能被这份旧快照覆盖, 所以只并回"这次下载真的写了"
+    的字段。
+    """
+    geo = target.setdefault("geodata", {})
+    src = source.get("geodata", {}) or {}
+    for key in ("files", "updated_at", "source", "last_attempt", "last_error"):
+        if key in src:
+            geo[key] = src[key]
+    if ok and not geo.get("user_set"):
+        geo["enabled"] = True
 
 
 def _validate(geo_dir_path: str) -> tuple[bool, str]:
@@ -172,14 +205,35 @@ def _validate(geo_dir_path: str) -> tuple[bool, str]:
     return ok, ("数据可被 xray 加载" if ok else f"xray 拒绝加载该数据: {tail}")
 
 
-def _fetch(name: str, dst: str, timeout: int) -> tuple[bool, str, int, str]:
-    """按候选源顺序下载到 dst。返回 (ok, 说明, 字节数, 生效源)。"""
+def _fetch(
+    name: str,
+    dst: str,
+    timeout: int,
+    *,
+    deadline: float | None = None,
+    on_source=None,
+    on_bytes=None,
+) -> tuple[bool, str, int, str]:
+    """按候选源顺序下载到 dst。返回 (ok, 说明, 字节数, 生效源)。
+
+    `on_source(index, count)` / `on_bytes(n)` 是给面板画进度用的回调: 一个
+    28 MB 的下载在慢线路上要几十秒, 没有进度用户只会看到"卡住了"。
+    """
     errors: list[str] = []
-    for url in SOURCES[name]:
+    count = len(SOURCES[name])
+    for index, url in enumerate(SOURCES[name], 1):
+        if on_source is not None:
+            on_source(index, count)
+        remaining = None if deadline is None else deadline - time.time()
+        if remaining is not None and remaining <= 1:
+            errors.append("总时间超限")
+            break
+        budget = timeout if remaining is None else max(2, int(min(timeout, remaining)))
         try:
             request = urllib.request.Request(url, headers={"User-Agent": UA})
             size = 0
-            with urllib.request.urlopen(request, timeout=timeout) as resp:
+            next_tick = 1 << 20        # 每 1 MB 回报一次, 进度条才是真的在动
+            with urllib.request.urlopen(request, timeout=budget) as resp:
                 # file:// 等非 HTTP 源的 status 为 None (测试用), 视为成功
                 status = getattr(resp, "status", 200)
                 if status is not None and status != 200:
@@ -192,6 +246,9 @@ def _fetch(name: str, dst: str, timeout: int) -> tuple[bool, str, int, str]:
                             break
                         out.write(chunk)
                         size += len(chunk)
+                        if on_bytes is not None and size >= next_tick:
+                            on_bytes(size)
+                            next_tick = size + (1 << 20)
             if size < MIN_BYTES[name]:
                 errors.append(f"{url} 体积异常 ({size} 字节)")
                 continue
@@ -209,36 +266,80 @@ def _source_label(url: str) -> str:
     return url.split("/")[2] if "//" in url else url
 
 
-def update(state: dict, *, timeout: int = 120, validate: bool = True) -> tuple[bool, str, dict]:
+def update(
+    state: dict,
+    *,
+    timeout: int = SOURCE_TIMEOUT,
+    validate: bool = True,
+    deadline: float | None = None,
+    progress=None,
+) -> tuple[bool, str, dict]:
     """下载两个数据文件并原子替换。
 
     先全部落到临时目录, 校验通过后才 rename 到位 —— 任一步失败都保持现有文件
     不变, 不会出现"半个数据集"导致 Xray 起不来。
+
+    `progress(index, total, name)` 每进入一步回调一次 (面板据此画实时进度);
+    `deadline` 是这次更新的绝对时间上限 (超时放弃剩余源, 而不是无限等下去)。
+    结果会写进 `state["geodata"]` 的 `last_attempt` / `last_error` —— 失败原因
+    要留在状态里, 面板才有东西可显示。
     """
     target = geo_dir()
     os.makedirs(target, exist_ok=True)
+    geo = state.setdefault("geodata", {})
+    geo["last_attempt"] = int(time.time())
+    geo["last_error"] = ""
+    if deadline is None:
+        deadline = time.time() + UPDATE_DEADLINE
+
+    names = list(SOURCES)
+    total = len(names) + (1 if validate else 0)
+
+    def step(index: int, name: str) -> None:
+        if progress is not None:
+            progress(index, total, name)
+
+    def failed(detail: str) -> tuple[bool, str, dict]:
+        geo["last_error"] = detail[:300]
+        return False, detail, {}
+
     details: list[str] = []
     meta: dict[str, dict] = {}
 
     with tempfile.TemporaryDirectory(prefix="zp-geo-dl-") as staging:
-        for name in SOURCES:
+        for index, name in enumerate(names, 1):
             dst = os.path.join(staging, name)
-            ok, detail, size, source = _fetch(name, dst, timeout)
+
+            def announce(source_index: int, source_count: int, _name: str = name, _i: int = index) -> None:
+                step(_i, f"下载 {_name} (源 {source_index}/{source_count})")
+
+            def report(size: int, _name: str = name, _i: int = index) -> None:
+                step(_i, f"下载 {_name} {size / 1048576:.1f} MB")
+
+            announce(1, len(SOURCES[name]))
+            ok, detail, size, source = _fetch(
+                name,
+                dst,
+                timeout,
+                deadline=deadline,
+                on_source=announce,
+                on_bytes=report,
+            )
             if not ok:
-                return False, f"{name} 下载失败: {detail}", {}
+                return failed(f"{name} 下载失败: {detail}")
             meta[name] = {"size": size, "sha256": sha256(dst), "source": source}
             details.append(f"{name} {size // 1024} KiB")
 
         if validate:
+            step(total, "校验数据 (真实 xray -test)")
             ok, detail = _validate(staging)
             if not ok:
-                return False, detail, {}
+                return failed(detail)
             details.append(detail)
 
-        for name in SOURCES:
+        for name in names:
             os.replace(os.path.join(staging, name), file_path(name))
 
-    geo = state.setdefault("geodata", {})
     geo["files"] = {name: {"size": m["size"], "sha256": m["sha256"]} for name, m in meta.items()}
     geo["updated_at"] = int(time.time())
     geo["source"] = _source_label(meta[list(meta)[0]]["source"]) if meta else ""

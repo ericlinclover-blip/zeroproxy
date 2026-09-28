@@ -66,7 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 141 项 (136 passed + 5 skipped; 带 `ZP_XRAY_BIN` 时 141 全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (92 项) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 149 项 (144 passed + 5 skipped; 带 `ZP_XRAY_BIN` 时 149 全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (92 项) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 | **看得懂的界面 (v2.6.0)** | 控制台布局: 左侧锚点导航 (带计数角标 + 滚动高亮) + 顶部指标条 (健康节点 / 落地出口 IP / 平均延迟 + 迷你折线 / 运行时长) + 节点密集表格 (名称 / 地址状态 / **握手延迟条** / **上下行双轨** / 开关与复制) + **流量卡 (双弧圆环 + 实时速率曲线 + 逐节点双色流量条)** + 链式链路拓扑 (你的设备 → 本机入口 → 落地端) + 程序更新闭环; 动效全部走 `transform`/自绘 rAF 并受 `prefers-reduced-motion` 约束 |
 
@@ -615,6 +615,37 @@ v2.6.8 修掉了"跳登录", 但用户紧接着反馈: **生成配对码 / 重�
 这三个按钮, 同样会撞上"重启内核掐断隧道"那个老问题。没一起改是因为它牵扯前端 (repair 的前端要用落地后重跑的
 诊断结果) 与会话签发时序 (restore 若处理不好会把刚发出的会话冲掉), 需要配套回归。
 
+### 8.9 v2.6.12: GeoIP 下载不再"点了没反应"
+
+用户反馈:「下载按钮无法正常下载更新所要的数据, 而且也没有对应的交互反馈」。真机上排查后确认问题不在下载
+本身 (镜像可达时 1.8s 就下完了), 而在**这条闭环的反馈与时限**:
+
+1. **接口是同步等的**: "下载 28 MB → 校验 → 重新生成配置 → 重启 Xray" 全程压在一个 POST 里。慢线路上
+   面板只有一句"下载中… (约 28 MB)", 页面干等; 而成功后重启 Xray 又会掐断"走本机链路访问面板"的浏览器,
+   于是那条请求直接失败 —— 用户看到的就是"下载失败", 其实数据已经落好了。
+2. **没有时限**: 每个镜像的 socket 超时是 120s, 三个镜像 × 两个文件 = 最坏 **12 分钟**; 真机上更常见的是
+   "连得上但不发数据", 那就一直等到超时。这期间用户没有任何可看的东西。
+3. **失败原因只在 toast 里闪 2.4 秒**: 回头再看卡片, 只剩"数据未下载"四个字, 完全不知道是镜像不可达、
+   被限流, 还是 `xray -test` 校验没过, 只能反复点按钮。
+4. **后台自动更新与手动按钮没有互斥**: 两条路径可能同时往 `geo/` 里写, 各自还拿着旧的 state 快照。
+
+改法 (与 v2.6.9 的改配置闭环对齐):
+
+* **改成长任务**: 接口立刻回执 + 后台线程跑"下载 → 校验 → 落地", 前端轮询 `/api/apply/job` 画实时进度条
+  —— **第 2/9 步 · 下载 geosite.dat 4.0 MB · 已用 4.5s**, 文案也跟着任务类型变成"正在下载 GeoIP 数据";
+* **加时限**: 单源 30s (`geodata.SOURCE_TIMEOUT`), 整体 180s (`geodata.UPDATE_DEADLINE`), 超时如实报
+  "总时间超限"并保留现有数据, 不再无限等;
+* **失败原因落到状态里**: `geodata.last_error` / `last_attempt` 写进 `state.json` 并随仪表盘下发, 卡片下方
+  常驻一行"上次更新失败: …"; 「一键诊断」的 GeoIP 那一项同样带上原因; 审计日志留 `geodata_update_failed`;
+* **互斥**: 手动下载与后台自动更新共用 `geodata.UPDATE_LOCK`; 已有任务在跑时, 再点按钮直接接管那个任务的
+  进度 (而不是弹一句"已有任务在进行中");
+* **不覆盖用户操作**: 下载在配置锁外跑, 结果只并回本次真的写过的字段 (`merge_result`), 用户在下载期间改的
+  开关不会被旧快照冲掉。
+
+回归: `pytest` 141 → **144 passed** (新增 8 条: 失败原因可见 / 自检带原因 / 后台任务与进度 / 连点接管同一任务 /
+整体超时 / `merge_result` 不覆盖开关 / 与自动更新互斥)。真实浏览器复跑三种线路 (正常 / 拒绝连接 / 只连不发):
+正常路径 4.8s 走完 9 步并提示成功; 后两种都能在几秒内给出结论, 且原因留在卡片上。
+
 ---
 
 ## 9. API
@@ -629,7 +660,7 @@ v2.6.8 修掉了"跳登录", 但用户紧接着反馈: **生成配对码 / 重�
 | POST | `/api/hysteria/hopping` | 会话 | 端口跳跃开关 → 热重载 |
 | POST | `/api/settings` | 会话 | 改 Reality SNI / Hysteria 伪装站点 / 节点端口 / 分流模板 (含端口占用校验; 只改模板时不重载服务) |
 | GET | `/api/probe` | 会话 | 节点探测 + 服务器出口 RTT (`?deep=1` 用临时 Xray 客户端真的从每个节点穿一次外网, 生产环境面板默认走它; 3s / 20s 缓存) |
-| POST | `/api/geodata/update` | 会话 | 下载/刷新 GeoIP + GeoSite 数据并热重载 (互斥, 并发时 409) |
+| POST | `/api/geodata/update` | 会话 | 下载/刷新 GeoIP + GeoSite 数据并热重载。从 v2.6.12 起和改配置一样**立刻回执 + 带 `job`** (前端轮询 `/api/apply/job` 看"下载 geoip.dat 4.0 MB"这样的实时进度), 下载与校验跑在后台; 已有任务在跑时返回同一个任务 (与后台自动更新共用一把锁, 真正冲突才 409) |
 | GET | `/api/backup` | 会话 | 导出备份 JSON (含密钥与令牌, 带 SHA-256 校验和, 不含会话) |
 | POST | `/api/restore` | 会话 | 从备份恢复并热重载 (校验和/必填字段/版本三重校验) |
 | POST | `/api/apply` | 会话 | 重新生成全部配置并热重载 |
@@ -706,7 +737,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 
 在 macOS (Apple Silicon, Python 3.14) 上实测通过:
 
-- `python -m pytest tests -q` → **136 passed, 5 skipped** (带 `ZP_XRAY_BIN` 时 **141 passed**, 约 30 秒);
+- `python -m pytest tests -q` → **144 passed, 5 skipped** (带 `ZP_XRAY_BIN` 时 **149 passed**, 约 30 秒);
   含 `/api/update` 鉴权与版本比较、`apply` 的"写不进 /etc/nginx 即失败"语义、CLI 退出码、以及
   `install.sh` 重跑不覆盖已初始化配置 / `upgrade.sh` 随包发布 / 自签证书可补签 Let's Encrypt /
   `systemctl` 参数顺序的回归断言 / Reality 密钥必须是成对的 X25519 (Ed25519 必须判无效) /
@@ -733,6 +764,9 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   **两个节点对调端口不再被误拦** / 诊断的"端口占用"只报别的进程, 不再把本机核心自己的监听算成冲突 /
   证书文件丢失时重新应用配置会补回自签 (换机恢复备份的典型场景) / 备份结构被改坏返回 400 而不是 500 /
   `state.json` 嵌套字段被改坏时退化为"字段缺失"而不是把面板打挂 / 链式入口在锁外探测期间端口被抢走会重新挑一个。
+  v2.6.12 又补 8 项 (见 8.9): GeoIP 下载改成后台任务 (进度可轮询) / 单源 30s + 整体 180s 两块超时 /
+  失败原因写进 `state` + 仪表盘 + 诊断 + 审计 / 连点接管同一个任务 / 与后台自动更新互斥 / `merge_result` 不覆盖用户在下载期间改的开关 /
+  跑着"改配置"任务时点下载会起自己的任务而不是接管别人。
 - `scripts/verify.py` (Xray 26.3.27 + Hysteria 2.12.3 + mihomo 1.19.31 + sing-box 1.14.2) → **77/77 项通过**:
   setup 8 步全绿 / 三种订阅格式可被真实客户端解析 / 三档分流模板分别被 `mihomo -t` 与
   `sing-box check` 通过 / **用真实 sing-box 实跑** 5 份订阅 (通用 + 1.14+ 写法 × 智能/全局/直连) 全部启动成功,
@@ -977,6 +1011,20 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 - **想改端口 / 伪装站点?** 仪表盘「高级设置」直接改, 保存后自动重新生成配置并热重载。
 - **「广告域名拦截」打开了但没效果?** 先确认 GeoIP 数据已下载 (高级设置里显示「数据未下载」时,
   分流规则不会下发); 点「下载 / 更新 GeoIP 数据」即可。
+- **GeoIP 数据下载不下来 / 点了没反应?** 从 v2.6.12 起, 点按钮后顶部会有一条实时进度条
+  (第几步 / 正在下的文件名与已下多少 MB / 已用多少秒), 失败原因会**常驻**在高级设置卡片下方
+  (例如 `上次更新失败: geoip.dat 下载失败: ... timed out; 总时间超限`), 「一键诊断」的 GeoIP
+  那一项也会带上同一句话。想在服务器上直接看原因:
+  `cd /opt/zeroproxy && ./venv/bin/python -m zeroproxy.geodata update` 会打印 `OK` / `FAIL` 与具体原因。
+  常见的失败是到 jsDelivr / GitHub 的线路不通 (单源 30s、整体 180s 就会如实报超时, 不再无限等);
+  数据拉不到时分流规则不会下发, 节点本身照常可用。
+- **打开 google.com 跳到 google.com.hk (或其他国家域名)?** 这是 **Google 按出口 IP 的归属地做跳转**,
+  与面板无关: 面板只负责把流量转发出去, 不会改写 HTTP 响应。判定方法是在服务器上直接请求一次
+  —— `curl -sI https://www.google.com/ | head -3`, 如果 `location:` 指向 `google.com.hk`, 说明这台机器的
+  **出口 IP 被 Google 判成香港** (常见于"美国"套餐但 IP 段注册在 HK 的服务商; 用
+  `curl -s https://ipinfo.io/json` 能看到 `country`)。想让 Google 给 `google.com`, 只能换一个归属地确实是
+  美国的落地出口 (本面板的**链式代理**就是干这个: 入口不变, 把落地端换成美国机器即可);
+  临时绕过可以在浏览器访问一次 `https://www.google.com/ncr` (写入"不再跳转"的 cookie)。
 - **想换分流策略 (国内直连 / 全局 / 直连)?** 高级设置「分流模板」一键切换, 订阅立刻生效且不重启服务;
   只想给某一个客户端用别的策略, 就在它的订阅地址后加 `?rules=global` (或 `smart` / `direct`)。
 - **sing-box 报 `unknown field "http_clients"`?** 说明用了 `?format=singbox-next`, 而客户端低于 1.14;

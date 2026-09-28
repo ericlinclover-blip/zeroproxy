@@ -1260,6 +1260,213 @@ def test_geodata_rejects_too_small_download(client, configured, home, monkeypatc
     assert geodata.present() is False
 
 
+def _geo_local_sources(tmp_path, size: int = 1_200_000) -> dict:
+    """file:// 假数据源 (不依赖网络)。"""
+    source = tmp_path / "geo-src-live"
+    source.mkdir()
+    for name in ("geoip.dat", "geosite.dat"):
+        (source / name).write_bytes(b"ZP" * (size // 2))
+    return {name: [(source / name).as_uri()] for name in ("geoip.dat", "geosite.dat")}
+
+
+def _wait_job(client, job_id: str, timeout: float = 30.0) -> dict:
+    import time
+
+    deadline = time.time() + timeout
+    snap: dict = {}
+    while time.time() < deadline:
+        snap = client.get(f"/api/apply/job?id={job_id}").json()
+        if snap.get("state") != "running":
+            return snap
+        time.sleep(0.05)
+    return snap
+
+
+def test_geodata_update_failure_leaves_a_visible_reason(client, configured, home, monkeypatch, tmp_path):
+    """下载失败必须留下原因 (state + 仪表盘字段 + 审计), 不能只在 toast 里闪 2 秒。
+
+    以前卡片上永远只有"数据未下载", 用户完全不知道是镜像不可达、被限流,
+    还是校验没过 —— 于是只能反复点按钮。
+    """
+    from zeroproxy import geodata
+
+    bogus = tmp_path / "bogus.dat"
+    bogus.write_bytes(b"<!doctype html>404")
+    monkeypatch.setattr(
+        geodata, "SOURCES", {name: [bogus.as_uri()] for name in geodata.MIN_BYTES}
+    )
+
+    body = client.post("/api/geodata/update").json()
+    assert body["ok"] is False
+    assert "体积异常" in body["detail"]
+
+    state = config.load_state()
+    assert "体积异常" in state["geodata"]["last_error"]
+    assert state["geodata"]["last_attempt"] > 0
+    assert "体积异常" in client.get("/api/dashboard").json()["geodata"]["last_error"]
+    assert any(e["action"] == "geodata_update_failed" for e in state["audit"])
+
+
+def test_diagnose_reports_why_geodata_is_missing(client, configured, home, monkeypatch, tmp_path):
+    """自检也要能说出"上次为什么没下下来" —— 否则用户只能反复点按钮。"""
+    from zeroproxy import geodata
+
+    bogus = tmp_path / "bogus.dat"
+    bogus.write_bytes(b"<!doctype html>404")
+    monkeypatch.setattr(
+        geodata, "SOURCES", {name: [bogus.as_uri()] for name in geodata.MIN_BYTES}
+    )
+    client.post("/api/geodata/update")
+
+    checks = {c["name"]: c for c in client.get("/api/diagnose").json()["checks"]}
+    assert "上次更新失败" in checks["GeoIP 数据"]["detail"], checks["GeoIP 数据"]
+
+
+def test_geodata_update_runs_as_background_job(client, configured, home, monkeypatch, tmp_path):
+    """下载是长任务: 接口立刻回执 + 后台任务 + 进度轮询 (和 v2.6.9 的改配置一致)。
+
+    以前是同步等: 慢线路上面板只有一句"下载中…", 而且成功后同一条请求还要重启
+    Xray —— 走本机链路访问面板的浏览器会被掐断, 用户看到的就是"下载失败"。
+    """
+    from zeroproxy import apply, geodata
+
+    monkeypatch.setenv("ZP_APPLY_ASYNC", "1")
+    monkeypatch.setattr(geodata, "SOURCES", _geo_local_sources(tmp_path))
+
+    body = client.post("/api/geodata/update").json()
+    job = body.get("job") or {}
+    assert job.get("state") == "running" and body["steps"] == [], body
+    assert job["total"] == len(geodata.SOURCES) + 1 + len(apply.STEP_NAMES), job
+
+    snap = _wait_job(client, job["id"])
+    assert snap["state"] == "done", snap
+    names = [s["name"] for s in snap["steps"]]
+    assert names[0] == "下载并校验 GeoIP 数据", names
+    assert names[1:] == list(apply.STEP_NAMES), names
+    assert all(s["ok"] for s in snap["steps"]), snap
+
+    # 数据真的落地并生效, 且上一次的失败原因被清掉
+    state = config.load_state()
+    assert state["geodata"]["files"]["geoip.dat"]["size"] == 1_200_000
+    assert state["geodata"]["last_error"] == ""
+    assert client.get("/api/dashboard").json()["geodata"]["active"] is True
+
+
+def test_geodata_update_reuses_running_job(client, configured, home, monkeypatch, tmp_path):
+    """连点两次不能撞车, 也不该弹"已有任务": 第二次接着第一个任务看同一个进度。"""
+    import threading
+
+    from zeroproxy import geodata
+
+    monkeypatch.setenv("ZP_APPLY_ASYNC", "1")
+    monkeypatch.setattr(geodata, "SOURCES", _geo_local_sources(tmp_path))
+
+    started = threading.Event()
+    release = threading.Event()
+    real_update = geodata.update
+
+    def slow_update(state, **kwargs):
+        started.set()
+        release.wait(20)
+        return real_update(state, **kwargs)
+
+    monkeypatch.setattr(geodata, "update", slow_update)
+
+    first = client.post("/api/geodata/update").json()
+    job_id = first["job"]["id"]
+    assert started.wait(10), "后台任务没起来"
+    second = client.post("/api/geodata/update").json()
+    assert second["job"]["id"] == job_id, second
+    assert "已有更新任务" in second["detail"]
+
+    release.set()
+    snap = _wait_job(client, job_id)
+    assert snap["state"] == "done", snap
+
+
+def test_geodata_update_starts_own_job_while_apply_runs(client, configured, home, monkeypatch, tmp_path):
+    """正在跑"改配置"任务时点 GeoIP 下载, 不能把那个任务当成下载任务还给前端 ——
+    否则界面显示"下载完成", 数据其实一个字节都没下。"""
+    import threading
+
+    from zeroproxy import apply, geodata
+
+    monkeypatch.setenv("ZP_APPLY_ASYNC", "1")
+    monkeypatch.setattr(geodata, "SOURCES", _geo_local_sources(tmp_path))
+
+    started = threading.Event()
+    release = threading.Event()
+    real_reapply = apply.reapply
+
+    def slow_reapply(state, timeout=0, progress=None):
+        started.set()
+        release.wait(20)          # 由定时器放开: 不能让"改配置"任务一直占着配置锁
+        return real_reapply(state, timeout=timeout, progress=progress)
+
+    monkeypatch.setattr(apply, "reapply", slow_reapply)
+
+    apply_job = client.post("/api/chain/exit", json={"action": "generate", "port": 8666}).json()["job"]
+    assert started.wait(10), "改配置任务没起来"
+    threading.Timer(0.5, release.set).start()
+
+    body = client.post("/api/geodata/update").json()
+    assert body["job"]["kind"] == "geodata", body["job"]
+    assert body["job"]["id"] != apply_job["id"], body["job"]
+
+    snap = _wait_job(client, body["job"]["id"])
+    assert snap["state"] == "done", snap
+    assert geodata.present() is True
+    _wait_job(client, apply_job["id"])          # 让改配置任务也跑完, 不留给下一个用例
+
+
+def test_geodata_update_has_an_overall_deadline(configured, home, monkeypatch):
+    """整体超时: 三个源依次 120s 等下去, 最坏能挂 12 分钟 (面板只能干等)。"""
+    import time
+
+    from zeroproxy import geodata
+
+    monkeypatch.setattr(
+        geodata, "SOURCES", {name: ["http://127.0.0.1:9/x"] for name in geodata.MIN_BYTES}
+    )
+    state = config.load_state()
+    ok, detail, _ = geodata.update(state, validate=False, deadline=time.time() - 1)
+    assert not ok and "总时间超限" in detail
+    assert "总时间超限" in state["geodata"]["last_error"]
+
+
+def test_geodata_merge_result_keeps_user_toggles(configured, home):
+    """下载在锁外跑, 期间用户改的开关不能被这份旧快照覆盖。"""
+    from zeroproxy import geodata
+
+    stale = config.load_state()
+    stale["geodata"]["enabled"] = True
+    stale["geodata"]["files"] = {"geoip.dat": {"size": 1234, "sha256": "x"}}
+
+    fresh = config.load_state()
+    fresh["geodata"]["enabled"] = False        # 用户在下载期间关掉了分流
+    fresh["geodata"]["block_ads"] = False
+    fresh["geodata"]["user_set"] = True
+
+    geodata.merge_result(fresh, stale, True)
+    assert fresh["geodata"]["files"]["geoip.dat"]["size"] == 1234
+    assert fresh["geodata"]["enabled"] is False
+    assert fresh["geodata"]["block_ads"] is False
+
+
+def test_geodata_update_conflicts_with_auto_update(client, configured, home, monkeypatch, tmp_path):
+    """后台自动更新正在下载时, 手动点按钮要明确拒绝, 不能两条路径同时写 geo 目录。"""
+    from zeroproxy import geodata
+
+    monkeypatch.setattr(geodata, "SOURCES", _geo_local_sources(tmp_path))
+    assert geodata.UPDATE_LOCK.acquire(blocking=False)
+    try:
+        response = client.post("/api/geodata/update")
+        assert response.status_code == 409
+        assert "已有更新任务" in response.json()["error"]
+    finally:
+        geodata.UPDATE_LOCK.release()
+
+
 def test_settings_reject_enabling_geodata_without_data(client, configured):
     response = client.post("/api/settings", json={"geodata_enabled": True})
     assert response.status_code == 400
