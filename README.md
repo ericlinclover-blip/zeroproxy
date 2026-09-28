@@ -66,7 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 113 项 (108 passed + 5 skipped; 带 `ZP_XRAY_BIN` 时 113 全通过) + `scripts/verify.py` (74 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (81 项) + `scripts/upgrade_sim.sh` (21 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 115 项 (110 passed + 5 skipped; 带 `ZP_XRAY_BIN` 时 115 全通过) + `scripts/verify.py` (74 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (81 项) + `scripts/upgrade_sim.sh` (21 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 
 竞品与技术调研见 `docs/RESEARCH.md`。
@@ -447,7 +447,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 
 在 macOS (Apple Silicon, Python 3.14) 上实测通过:
 
-- `python -m pytest tests -q` → **108 passed, 5 skipped** (带 `ZP_XRAY_BIN` 时 **113 passed**, 约 29 秒);
+- `python -m pytest tests -q` → **110 passed, 5 skipped** (带 `ZP_XRAY_BIN` 时 **115 passed**, 约 29 秒);
   含 `/api/update` 鉴权与版本比较、`apply` 的"写不进 /etc/nginx 即失败"语义、CLI 退出码、以及
   `install.sh` 重跑不覆盖已初始化配置 / `upgrade.sh` 随包发布 / 自签证书可补签 Let's Encrypt /
   `systemctl` 参数顺序的回归断言 / Reality 密钥必须是成对的 X25519 (Ed25519 必须判无效) /
@@ -455,7 +455,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   深度体检客户端在自签场景下不发已被 Xray 26 移除的 `allowInsecure` (改用 `pinnedPeerCertSha256`) /
   深度体检必须把 SOCKS5 回复读满 (只读 4 字节会让 TLS 报 `WRONG_VERSION_NUMBER`) /
   服务版本探测要跳过 Hysteria 2 的块字符 banner (否则面板挂一串花屏方块)。
-  链式代理另有 20 项 (`tests/test_chain.py`): 配对码往返与 8 类坏码的中文报错 /
+  链式代理另有 21 项 (`tests/test_chain.py`): 配对码往返与 8 类坏码的中文报错 /
   落地端生成-轮换-关闭与端口冲突 / **探测不通必须拦一下 (400 + needs_force), 只有 `force=1` 才硬加** /
   环境不支持探测 (无 xray 二进制) 时不该拦住用户 / 拒绝"配对码指向本机自己"与重复添加 /
   入站与出站/路由规则落在生成配置里、订阅三种格式都带上它、默认出口会把 4 个主力入站整体改道、
