@@ -134,7 +134,45 @@ async function main() {
       return img && img.complete && img.naturalWidth > 0;
     }, { timeout: 15000 });
     check("订阅二维码出图", true, await page.locator("#qr-sub").innerText());
+    const qrSvg = await page.evaluate(() => {
+      const img = document.querySelector("#qr-img");
+      const box = document.querySelector(".qr-frame").getBoundingClientRect();
+      const card = document.querySelector(".qr-modal").getBoundingClientRect();
+      const link = document.querySelector("#qr-link");
+      return {
+        svg: img.getAttribute("src").includes("img=svg"),
+        fits: box.left >= card.left - 1 && box.right <= card.right + 1,
+        clipped: link.scrollWidth > link.clientWidth + 1,   // 长链接要省略号, 不能顶出卡片
+        overflowRight: card.right > document.documentElement.clientWidth,
+        hasButtons: ["#qr-copy", "#qr-save", "#qr-close"].every((s) => !!document.querySelector(s)),
+      };
+    });
+    check("二维码走 SVG (缩放不糊)", qrSvg.svg, "");
+    check("二维码完整落在卡片内", qrSvg.fits && !qrSvg.overflowRight, "");
+    check("长链接不撑破卡片 (省略号截断)", qrSvg.clipped, "");
+    check("弹窗有复制 / 保存 / 关闭", qrSvg.hasButtons, "");
     await page.click("#qr-close");
+    check("关闭后不残留二维码", await page.evaluate(() => !document.querySelector("#qr-img").getAttribute("src")), "");
+
+    await page.locator("[data-qr='vless-xhttp']").click();
+    await page.waitForSelector("#qr-mask:not(.hidden)");
+    await page.waitForFunction(() => {
+      const img = document.querySelector("#qr-img");
+      return img && img.complete && img.naturalWidth > 0;
+    }, { timeout: 15000 });
+    const nodeQr = await page.evaluate(() => {
+      const card = document.querySelector(".qr-modal").getBoundingClientRect();
+      return {
+        sub: document.querySelector("#qr-sub").innerText,
+        title: document.querySelector("#qr-title").innerText,
+        inside: card.left >= 0 && card.right <= document.documentElement.clientWidth + 1,
+      };
+    });
+    check("节点二维码副标题是人话不是长链接", /:8445/.test(nodeQr.sub) && !nodeQr.sub.includes("://"), nodeQr.sub);
+    check("节点二维码卡片不出屏", nodeQr.inside, nodeQr.title);
+    await page.screenshot({ path: path.join(SHOT_DIR, "qr-modal.png") });
+    await page.keyboard.press("Escape");
+    check("Esc 可关二维码弹窗", await page.locator("#qr-mask.hidden").count() === 1, "");
 
     await page.click("#btn-diag");
     await page.waitForSelector("#diag-list .check", { timeout: 30000 });

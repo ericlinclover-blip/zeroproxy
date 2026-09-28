@@ -64,7 +64,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 90 项 (86 passed + 4 skipped; 带 `ZP_XRAY_BIN` 时 90 全通过) + `scripts/verify.py` (74 项) + `scripts/browser_check.cjs` (33 项) + `scripts/upgrade_sim.sh` (13 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 91 项 (87 passed + 4 skipped; 带 `ZP_XRAY_BIN` 时 91 全通过) + `scripts/verify.py` (74 项) + `scripts/browser_check.cjs` (41 项) + `scripts/upgrade_sim.sh` (13 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 
 竞品与技术调研见 `docs/RESEARCH.md`。
 
@@ -391,7 +391,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 
 在 macOS (Apple Silicon, Python 3.14) 上实测通过:
 
-- `python -m pytest tests -q` → **86 passed, 4 skipped** (带 `ZP_XRAY_BIN` 时 **90 passed**, 约 20 秒);
+- `python -m pytest tests -q` → **87 passed, 4 skipped** (带 `ZP_XRAY_BIN` 时 **91 passed**, 约 20 秒);
   含 `/api/update` 鉴权与版本比较、`apply` 的"写不进 /etc/nginx 即失败"语义、CLI 退出码、以及
   `install.sh` 重跑不覆盖已初始化配置 / `upgrade.sh` 随包发布 / 自签证书可补签 Let's Encrypt /
   `systemctl` 参数顺序的回归断言 / Reality 密钥必须是成对的 X25519 (Ed25519 必须判无效) /
@@ -408,9 +408,11 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   **启动期自愈闭环**: 配置带 geo 规则 + 数据文件消失 → 原样启动被 Xray 拒绝 (复现) → `geodata guard`
   重新生成 (已移除 geo 规则) → 再自检通过 / 备份-恢复往返一致且篡改被拒 /
   5 个节点握手探测全部成功 (Reality TLS 136ms, 出口 RTT 54ms)。
-- `scripts/browser_check.cjs` → **33/33 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
-  二维码出图、诊断 8/8、节点测速结果落到卡片、GeoIP 开关与状态、**分流模板选择器 (切换 → 订阅内容
-  真的变化 → 切回)**、备份下载、**程序更新卡片 (版本行 / 检查更新 / 非生产环境隐藏一键更新)**;
+- `scripts/browser_check.cjs` → **41/41 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
+  诊断 8/8、节点测速结果落到卡片、GeoIP 开关与状态、**分流模板选择器 (切换 → 订阅内容
+  真的变化 → 切回)**、备份下载、**程序更新卡片 (版本行 / 检查更新 / 非生产环境隐藏一键更新)**、
+  **二维码弹窗 (走 SVG 缩放不糊 / 图案完整落在卡片内 / 长链接省略号截断而不顶破卡片 /
+  复制·保存·关闭三个按钮 / 节点卡片副标题是人话不是长链接 / Esc 可关闭)**;
   无 console 错误、无失败请求。
 - `scripts/upgrade_sim.sh` → **13/13 项通过**: 在模拟的"已部署机器"上真跑 `upgrade.sh` ——
   备份 → 换代码 → 按 `state.json` 重新落地配置 (把占位配置修回真实配置) → 写 `update.json` /
@@ -468,6 +470,11 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
    第一行先打一段块字符 banner (`░█░█░█░█░█▀▀░▀█▀…`) → 面板上显示成"Hysteria 2 运行中 · ░█░█…"
    一串花屏方块。修复: 剥掉 ANSI / 块字符后优先认 `Version: v2.12.3` 这类带标签的行, banner-only
    的输出宁可显示为空也不当版本号。
+9. **二维码弹窗 (界面)**: 旧版把整条 `vless://…` 当副标题铺在卡片里 —— 长链接不换行, 直接把
+   文字顶出卡片右侧被裁掉; 位图二维码被 CSS 缩到 260px 后又糊成一团, 手机上难扫。
+   修复: 副标题改成 `XHTTP · hkk.i3.pub:8445` 这种人话摘要, 二维码改走 `?img=svg`
+   (矢量 + `shape-rendering="crispEdges"`, 缩放到任何尺寸都是硬边方块), 完整链接单独一行
+   省略号截断 + 一键复制, 并补上"保存图片"(PNG) 与 Esc 关闭。
 
 macOS 上仍无法覆盖的只有: ufw/云安全组规则、systemd 单元里的 `XRAY_LOCATION_ASSET` 生效细节
 (单元文件已写入该变量, 真机 `xray -test` 与启动均通过) 与不同客户端 App 的导入行为。

@@ -185,10 +185,27 @@ code.inline { background: var(--border); padding: 2px 7px; border-radius: 6px; f
   position: fixed; inset: 0; background: rgba(0, 0, 0, 0.55);
   display: grid; place-items: center; z-index: 50; backdrop-filter: blur(4px);
 }
-.modal { background: var(--card); border-radius: 20px; padding: 28px; max-width: 400px; width: calc(100% - 40px); text-align: center; }
+.modal {
+  background: var(--card); border-radius: 20px; padding: 26px 26px 22px; max-width: 400px;
+  width: calc(100% - 40px); text-align: center; max-height: calc(100vh - 40px); overflow: auto;
+}
 .modal h3 { margin: 0 0 6px; font-size: 17px; }
 .modal img { width: 260px; height: 260px; border-radius: 12px; margin: 14px auto; display: block; background: #fff; }
-.modal .close-row { margin-top: 14px; }
+.modal .close-row { margin-top: 14px; display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+/* 二维码弹窗: 位图被 CSS 缩放会糊, 所以走 SVG (后端 ?img=svg) 并统一留白 */
+.qr-modal { max-width: 360px; }
+.qr-sub { color: var(--sub); font-size: 12.5px; line-height: 1.5; padding: 0 4px; }
+.qr-frame {
+  background: #fff; border: 1px solid var(--border); border-radius: 18px;
+  padding: 14px; margin: 16px auto 12px; width: min(272px, 70vw);
+}
+.qr-frame img { width: 100%; height: auto; margin: 0; border-radius: 4px; }
+.qr-link {
+  font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 11.5px; color: var(--sub);
+  background: var(--border); border-radius: 9px; padding: 8px 10px; text-align: left;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.qr-tip { color: var(--sub); font-size: 11.5px; margin-top: 9px; }
 .toast {
   position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%);
   background: var(--card); color: var(--text); border: 1px solid var(--border);
@@ -379,11 +396,17 @@ code.inline { background: var(--border); padding: 2px 7px; border-radius: 6px; f
 </div>
 
 <div class="modal-mask hidden" id="qr-mask">
-  <div class="modal">
+  <div class="modal qr-modal">
     <h3 id="qr-title">二维码</h3>
-    <div class="muted" style="font-size:12.5px" id="qr-sub">手机 App 扫码导入</div>
-    <img id="qr-img" alt="QR">
-    <div class="close-row"><button class="btn ghost" id="qr-close">关闭</button></div>
+    <div class="qr-sub" id="qr-sub">手机 App 扫码导入</div>
+    <div class="qr-frame"><img id="qr-img" alt="二维码"></div>
+    <div class="qr-link" id="qr-link"></div>
+    <div class="qr-tip">扫不进就把这张图放大、或调高屏幕亮度再试; 链接可直接复制。</div>
+    <div class="close-row">
+      <button class="btn ghost small" id="qr-copy">复制链接</button>
+      <button class="btn ghost small" id="qr-save">保存图片</button>
+      <button class="btn small" id="qr-close">关闭</button>
+    </div>
   </div>
 </div>
 <div class="toast" id="toast"></div>
@@ -595,12 +618,18 @@ function renderDash(quiet) {
     (el.onclick = () => copyText(dash.subscription_formats[el.dataset.copyFmt]))
   );
   document.querySelectorAll("[data-qr-fmt]").forEach((el) =>
-    (el.onclick = () =>
-      openModal(
-        "订阅二维码",
-        dash.subscription_formats[el.dataset.qrFmt],
-        `/api/subscription/qr?size=8&format=${encodeURIComponent(el.dataset.qrFmt)}`
-      ))
+    (el.onclick = () => {
+      const fmt = el.dataset.qrFmt;
+      const q = `format=${encodeURIComponent(fmt)}`;
+      openQr({
+        title: "订阅二维码",
+        sub: `${SUB_FMT_LABEL[fmt] || fmt} 订阅 · 手机 App 扫码导入`,
+        link: dash.subscription_formats[fmt],
+        svg: `/api/subscription/qr?img=svg&${q}`,
+        png: `/api/subscription/qr?size=8&${q}`,
+        file: `zeroproxy-sub-${fmt}.png`,
+      });
+    })
   );
 
   renderTraffic(dash.traffic);
@@ -696,7 +725,15 @@ function renderNodes() {
   );
   document.querySelectorAll("[data-qr]").forEach((el) => {
     const n = dash.nodes.find((x) => x.id === el.dataset.qr);
-    el.onclick = () => openModal(`${n.name} 二维码`, n.share_link, `${n.qr_url}?size=8`);
+    el.onclick = () =>
+      openQr({
+        title: `${n.name} 二维码`,
+        sub: `${n.transport} · ${n.host}:${n.port}`,
+        link: n.share_link,
+        svg: `${n.qr_url}?img=svg`,
+        png: `${n.qr_url}?size=8`,
+        file: `zeroproxy-${n.id}.png`,
+      });
   });
   renderProbe();
 }
@@ -1219,15 +1256,42 @@ $("#btn-update").onclick = () => {
   else $("#btn-update-check").click();
 };
 
-/* ---------------- 模态 ---------------- */
-function openModal(title, sub, imgUrl) {
+/* ---------------- 二维码弹窗 ----------------
+ * 以前的弹窗把整条 vless:// 链接当副标题铺在卡片里: 长链接不换行, 直接顶出卡片
+ * 右边被裁掉, 位图二维码被缩到 260px 又糊成一团。现在: 标题下只放一句人话摘要,
+ * 二维码走 SVG (无级缩放), 完整链接单独一行截断显示 + 一键复制, 另配保存 PNG。 */
+const SUB_FMT_LABEL = { base64: "Base64", clash: "Clash", singbox: "sing-box" };
+let qrState = { link: "", png: "", file: "" };
+
+function openQr({ title, sub, link, svg, png, file }) {
   $("#qr-title").textContent = title;
-  $("#qr-sub").textContent = sub;
-  $("#qr-img").src = imgUrl;
+  $("#qr-sub").textContent = sub || "手机 App 扫码导入";
+  $("#qr-img").src = svg;
+  $("#qr-link").textContent = link;
+  $("#qr-link").title = link;
+  qrState = { link, png, file: file || "zeroproxy-qr.png" };
   $("#qr-mask").classList.remove("hidden");
 }
-$("#qr-close").onclick = () => $("#qr-mask").classList.add("hidden");
-$("#qr-mask").onclick = (e) => { if (e.target.id === "qr-mask") $("#qr-mask").classList.add("hidden"); };
+
+function closeQr() {
+  $("#qr-mask").classList.add("hidden");
+  $("#qr-img").removeAttribute("src");   // 关闭后别把二维码留在内存里
+}
+
+$("#qr-copy").onclick = () => copyText(qrState.link);
+$("#qr-save").onclick = () => {
+  const a = document.createElement("a");
+  a.href = qrState.png;
+  a.download = qrState.file;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+};
+$("#qr-close").onclick = closeQr;
+$("#qr-mask").onclick = (e) => { if (e.target.id === "qr-mask") closeQr(); };
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("#qr-mask").classList.contains("hidden")) closeQr();
+});
 
 boot();
 </script>

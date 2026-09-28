@@ -358,6 +358,24 @@ def test_qr_endpoints(client, configured):
     assert client.get("/api/nodes/nope/qr").status_code == 404
 
 
+def test_qr_endpoints_support_svg_for_screen(client, configured):
+    """面板里的二维码走矢量: 位图被 CSS 缩到卡片宽度后会糊, 手机上扫码容易失败。
+
+    同时保留 PNG 后缀行为 (「保存图片」按钮和既有调用方要位图)。
+    """
+    for url in ("/api/nodes/vless-reality/qr?img=svg",
+                "/api/subscription/qr?img=svg&format=clash"):
+        resp = client.get(url)
+        assert resp.status_code == 200, url
+        assert resp.headers["content-type"].startswith("image/svg+xml"), url
+        body = resp.content.decode()
+        assert "<svg" in body and "viewBox" in body        # 有 viewBox 才能无级缩放
+        assert 'shape-rendering="crispEdges"' in body      # 硬边方块, 不做抗锯齿
+        assert resp.headers["cache-control"] == "no-store"
+    # 未知 img 值退回 PNG (不能让"保存图片"拿到一张坏图)
+    assert client.get("/api/nodes/vless-reality/qr?img=bogus").headers["content-type"] == "image/png"
+
+
 def test_traffic_unavailable_without_xray(client, configured):
     body = client.get("/api/traffic").json()
     assert body.get("available") is not True

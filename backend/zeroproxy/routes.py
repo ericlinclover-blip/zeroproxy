@@ -27,6 +27,7 @@ import time
 import qrcode
 import qrcode.constants
 import qrcode.image.pil  # noqa: F401  (PIL 后端需显式导入)
+import qrcode.image.svg
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
@@ -1134,18 +1135,38 @@ def subscribe(token: str, request: Request, format: str = "base64", rules: str =
     return Response(body, media_type=media_type, headers=headers)
 
 
-def _qr_png(data: str, size: int = 8) -> Response:
+class _CrispSvgPathImage(qrcode.image.svg.SvgPathImage):
+    """矢量二维码: 关掉边缘抗锯齿, 放大缩小都是硬边方块 (位图缩小会糊成一片)。"""
+
+    QR_PATH_STYLE = {**qrcode.image.svg.SvgPathImage.QR_PATH_STYLE, "shape-rendering": "crispEdges"}
+
+
+def _qr_response(data: str, size: int = 8, img: str = "png") -> Response:
+    """二维码图片。
+
+    `img=png` (默认) 给"保存图片"用; `img=svg` 给屏幕显示用 —— 面板里的二维码是
+    矢量缩放的, 位图被 CSS 缩到卡片宽度后会糊成一团, 手机上扫码容易失败。
+    """
     size = max(2, min(int(size), 20))
     qc = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=size, border=2)
     qc.add_data(data)
-    img = qc.make_image(image_factory=qrcode.image.pil.PilImage)
+    headers = {"cache-control": "no-store"}
+    if (img or "png").lower() == "svg":
+        buf = io.BytesIO()
+        qc.make_image(image_factory=_CrispSvgPathImage).save(buf)
+        return Response(buf.getvalue(), media_type="image/svg+xml", headers=headers)
+    png = qc.make_image(image_factory=qrcode.image.pil.PilImage)
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return Response(buf.getvalue(), media_type="image/png", headers={"cache-control": "no-store"})
+    png.save(buf, format="PNG")
+    return Response(buf.getvalue(), media_type="image/png", headers=headers)
+
+
+def _qr_png(data: str, size: int = 8) -> Response:
+    return _qr_response(data, size, "png")
 
 
 @router.get("/api/nodes/{node_id}/qr")
-def qr(node_id: str, request: Request, size: int = 8):
+def qr(node_id: str, request: Request, size: int = 8, img: str = "png"):
     if node_id not in NODE_IDS:
         return _err("未知节点", 404)
     state = load_state()
@@ -1154,11 +1175,11 @@ def qr(node_id: str, request: Request, size: int = 8):
     link = share_links.share_links(state).get(node_id, "")
     if not link:
         return _err("节点不可用", 409)
-    return _qr_png(link, size)
+    return _qr_response(link, size, img)
 
 
 @router.get("/api/subscription/qr")
-def subscription_qr(request: Request, size: int = 8, format: str = "base64"):
+def subscription_qr(request: Request, size: int = 8, format: str = "base64", img: str = "png"):
     """订阅二维码 (前端卡片上的「二维码」按钮; 之前误把 URL 当图片地址)。"""
     state = load_state()
     if not _require_auth(state, request):
@@ -1166,4 +1187,4 @@ def subscription_qr(request: Request, size: int = 8, format: str = "base64"):
     url = share_links.subscription_url(request, state)
     if (format or "base64").lower() != "base64":
         url = f"{url}?format={format}"
-    return _qr_png(url, size)
+    return _qr_response(url, size, img)
