@@ -851,6 +851,11 @@ function toast(msg) {
   t._h = setTimeout(() => t.classList.remove("show"), 2400);
 }
 
+/* 正在跑的长耗时操作 (链式连接 / 热更新 / 测速): 计数 > 0 时暂停 20s 自动刷新。
+ * 自动刷新会整块重绘链式卡片, 把按钮的"进行中"状态和禁用状态一起冲掉 ——
+ * 用户以为没反应就会再点一次, 于是同一条链被落地两次。 */
+let opBusy = 0;
+
 /* ---------------- 重渲染时的"草稿保护" ----------------
  * 仪表盘每 20s 自动刷新一次, 而刷新是整块重画 DOM 的 (节点表 / 高级设置 /
  * 链式代理全是 innerHTML)。没有这层保护时, 用户正在填的 SNI、端口、配对码
@@ -1132,7 +1137,9 @@ async function loadDash(quiet) {
     return;
   }
   clearInterval(refreshTimer);
-  refreshTimer = setInterval(() => { if (dash) loadDash(true); }, 20000);
+  // 链式连接 / 热更新这类操作可能跑十几秒: 期间别整块重绘, 否则按钮的"进行中"
+  // 状态会被冲掉, 用户还能再点一次 (连接落地端会重复落地)
+  refreshTimer = setInterval(() => { if (dash && !opBusy) loadDash(true); }, 20000);
   // 首次进入仪表盘自动测一次速 (之后由用户点「节点测速」触发)
   if (!probeRan) { probeRan = true; runProbe(false); }
 }
@@ -1437,8 +1444,12 @@ function renderProbe() {
 /* ---------------- 顶部指标条 ----------------
  * 全部数据都来自已经拉到的 /api/dashboard 与 /api/probe, 不额外发请求。 */
 function chainEgress() {
-  const entries = (dash && dash.chain && dash.chain.entries) || [];
-  const hit = entries.find((e) => ((e.last_probe || {}).exit_ip || "").trim());
+  // 只看启用中的链路, 且优先"默认出口": 停用的那条还留着上次的探测结果,
+  // 拿它当"当前出口 IP"就是假的
+  const entries = (((dash || {}).chain || {}).entries || []).filter((e) => e.enabled);
+  const hit =
+    entries.find((e) => e.default_out && ((e.last_probe || {}).exit_ip || "").trim()) ||
+    entries.find((e) => ((e.last_probe || {}).exit_ip || "").trim());
   if (!hit) return null;
   const p = hit.last_probe || {};
   return { ip: p.exit_ip, label: hit.label || hit.host, ms: p.ms || 0 };
@@ -1995,9 +2006,17 @@ function renderChainPath(d) {
   if (!el) return;
   const c = d.chain || {};
   const ex = c.exit || {};
-  const e = (c.entries || [])[0];
+  const all = c.entries || [];
+  // 拓扑只画"活着"的那条链: 优先默认出口, 其次是第一条启用中的; 全停用就别画成通的
+  const live = all.filter((x) => x.enabled);
+  const e = live.find((x) => x.default_out) || live[0];
   const probe = (e && e.last_probe) || {};
-  const onCount = (d.nodes || []).filter((n) => n.enabled).length;
+  const onCount = (d.nodes || []).filter((n) => n.enabled && !n.chain).length;
+  const emptyMeta = all.length
+    ? `已连接的 ${all.length} 条链都处于停用状态 — 在下面打开开关即可恢复`
+    : ex.enabled
+      ? "本机开着落地端, 等另一台机器接进来"
+      : "还没接入落地端 — 在下面粘贴配对码";
 
   const client = `<div class="hop">
       <span class="who">你的设备</span><span class="id">Clash / sing-box / 手机 App</span>
@@ -2006,7 +2025,7 @@ function renderChainPath(d) {
     ? `<div class="hop accent"><span class="who">入口 · 就近加速</span><span class="id">${esc(d.domain)}:${e.local_port}</span>
         <span class="meta">${onCount} 个主力节点在这台机器上 · 客户端连它</span></div>`
     : `<div class="hop empty"><span class="who">入口 · 就近加速</span><span class="id">${esc(d.domain)}</span>
-        <span class="meta">${ex.enabled ? "本机开着落地端, 等另一台机器接进来" : "还没接入落地端 — 在下面粘贴配对码"}</span></div>`;
+        <span class="meta">${emptyMeta}</span></div>`;
   const exitHop = e
     ? `<div class="hop"><span class="who">落地 · ${esc(e.label || "出口")}</span><span class="id">${esc(e.host)}:${e.port}</span>
         <span class="meta">出口 IP ${esc(probe.exit_ip || "未探测")}${
@@ -2038,7 +2057,8 @@ function chainExitCard(d, ex) {
         <div class="field"><label>落地端口 (TCP)</label>
           <input class="mono" id="chain-exit-port" value="${ex.port || 8447}" inputmode="numeric"></div>
         <div class="field"><label>名称 (给对方看, 可留空)</label>
-          <input id="chain-exit-label" placeholder="${escAttr(d.domain)}" spellcheck="false"></div>
+          <input id="chain-exit-label" value="${escAttr(ex.label || "")}"
+            placeholder="${escAttr(d.domain)}" spellcheck="false"></div>
       </div>
       <div class="row" style="margin-top:4px">
         <button class="btn small" id="btn-chain-exit-gen">生成配对码</button>
@@ -2100,6 +2120,12 @@ function chainEntryCard(d, e) {
   let probe;
   if (!p.ts && !p.detail) {
     probe = `<span class="muted" style="font-size:12.5px">还没测过这条链 —— 点「测速」跑一次真实出口往返。</span>`;
+  } else if (p.probe_ok === false) {
+    // 环境不允许探测 (本机没有 xray 二进制): 这不是"链不通", 别标成红的
+    probe = `<span class="ping other">未测得</span>
+      <span class="muted" style="font-size:12px">${esc(p.detail || "")}${
+        p.ts ? " · " + esc(fmtTime(p.ts)) : ""
+      }</span>`;
   } else {
     const cls = p.ok ? "ok" : "bad";
     const head = p.ok
@@ -2139,6 +2165,7 @@ function chainEntryCard(d, e) {
 async function applyAction(method, path, payload, btn, busyText) {
   const original = btn ? btn.textContent : "";
   if (btn) { btn.disabled = true; if (busyText) btn.textContent = busyText; }
+  opBusy += 1;
   try {
     const opts = { method };
     if (payload !== undefined) {
@@ -2152,6 +2179,8 @@ async function applyAction(method, path, payload, btn, busyText) {
   } catch (e) {
     toast("操作失败: " + e.message);
     renderDash(true);   // 失败时按最后一次拿到的状态回灌, 别把界面留在"看起来改成功了"的样子
+  } finally {
+    opBusy -= 1;
   }
   // 控件可能已经被整体重渲染掉, 只有还留在页面上时才恢复
   if (btn && document.body.contains(btn)) {
@@ -2194,7 +2223,8 @@ function bindChainExit(ex) {
       title: "关闭落地端?",
       okLabel: "关闭 (配对码作废)",
       html: `<div class="qr-sub" style="text-align:left">本机的落地入站会下线, 配对码同时作废;
-        已连接的入口服务器那条链会不通。<br>随时可以再点「生成配对码」重新开启 (端口与凭据会重新生成)。</div>`,
+        已连接的入口服务器那条链会不通。<br>随时可以再点「生成配对码」重新开启 —— 端口沿用原来的,
+        凭据会重新生成 (旧配对码永久失效, 不会复活)。</div>`,
       onOk: () => applyAction("POST", "/api/chain/exit", { action: "disable" }, $("#btn-chain-exit-off"), "关闭中…"),
     });
 }
@@ -2214,6 +2244,7 @@ async function connectChain(force) {
   };
   btn.disabled = true;
   btn.textContent = force ? "强制连接中…" : "连接并测试中…";
+  opBusy += 1;
   try {
     const res = await fetch("/api/chain/entries", {
       method: "POST",
@@ -2248,10 +2279,18 @@ async function connectChain(force) {
     $("#chain-default-out").checked = false;
     renderDash(true);
     const probe = (body.steps || []).find((s) => s.name.indexOf("链路测试") === 0) || {};
-    toast(probe.ok === false ? "已添加, 但链路测试没通过: " + String(probe.detail || "").slice(0, 60) : "链路已接通, 订阅里已多出这个节点");
+    if (probe.skipped) {
+      toast("已添加; 本机缺少 xray 二进制, 没能做链路测试 —— 可稍后点「测速」复验");
+    } else if (probe.ok === false) {
+      toast("已添加, 但链路测试没通过: " + String(probe.detail || "").slice(0, 60));
+    } else {
+      toast("链路已接通, 订阅里已多出这个节点");
+    }
   } catch (e) {
     toast("连接失败: " + e.message);
     if (document.body.contains(btn)) { btn.disabled = false; btn.textContent = "连接并测试"; }
+  } finally {
+    opBusy -= 1;
   }
 }
 

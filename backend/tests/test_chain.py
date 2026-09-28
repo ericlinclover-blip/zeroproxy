@@ -142,6 +142,7 @@ def test_code_rejects_fields_that_would_break_reality():
         ({**base, "uuid": "nope"}, "UUID"),
         ({**base, "sni": "no"}, "SNI"),
         ({**base, "sid": "zzzz"}, "shortId"),
+        ({**base, "sid": "abc"}, "shortId"),        # 奇数长度: Xray hex 解码必失败
         ({**base, "flow": "xtls-rprx-direct"}, "flow"),
         ({**base, "pbk": base64.urlsafe_b64encode(b"short").decode().rstrip("=")}, "公钥长度"),
         ({**base, "pbk": "!!!!"}, "公钥"),
@@ -150,6 +151,17 @@ def test_code_rejects_fields_that_would_break_reality():
         with pytest.raises(chain.CodeError) as exc:
             chain.parse_code(chain.make_code(**fields))
         assert hint in str(exc.value), (fields, str(exc.value))
+
+
+def test_code_accepts_even_length_short_ids():
+    """奇数长度 shortId 会让整份 Xray 配置构建失败, 偶数长度 (含空) 都是合法的。"""
+    from zeroproxy import crypto
+
+    _, public_key, _ = crypto.new_reality_keys()
+    for sid in ("", "ab", "abcdef12"):
+        code = chain.make_code(host="1.2.3.4", port=443, uuid=str(uuid_mod.uuid4()),
+                               pbk=public_key, sid=sid, sni="www.cloudflare.com")
+        assert chain.parse_code(code)["sid"] == sid
 
 
 # ---------------------------------------------------------------- 落地端 (本机当出口)
@@ -200,6 +212,51 @@ def test_exit_port_conflicts_and_bad_action(client, configured):
     again = client.post("/api/chain/exit",
                         json={"action": "generate", "port": 8777, "label": "改过名"}).json()
     assert again["chain"]["exit"]["port"] == 8777 and again["chain"]["exit"]["label"] == "改过名"
+
+
+def test_exit_rejects_ipv6_host(client, configured):
+    """本机用 IPv6 初始化时, 配对码装不下这个地址 —— 生成时就该拦下说清楚。
+
+    parse_code 只认域名 / IPv4, 否则生成出来的码对方一律解析失败; 与其发出去一条
+    "看着成功、粘过去报格式不对"的码, 不如当场提示换域名 / IPv4。
+    """
+    state = config.load_state()
+    state["domain"] = "2001:db8::1"
+    config.save_state(state)
+
+    response = client.post("/api/chain/exit", json={"action": "generate", "port": 8666})
+    assert response.status_code == 400, response.text
+    assert "IPv6" in response.json()["error"]
+    # 没生成成功 → 不能留下"看起来已开启"的落地端
+    assert client.get("/api/dashboard").json()["chain"]["exit"]["enabled"] is False
+
+
+def test_exit_disable_revokes_code_for_good(client, configured):
+    """关闭落地端 = 配对码永久作废: 重新开启不会让旧码复活 (端口与名称沿用)。
+
+    面板上「关闭」的确认框写着"配对码作废 / 凭据会重新生成"; 如果重新开启时复用
+    同一份 UUID, 泄露出去的旧码就会在开关一次之后重新能用 —— 与承诺不符。
+    """
+    first = client.post("/api/chain/exit",
+                        json={"action": "generate", "port": 8666, "label": "香港落地"}).json()
+    first_uuid = chain.parse_code(first["chain"]["exit"]["code"])["uuid"]
+
+    off = client.post("/api/chain/exit", json={"action": "disable"}).json()["chain"]["exit"]
+    assert off["enabled"] is False and off["code"] == ""
+    assert off["port"] == 8666 and off["label"] == "香港落地"   # 端口与名称留着, 方便原样重开
+
+    # 前端重新开启时会把回填的端口 / 名称一起发回来
+    again = client.post("/api/chain/exit",
+                        json={"action": "generate", "port": off["port"], "label": off["label"]}).json()
+    ex = again["chain"]["exit"]
+    assert ex["enabled"] is True and ex["port"] == 8666 and ex["label"] == "香港落地"
+    assert chain.parse_code(ex["code"])["uuid"] != first_uuid          # 旧码永久失效
+    # 停用期间端口必须真的处于"该关闭"清单里 (重启后要复查它不再监听)
+    from zeroproxy import apply
+
+    client.post("/api/chain/exit", json={"action": "disable"})
+    closed = [label for _, _, label in apply._ports_that_must_be_closed(config.load_state())]
+    assert "链式落地端入站" in closed
 
 
 # ---------------------------------------------------------------- 入口端 (连到落地)
@@ -273,7 +330,18 @@ def test_entry_probe_gate_and_force(client, configured, monkeypatch):
         lambda target, timeout=10.0: {"ok": False, "probe_ok": False, "ms": None,
                                       "exit_ip": "", "detail": "TCP 可达, 但本机没有 xray 二进制"},
     )
-    assert client.post("/api/chain/entries", json={"code": other}).status_code == 200
+    untested = client.post("/api/chain/entries", json={"code": other})
+    assert untested.status_code == 200
+    # "没测成"不是"没通过": 这一步不该在面板上标红, 但要留下 skipped 说明
+    step = next(s for s in untested.json()["steps"] if s["name"].startswith("链路测试"))
+    assert step["ok"] is True and step["skipped"] is True
+    got = next(e for e in untested.json()["chain"]["entries"] if e["host"] == "198.51.100.7")
+    assert got["last_probe"]["probe_ok"] is False and got["last_probe"]["ok"] is False
+    # 同一个判断也要用在「测速」按钮上
+    probed = client.post(f"/api/chain/entries/{got['id']}/probe")
+    assert probed.status_code == 200
+    assert probed.json()["steps"][0]["skipped"] is True
+    assert probed.json()["steps"][0]["ok"] is True
 
 
 def test_entry_rejects_bad_codes_and_self(client, configured, monkeypatch):
@@ -302,6 +370,44 @@ def test_entry_local_port_conflict(client, configured, monkeypatch):
     res = client.post("/api/chain/entries",
                       json={"code": _fake_code(config.load_state()), "local_port": taken})
     assert res.status_code == 400 and "占用" in res.json()["error"]
+
+
+def test_entry_names_stay_unique_in_subscriptions(client, configured, monkeypatch):
+    """两条链取同一个名字时, 订阅里的节点名必须自动区分开。
+
+    客户端把节点名当代理名 / 出站 tag: Clash 会丢掉重名项、sing-box 直接报
+    duplicate tag, 整份订阅都导不进来 —— 所以落地时就要把名字去重。
+    """
+    monkeypatch.setattr(chain, "probe_target", _ok_probe())
+    ids = []
+    for host in ("203.0.113.70", "203.0.113.71"):
+        res = client.post("/api/chain/entries",
+                          json={"code": _fake_code(config.load_state(), host=host, label="美国落地")})
+        assert res.status_code == 200, res.text
+        ids.append(res.json()["chain"]["entries"][-1]["id"])
+
+    state = config.load_state()
+    names = [share_links.chain_node_name(e) for e in state["chain"]["entries"]]
+    assert len(set(names)) == 2, names
+    assert names[0] == "ZeroProxy 链式 · 美国落地" and names[1].startswith("ZeroProxy 链式 · 美国落地 (")
+
+    # 三种订阅里都不能出现重名
+    import yaml
+
+    clash = yaml.safe_load(_sub(client, configured, "clash").text)
+    clash_names = [p["name"] for p in clash["proxies"]]
+    assert len(set(clash_names)) == len(clash_names), clash_names
+    singbox = json.loads(_sub(client, configured, "singbox").text)
+    tags = [o["tag"] for o in singbox["outbounds"]]
+    assert len(set(tags)) == len(tags), tags
+    b64 = unquote(base64.b64decode(_sub(client, configured).text).decode())
+    assert names[0] in b64 and names[1] in b64
+
+    # 改名撞上已有名称时同样要自动区分
+    body = client.post(f"/api/chain/entries/{ids[1]}", json={"label": "日本落地"}).json()
+    assert [e["label"] for e in body["chain"]["entries"]][1] == "日本落地"
+    body = client.post(f"/api/chain/entries/{ids[1]}", json={"label": "美国落地"}).json()
+    assert [e["label"] for e in body["chain"]["entries"]] == ["美国落地", "美国落地 (2)"]
 
 
 def test_entry_toggle_default_and_delete(client, configured, monkeypatch):

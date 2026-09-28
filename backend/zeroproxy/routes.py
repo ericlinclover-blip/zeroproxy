@@ -886,9 +886,16 @@ def chain_exit(payload: ChainExitIn, request: Request):
             if not exit_cfg.get("enabled"):
                 return _err("落地端当前就是关闭的")
             exit_cfg["enabled"] = False
-            changed = ["关闭落地端 (入站已下线, 配对码作废)"]
+            # 关闭 = 连凭据一起作废: 否则重新开启后, 之前发出去的旧配对码会"复活"
+            # (端口保留, 所以 _ports_that_must_be_closed 仍会盯着这个端口确认已关闭)
+            exit_cfg["uuid"] = str(uuid_mod.uuid4())
+            changed = ["关闭落地端 (入站已下线, 配对码作废且不会复用)"]
         else:
             changed = []
+            # 本机地址 (域名 / IPv4) 会被原样写进配对码; IPv6 装不下, 当场说清
+            host_error = chain.exit_host_error(state)
+            if host_error:
+                return _err(host_error)
             port = int(payload.port or exit_cfg.get("port") or chain.DEFAULT_EXIT_PORT)
             if not 1 <= port <= 65535:
                 return _err("端口需在 1-65535 之间")
@@ -972,6 +979,8 @@ def chain_entry_add(payload: ChainEntryIn, request: Request):
 
     # 探测放在锁外面: 起临时客户端 + 真实出网要好几秒, 不该把整个面板卡住
     probe = chain.probe_target(target)
+    # probe_ok=False 表示"本机环境没法做这个测试"(没有 xray 二进制), 与"配错了连不通"不是一回事
+    probe_ran = bool(probe.get("probe_ok", True))
     if not probe.get("ok") and probe.get("probe_ok", True) and not payload.force:
         return JSONResponse(
             {"error": probe.get("detail") or "链路测试没通过", "probe": probe, "needs_force": True},
@@ -983,7 +992,9 @@ def chain_entry_add(payload: ChainEntryIn, request: Request):
         if not _require_auth(state, request):
             return _err("未登录", 401)
         entries = state.setdefault("chain", {}).setdefault("entries", [])
-        label = (payload.label or target["label"] or target["host"]).strip()[:40]
+        label = chain.unique_label(
+            entries, payload.label or target["label"] or target["host"], target["host"]
+        )
         entry = {
             "id": chain.new_id(),
             "label": label,
@@ -1018,9 +1029,11 @@ def chain_entry_add(payload: ChainEntryIn, request: Request):
         steps.append(
             {
                 "name": "链路测试 (真实出口往返)",
-                "ok": bool(probe.get("ok")),
+                # 环境不支持探测不算失败 (与 apply 里"跳过"步骤的约定一致)
+                "ok": bool(probe.get("ok")) or not probe_ran,
                 "detail": probe.get("detail") or "",
                 "ms": int(probe.get("ms") or 0),
+                "skipped": not probe_ran,
             }
         )
         steps.append(
@@ -1079,7 +1092,12 @@ def chain_entry_update(entry_id: str, payload: ChainEntryPatch, request: Request
                 else f"{label} 取消默认出口"
             )
         if payload.label is not None:
-            new_label = payload.label.strip()[:40]
+            new_label = chain.unique_label(
+                (state.get("chain") or {}).get("entries") or [],
+                payload.label,
+                str(entry.get("host") or ""),
+                keep_id=str(entry.get("id") or ""),
+            )
             if new_label and new_label != (entry.get("label") or ""):
                 entry["label"] = new_label
                 changed.append(f"名称改为「{new_label}」")
@@ -1125,12 +1143,15 @@ def chain_entry_probe(entry_id: str, request: Request):
         config.audit(state, "chain_probe", f"{label}: {'ok' if probe.get('ok') else 'failed'}", actor=_client_ip(request))
         save_state(state)
         body = _dashboard_body(state, request)
+        probe_ran = bool(probe.get("probe_ok", True))
         body["steps"] = [
             {
                 "name": f"链路测速 · {label}",
-                "ok": bool(probe.get("ok")),
+                # 没有 xray 二进制时这一步只是"没测成", 不该在面板上标红
+                "ok": bool(probe.get("ok")) or not probe_ran,
                 "detail": probe.get("detail") or "",
                 "ms": int(probe.get("ms") or 0),
+                "skipped": not probe_ran,
             }
         ]
         return body

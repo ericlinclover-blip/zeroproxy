@@ -99,6 +99,47 @@ def is_host(value: str) -> bool:
     return bool(_IPV4_RE.match(value) or _DOMAIN_RE.match(value))
 
 
+def exit_host_error(state: dict) -> str:
+    """本机地址能不能当"落地地址"写进配对码 —— 不能就返回给用户看的原因。
+
+    配对码里的地址既要是对方能连的, 也要能通过 `parse_code` 的校验: 本机如果是
+    IPv6 (面板允许用 IPv6 初始化), 生成出来的码对方一律解析失败, 不如当场说清。
+    """
+    host = str(state.get("domain") or "").strip()
+    if not host:
+        return "本机还没有域名 / IP, 无法生成配对码"
+    if not is_host(host):
+        return (
+            f"本机地址 {host} 不是域名或 IPv4 —— 配对码里放不下 IPv6 地址, "
+            "请给落地端一个域名 (或在面板里改用 IPv4 重新初始化)"
+        )
+    return ""
+
+
+def node_label(entry: dict) -> str:
+    """条目在订阅 / 客户端里的显示名 (没填名称就回退到落地地址)。"""
+    return (entry.get("label") or "").strip() or str(entry.get("host") or "")
+
+
+def unique_label(entries: list[dict], label: str, host: str, keep_id: str = "") -> str:
+    """给链式条目挑一个不与其它条目重名的名称。
+
+    客户端把节点名当代理名 / 出站 tag: 两条链同名时 Clash(mihomo) 会丢掉重复项、
+    sing-box 直接报 duplicate tag —— 整个订阅都导不进来。所以重名时自动加序号后缀
+    (后缀加在 34 字符以内, 保证截断后仍然唯一)。
+    """
+    base = (label or "").strip()[:40]
+    mine = base or host
+    taken = {node_label(e) for e in entries if e.get("id") != keep_id}
+    if mine not in taken:
+        return base
+    for n in range(2, 100):
+        candidate = f"{mine[:34]} ({n})"
+        if candidate not in taken:
+            return candidate
+    return f"{mine[:36]} ({keep_id or 'x'})"[:40]  # pragma: no cover - 兜底
+
+
 # ---------------------------------------------------------------- 配对码
 
 def make_code(
@@ -167,8 +208,10 @@ def parse_code(text: str) -> dict:
         raise CodeError(f"配对码里的端口不合法: {port}")
     if not _UUID_RE.match(uid):
         raise CodeError("配对码里的 UUID 不合法 (需要标准 UUID 格式)")
-    if not _HEX_RE.match(sid):
-        raise CodeError("配对码里的 shortId 不合法 (应为不超过 16 位的十六进制)")
+    # shortId 是十六进制串, 且长度必须是偶数 —— Xray 会 hex 解码, 奇数长度会让
+    # **整份配置**构建失败 (不是这一个入站连不上), 所以必须在粘贴时就挡住。
+    if not _HEX_RE.match(sid) or len(sid) % 2:
+        raise CodeError("配对码里的 shortId 不合法 (应为不超过 16 位、长度为偶数的十六进制)")
     if not _DOMAIN_RE.match(sni):
         raise CodeError(f"配对码里的伪装 SNI 不合法: {sni or '(空)'}")
     if flow not in FLOWS:
