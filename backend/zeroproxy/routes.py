@@ -279,9 +279,9 @@ def setup(payload: SetupIn, request: Request):
         steps = _steps_recorder()
 
         def step_keys(state, t=0):
-            # 1. 密钥材料: VLESS UUID 派生 / Reality ed25519 密钥对 / 订阅令牌
+            # 1. 密钥材料: VLESS UUID 派生 / Reality X25519 密钥对 / 订阅令牌
             r = state["reality"]
-            if not r["private_key"]:
+            if not crypto.reality_key_valid(r["private_key"], r["public_key"]):
                 r["private_key"], r["public_key"], r["short_id"] = crypto.new_reality_keys()
             state["uuid"] = crypto.derive_uuid(username, password)
             state["subscription_token"] = state["subscription_token"] or crypto.new_token()
@@ -1040,6 +1040,8 @@ async def restore(request: Request):
     for key in ("uuid", "subscription_token", "domain"):
         if not restored.get(key):
             return _err(f"备份缺少必填字段: {key}")
+    # 只要求密钥存在: 旧备份里的 Ed25519 密钥对会在下面的 _reapply 里被自动换成
+    # 合法的 X25519 (见 apply.ensure_reality_keys)
     if not restored["reality"].get("private_key") or not restored["reality"].get("public_key"):
         return _err("备份缺少 Reality 密钥对")
     if not restored["admin"].get("username") or not restored["admin"].get("password_hash"):

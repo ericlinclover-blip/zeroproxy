@@ -347,7 +347,7 @@ def test_diagnose_reports_checks(client, configured):
 
 def test_repair_regenerates_configs(client, configured):
     body = client.post("/api/repair").json()
-    assert [s["name"] for s in body["steps"]][0] == "重新生成 Xray 配置"
+    assert [s["name"] for s in body["steps"]][:2] == ["校验 Reality 密钥", "重新生成 Xray 配置"]
     assert all(s["ok"] for s in body["steps"]), body["steps"]
 
 
@@ -429,6 +429,89 @@ def test_xray_config_with_real_binary(client, configured, home, monkeypatch):
     xray_config.write_xray_config(config.load_state())
     ok, detail = services.xray_config_test()
     assert ok, detail
+
+
+# ---------------------------------------------------------------- Reality 密钥体系
+
+def _legacy_ed25519_pair() -> tuple[str, str]:
+    """复刻 v2.3.2 及更早版本 crypto.new_reality_keys() 的产物 (Ed25519)。"""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding,
+        NoEncryption,
+        PrivateFormat,
+        PublicFormat,
+    )
+
+    key = Ed25519PrivateKey.generate()
+    private_key = base64.urlsafe_b64encode(
+        key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
+    ).decode().rstrip("=")
+    public_key = base64.urlsafe_b64encode(
+        key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+    ).decode().rstrip("=")
+    return private_key, public_key
+
+
+def test_reality_keys_are_paired_x25519(home):
+    """回归: REALITY 只认 X25519, 且服务端私钥必须与下发客户端的 pbk 是同一对。
+
+    历史 bug: 用 Ed25519 生成密钥 → 服务端与订阅里的 pbk 对不上 → Xray 每次握手
+    都失败 (客户端日志 "received real certificate", 疑似 MITM), 而服务一直是
+    active、面板显示"运行中" —— 4 个 TCP 节点全不通, 只有 Hysteria 2 可达。
+    """
+    from zeroproxy import crypto
+
+    private_key, public_key, short_id = crypto.new_reality_keys()
+    assert crypto.reality_public_from_private(private_key) == public_key
+    assert crypto.reality_key_valid(private_key, public_key)
+    assert len(private_key) == 43 and len(public_key) == 43   # base64url 无填充的 32B
+    assert len(short_id) == 8
+
+    legacy_private, legacy_public = _legacy_ed25519_pair()
+    assert not crypto.reality_key_valid(legacy_private, legacy_public)
+    assert not crypto.reality_key_valid(public_key, public_key)      # 公私钥错位
+    assert not crypto.reality_key_valid("!!!not-base64!!!", public_key)
+    assert not crypto.reality_key_valid("", public_key)
+    assert not crypto.reality_key_valid(private_key, "")
+
+
+def test_apply_migrates_legacy_reality_keys(client, home, configured):
+    """旧 state 里的 Ed25519 密钥对必须在落地时被自动换成 X25519 (升级即自愈)。"""
+    from zeroproxy import apply, crypto
+
+    state = config.load_state()
+    state["reality"]["private_key"], state["reality"]["public_key"] = _legacy_ed25519_pair()
+    state["reality"]["short_id"] = "a1b2c3d4"
+    config.save_state(state)
+
+    steps = apply.reapply(state)
+
+    assert steps[0]["name"] == "校验 Reality 密钥" and steps[0]["ok"] is True
+    assert "X25519" in steps[0]["detail"] and "重新生成" in steps[0]["detail"]
+    assert crypto.reality_key_valid(state["reality"]["private_key"], state["reality"]["public_key"])
+    assert state["reality"]["short_id"] == "a1b2c3d4"        # sid 本身合法, 保留原值
+
+    # 幂等: 已经是合法密钥时不动它 (否则每次落地都换 pbk, 客户端订阅白拉)
+    again = apply.reapply(state)
+    assert again[0]["ok"] is True and "有效" in again[0]["detail"]
+
+
+@pytest.mark.skipif(not os.environ.get("ZP_XRAY_BIN"), reason="需要真实 xray 二进制 (ZP_XRAY_BIN)")
+def test_reality_keys_match_real_xray(home, monkeypatch):
+    """最硬的校验: 用真实 `xray x25519 -i <私钥>` 反推公钥, 必须与 state 里的 pbk 一致。"""
+    import subprocess
+
+    from zeroproxy import crypto, services
+
+    binary = services.bin_path("xray")
+    private_key, public_key, _ = crypto.new_reality_keys()
+    proc = subprocess.run(
+        [binary, "x25519", "-i", private_key], capture_output=True, text=True, timeout=30
+    )
+    assert proc.returncode == 0, proc.stderr
+    line = next(l for l in proc.stdout.splitlines() if "PublicKey" in l)
+    assert line.split(":", 1)[1].strip() == public_key
 
 
 # ---------------------------------------------------------------- 节点延迟探测
@@ -842,6 +925,7 @@ def test_apply_reapply_persists_steps(client, configured, home):
     state = config.load_state()
     steps = apply.reapply(state)
     assert [s["name"] for s in steps] == [
+        "校验 Reality 密钥",
         "重新生成 Xray 配置",
         "重新生成 Nginx 配置",
         "重新生成 Hysteria 2 配置",

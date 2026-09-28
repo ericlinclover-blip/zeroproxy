@@ -21,7 +21,7 @@ import os
 import sys
 import time
 
-from . import config, hysteria_config, nginx_config, services, xray_config
+from . import config, crypto, hysteria_config, nginx_config, services, xray_config
 from .config import XRAY_NODE_IDS, load_state, paths, save_state
 
 
@@ -59,6 +59,29 @@ def gen_xray(state: dict, timeout: int = 0) -> tuple[bool, str]:
             return False, f"已生成但 xray -test 未通过: {' '.join(out.split())[:150]}"
         return True, f"已生成 ({count} 个入站, xray -test 通过)"
     return True, f"已生成 ({count} 个入站)"
+
+
+def ensure_reality_keys(state: dict, timeout: int = 0) -> tuple[bool, str]:
+    """落地前保证 state 里是一对有效的 X25519 Reality 密钥对。
+
+    v2.3.2 及更早的 `new_reality_keys()` 误用 Ed25519 生成密钥, 而 REALITY 只认
+    X25519 → 服务端私钥与订阅下发的 `pbk` 对不上, 四个 TCP 节点全部握手失败
+    (服务却一直是 active, 面板显示"运行中")。升级到 v2.3.3 后跑一次落地即可自愈,
+    不必重装、也不必手动改 state.json。
+
+    密钥被替换时订阅 URL 不变 (UUID / 令牌都没动), 客户端重新拉一次订阅即可。
+    """
+    reality = state["reality"]
+    if crypto.reality_key_valid(reality.get("private_key", ""), reality.get("public_key", "")):
+        return True, "Reality 密钥对有效 (X25519)"
+    private_key, public_key, short_id = crypto.new_reality_keys()
+    reality["private_key"] = private_key
+    reality["public_key"] = public_key
+    reality["short_id"] = reality.get("short_id") or short_id
+    return True, (
+        "检测到无效的 Reality 密钥对 (旧版 Ed25519, REALITY 需要 X25519) → "
+        "已重新生成, 客户端需重新拉取订阅"
+    )
 
 
 def gen_nginx(state: dict, timeout: int = 0) -> tuple[bool, str]:
@@ -172,6 +195,7 @@ def verify_listeners(state: dict, timeout: int = 0) -> tuple[bool, str]:
 def reapply(state: dict, timeout: int = 0) -> list[dict]:
     """完整闭环: 重新生成三份配置 → 校验 → 重载服务 → 验证端口。"""
     steps = steps_recorder()
+    add_step(steps, "校验 Reality 密钥", ensure_reality_keys, state)
     add_step(steps, "重新生成 Xray 配置", gen_xray, state)
     add_step(steps, "重新生成 Nginx 配置", gen_nginx, state)
     add_step(steps, "重新生成 Hysteria 2 配置", gen_hysteria, state)

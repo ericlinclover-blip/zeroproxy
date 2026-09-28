@@ -121,7 +121,7 @@ DEFAULTS: dict = {
     # 由 用户名+密码 确定性派生的 VLESS UUID (同一凭据始终得到同一 UUID)
     "uuid": "",
     "reality": {
-        "private_key": "",   # base64url(32B ed25519 seed)
+        "private_key": "",   # base64url(32B X25519 私钥, 见 crypto.new_reality_keys)
         "public_key": "",    # base64url(32B 公钥)
         "short_id": "",      # hex, 客户端 sid
         "dest": DEFAULT_REALITY_DEST,
