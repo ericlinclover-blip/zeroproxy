@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import errno
 import json
 import os
 import shutil
@@ -1473,6 +1474,104 @@ def test_settings_reject_enabling_geodata_without_data(client, configured):
     response = client.post("/api/settings", json={"geodata_enabled": True})
     assert response.status_code == 400
     assert "GeoIP" in response.json()["error"]
+
+
+def test_geodata_staging_stays_on_the_target_filesystem(client, configured, home, monkeypatch, tmp_path):
+    """下载的临时文件必须建在 geo 目录里 (同一个文件系统)。
+
+    用户的 "更新失败: OSError: [Errno 18] Invalid cross-device link:
+    '/tmp/zp-geo-dl-xxx/geoip.dat' -> '/opt/zeroproxy/geo/geoip.dat'" 就是它 ——
+    那台机器的 /tmp 是单独挂载 (tmpfs / 容器 overlay), 从那里 os.replace 到 geo
+    目录跨了文件系统, 于是下载成功也一步都落不了地。
+    """
+    from zeroproxy import config, geodata
+
+    monkeypatch.setattr(geodata, "SOURCES", _geo_local_sources(tmp_path))
+    geo = os.path.realpath(str(config.paths()["geo_dir"]))
+    staging_dirs: list[str] = []
+    real_fetch = geodata._fetch
+
+    def spy(name, dst, *args, **kwargs):
+        staging_dirs.append(os.path.dirname(dst))
+        return real_fetch(name, dst, *args, **kwargs)
+
+    monkeypatch.setattr(geodata, "_fetch", spy)
+    body = client.post("/api/geodata/update").json()
+    assert body["ok"] is True, body
+    assert staging_dirs, "没抓到下载路径"
+    assert all(os.path.dirname(os.path.realpath(d)) == geo for d in staging_dirs), staging_dirs
+    # 收工后不留临时目录 (中断过的下载由下一次 update 开头清掉)
+    left = [n for n in os.listdir(geo) if n.startswith(".zp-geo-dl-")]
+    assert left == [], left
+
+
+def test_geodata_update_prunes_stale_staging(client, configured, home, monkeypatch, tmp_path):
+    """中断的下载 (面板被升级/杀掉) 会留下几十 MB 的临时目录, 下一次下载顺手收掉。"""
+    import time as _time
+
+    from zeroproxy import config, geodata
+
+    monkeypatch.setattr(geodata, "SOURCES", _geo_local_sources(tmp_path))
+    geo = config.paths()["geo_dir"]
+    stale = os.path.join(geo, ".zp-geo-dl-stale")
+    os.makedirs(os.path.join(stale, "part"), exist_ok=True)
+    old = _time.time() - 7200
+    os.utime(stale, (old, old))
+
+    body = client.post("/api/geodata/update").json()
+    assert body["ok"] is True, body
+    assert not os.path.exists(stale)
+
+
+def test_geodata_job_records_unexpected_exception_in_state(client, configured, home, monkeypatch):
+    """update() 抛异常 (而不是 return False) 时, 失败原因也要落到 state 和诊断里。
+
+    用户的 Errno 18 就属于这一类: 面板当时只弹了一句 toast, 卡片和"一键诊断"
+    里都查不到 —— 回头再看只剩"数据未下载"。
+    """
+    from zeroproxy import geodata
+
+    monkeypatch.setenv("ZP_APPLY_ASYNC", "1")
+
+    def boom(*_args, **_kwargs):
+        raise OSError(errno.EXDEV, "Invalid cross-device link", "/tmp/x/geoip.dat", "/opt/zeroproxy/geo/geoip.dat")
+
+    monkeypatch.setattr(geodata, "update", boom)
+    body = client.post("/api/geodata/update").json()
+    snap = _wait_job(client, body["job"]["id"])
+    assert snap["state"] == "failed", snap
+    assert "cross-device" in snap["error"], snap
+
+    state = config.load_state()
+    assert "cross-device" in state["geodata"]["last_error"], state["geodata"]
+    actions = [e["action"] for e in state.get("audit", [])]
+    assert "geodata_update_failed" in actions, actions
+    checks = {c["name"]: c for c in client.get("/api/diagnose").json()["checks"]}
+    assert "上次更新失败" in checks["GeoIP 数据"]["detail"], checks["GeoIP 数据"]
+
+
+def test_atomic_install_falls_back_when_replace_cannot_cross_devices(tmp_path, monkeypatch):
+    """兜底路径: 万一 staging 还是在别的文件系统上, 也要落地成功而不是报 Errno 18。"""
+    from zeroproxy import geodata
+
+    src = tmp_path / "other-fs" / "geoip.dat"
+    src.parent.mkdir()
+    src.write_bytes(b"NEW" * 10)
+    dst = tmp_path / "geo" / "geoip.dat"
+    dst.parent.mkdir()
+    dst.write_bytes(b"OLD")
+
+    real_replace = os.replace
+
+    def fake_replace(old, new, *args, **kwargs):
+        if str(old).startswith(str(src.parent)):
+            raise OSError(errno.EXDEV, "Invalid cross-device link", str(old), str(new))
+        return real_replace(old, new, *args, **kwargs)
+
+    monkeypatch.setattr(geodata.os, "replace", fake_replace)
+    geodata.atomic_install(str(src), str(dst))
+    assert dst.read_bytes() == b"NEW" * 10
+    assert [p.name for p in dst.parent.iterdir()] == ["geoip.dat"]      # 不留临时名
 
 
 def test_nginx_conf_never_leaves_home_outside_prod(configured, home, monkeypatch, tmp_path):

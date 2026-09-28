@@ -1876,6 +1876,20 @@ def _run_geo_job(job_id: str, actor: str) -> None:
     except Exception as exc:  # noqa: BLE001 — 后台任务不能把异常吞成"静默失败"
         error = f"{type(exc).__name__}: {exc}"
         steps = steps or [{"name": "下载并校验 GeoIP 数据", "ok": False, "detail": error, "ms": 0}]
+        # 意外异常 (不是 update 自己 return False 的那种失败) 走不到上面的存档路径,
+        # 但失败原因一样要落地: 否则 toast 闪 2.4 秒之后, 卡片上只剩"数据未下载",
+        # 用户完全不知道发生了什么。用户的 "OSError: [Errno 18] Invalid
+        # cross-device link" 就属于这一类 —— 它没被记进 state, 所以面板上查不到。
+        try:
+            with config.locked():
+                broken = load_state()
+                geo = broken.setdefault("geodata", {})
+                geo["last_attempt"] = int(time.time())
+                geo["last_error"] = error[:300]
+                config.audit(broken, "geodata_update_failed", error[:190], actor=actor)
+                save_state(broken)
+        except Exception:  # noqa: BLE001 — 连原因都存不下来时, 也不能再炸一次
+            pass
     finally:
         _GEO_UPDATE_LOCK.release()
     _finish_job(job_id, steps, error)

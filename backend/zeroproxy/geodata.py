@@ -18,9 +18,11 @@ GitHub Release 资产在国内网络常不可达, 因此按"多镜像顺序回�
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -272,6 +274,60 @@ def _source_label(url: str) -> str:
     return url.split("/")[2] if "//" in url else url
 
 
+def atomic_install(src: str, dst: str) -> None:
+    """把一个临时文件换到 dst 的位置 (同名覆盖, 不会留半个文件)。
+
+    同盘时 `os.replace` 就是原子的 rename(2)。但**跨文件系统**时它直接报
+    `OSError: [Errno 18] Invalid cross-device link` —— 这正是 v2.6.14 用户报的
+    "更新失败: OSError: [Errno 18] ... '/tmp/zp-geo-dl-xxx/geoip.dat' ->
+    '/opt/zeroproxy/geo/geoip.dat'": 那台机器的 /tmp 是另一套挂载 (tmpfs /
+    容器 overlay), 于是每次下载都卡在最后一步 —— 下载明明成功了, 却一步都落不了地。
+
+    现在 staging 目录就建在目标目录里 (见 `update`), 正常根本走不到这条分支;
+    这里再兜一层: 跨盘时改成"先拷到同目录的临时名, 再 rename"。拷贝过程中 dst
+    始终是旧文件, rename 之后才是新文件 —— 对读方 (Xray) 依然是原子的。
+    """
+    try:
+        os.replace(src, dst)
+        return
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+    tmp = f"{dst}.zp-new-{os.getpid()}"
+    try:
+        shutil.copyfile(src, tmp)
+        os.replace(tmp, dst)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _prune_stale_staging(target: str, max_age: float = 3600.0) -> None:
+    """清掉上一次被中断的下载留在 geo 目录里的 staging 目录。
+
+    面板在下载途中被重启 (升级 / 崩溃 / 用户重启服务) 时, TemporaryDirectory 的
+    清理不会执行, 一个 28 MB 的临时目录就留在那儿了。这里在下一次下载开始时顺手
+    收掉 (UPDATE_LOCK 保证不会有别的下载正在用, 1 小时也远超 180s 的总超时)。
+    """
+    now = time.time()
+    try:
+        names = os.listdir(target)
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith(".zp-geo-dl-"):
+            continue
+        path = os.path.join(target, name)
+        try:
+            if now - os.path.getmtime(path) > max_age:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            continue
+
+
 def update(
     state: dict,
     *,
@@ -292,6 +348,7 @@ def update(
     """
     target = geo_dir()
     os.makedirs(target, exist_ok=True)
+    _prune_stale_staging(target)
     geo = state.setdefault("geodata", {})
     geo["last_attempt"] = int(time.time())
     geo["last_error"] = ""
@@ -312,7 +369,10 @@ def update(
     details: list[str] = []
     meta: dict[str, dict] = {}
 
-    with tempfile.TemporaryDirectory(prefix="zp-geo-dl-") as staging:
+    # staging 建在**目标目录里** (而不是 /tmp): 最后一步是把文件 rename 到位, 而
+    # rename 不能跨文件系统。有些机器的 /tmp 是单独挂载 (tmpfs / 容器 overlay),
+    # 从那里搬过来就是 Errno 18 (见 atomic_install 的说明)。
+    with tempfile.TemporaryDirectory(prefix=".zp-geo-dl-", dir=target) as staging:
         for index, name in enumerate(names, 1):
             dst = os.path.join(staging, name)
 
@@ -344,7 +404,7 @@ def update(
             details.append(detail)
 
         for name in names:
-            os.replace(os.path.join(staging, name), file_path(name))
+            atomic_install(os.path.join(staging, name), file_path(name))
 
     geo["files"] = {name: {"size": m["size"], "sha256": m["sha256"]} for name, m in meta.items()}
     geo["updated_at"] = int(time.time())

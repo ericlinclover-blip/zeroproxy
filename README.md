@@ -66,7 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 150 项 (145 passed + 5 skipped; 带 `ZP_XRAY_BIN` 时 150 全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (100 项) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 154 项 (149 passed + 5 skipped; 带 `ZP_XRAY_BIN` 时 154 全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (100 项) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 | **看得懂的界面 (v2.6.0)** | 控制台布局: 左侧锚点导航 (带计数角标 + 滚动高亮) + 顶部指标条 (健康节点 / 落地出口 IP / 平均延迟 + 迷你折线 / 运行时长) + 节点密集表格 (名称 / 地址状态 / **握手延迟条** / **上下行双轨** / 开关与复制) + **流量卡 (双弧圆环 + 实时速率曲线 + 逐节点双色流量条)** + 链式链路拓扑 (你的设备 → 本机入口 → 落地端) + 程序更新闭环; 动效全部走 `transform`/自绘 rAF 并受 `prefers-reduced-motion` 约束 |
 
@@ -715,6 +715,49 @@ v2.6.12 把下载改成后台任务之后, 用户反馈"点击下载/更新 GeoI
 全程没有提前报成功 / 按钮保持"下载中…" / 跑完给的是「GeoIP 数据已更新并生效」/ 卡片刷成
 `0 天前更新 · 分流已启用` / 结论留 4 秒后进度条收起、按钮复位), 短跑 `ZP_SLOW_SECS=5` 为 3/3。
 
+### 8.12 v2.6.15: 终于抓到那句报错了 —— `OSError: [Errno 18] Invalid cross-device link`
+
+用户贴出了 toast 原文:
+
+```
+更新失败: OSError: [Errno 18] Invalid cross-device link:
+  '/tmp/zp-geo-dl-16xolgmr/geoip.dat' -> '/opt/zeroproxy/geo/geoip.dat'
+```
+
+**根因**: 下载是"先落到临时目录, 校验收全后再 rename 到位"的, 而临时目录建在 `tempfile` 的默认位置
+(`/tmp`)。`rename(2)` **不能跨文件系统** —— 有些机器的 `/tmp` 是单独挂载 (tmpfs, 或容器里的
+overlay 层), 于是 `os.replace()` 直接从 `/tmp` 搬到 `/opt/zeroproxy/geo` 就报 `Errno 18`:
+**下载全程成功, 最后一步一步都落不了地**。这也解释了为什么之前的排查在面板那台机器上"怎么试都正常"
+(`/tmp` 与 `/opt` 在同一个文件系统上, 复现不出来), 而用户每次点都失败。
+
+复现与验证 (用一块 ramdisk 充当"另一个文件系统", 同一份数据跑两版代码):
+
+| | 代码 | `TMPDIR` | 结果 |
+|---|---|---|---|
+| A | v2.6.14 (线上跑的) | ramdisk | `OSError: [Errno 18] Cross-device link: '/Volumes/ZPEXDEV/zp-geo-dl-814c84uh/geoip.dat' -> '…/geo/geoip.dat'` |
+| B | 本次修复 | ramdisk | `update ok: True` — `geoip.dat 1171 KiB; geosite.dat 1171 KiB`, 两个文件都到位 |
+
+**改法** (两处):
+
+1. **staging 目录建在目标目录里** (`tempfile.TemporaryDirectory(dir=geo_dir())`), 于是
+   `os.replace` 永远是同盘 rename —— 既保留了"要么旧文件要么新文件"的原子性, 也不再需要把 28 MB
+   抄来抄去;
+2. **兜底 `atomic_install()`**: 万一 staging 还是在别的文件系统上 (有人改了 `TMPDIR`、挂载点变了),
+   捕获 `errno.EXDEV` 后退化成"先拷到目标同目录的临时名, 再 rename", 而不是把 `Errno 18` 甩给用户。
+
+顺带修掉两个让这条报错"查不出原因"的缺陷:
+
+* **意外异常没落进 state**: `update()` 自己 `return False` 的失败会被写进 `geodata.last_error`,
+  但**抛异常**的失败 (Errno 18 就是) 走的是 `_run_geo_job` 的兜底分支, 那条路径以前只把错误交给
+  任务表 —— toast 闪 2.4 秒之后, 卡片上只剩"数据未下载", 诊断里也查不到。现在抛异常同样写
+  `last_error` + `geodata_update_failed` 审计;
+* **中断的下载会留垃圾**: 面板在下载途中被升级/重启时 `TemporaryDirectory` 的清理不执行, 一个
+  几十 MB 的临时目录就留在 `geo/` 里。下一次下载开始时会顺手收掉超过 1 小时的残留。
+
+回归: `pytest` 150 → **154 项** (149 passed + 5 skipped, 新增 4 条: staging 必须在 geo 目录里 +
+中断残留会被清掉 + `atomic_install` 的 EXDEV 兜底 + 抛异常也要落进 state 与诊断); 同一条
+`scripts/geo_slow_check.cjs` 复跑不变。
+
 ---
 
 ## 9. API
@@ -811,7 +854,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 
 在 macOS (Apple Silicon, Python 3.14) 上实测通过:
 
-- `python -m pytest tests -q` → **145 passed, 5 skipped** (带 `ZP_XRAY_BIN` 时 **150 passed**, 约 31 秒);
+- `python -m pytest tests -q` → **149 passed, 5 skipped** (带 `ZP_XRAY_BIN` 时 **154 passed**, 约 31 秒);
   含 `/api/update` 鉴权与版本比较、`apply` 的"写不进 /etc/nginx 即失败"语义、CLI 退出码、以及
   `install.sh` 重跑不覆盖已初始化配置 / `upgrade.sh` 随包发布 / 自签证书可补签 Let's Encrypt /
   `systemctl` 参数顺序的回归断言 / Reality 密钥必须是成对的 X25519 (Ed25519 必须判无效) /
@@ -845,6 +888,9 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   出口 IP 药丸单行不折成三行 / 测速等按钮不压到探测结果上且不越出卡片。
   v2.6.14 再补 2 项 (见 8.11): 下载撞上后台自动更新时给的是「先等一下 … 请稍等再点」而不是「更新失败」 /
   这之后按钮自己恢复可用 (不再卡在"下载中…")。
+  v2.6.15 再补 4 项 (见 8.12): 下载的 staging 必须建在 geo 目录里 (跨文件系统 rename 会 Errno 18) /
+  中断的下载残留会被下一次下载清掉 / `atomic_install` 跨盘时的拷贝兜底 / `update()` 抛异常时失败原因
+  也要落进 state 与「一键诊断」。
 - `scripts/verify.py` (Xray 26.3.27 + Hysteria 2.12.3 + mihomo 1.19.31 + sing-box 1.14.2) → **77/77 项通过**:
   setup 8 步全绿 / 三种订阅格式可被真实客户端解析 / 三档分流模板分别被 `mihomo -t` 与
   `sing-box check` 通过 / **用真实 sing-box 实跑** 5 份订阅 (通用 + 1.14+ 写法 × 智能/全局/直连) 全部启动成功,
