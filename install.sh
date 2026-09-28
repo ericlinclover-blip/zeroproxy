@@ -94,7 +94,9 @@ case "$ARCH" in
   arm64) XRAY_ASSET_PAT="Xray-linux-arm64(-v8a)?\\.zip$" ;;
   *)     XRAY_ASSET_PAT="Xray-linux-64\\.zip$" ;;
 esac
-XRAY_URL="$(printf '%s' "$XRAY_JSON" | grep -oE '"browser_download_url": *"[^"]+"' | sed -E 's/.*"([^"]+)"$/\\1/' | grep -E "$XRAY_ASSET_PAT" | head -1)"
+# 注意: 这里是单引号包裹的 sed 脚本, 必须写 \1; 写成 \\1 会替换成字面量 "\1",
+# 后面的 grep 一个都匹配不到 → 在 pipefail 下静默退出, 连"下载失败"提示都打不出来。
+XRAY_URL="$(printf '%s' "$XRAY_JSON" | grep -oE '"browser_download_url": *"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/' | grep -E "$XRAY_ASSET_PAT" | head -1 || true)"
 [ -n "$XRAY_URL" ] || XRAY_URL="$GH/XTLS/Xray-core/releases/download/v${XRAY_DL_VERSION}/Xray-linux-$( [ "$ARCH" = "arm64" ] && echo arm64-v8a || echo 64 ).zip"
 rm -f /tmp/xray.zip
 wget -q -O /tmp/xray.zip "$XRAY_URL" || fail "Xray 下载失败: $XRAY_URL"
@@ -107,7 +109,7 @@ ok "Xray $(/usr/local/bin/xray version 2>/dev/null | head -1 || echo installed)"
 info "下载 Hysteria 2 ..."
 HY_JSON="$(curl -fsSL --max-time 20 "$GH_API/repos/apernet/hysteria/releases/latest" || true)"
 HY_TAG="$(printf '%s' "$HY_JSON" | grep -oP '"tag_name":\\s*"\\Kv?[^"]+' | head -1 || true)"
-HY_URL="$(printf '%s' "$HY_JSON" | grep -oE '"browser_download_url": *"[^"]+"' | sed -E 's/.*"([^"]+)"$/\\1/' | grep -E "hysteria-linux-${ARCH}(-v[0-9]+(\\.[0-9]+)*)?(\\.tar\\.gz)?$" | head -1)"
+HY_URL="$(printf '%s' "$HY_JSON" | grep -oE '"browser_download_url": *"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/' | grep -E "hysteria-linux-${ARCH}(-v[0-9]+(\\.[0-9]+)*)?(\\.tar\\.gz)?$" | head -1 || true)"
 [ -n "$HY_URL" ] || HY_URL="$GH/apernet/hysteria/releases/download/${HY_TAG:-v1.1.5}/hysteria-linux-${ARCH}.tar.gz"
 HY_TAG="${HY_TAG#v}"; HY_TAG="${HY_TAG:-1.1.5}"
 if wget -q -O /tmp/hysteria-dl "$HY_URL"; then
