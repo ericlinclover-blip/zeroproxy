@@ -6,7 +6,24 @@
 一条命令从空服务器到可用节点:
 
 ```bash
-curl -fsSL https://<raw-host>/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/install.sh | bash
+```
+
+网络受限时可用镜像源 (内容相同), 或指定分支 / 版本:
+
+```bash
+# jsDelivr 镜像 (国内通常更快)
+curl -fsSL https://cdn.jsdelivr.net/gh/ericlinclover-blip/zeroproxy@main/install.sh | bash
+
+# 指定版本或分支, 或改用 fork / 自建镜像
+ZP_REF=v2.2 bash -c "$(curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/install.sh)"
+ZP_REPO=your-name/zeroproxy ZP_REF=main bash -c "$(curl -fsSL https://raw.githubusercontent.com/your-name/zeroproxy/main/install.sh)"
+```
+
+已经 clone 了仓库的话, 直接跑本地脚本即可 (会自动走「本地代码目录」路径, 不再下载仓库):
+
+```bash
+sudo bash install.sh
 ```
 
 终端会输出形如 `https://<服务器IP>:8899/?token=xxxx` 的地址 (引导阶段自签证书) →
@@ -373,8 +390,14 @@ systemd 单元中的生效 (单元文件已写入该变量, 但只在 Linux 上�
 # 查看服务日志
 journalctl -u xray -n 50 --no-pager         # 也可用面板 GET /api/logs/xray
 
-# 升级核心 (也可指定版本回退)
-XRAY_VERSION=24.11.30 bash install.sh       # install.sh 可重复执行
+# 升级 / 重装面板 (install.sh 可重复执行, 不会动 data/ 里的密钥与订阅令牌)
+curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/install.sh | bash
+
+# 指定 Xray 版本 (回退), 或指定面板分支 / tag
+XRAY_VERSION=24.11.30 ZP_REF=main bash -c "$(curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/install.sh)"
+
+# 只更新面板代码 (已经 clone 了仓库时)
+sudo bash install.sh
 
 # 备份 / 恢复 (两种方式任选)
 #   1) 面板「系统 → 下载备份」得到 JSON (带校验和, 换机可一键还原)
@@ -387,7 +410,8 @@ curl -X POST --cookie 'zp_session=...' https://<域名>:8899/api/geodata/update
 ls -la /opt/zeroproxy/geo/            # geoip.dat / geosite.dat
 
 # 卸载 (保留数据: ZP_KEEP_DATA=1; 保留证书: ZP_KEEP_CERT=1)
-bash /opt/zeroproxy/uninstall.sh
+bash /opt/zeroproxy/uninstall.sh            # 安装时已随面板一起放到 $ZP_HOME
+curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/uninstall.sh | bash
 ```
 
 ---

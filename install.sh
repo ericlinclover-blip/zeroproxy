@@ -3,7 +3,13 @@
 #  ZeroProxy 一键部署脚本  —  Ubuntu / Debian
 #
 #  用法 (服务器上, root):
-#    curl -fsSL https://<raw-host>/install.sh | bash
+#    curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/install.sh | bash
+#
+#  可覆盖的变量:
+#    ZP_REPO=owner/repo      改用 fork / 镜像仓库 (默认 ericlinclover-blip/zeroproxy)
+#    ZP_REF=main|v2.2        指定分支或 tag (默认取最新 release, 仓库无 release 时用 main)
+#    ZP_PORT=8899            面板端口
+#    XRAY_VERSION=24.11.30   指定 Xray 版本 (默认 latest)
 #
 #  完成后终端输出面板地址 https://<IP>:8899 (自签证书, 浏览器需点一次"继续访问"),
 #  浏览器打开 → 输入 域名/用户名/密码 → 一键生成全部配置。
@@ -17,6 +23,9 @@ XRAY_BIN="/usr/local/bin/xray"
 HYSTERIA_BIN="/usr/local/bin/hysteria"
 GH="https://github.com"
 GH_API="https://api.github.com"
+# 面板核心来源: 默认官方仓库; 远程安装时从这里拉取 tarball。
+ZP_REPO="${ZP_REPO:-ericlinclover-blip/zeroproxy}"
+ZP_DEFAULT_REF="${ZP_DEFAULT_REF:-main}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
 info() { printf '\033[1;34m[ZeroProxy]\033[0m %s\n' "$*"; }
@@ -119,28 +128,80 @@ rm -f /tmp/hysteria-dl /tmp/hysteria
 info "安装面板核心 → $ZP_HOME ..."
 mkdir -p "$ZP_HOME"/{xray,hysteria,data,www,certs,nginx,panel,geo}
 
-if [ -f "$SCRIPT_DIR/backend/zeroproxy/main.py" ]; then
-  # 从代码仓库 checkout 直接安装
-  cp -r "$SCRIPT_DIR/backend/zeroproxy" "$ZP_HOME/zeroproxy"
-  cp -r "$SCRIPT_DIR/backend/static" "$ZP_HOME/static"
-  cp "$SCRIPT_DIR/backend/requirements.txt" "$ZP_HOME/requirements.txt"
-  cp "$SCRIPT_DIR"/systemd/*.service /etc/systemd/system/
-  [ -f "$SCRIPT_DIR/uninstall.sh" ] && cp "$SCRIPT_DIR/uninstall.sh" "$ZP_HOME/uninstall.sh"
+# 解析要安装的版本: ZP_REF 优先; 否则取最新 release tag; 仓库没有 release 时退回默认分支。
+resolve_zp_ref() {
+  if [ -n "${ZP_REF:-}" ]; then
+    printf '%s' "$ZP_REF"
+    return 0
+  fi
+  local tag=""
+  tag="$(curl -fsSL --max-time 20 "$GH_API/repos/$ZP_REPO/releases/latest" 2>/dev/null \
+    | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1 || true)"
+  printf '%s' "${tag:-$ZP_DEFAULT_REF}"
+}
+
+# 下载并校验仓库 tarball: tag → 分支 → API tarball 三级兜底。
+# 用 curl (-f 让 404 立刻失败): 实测 wget 遇到 404 会重试到超时, 失败时要多等好几分钟。
+# GitHub 对 tag 会剥掉前导 v 且不同 ref 的顶层目录名不同, 所以统一用 tar 列表定位目录。
+fetch_zp_tarball() {
+  local out="$1" ref="$2" url err
+  err="$(mktemp)"
+  for url in \
+    "$GH/$ZP_REPO/archive/refs/tags/$ref.tar.gz" \
+    "$GH/$ZP_REPO/archive/refs/heads/$ref.tar.gz" \
+    "$GH_API/repos/$ZP_REPO/tarball/$ref"
+  do
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL --connect-timeout 10 --max-time 120 -o "$out" "$url" 2>"$err" || { rm -f "$out"; continue; }
+    else
+      wget -q --timeout=30 --tries=1 -O "$out" "$url" 2>"$err" || { rm -f "$out"; continue; }
+    fi
+    if tar -tzf "$out" >/dev/null 2>&1; then
+      rm -f "$err"
+      return 0
+    fi
+    rm -f "$out"
+  done
+  # 三级都失败: 只把最后一次的真实报错留给调用方打印, 避免满屏 404/重定向噪声
+  ZP_DL_ERR="$(tail -1 "$err" 2>/dev/null || true)"
+  rm -f "$err"
+  return 1
+}
+
+if [ -f "$SCRIPT_DIR/backend/zeroproxy/main.py" ] && [ -d "$SCRIPT_DIR/systemd" ]; then
+  info "检测到本地代码目录, 直接安装: $SCRIPT_DIR"
+  SRC_DIR="$SCRIPT_DIR"
 else
-  # 远程安装: 下载仓库 tarball (需可访问 GitHub)
-  ZP_REPO="${ZP_REPO:-owner/zeroproxy}"
-  ZP_TAG="${ZP_TAG:-v1.0.0}"
+  # 远程安装 (curl | bash): 下载仓库 tarball, 需服务器能访问 GitHub
+  ZP_REF_RESOLVED="$(resolve_zp_ref)"
+  info "从 GitHub 下载面板核心 ($ZP_REPO @ $ZP_REF_RESOLVED) ..."
   rm -f /tmp/zp.tar.gz
-  wget -q -O /tmp/zp.tar.gz "$GH/$ZP_REPO/archive/refs/tags/$ZP_TAG.tar.gz" || fail "面板核心下载失败"
-  tar -xzf /tmp/zp.tar.gz -C /tmp
-  SRC_DIR="$(find /tmp -maxdepth 1 -name "$(basename "$ZP_REPO")-$ZP_TAG" -o -maxdepth 1 -name "${ZP_REPO#*/}-$ZP_TAG" | head -1)"
-  [ -n "$SRC_DIR" ] || fail "解压失败"
-  cp -r "$SRC_DIR/backend/zeroproxy" "$ZP_HOME/zeroproxy"
-  cp -r "$SRC_DIR/backend/static" "$ZP_HOME/static"
-  cp "$SRC_DIR/backend/requirements.txt" "$ZP_HOME/requirements.txt"
-  cp "$SRC_DIR"/systemd/*.service /etc/systemd/system/
-  rm -rf /tmp/zp.tar.gz "$SRC_DIR"
+  rm -rf /tmp/zp-src
+  if ! fetch_zp_tarball /tmp/zp.tar.gz "$ZP_REF_RESOLVED"; then
+    fail "面板核心下载失败: $ZP_REPO @ $ZP_REF_RESOLVED
+       原因: ${ZP_DL_ERR:-无法访问 GitHub}
+       可指定镜像或版本后重试: ZP_REPO=owner/repo ZP_REF=main bash install.sh"
+  fi
+  mkdir -p /tmp/zp-src
+  tar -xzf /tmp/zp.tar.gz -C /tmp/zp-src
+  SRC_DIR="$(find /tmp/zp-src -mindepth 1 -maxdepth 1 -type d | head -1)"
+  [ -n "$SRC_DIR" ] || fail "解压失败: /tmp/zp.tar.gz"
 fi
+
+[ -f "$SRC_DIR/backend/zeroproxy/main.py" ] || fail "代码目录不完整 (缺少 backend/zeroproxy/main.py): $SRC_DIR"
+
+# 先清掉旧代码再拷贝, 保证脚本可重复执行 (否则 cp -r 会套出 zeroproxy/zeroproxy)
+rm -rf "$ZP_HOME/zeroproxy" "$ZP_HOME/static"
+cp -r "$SRC_DIR/backend/zeroproxy" "$ZP_HOME/zeroproxy"
+cp -r "$SRC_DIR/backend/static" "$ZP_HOME/static"
+cp "$SRC_DIR/backend/requirements.txt" "$ZP_HOME/requirements.txt"
+rm -rf "$ZP_HOME/zeroproxy/__pycache__" "$ZP_HOME/zeroproxy"/*/__pycache__
+cp "$SRC_DIR"/systemd/*.service /etc/systemd/system/
+if [ -f "$SRC_DIR/uninstall.sh" ]; then
+  cp "$SRC_DIR/uninstall.sh" "$ZP_HOME/uninstall.sh"
+fi
+rm -rf /tmp/zp.tar.gz /tmp/zp-src
+ok "面板核心已就位 ($(basename "$ZP_REPO") @ ${ZP_REF_RESOLVED:-本地目录})"
 
 info "创建 Python 虚拟环境并安装依赖 ..."
 python3 -m venv "$ZP_HOME/venv"
