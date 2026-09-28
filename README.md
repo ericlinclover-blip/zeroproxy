@@ -66,7 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 150 项 (145 passed + 5 skipped; 带 `ZP_XRAY_BIN` 时 150 全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (100 项) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 150 项 (145 passed + 5 skipped; 带 `ZP_XRAY_BIN` 时 150 全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (100 项) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 | **看得懂的界面 (v2.6.0)** | 控制台布局: 左侧锚点导航 (带计数角标 + 滚动高亮) + 顶部指标条 (健康节点 / 落地出口 IP / 平均延迟 + 迷你折线 / 运行时长) + 节点密集表格 (名称 / 地址状态 / **握手延迟条** / **上下行双轨** / 开关与复制) + **流量卡 (双弧圆环 + 实时速率曲线 + 逐节点双色流量条)** + 链式链路拓扑 (你的设备 → 本机入口 → 落地端) + 程序更新闭环; 动效全部走 `transform`/自绘 rAF 并受 `prefers-reduced-motion` 约束 |
 
@@ -709,6 +709,12 @@ v2.6.12 把下载改成后台任务之后, 用户反馈"点击下载/更新 GeoI
 「等一下」而不是「更新失败」/ 这之后按钮自己恢复可用); `pytest` 149 → **150 项通过** (145 passed + 5 skipped,
 新增一条: 非生产环境绝不写 `/etc/nginx/conf.d/` 的 nginx 配置)。
 
+另外新增 `scripts/geo_slow_check.cjs` (+ `scripts/geo_slow_panel.py`): 起一个"GeoIP 下载要 150 秒"的
+本地面板, 用真实浏览器在**第 135 秒**采样 —— 这条线才是这次真正要钉住的东西 (旧版此时早已收工并报过
+成功)。实测 150s 场景 **6/6 项通过** (t=135s 进度条仍在 `第 2/9 步 · 下载 geosite.dat · 已用 135.3s` /
+全程没有提前报成功 / 按钮保持"下载中…" / 跑完给的是「GeoIP 数据已更新并生效」/ 卡片刷成
+`0 天前更新 · 分流已启用` / 结论留 4 秒后进度条收起、按钮复位), 短跑 `ZP_SLOW_SECS=5` 为 3/3。
+
 ---
 
 ## 9. API
@@ -785,6 +791,11 @@ python3 scripts/verify.py
 # ZP_CHROME_PATH 可选: 指定 Chromium 可执行文件 (Playwright 自带的浏览器版本对不上缓存时用)
 ZP_NODE_PATH=/path/to/node_modules \
 ZP_CHROME_PATH="/path/to/Chromium" node scripts/browser_check.cjs
+
+# 长任务前端验证: 起一个"GeoIP 下载要 150 秒"的面板, 钉住"前端 2 分钟就放弃"那类缺陷
+# (默认约 3 分钟; ZP_SLOW_SECS=5 只看收尾, 约 15 秒)
+ZP_NODE_PATH=/path/to/node_modules ZP_PYTHON=/path/to/python \
+ZP_CHROME_PATH="/path/to/Chromium" node scripts/geo_slow_check.cjs
 
 # 一键升级演练: 造一台"已部署的假机器", 用桩二进制真跑 upgrade.sh
 # (不需要 root / systemd; 覆盖正常升级 + 下载失败自动回滚两条路径)
