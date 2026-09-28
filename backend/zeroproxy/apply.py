@@ -97,7 +97,10 @@ def restart_services(state: dict, timeout: int = 0) -> tuple[bool, str]:
     results: list[str] = []
 
     def run(name: str, fn, t: int) -> None:
-        ok, detail = fn(t)
+        # 注意参数顺序: restart_service(name, timeout) / reload_service(name, timeout)。
+        # 曾经的写法是 fn(t) —— 把 timeout 当服务名传下去, 生产环境下 systemctl 直接抛
+        # "expected str, bytes or os.PathLike object, not int", 而面板当时把失败吞掉了。
+        ok, detail = fn(name, t)
         mark = "✓" if ok else ("↷" if "跳过" in detail else "✗")
         results.append(f"{name} {mark} {detail}")
 

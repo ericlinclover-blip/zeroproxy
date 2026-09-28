@@ -842,6 +842,29 @@ def test_apply_reapply_persists_steps(client, configured, home):
     assert (home / "xray" / "config.json").is_file()
 
 
+def test_apply_restart_services_uses_correct_systemctl_args(client, configured, monkeypatch):
+    """回归: 曾经把 timeout 当服务名传下去 (fn(t) 而不是 fn(name, t)), 生产环境必炸 ——
+    本地 dry-run 看不到, 因为非生产环境直接"跳过"。"""
+    from zeroproxy import apply, services
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, timeout=120, env=None):
+        calls.append(list(cmd))
+        return True, "ok"
+
+    monkeypatch.setattr(services, "is_prod", lambda: True)
+    monkeypatch.setattr(services, "run", fake_run)
+    ok, detail = apply.restart_services(config.load_state(), timeout=90)
+
+    assert ok is True, detail
+    assert ["systemctl", "restart", "xray"] in calls
+    assert ["systemctl", "restart", "hysteria2"] in calls
+    assert ["systemctl", "reload", "nginx"] in calls
+    # 关键: 命令里不允许出现非字符串 (即被误当成服务名传下去的 timeout)
+    assert all(isinstance(arg, str) for cmd in calls for arg in cmd), calls
+
+
 def test_apply_cli_reports_failure_as_nonzero(configured, home, monkeypatch, capsys):
     from zeroproxy import apply, nginx_config, services
 
