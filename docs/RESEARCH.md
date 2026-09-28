@@ -168,7 +168,8 @@ Xray 的 VLESS/Trojan 用 `user:pass@` 是 **HTTP Basic 风格的 URI 语法糖*
 3. **无 Docker 交付** — 目前是 Shell 一行部署, 未提供镜像。
 4. **无多域名/多证书** — 单域名单证书。
 5. **IPv6 未专门处理** — 双栈环境需手动确认。
-6. **无核心二进制自动更新** — Xray / Hysteria 需重跑 `install.sh` 升级。
+6. **核心二进制更新非自动 (opt-in)** — 面板「一键更新」只换面板代码; 要连 Xray / Hysteria 2
+   一起升到最新, 需显式给 `upgrade.sh` 加 `ZP_UPDATE_CORE=1` (默认不执行, 避免动到正在跑的内核)。
 
 ### 已补齐 (本轮)
 
@@ -193,6 +194,6 @@ Xray 的 VLESS/Trojan 用 `user:pass@` 是 **HTTP Basic 风格的 URI 语法糖*
   release 分支 (每日构建); 客户端侧数据源 [MetaCubeX/meta-rules-dat](https://github.com/MetaCubeX/meta-rules-dat)。
 - sing-box 源码: `option/route.go` / `option/options.go` / `option/http.go` (v1.14.2),
   `docs/configuration/route/*` 与 `docs/configuration/shared/http-client*` (字段版本号与语义)。
-- 端到端复现: 见仓库 `scripts/verify.py` (真实内核 **74/74**) 与 `backend/tests/` (**52 项**)。
+- 端到端复现: 见仓库 `scripts/verify.py` (真实内核 **74/74**) 与 `backend/tests/` (**133 项**: 128 通过 / 5 跳过, 跳过多为 Linux 专属校验)。
 
 原始取数结果保存在开发机的 `/tmp/zp-bin/competitors.json` (临时文件, 不入库)。
