@@ -373,6 +373,86 @@ def test_traffic_tags_include_enabled_chain_entries(client, configured, monkeypa
     assert f"chain-{entry['id']}" not in services.traffic_tags(config.load_state())
 
 
+def _fake_http_over_socks5(parts: list[bytes], expect_host: bytes = b"echo.test"):
+    """假 SOCKS5 + 分片 HTTP 响应 (每段之间隔 50ms, 模拟真实 TCP 分段)。"""
+    import socket
+    import threading
+    import time
+
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+
+    def recv_exact(conn, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = conn.recv(n - len(buf))
+            if not chunk:
+                break
+            buf += chunk
+        return buf
+
+    def serve():
+        conn, _ = server.accept()
+        conn.settimeout(3)
+        try:
+            recv_exact(conn, 3)
+            conn.sendall(b"\x05\x00")
+            recv_exact(conn, 4 + 1 + len(expect_host) + 2)
+            conn.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+            try:
+                conn.recv(4096)          # 读掉 HTTP 请求
+            except OSError:
+                pass
+            for index, part in enumerate(parts):
+                if index:
+                    time.sleep(0.05)
+                conn.sendall(part)
+            time.sleep(0.2)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return server.getsockname()[1], server
+
+
+def test_socks5_http_get_reads_full_body():
+    """出口 IP 的正文可能被拆成多个 TCP 分段 —— 只凭"正文非空"收工会把 IP 截断。
+
+    真机踩到过: 落地服务器的 IPv6 出口地址被读成 `2401:1fe0:6` 这样的半截, 面板上
+    显示的"落地出口 IP"就是错的 (看起来像格式怪异的地址, 实际是被截断)。
+    """
+    from zeroproxy import services
+
+    body = b"2401:1fe0:600:1234:5678:9abc:def0:1234"
+    head = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n"
+    port, server = _fake_http_over_socks5([head + body[:12], body[12:]])
+    try:
+        text, detail = services.socks5_http_get(port, "echo.test", 80, "/", 3)
+    finally:
+        server.close()
+    assert text == body.decode(), (text, detail)
+
+
+def test_socks5_http_get_handles_chunked_body():
+    """分块传输的回显服务 (ifconfig.me/ip 就是) 也要还原成完整 IP, 不能带 chunk 头。"""
+    from zeroproxy import services
+
+    body = b"2401:1fe0:600:1234:5678:9abc:def0:1234"
+    chunked = b"".join(
+        f"{len(part):x}\r\n".encode() + part + b"\r\n" for part in (body[:10], body[10:])
+    ) + b"0\r\n\r\n"
+    head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+    port, server = _fake_http_over_socks5([head + chunked[:18], chunked[18:]])
+    try:
+        text, detail = services.socks5_http_get(port, "echo.test", 80, "/", 3)
+    finally:
+        server.close()
+    assert text == body.decode(), (text, detail)
+
+
 def test_diagnose_flags_unreachable_exit(client, configured, monkeypatch):
     from zeroproxy import services
 

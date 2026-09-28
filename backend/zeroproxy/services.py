@@ -661,6 +661,24 @@ def _socks5_tls_probe(proxy_port: int, host: str, port: int, timeout: float = 8.
                 pass
 
 
+def _dechunk(raw: bytes) -> bytes:
+    """把 HTTP/1.1 chunked 正文还原 (有的回显服务用分块传输)。"""
+    out = bytearray()
+    while raw:
+        line, sep, rest = raw.partition(b"\r\n")
+        if not sep and not rest:
+            break
+        try:
+            size = int(line.split(b";", 1)[0].strip(), 16)
+        except ValueError:
+            return bytes(out) if out else raw          # 不是分块正文, 原样返回
+        if size == 0:
+            break
+        out += rest[:size]
+        raw = rest[size + 2:] if len(rest) >= size + 2 else b""
+    return bytes(out)
+
+
 def socks5_http_get(
     proxy_port: int, host: str, port: int = 80, path: str = "/", timeout: float = 8.0
 ) -> tuple[str, str]:
@@ -668,6 +686,10 @@ def socks5_http_get(
 
     链式代理"落地出口 IP"就是靠这个读回来的 —— 走的是真实数据面, 因此顺带
     把整条链 (客户端 → 本机入站 → 落地端 → 目标站) 都验证了一遍。
+
+    正文必须读完整: 回显服务的 IP 可能被拆成多个 TCP 分段, 也可能走 chunked 传输 ——
+    只凭"正文非空"就收工会把 IP 截断 (真机踩到过: 落地服务器的 IPv6 出口地址被读成
+    `2401:1fe0:6` 这样的半截, 面板显示的出口 IP 就是错的)。
     """
     sock = None
     try:
@@ -683,6 +705,7 @@ def socks5_http_get(
         sock.sendall(request.encode("ascii"))
         chunks: list[bytes] = []
         total = 0
+        head_end = -1
         while total < 8192:
             try:
                 chunk = sock.recv(4096)
@@ -692,10 +715,24 @@ def socks5_http_get(
                 break
             chunks.append(chunk)
             total += len(chunk)
-            if b"\r\n\r\n" in b"".join(chunks):
-                body_head = b"".join(chunks).split(b"\r\n\r\n", 1)
-                # 有 Content-Length 或已读到正文起始就够判断了
-                if len(body_head) == 2 and body_head[1].strip():
+            raw = b"".join(chunks)
+            if head_end < 0:
+                idx = raw.find(b"\r\n\r\n")
+                if idx >= 0:
+                    head_end = idx + 4
+            if head_end < 0:
+                continue
+            head, body = raw[:head_end], raw[head_end:]
+            if re.search(rb"transfer-encoding:\s*chunked", head, re.I):
+                if body.endswith(b"0\r\n\r\n") or body.endswith(b"0\r\n"):
+                    break
+            else:
+                # 有 Content-Length 就必须读满
+                size = re.search(rb"content-length:\s*(\d+)", head, re.I)
+                if size is not None:
+                    if len(body) >= int(size.group(1)):
+                        break
+                elif body.strip():
                     break
         raw = b"".join(chunks)
         if not raw:
@@ -703,6 +740,8 @@ def socks5_http_get(
         head, _, body = raw.partition(b"\r\n\r\n")
         if b"200" not in head.split(b"\r\n", 1)[0]:
             return "", f"目标站返回异常: {head.split(b'\r\n', 1)[0].decode('latin1')}"
+        if re.search(rb"transfer-encoding:\s*chunked", head, re.I):
+            body = _dechunk(body)
         return body.decode("utf-8", "replace").strip(), "HTTP 往返成功"
     except OSError as exc:
         return "", f"{type(exc).__name__}: {exc}"
