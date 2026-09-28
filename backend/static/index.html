@@ -8,42 +8,45 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230a84ff'/%3E%3Ctext x='32' y='44' font-family='-apple-system,Segoe UI,sans-serif' font-size='38' font-weight='700' fill='%23fff' text-anchor='middle'%3EZ%3C/text%3E%3C/svg%3E">
 <style>
 /* ============================================================
-   ZeroProxy 设计系统 v2
-   骨架: 指标条 (KPI) + Bento 磁贴网格 + 链路拓扑
+   ZeroProxy 设计系统 v3 — 控制台 (侧栏 + 密集表格 + 动效)
    约定: 下面每个类名都被 index.html 的模板或 JS 用到, 改名会打断面板逻辑与回归脚本。
+   动效一律走 transform / opacity / 自绘 rAF; 并整体受 prefers-reduced-motion 约束。
    ============================================================ */
 :root {
-  --bg: #f4f5f7;
-  --bg-soft: #eceef2;
+  --bg: #f3f4f7;
+  --bg-soft: #eaecf1;
   --card: #ffffff;
   --card-2: #fafbfc;
-  --text: #111318;
+  --text: #101318;
   --sub: #6b7280;
-  --border: rgba(17, 19, 24, 0.10);
-  --border-soft: rgba(17, 19, 24, 0.06);
+  --border: rgba(16, 19, 24, 0.10);
+  --border-soft: rgba(16, 19, 24, 0.055);
   --accent: #0a84ff;
   --accent-2: #5e5ce6;
+  --down: #14b8a6;
   --ok: #22c55e;
   --warn: #f59e0b;
   --err: #ef4444;
   --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.05);
-  --shadow: 0 1px 3px rgba(16, 24, 40, 0.06), 0 12px 32px -14px rgba(16, 24, 40, 0.20);
+  --shadow: 0 1px 3px rgba(16, 24, 40, 0.06), 0 14px 36px -18px rgba(16, 24, 40, 0.24);
   --radius-sm: 10px;
-  --radius: 16px;
-  --radius-lg: 20px;
+  --radius: 14px;
+  --radius-lg: 18px;
+  --side-w: 214px;
   --mono: "SF Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
 }
 [data-theme="dark"] {
-  --bg: #0b0d12;
-  --bg-soft: #14171f;
-  --card: #14171f;
-  --card-2: #191d26;
+  --bg: #0a0c11;
+  --bg-soft: #141822;
+  --card: #131822;
+  --card-2: #171d29;
   --text: #eef1f6;
   --sub: #8b94a7;
   --border: rgba(255, 255, 255, 0.10);
-  --border-soft: rgba(255, 255, 255, 0.06);
+  --border-soft: rgba(255, 255, 255, 0.055);
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.40);
-  --shadow: 0 1px 3px rgba(0, 0, 0, 0.50), 0 18px 44px -18px rgba(0, 0, 0, 0.75);
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.50), 0 20px 48px -20px rgba(0, 0, 0, 0.80);
 }
 * { box-sizing: border-box; }
 body {
@@ -56,23 +59,22 @@ body {
   -webkit-font-smoothing: antialiased;
   transition: background 0.25s, color 0.25s;
 }
-.wrap { max-width: 1180px; margin: 0 auto; padding: 0 22px 72px; }
+.wrap { max-width: 1220px; margin: 0 auto; padding: 0 22px 80px; }
 .hidden { display: none !important; }
 .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 .muted { color: var(--sub); }
 .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .grow { flex: 1; }
 .divider { height: 1px; background: var(--border-soft); margin: 16px 0 14px; }
-.section-title { font-size: 12px; font-weight: 650; color: var(--sub); text-transform: uppercase; letter-spacing: 0.08em; margin: 24px 0 10px; }
 code.inline { background: var(--border-soft); padding: 3px 8px; border-radius: 7px; font-family: var(--mono); font-size: 12px; }
 
 /* ---------- 品牌栏 (吸顶) ---------- */
 .brand {
   position: sticky; top: 0; z-index: 30;
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
-  margin: 0 -22px 12px; padding: 13px 22px;
-  background: color-mix(in srgb, var(--bg) 80%, transparent);
-  backdrop-filter: blur(16px) saturate(180%);
+  margin: 0 -22px 14px; padding: 12px 22px;
+  background: color-mix(in srgb, var(--bg) 78%, transparent);
+  backdrop-filter: blur(18px) saturate(180%);
   border-bottom: 1px solid var(--border-soft);
 }
 .logo { display: flex; align-items: center; gap: 10px; font-size: 16px; font-weight: 700; letter-spacing: -0.02em; }
@@ -85,31 +87,83 @@ code.inline { background: var(--border-soft); padding: 3px 8px; border-radius: 7
 .theme-btn {
   border: 1px solid var(--border); background: var(--card); color: var(--text);
   width: 34px; height: 34px; border-radius: 50%; cursor: pointer; font-size: 14px;
-  box-shadow: var(--shadow-sm); transition: 0.15s;
+  box-shadow: var(--shadow-sm); transition: transform 0.25s var(--ease), color 0.2s, border-color 0.2s;
 }
-.theme-btn:hover { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 50%, var(--border)); }
+.theme-btn:hover { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 50%, var(--border)); transform: rotate(-12deg); }
 
-/* ---------- 卡片 / 磁贴网格 ---------- */
-.card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); padding: 18px 20px; }
-.tile-head { display: flex; align-items: center; gap: 10px; margin: 0 0 12px; }
+/* ---------- 卡片 ---------- */
+.card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-lg); box-shadow: var(--shadow); padding: 16px 18px; }
+.tile-head { display: flex; align-items: center; gap: 10px; margin: 0 0 12px; flex-wrap: wrap; }
 .tile-head h2 { margin: 0; font-size: 13.5px; font-weight: 650; letter-spacing: -0.01em; }
 .tile-head .hint { font-size: 11.5px; color: var(--sub); }
-.bento { display: grid; grid-template-columns: repeat(12, 1fr); gap: 14px; align-items: start; }
-.bento > .card { grid-column: span 12; min-width: 0; }
-@media (min-width: 940px) {
-  .bento > .s5 { grid-column: span 5; }
-  .bento > .s6 { grid-column: span 6; }
-  .bento > .s7 { grid-column: span 7; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(320px, 100%), 1fr)); gap: 14px; }
+/* 卡片里再嵌一层的卡片 (系统 / 链式): 压平, 免得边框套边框 */
+.card .grid > .card { background: var(--card-2); border-color: var(--border-soft); box-shadow: none; }
+
+/* ---------- 控制台骨架: 侧栏 + 主列 ---------- */
+.console { display: grid; grid-template-columns: var(--side-w) minmax(0, 1fr); gap: 22px; align-items: start; }
+.main > [id] { scroll-margin-top: 84px; }   /* 侧栏跳转别被吸顶品牌栏压住 */
+.main { min-width: 0; display: flex; flex-direction: column; gap: 16px; }
+.side {
+  position: sticky; top: 72px; display: flex; flex-direction: column; gap: 14px;
+  max-height: calc(100vh - 92px);
+}
+.nav { display: flex; flex-direction: column; gap: 2px; position: relative; }
+.nav a {
+  position: relative; display: flex; align-items: center; gap: 9px;
+  padding: 8px 11px 8px 13px; border-radius: 10px; font-size: 13px; font-weight: 500;
+  color: var(--sub); text-decoration: none; transition: background 0.18s, color 0.18s, transform 0.18s var(--ease);
+}
+.nav a::before {
+  content: ""; position: absolute; left: 3px; top: 50%; width: 3px; height: 0; border-radius: 3px;
+  background: linear-gradient(180deg, var(--accent), var(--accent-2));
+  transform: translateY(-50%); transition: height 0.26s var(--ease);
+}
+.nav a:hover { background: var(--card); color: var(--text); transform: translateX(2px); }
+.nav a.on { background: var(--card); color: var(--text); font-weight: 650; box-shadow: var(--shadow-sm); }
+.nav a.on::before { height: 16px; }
+.nav a .ic { width: 15px; text-align: center; opacity: 0.85; font-size: 12px; }
+.nav a .cnt { margin-left: auto; font-size: 11px; font-weight: 600; color: var(--sub); font-variant-numeric: tabular-nums; }
+.nav a.on .cnt { color: var(--accent); }
+.side-foot { border-top: 1px solid var(--border-soft); padding-top: 12px; display: flex; flex-direction: column; gap: 7px; }
+.side-foot .kv { font-size: 11.5px; padding: 0; gap: 8px; }
+.side-foot .kv b { font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 窄到侧栏开始挤压节点表 (地址 / 名称被截成省略号) 时, 侧栏落成横滚导航 */
+@media (max-width: 1180px) {
+  .console { grid-template-columns: minmax(0, 1fr); gap: 14px; }
+  .side { position: static; max-height: none; }
+  .nav { flex-direction: row; overflow-x: auto; padding-bottom: 4px; gap: 6px; }
+  .nav a { padding: 7px 12px; white-space: nowrap; border: 1px solid var(--border); }
+  .nav a::before { display: none; }
+  .side-foot { display: none; }
 }
 
 /* ---------- 顶部指标条 ---------- */
-.kpi { display: grid; grid-template-columns: repeat(auto-fit, minmax(168px, 1fr)); gap: 12px; margin: 14px 0; }
-.kpi .k { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow-sm); padding: 13px 15px; min-width: 0; }
-.kpi .k-lab { font-size: 11px; font-weight: 650; letter-spacing: 0.06em; text-transform: uppercase; color: var(--sub); }
-.kpi .k-val { display: flex; align-items: baseline; gap: 4px; margin-top: 5px; font-size: 22px; font-weight: 650; letter-spacing: -0.025em; font-variant-numeric: tabular-nums; }
+.kpi { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+.kpi .k {
+  position: relative; overflow: hidden;
+  background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: var(--shadow-sm); padding: 12px 15px 13px;
+  transition: transform 0.22s var(--ease), box-shadow 0.22s, border-color 0.22s;
+}
+.kpi .k::after {
+  content: ""; position: absolute; left: 0; right: 0; top: 0; height: 2px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2), transparent);
+  transform: scaleX(0); transform-origin: left; transition: transform 0.5s var(--ease);
+}
+.kpi .k:hover { transform: translateY(-2px); box-shadow: var(--shadow); border-color: color-mix(in srgb, var(--accent) 30%, var(--border)); }
+.kpi .k:hover::after { transform: scaleX(1); }
+.kpi .k-lab { font-size: 10.5px; font-weight: 650; letter-spacing: 0.07em; text-transform: uppercase; color: var(--sub); }
+.kpi .k-val {
+  display: flex; align-items: baseline; gap: 3px; margin-top: 4px;
+  font-size: 23px; font-weight: 680; letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums; line-height: 1.15;
+}
 .kpi .k-val small { font-size: 12px; font-weight: 500; color: var(--sub); }
-.kpi .k-sub { margin-top: 3px; font-size: 11.5px; color: var(--sub); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.kpi .k-sub .dot { margin-right: 5px; }
+.kpi .k-val.mono { font-size: 17px; }
+.kpi .k-sub { margin-top: 4px; font-size: 11.5px; color: var(--sub); line-height: 1.5; }
+.kpi .k-sub .dot { margin-right: 4px; }
+.kpi .k-spark { display: block; width: 100%; height: 22px; margin-top: 6px; overflow: visible; }
 
 /* ---------- 徽标 / 药丸 / 状态点 ---------- */
 .badge { display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: 650; letter-spacing: 0.02em; background: var(--border-soft); color: var(--sub); }
@@ -123,10 +177,20 @@ code.inline { background: var(--border-soft); padding: 3px 8px; border-radius: 7
 .pill.info { background: color-mix(in srgb, var(--accent) 13%, transparent); color: var(--accent); }
 .pill.other { background: var(--border-soft); color: var(--sub); }
 .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; background: var(--sub); }
-.dot.running, .dot.active { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 20%, transparent); }
+.dot.running, .dot.active { background: var(--ok); }
+.dot.running, .dot.active { animation: zp-pulse 2.4s var(--ease) infinite; }
 .dot.failed, .dot.err { background: var(--err); }
 .dot.other { background: var(--warn); }
-.ping { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 650; background: var(--border-soft); color: var(--sub); }
+@keyframes zp-pulse {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 45%, transparent); }
+  70% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--ok) 0%, transparent); }
+  100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 0%, transparent); }
+}
+.ping {
+  display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 999px;
+  font-size: 11px; font-weight: 650; background: var(--border-soft); color: var(--sub);
+  font-variant-numeric: tabular-nums; transition: background 0.2s, color 0.2s;
+}
 .ping.ok { background: color-mix(in srgb, var(--ok) 15%, transparent); color: var(--ok); }
 .ping.bad { background: color-mix(in srgb, var(--err) 15%, transparent); color: var(--err); }
 .ping.other { background: var(--border-soft); color: var(--sub); }
@@ -135,10 +199,12 @@ code.inline { background: var(--border-soft); padding: 3px 8px; border-radius: 7
 .btn {
   appearance: none; border: 1px solid var(--border); background: var(--card); color: var(--text);
   cursor: pointer; border-radius: 11px; padding: 9px 16px; font-size: 13px; font-weight: 600;
-  box-shadow: var(--shadow-sm); transition: 0.15s;
+  white-space: nowrap;
+  box-shadow: var(--shadow-sm); transition: transform 0.16s var(--ease), border-color 0.18s, color 0.18s, background 0.18s;
 }
-.btn:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); color: var(--accent); }
-.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.btn:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); color: var(--accent); transform: translateY(-1px); }
+.btn:active { transform: translateY(0); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
 .btn.primary { background: var(--accent); border-color: transparent; color: #fff; }
 .btn.primary:hover { filter: brightness(1.08); color: #fff; }
 .btn.ghost { background: transparent; box-shadow: none; color: var(--sub); }
@@ -149,7 +215,8 @@ code.inline { background: var(--border-soft); padding: 3px 8px; border-radius: 7
 input, select {
   width: 100%; padding: 11px 14px; border-radius: var(--radius-sm);
   border: 1px solid var(--border); background: var(--card); color: var(--text);
-  font-size: 13.5px; font-family: inherit; outline: none; transition: border 0.15s, box-shadow 0.15s;
+  font-size: 13.5px; font-family: inherit; outline: none;
+  transition: border 0.15s, box-shadow 0.15s;
 }
 select { cursor: pointer; }
 input:focus, select:focus, textarea:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
@@ -167,36 +234,70 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
 .chk input { width: auto; padding: 0; margin: 0; accent-color: var(--accent); }
 .switch { position: relative; width: 38px; height: 22px; flex-shrink: 0; }
 .switch input { opacity: 0; width: 0; height: 0; }
-.switch .slider { position: absolute; inset: 0; border-radius: 999px; cursor: pointer; background: var(--border); transition: 0.2s; }
+.switch .slider { position: absolute; inset: 0; border-radius: 999px; cursor: pointer; background: var(--border); transition: background 0.25s var(--ease); }
 .switch .slider::before {
   content: ""; position: absolute; width: 16px; height: 16px; border-radius: 50%; left: 3px; top: 3px;
-  background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3); transition: 0.2s;
+  background: #fff; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+  transition: transform 0.28s cubic-bezier(0.34, 1.56, 0.64, 1);
 }
-.switch input:checked + .slider { background: var(--ok); }
+.switch input:checked + .slider { background: linear-gradient(135deg, var(--ok), #16a34a); }
 .switch input:checked + .slider::before { transform: translateX(16px); }
 
 /* ---------- 仪表盘头部 ---------- */
-.head-card { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin: 8px 0 4px; }
-.head-card .domain { font-size: 26px; font-weight: 700; letter-spacing: -0.03em; line-height: 1.2; }
+.head-card { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.head-card .domain { font-size: 25px; font-weight: 700; letter-spacing: -0.03em; line-height: 1.2; }
 .head-card .actions { display: flex; gap: 8px; flex-wrap: wrap; }
 
-/* ---------- 节点 (密集行) ---------- */
-#node-grid { display: flex; flex-direction: column; gap: 0; }
-.node-card {
-  background: none; border: 0; border-top: 1px solid var(--border-soft);
-  border-radius: 0; box-shadow: none; padding: 11px 2px 12px;
+/* ---------- 节点: 密集表格 ---------- */
+.node-head {
+  display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1.1fr) 92px 116px 176px;
+  gap: 12px; padding: 0 4px 8px; border-bottom: 1px solid var(--border-soft);
+  font-size: 10.5px; font-weight: 650; letter-spacing: 0.07em; text-transform: uppercase; color: var(--sub);
 }
-.node-card:first-child { border-top: 0; padding-top: 2px; }
-.node-card:hover { background: color-mix(in srgb, var(--accent) 4%, transparent); }
-.node-card .top { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 3px; }
-.node-card .name { display: flex; align-items: center; gap: 8px; min-width: 0; font-weight: 650; font-size: 14px; }
-.node-card .meta { font-size: 12px; color: var(--sub); margin: 0; }
-.node-card .addr { font-size: 12.5px; margin: 3px 0 0; }
-.node-card .actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 9px !important; }
-.note { font-size: 12px; color: var(--warn); margin-top: 7px; }
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(320px, 100%), 1fr)); gap: 14px; }
-/* 磁贴里再嵌一层的卡片 (系统 / 链式): 压平, 免得边框套边框 */
-.bento > .card > .grid > .card { background: var(--card-2); border-color: var(--border-soft); box-shadow: none; }
+#node-grid { display: flex; flex-direction: column; }
+.node-card {
+  display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(0, 1.1fr) 92px 116px 176px;
+  gap: 12px; align-items: center;
+  background: none; border: 0; border-bottom: 1px solid var(--border-soft);
+  border-radius: 0; box-shadow: none; padding: 11px 4px; position: relative;
+  transition: background 0.18s;
+}
+.node-card > div { min-width: 0; }
+.node-card:last-child { border-bottom: 0; }
+.node-card::before {
+  content: ""; position: absolute; left: -18px; top: 6px; bottom: 6px; width: 3px; border-radius: 3px;
+  background: linear-gradient(180deg, var(--accent), var(--accent-2));
+  transform: scaleY(0); transform-origin: center; transition: transform 0.24s var(--ease);
+}
+.node-card:hover { background: color-mix(in srgb, var(--accent) 4.5%, transparent); }
+.node-card:hover::before { transform: scaleY(1); }
+.node-card .top { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.node-card .name { display: flex; align-items: center; gap: 8px; min-width: 0; font-weight: 650; font-size: 13.5px; }
+.node-card .name > .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.node-card .meta { font-size: 11.5px; color: var(--sub); margin: 1px 0 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.node-card .addr { font-size: 12.5px; margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.node-card .nc-addr { display: flex; flex-direction: column; gap: 4px; }
+.node-card .nc-addr .state { display: flex; align-items: center; gap: 5px; font-size: 11.5px; }
+.node-card .nc-desc { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.node-card .actions { display: flex; gap: 6px; align-items: center; justify-content: flex-end; }
+.node-card .actions .btn { flex-shrink: 0; }
+.note { font-size: 11.5px; color: var(--warn); margin-top: 4px; }
+.nc-lat { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.latbar { height: 4px; border-radius: 99px; background: var(--border-soft); overflow: hidden; }
+.latbar i { display: block; height: 100%; border-radius: 99px; width: 0; transition: width 0.75s var(--ease); }
+.latbar i.ok { background: linear-gradient(90deg, var(--ok), #4ade80); }
+.latbar i.warn { background: linear-gradient(90deg, var(--warn), #fbbf24); }
+.latbar i.bad { background: linear-gradient(90deg, var(--err), #f87171); }
+.latbar i.other { background: var(--border); }
+.nc-traffic { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.nc-traffic .vals { font-size: 11px; color: var(--sub); font-variant-numeric: tabular-nums; }
+.duo { display: flex; flex-direction: column; gap: 4px; }
+.duo .rail { height: 4px; border-radius: 99px; background: var(--border-soft); overflow: hidden; }
+.duo .rail i { display: block; height: 100%; width: 0; border-radius: 99px; transition: width 0.75s var(--ease); }
+.duo .rail.up i { background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+.duo .rail.dn i { background: linear-gradient(90deg, var(--down), #5eead4); }
+#node-grid.probing .node-card { animation: zp-shimmer 1.4s var(--ease) infinite; }
+@keyframes zp-shimmer { 0%, 100% { opacity: 1; } 50% { opacity: 0.62; } }
 
 /* ---------- 订阅格式 ---------- */
 .fmt-row { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-top: 1px solid var(--border-soft); }
@@ -207,15 +308,65 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
 .linkline { display: flex; gap: 10px; align-items: center; }
 .linkline .val { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .kv { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; padding: 6px 0; }
-.kv .k { color: var(--sub); flex-shrink: 0; }
+.kv .k { color: var(--sub); flex-shrink: 0; display: flex; align-items: center; gap: 6px; }
+
+/* ---------- 流量可视化 ---------- */
+.tr-top { display: grid; grid-template-columns: 148px minmax(0, 1fr); gap: 20px; align-items: center; }
+@media (max-width: 620px) { .tr-top { grid-template-columns: minmax(0, 1fr); justify-items: center; } }
+.ring-wrap { display: flex; justify-content: center; }
+.ring { width: 138px; height: 138px; }
+.ring circle { fill: none; stroke-width: 11; stroke-linecap: round; }
+.ring .bg { stroke: var(--border-soft); }
+.ring .arc { transform: rotate(-90deg); transform-origin: 50% 50%; transition: stroke-dasharray 0.9s var(--ease), stroke-dashoffset 0.9s var(--ease); }
+.ring .arc.up { stroke: var(--accent); }
+.ring .arc.dn { stroke: var(--down); }
+.ring .num { fill: var(--text); font-size: 19px; font-weight: 680; font-family: var(--mono); letter-spacing: -0.03em; }
+.ring .lab { fill: var(--sub); font-size: 9.5px; letter-spacing: 0.08em; text-transform: uppercase; }
+.tr-nums { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.tr-nums .kv { padding: 4px 0; max-width: 320px; }
+.tr-nums .kv b { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.tr-nums .kv .k .dot { width: 7px; height: 7px; animation: none; }
+.tr-nums .kv .k .dot.up { background: var(--accent); }
+.tr-nums .kv .k .dot.dn { background: var(--down); }
+.rate { margin-top: 10px; border-top: 1px solid var(--border-soft); padding-top: 9px; }
+.rate-head { display: flex; align-items: baseline; gap: 8px; font-size: 11.5px; color: var(--sub); }
+.rate-head b { font-family: var(--mono); font-size: 12.5px; color: var(--text); font-variant-numeric: tabular-nums; }
+.rate-head .hint { margin-left: auto; font-size: 11px; }
+.spark { display: block; width: 100%; height: 46px; margin-top: 6px; overflow: visible; }
+.spark .area { fill: url(#rateGrad); }
+.spark .line { fill: none; stroke: var(--accent); stroke-width: 1.8; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.spark .cursor { stroke: var(--accent); stroke-width: 1.2; stroke-dasharray: 3 3; opacity: 0.6; }
+.spark .head { fill: var(--accent); }
+.trows { margin-top: 16px; display: flex; flex-direction: column; gap: 11px; }
+.trow { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; align-items: center; }
+.trow .nm { font-size: 12.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trow .val { font-family: var(--mono); font-size: 11px; color: var(--sub); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.trow .rail { grid-column: 1 / -1; display: flex; height: 8px; border-radius: 99px; overflow: hidden; background: var(--border-soft); position: relative; }
+.trow .rail i { display: block; height: 100%; width: 0; flex: 0 0 auto; transition: width 0.85s var(--ease); }
+.trow .rail i.up { background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
+.trow .rail i.dn { background: linear-gradient(90deg, var(--down), #5eead4); }
+.trow .rail::after {
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background: linear-gradient(100deg, transparent 20%, rgba(255, 255, 255, 0.38) 50%, transparent 80%);
+  transform: translateX(-100%); animation: zp-sheen 3.6s var(--ease) infinite;
+}
+.trow:nth-child(2) .rail::after { animation-delay: 0.35s; }
+.trow:nth-child(3) .rail::after { animation-delay: 0.7s; }
+.trow:nth-child(4) .rail::after { animation-delay: 1.05s; }
+.trow:nth-child(5) .rail::after { animation-delay: 1.4s; }
+.trow:nth-child(6) .rail::after { animation-delay: 1.75s; }
+@keyframes zp-sheen { 0% { transform: translateX(-100%); } 55%, 100% { transform: translateX(100%); } }
+.trow.hot .nm { color: var(--text); }
 
 /* ---------- 链路拓扑 ---------- */
 .chain-path { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; align-items: center; gap: 10px; margin: 0 0 14px; }
-@media (max-width: 840px) { .chain-path { grid-template-columns: 1fr; } }
+@media (max-width: 900px) { .chain-path { grid-template-columns: 1fr; } }
 .hop {
   display: flex; flex-direction: column; gap: 3px; min-width: 0;
   border: 1px solid var(--border); border-radius: var(--radius); padding: 11px 14px; background: var(--card-2);
+  transition: transform 0.22s var(--ease), border-color 0.22s;
 }
+.hop:hover { transform: translateY(-2px); }
 .hop .who { font-size: 10.5px; font-weight: 650; letter-spacing: 0.07em; text-transform: uppercase; color: var(--sub); }
 .hop .id { font-family: var(--mono); font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hop .meta { font-size: 11.5px; color: var(--sub); line-height: 1.6; }
@@ -230,7 +381,7 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
 @keyframes zp-wire { to { background-position: 13px 0; } }
 .wire.off i { background: repeating-linear-gradient(90deg, var(--sub) 0 7px, transparent 7px 13px); background-size: 13px 2px; animation: none; opacity: 0.45; }
 
-/* ---------- 诊断 / 流量 ---------- */
+/* ---------- 诊断 / 进度 ---------- */
 .check { display: flex; gap: 9px; align-items: flex-start; padding: 8px 0; font-size: 13px; border-top: 1px solid var(--border-soft); }
 .check:first-child { border-top: 0; }
 .check .ico { width: 16px; text-align: center; flex-shrink: 0; }
@@ -238,15 +389,18 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
 .check .ico.bad { color: var(--err); }
 .check .name { font-weight: 600; flex-shrink: 0; }
 .check .detail { color: var(--sub); font-size: 12.5px; }
-.traffic-row { display: flex; align-items: center; gap: 12px; font-size: 12.5px; padding: 7px 0; }
-.traffic-row .k { width: 150px; flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.traffic-row .bar { flex: 1; }
-.bar { height: 6px; border-radius: 999px; background: var(--border-soft); overflow: hidden; margin-top: 8px; }
-.bar > i { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width 0.4s; }
-.bar > i.bad { background: var(--err); }
+.bar { height: 6px; border-radius: 999px; background: var(--border-soft); overflow: hidden; margin-top: 8px; position: relative; }
+.bar > i { display: block; height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width 0.5s var(--ease); }
+.bar > i.bad { background: linear-gradient(90deg, var(--err), #f87171); }
+.bar.live > i::after {
+  content: ""; position: absolute; inset: 0;
+  background: repeating-linear-gradient(115deg, rgba(255, 255, 255, 0.30) 0 8px, transparent 8px 18px);
+  animation: zp-stripes 0.9s linear infinite;
+}
+@keyframes zp-stripes { to { background-position: 26px 0; } }
 
 /* ---------- 提示条 / 日志 / 部署流程 ---------- */
-.banner { display: flex; gap: 10px; align-items: flex-start; border-radius: var(--radius); padding: 12px 15px; font-size: 13px; line-height: 1.55; border: 1px solid var(--border); margin-bottom: 14px; }
+.banner { display: flex; gap: 10px; align-items: flex-start; border-radius: var(--radius); padding: 12px 15px; font-size: 13px; line-height: 1.55; border: 1px solid var(--border); }
 .banner.bad { background: color-mix(in srgb, var(--err) 9%, var(--card)); border-color: color-mix(in srgb, var(--err) 32%, var(--border)); }
 .banner.good { background: color-mix(in srgb, var(--ok) 9%, var(--card)); border-color: color-mix(in srgb, var(--ok) 30%, var(--border)); }
 .banner.info { background: color-mix(in srgb, var(--accent) 8%, var(--card)); border-color: color-mix(in srgb, var(--accent) 26%, var(--border)); }
@@ -267,7 +421,7 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
 .pstep .ico.ok { color: var(--ok); }
 .pstep .ico.bad { color: var(--err); }
 .pstep .detail { color: var(--sub); font-size: 12px; margin-left: 28px; word-break: break-all; }
-.hero { text-align: center; margin: 40px 0 28px; }
+.hero { text-align: center; margin: 44px 0 28px; }
 .hero h1 { font-size: 38px; letter-spacing: -0.035em; margin: 0 0 10px; font-weight: 700; }
 .hero h1 .grad { background: linear-gradient(90deg, var(--accent), var(--accent-2), #ff375f); -webkit-background-clip: text; background-clip: text; color: transparent; }
 .hero p { color: var(--sub); margin: 0; font-size: 14.5px; }
@@ -293,12 +447,15 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
 .confirm-keep { text-align: left; margin-top: 10px; font-size: 12.5px; color: var(--sub); line-height: 1.6; }
 
 /* ---------- 弹窗 / 二维码 / Toast ---------- */
-.modal-mask { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; background: rgba(8, 10, 14, 0.55); backdrop-filter: blur(6px); }
+.modal-mask { position: fixed; inset: 0; z-index: 50; display: grid; place-items: center; background: rgba(8, 10, 14, 0.55); backdrop-filter: blur(6px); animation: zp-fade 0.18s var(--ease); }
+@keyframes zp-fade { from { opacity: 0; } }
 .modal {
   background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-lg);
   padding: 24px 24px 20px; max-width: 400px; width: calc(100% - 40px); text-align: center;
   box-shadow: var(--shadow); max-height: calc(100vh - 40px); overflow: auto;
+  animation: zp-pop 0.24s var(--ease);
 }
+@keyframes zp-pop { from { opacity: 0; transform: translateY(10px) scale(0.98); } }
 .modal h3 { margin: 0 0 6px; font-size: 17px; letter-spacing: -0.02em; }
 .modal img { width: 260px; height: 260px; border-radius: var(--radius-sm); margin: 14px auto; display: block; background: #fff; }
 .modal .close-row { margin-top: 14px; display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
@@ -316,10 +473,19 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
   position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%);
   background: var(--card); color: var(--text); border: 1px solid var(--border);
   padding: 10px 22px; border-radius: 999px; font-size: 13px; box-shadow: var(--shadow);
-  opacity: 0; pointer-events: none; transition: opacity 0.25s, transform 0.25s; z-index: 99;
+  opacity: 0; pointer-events: none; transition: opacity 0.25s, transform 0.25s var(--ease); z-index: 99;
 }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(-6px); }
 .footer { text-align: center; color: var(--sub); font-size: 12px; margin-top: 40px; }
+
+/* ---------- 入场动画 (renderDash 里逐块加 .reveal) ---------- */
+.reveal { opacity: 0; transform: translateY(8px); }
+.reveal.in { opacity: 1; transform: none; transition: opacity 0.4s var(--ease), transform 0.4s var(--ease); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+  .reveal { opacity: 1; transform: none; }
+}
 </style>
 </head>
 <body>
@@ -346,8 +512,10 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
         <input id="in-user" placeholder="admin" spellcheck="false"></div>
       <div class="field">
         <label>管理密码 (同时作为代理口令)</label>
-        <input id="in-pass" type="password" placeholder="••••••••"></div>
+      <input id="in-pass" type="password" placeholder="••••••••"></div>
       <button class="btn" id="btn-setup" style="width:100%">一键生成</button>
+      <!-- 部署是一次长请求 (证书签发 30-60s), 这里给一条不定量斜纹进度条: 只表示"在动", 不谎报百分比 -->
+      <div class="bar live hidden" id="setup-bar" style="margin-top:14px"><i style="width:100%"></i></div>
       <div class="hint-box hidden" id="setup-hint"></div>
       <div class="err-box hidden" id="setup-err"></div>
       <div class="progress hidden" id="setup-progress"></div>
@@ -369,7 +537,28 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
 
   <!-- ============ 视图 3: 仪表盘 ============ -->
   <section id="view-dash" class="hidden">
-    <div class="head-card">
+    <div class="console">
+      <aside class="side">
+        <nav class="nav" id="dash-nav">
+          <a href="#sec-nodes" class="on"><span class="ic">◆</span>节点<span class="cnt" id="nav-nodes">—</span></a>
+          <a href="#sec-subs"><span class="ic">⌘</span>订阅</a>
+          <a href="#sec-traffic"><span class="ic">▤</span>流量</a>
+          <a href="#chain-intro"><span class="ic">⇄</span>链式代理<span class="cnt" id="nav-chain">—</span></a>
+          <a href="#sec-adv"><span class="ic">⑃</span>高级 / 分流</a>
+          <a href="#diag-card"><span class="ic">✓</span>诊断<span class="cnt" id="nav-diag">—</span></a>
+          <a href="#sec-sys"><span class="ic">⚙</span>系统</a>
+          <a href="#update-card"><span class="ic">↑</span>程序更新<span class="cnt" id="nav-update"></span></a>
+        </nav>
+        <div class="side-foot">
+          <div class="kv"><span class="k">管理员</span><b id="side-user">—</b></div>
+          <div class="kv"><span class="k">主机</span><b id="side-os" title="">—</b></div>
+          <div class="kv"><span class="k">在线</span><b id="side-uptime">—</b></div>
+          <div class="kv"><span class="k">版本</span><b id="side-ver">—</b></div>
+        </div>
+      </aside>
+
+      <div class="main">
+    <div class="head-card reveal">
       <div>
         <div class="row" style="gap:10px">
           <span class="domain" id="dash-domain">—</span>
@@ -388,7 +577,7 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
 
     <div id="dash-banner" class="hidden"></div>
 
-    <div class="kpi">
+    <div class="kpi reveal">
       <div class="k">
         <div class="k-lab">健康节点</div>
         <div class="k-val" id="kpi-nodes">—</div>
@@ -403,6 +592,7 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
         <div class="k-lab">平均握手延迟</div>
         <div class="k-val" id="kpi-lat">—</div>
         <div class="k-sub" id="kpi-lat-sub">点「节点测速」后更新</div>
+        <svg class="k-spark" id="kpi-lat-spark" viewBox="0 0 120 22" preserveAspectRatio="none"></svg>
       </div>
       <div class="k">
         <div class="k-lab">运行时长</div>
@@ -411,14 +601,17 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
       </div>
     </div>
 
-    <div class="bento">
-    <div class="card">
-      <div class="tile-head"><h2>节点</h2><span class="hint">启停 / 端口变更自动同步, 客户端无需重导</span></div>
+    <section class="card reveal" id="sec-nodes">
+      <div class="tile-head"><h2>节点</h2><span class="hint">启停 / 端口变更自动同步, 客户端无需重导</span>
+        <span class="grow"></span><span class="muted" style="font-size:11.5px" id="node-count">—</span></div>
       <div class="row" id="probe-summary" style="margin:0 0 10px"></div>
+      <div class="node-head">
+        <span>节点</span><span>地址 / 状态</span><span>握手</span><span>流量</span><span style="text-align:right">操作</span>
+      </div>
       <div id="node-grid"></div>
-    </div>
+    </section>
 
-    <div class="card s5">
+    <section class="card reveal" id="sec-subs">
       <div class="tile-head"><h2>订阅</h2><span class="hint">三格式同源 · 自动同步</span></div>
       <div class="fmt-row">
         <span class="tag">Base64</span>
@@ -441,14 +634,56 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
       <div class="muted" style="font-size:12px;margin-top:8px">
         三个地址指向同一份订阅内容; 节点启停 / 端口变更 / 伪装设置都会自动同步, 客户端无需重新导入。
       </div>
-    </div>
+    </section>
 
-    <div class="card s7">
-      <div class="tile-head"><h2>流量</h2><span class="hint">内置 Xray Stats API</span></div>
-      <div id="traffic-card"></div>
-    </div>
+    <section class="card reveal" id="sec-traffic">
+      <div class="tile-head"><h2>流量</h2><span class="hint">内置 Xray Stats API</span>
+        <span class="grow"></span><span class="muted" style="font-size:11.5px" id="traffic-note">—</span></div>
+      <div id="traffic-card">
+        <div id="traffic-empty" class="muted hidden" style="font-size:13px">
+          统计不可用: 需要 Xray 运行中 (生产环境部署完成后自动显示)。
+        </div>
+        <div id="traffic-main" class="hidden">
+          <div class="tr-top">
+            <div class="ring-wrap">
+              <svg class="ring" viewBox="0 0 120 120">
+                <circle class="bg" cx="60" cy="60" r="50"></circle>
+                <circle class="arc up" id="tr-arc-up" cx="60" cy="60" r="50" stroke-dasharray="0 999"></circle>
+                <circle class="arc dn" id="tr-arc-dn" cx="60" cy="60" r="50" stroke-dasharray="0 999"></circle>
+                <text class="num" id="tr-total" x="60" y="57" text-anchor="middle">—</text>
+                <text class="lab" x="60" y="74" text-anchor="middle">合计</text>
+              </svg>
+            </div>
+            <div class="tr-nums">
+              <div class="kv"><span class="k"><i class="dot up"></i>总上行</span><b id="tr-up">—</b></div>
+              <div class="kv"><span class="k"><i class="dot dn"></i>总下行</span><b id="tr-down">—</b></div>
+              <div class="kv"><span class="k">计费节点</span><b id="tr-nodes">—</b></div>
+              <div class="rate">
+                <div class="rate-head">
+                  <span>实时速率</span><b id="rate-now">—</b>
+                  <span class="hint" id="rate-hint">本页打开后采样, 每 20s 一点</span>
+                </div>
+                <svg class="spark" id="rate-spark" viewBox="0 0 320 46" preserveAspectRatio="none">
+                  <defs>
+                    <linearGradient id="rateGrad" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="0" stop-color="var(--accent)" stop-opacity="0.45"></stop>
+                      <stop offset="1" stop-color="var(--accent)" stop-opacity="0"></stop>
+                    </linearGradient>
+                  </defs>
+                  <path class="area" id="rate-area" d=""></path>
+                  <path class="line" id="rate-line" d=""></path>
+                  <line class="cursor" id="rate-cursor" x1="0" y1="0" x2="0" y2="46"></line>
+                  <circle class="head" id="rate-head" r="2.5" cx="0" cy="0"></circle>
+                </svg>
+              </div>
+            </div>
+          </div>
+          <div class="trows" id="tr-bars"></div>
+        </div>
+      </div>
+    </section>
 
-    <div class="card">
+    <section class="card reveal" id="sec-adv">
       <div class="tile-head"><h2>高级设置</h2><span class="hint">改动热重载, 不重启服务</span></div>
       <div class="adv-grid">
         <div class="field">
@@ -487,9 +722,9 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
         <button class="btn ghost small" id="btn-geo-update">下载 / 更新 GeoIP 数据</button>
         <span class="muted" style="font-size:12px">数据源 Loyalsoldier/v2ray-rules-dat, 每 7 天自动更新</span>
       </div>
-    </div>
+    </section>
 
-    <div class="card" id="chain-intro">
+    <section class="card reveal" id="chain-intro">
       <div class="tile-head">
         <h2>链式代理</h2><span class="hint">两台机器接成一条链: 近的做入口加速, 远的做落地出口</span>
         <span class="grow"></span>
@@ -504,25 +739,25 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
       </div>
       <div class="grid" id="chain-grid"></div>
       <div id="chain-entries"></div>
-    </div>
+    </section>
 
-    <div class="card s6" id="diag-card">
+    <section class="card reveal" id="diag-card">
       <div class="tile-head"><h2>诊断</h2><span class="hint">服务 / 配置 / 证书 / 端口 / 链式落地端</span></div>
       <div class="muted" style="font-size:12.5px">点击右上角「一键诊断」检查服务状态、配置合法性、证书与端口。</div>
       <div id="diag-list" style="margin-top:10px"></div>
       <div class="row hidden" id="diag-actions" style="margin-top:14px">
         <button class="btn small" id="btn-repair">一键修复 (重新生成 + 重启)</button>
       </div>
-    </div>
+    </section>
 
-    <div class="card s6">
+    <section class="card reveal" id="sec-sys">
       <div class="tile-head"><h2>系统</h2><span class="hint">服务版本 / 主机 / 操作记录</span></div>
       <div class="grid" id="sys-grid"></div>
       <div class="divider"></div>
       <div class="kv"><span class="k">操作记录</span><span class="muted" style="font-size:12.5px;text-align:right" id="audit-tail">—</span></div>
-    </div>
+    </section>
 
-    <div class="card" id="update-card">
+    <section class="card reveal" id="update-card">
       <div class="tile-head"><h2>程序更新</h2><span class="hint">版本对比 → 确认 → 进度 → 结果</span>
         <span class="grow"></span><span class="muted" style="font-size:11.5px">升级只替换代码, 密钥 / 令牌 / 节点配置保留</span></div>
       <div class="row" style="justify-content:space-between;align-items:flex-start">
@@ -536,7 +771,8 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
         <button class="btn small hidden" id="btn-update-reload">重新加载面板</button>
         <span class="muted" style="font-size:12px" id="update-hint">升级只替换程序代码, 密钥 / 订阅令牌 / 节点配置全部保留</span>
       </div>
-    </div>
+    </section>
+      </div>
     </div>
   </section>
 
@@ -575,6 +811,9 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const escAttr = esc;
 const PROTO_BADGE = { VLESS: "vless", Trojan: "trojan", "Hysteria 2": "hysteria" };
 let dash = null, refreshTimer = null, bootstrapToken = "", probeData = null, probeRan = false;
+// 最近一次「一键诊断」的结果 (侧栏角标用); 以及实时速率采样窗口
+let diagRes = null;
+const rateHist = [];
 let updateInfo = null, updateTimer = null, updatePollFailures = 0;
 //: 本页 JS 是哪个版本加载的 (升级后服务器版本会变, 此时必须重新加载页面才会生效)
 let pageVersion = "";
@@ -693,6 +932,7 @@ $("#btn-setup").onclick = async () => {
   const btn = $("#btn-setup");
   btn.disabled = true;
   btn.textContent = "部署中, 证书申请约需 30-60 秒…";
+  $("#setup-bar").classList.remove("hidden");
   try {
     const res = await api("/api/setup", {
       method: "POST",
@@ -701,6 +941,7 @@ $("#btn-setup").onclick = async () => {
     });
     renderSteps(res.steps || [], prog);
     prog.classList.remove("hidden");
+    $("#setup-bar").classList.add("hidden");
     const failed = (res.steps || []).filter((s) => !s.ok);
     const dest = res.redirect || {};
     if (!failed.length && dest.ready) {
@@ -731,6 +972,7 @@ $("#btn-setup").onclick = async () => {
     }
     setTimeout(() => { loadDash(); }, 1400);
   } catch (e) {
+    $("#setup-bar").classList.add("hidden");
     errBox.textContent = "部署失败: " + e.message;
     errBox.classList.remove("hidden");
     btn.disabled = false;
@@ -828,6 +1070,7 @@ async function loadDash(quiet) {
 
 function renderDash(quiet) {
   if (!dash) return;
+  revealBlocks();   // 先挂入场动画, 万一后面某块渲染抛错也不会留下"整页透明"
   $("#dash-domain").textContent = dash.domain;
   $("#dash-sub").textContent = `面板 ${dash.panel_url} · 管理用户 ${dash.admin_user}`;
 
@@ -865,6 +1108,52 @@ function renderDash(quiet) {
   renderDashboardBanner();
   if (!updateInfo) loadUpdate(false);
   if (!quiet) { $("#diag-list").innerHTML = ""; $("#diag-actions").classList.add("hidden"); }
+}
+
+/* 首次进入仪表盘时, 各区块按 40ms 逐个淡入 (只在第一次跑;
+ * 20s 轮询重绘不再触发, 免得页面一直在闪)。 */
+let revealed = false;
+function revealBlocks() {
+  if (revealed) return;
+  revealed = true;
+  document.querySelectorAll("#view-dash .reveal").forEach((el, i) => {
+    setTimeout(() => el.classList.add("in"), Math.min(i * 40, 400));
+  });
+  setupScrollSpy();
+}
+
+/* 侧栏: 点击平滑滚动 + 滚动时高亮当前区块 (吸顶栏高度用 scroll-margin 让开) */
+function setupScrollSpy() {
+  const nav = $("#dash-nav");
+  if (!nav) return;
+  const links = [...nav.querySelectorAll("a")];
+  const secs = links
+    .map((a) => document.querySelector(a.getAttribute("href")))
+    .filter(Boolean);
+  links.forEach((a) => {
+    a.addEventListener("click", (e) => {
+      const target = document.querySelector(a.getAttribute("href"));
+      if (!target) return;
+      e.preventDefault();
+      target.scrollIntoView({ behavior: "smooth", block: "start" });
+      history.replaceState(null, "", a.getAttribute("href"));
+    });
+  });
+  if (!("IntersectionObserver" in window) || !secs.length) return;
+  const visible = new Map();
+  const io = new IntersectionObserver(
+    (entries) => {
+      entries.forEach((en) => visible.set(en.target.id, en.isIntersecting ? en.intersectionRatio : 0));
+      let best = "", bestRatio = 0;
+      visible.forEach((ratio, id) => {
+        if (ratio > bestRatio) { bestRatio = ratio; best = id; }
+      });
+      if (!best) return;
+      links.forEach((a) => a.classList.toggle("on", a.getAttribute("href") === "#" + best));
+    },
+    { rootMargin: "-84px 0px -55% 0px", threshold: [0, 0.15, 0.4, 0.75, 1] }
+  );
+  secs.forEach((s) => io.observe(s));
 }
 
 /* ---------------- 失败告警横幅 ----------------
@@ -928,39 +1217,100 @@ function pingHtml(nodeId) {
   return ` <span class="ping ${cls}" title="${escAttr(p.detail || "")}">${esc(text)}</span>`;
 }
 
+/* 延迟条宽度: 最快的节点画满, 最慢的画到 40% —— 一眼看出谁快谁慢。
+ * 只有 1 个结果 (或全部相等) 时直接画满, 免得所有条都退化成同一长度。 */
+function latPct(ms, min, max) {
+  if (!(max > min)) return 100;
+  return Math.round(40 + 60 * ((max - ms) / (max - min)));
+}
+
 function renderNodes() {
-  $("#node-grid").innerHTML = dash.nodes
+  const nodes = dash.nodes || [];
+  const on = nodes.filter((n) => n.enabled).length;
+  const ms = ((probeData && probeData.nodes) || []).filter((p) => p.ok === true && p.ms).map((p) => p.ms);
+  const minMs = ms.length ? Math.min(...ms) : 0;
+  const maxMs = ms.length ? Math.max(...ms) : 0;
+  // 流量双轨按"全节点单向上行/下行的最大值"归一化, 全是 0 时不会除零
+  const peak = Math.max(
+    1,
+    ...nodes.map((n) => (n.traffic ? Math.max(n.traffic.uplink || 0, n.traffic.downlink || 0) : 0))
+  );
+  const barPct = (v) => (v > 0 ? Math.max(6, Math.round((v / peak) * 100)) : 0);
+
+  const count = $("#node-count");
+  if (count) count.textContent = nodes.length ? `${on} 启用 / 共 ${nodes.length}` : "—";
+
+  $("#node-grid").innerHTML = nodes
     .map((n) => {
-      const traffic = n.traffic
-        ? `<div class="muted" style="font-size:12.5px;margin-top:6px">↑ ${fmtBytes(n.traffic.uplink)} · ↓ ${fmtBytes(n.traffic.downlink)}</div>`
-        : "";
-      // 链式节点: 客户端连的是本机, 出口在落地服务器 —— 卡片上把这两件事说清楚
-     return `<div class="card node-card">
-        <div class="top">
-          <span class="name">${
-            n.chain
-              ? '<span class="badge hysteria" title="链式中转: 客户端连本机, 出口 IP 是落地服务器">链式</span>'
-              : `<span class="badge ${PROTO_BADGE[n.protocol] || "vless"}">${esc(n.protocol)}</span>`
-          }${esc(n.name)}${n.default_out ? '<span class="badge trojan">默认出口</span>' : ""}</span>
-          <label class="switch"><input type="checkbox" data-node="${escAttr(n.id)}" ${n.enabled ? "checked" : ""}><span class="slider"></span></label>
-        </div>
-        <div class="meta">${esc(n.transport)} · ${esc(n.security)}</div>
-        <div class="addr mono">${esc(n.host)}:${n.port} <span class="dot ${stateClass(n.service_state)}" title="${escAttr(n.service)}"></span> <span class="muted">${STATE_TXT[n.service_state] || esc(n.service_state)}</span>${pingHtml(n.id)}</div>
-        <div class="muted" style="font-size:12.5px">${esc(n.desc || "")}</div>
-        ${
-          n.chain && n.last_probe && n.last_probe.exit_ip
-            ? `<div class="muted" style="font-size:12.5px;margin-top:4px">落地出口 IP ${esc(n.last_probe.exit_ip)}${
-                n.last_probe.ms ? " · " + n.last_probe.ms + "ms" : ""
-              } · ${esc(fmtTime(n.last_probe.ts))}</div>`
-            : ""
-        }
+      const p = pingOf(n.id);
+      // 左侧: 名称 / 传输 / 说明 / 链式出口 / 告警
+      const left = `<div>
+          <div class="top">
+            <span class="name">${
+              n.chain
+                ? '<span class="badge hysteria" title="链式中转: 客户端连本机, 出口 IP 是落地服务器">链式</span>'
+                : `<span class="badge ${PROTO_BADGE[n.protocol] || "vless"}">${esc(n.protocol)}</span>`
+            }<span class="nm">${esc(n.name)}</span>${
+              n.default_out ? '<span class="badge trojan">默认出口</span>' : ""
+            }</span>
+          </div>
+          <div class="meta">${esc(n.transport)} · ${esc(n.security)}</div>
+          <div class="muted nc-desc" title="${escAttr(n.desc || "")}">${esc(n.desc || "")}</div>
+          ${
+            n.chain && n.last_probe && n.last_probe.exit_ip
+              ? `<div class="muted" style="font-size:11.5px;margin-top:2px">落地出口 IP ${esc(n.last_probe.exit_ip)}${
+                  n.last_probe.ms ? " · " + n.last_probe.ms + "ms" : ""
+                }</div>`
+              : ""
+          }
+          ${n.note ? `<div class="note">${esc(n.note)}</div>` : ""}
+        </div>`;
+
+      // 第二列: 地址 + 服务状态
+      const addr = `<div class="nc-addr">
+          <div class="addr mono" title="${escAttr(n.host + ":" + n.port)}">${esc(n.host)}:${n.port}</div>
+          <div class="state"><span class="dot ${stateClass(n.service_state)}" title="${escAttr(n.service || "")}"></span>
+            <span class="muted">${STATE_TXT[n.service_state] || esc(n.service_state)}</span></div>
+        </div>`;
+
+      // 第三列: 握手延迟 (徽标 + 长度条)
+      let lat = `<div class="nc-lat"><span class="muted" style="font-size:11.5px">未测速</span></div>`;
+      if (p) {
+        const cls = p.ok === true ? "ok" : p.ok === false ? "bad" : "other";
+        const text = p.ok === true ? (p.ms ? p.ms + "ms" : "可达") : p.ok === false ? "握手失败" : "未知";
+        const bar =
+          p.ok === true && p.ms
+            ? `<span class="latbar"><i class="${p.ms <= 120 ? "ok" : p.ms <= 250 ? "warn" : "bad"}"
+                 style="width:${latPct(p.ms, minMs, maxMs)}%"></i></span>`
+            : "";
+        lat = `<div class="nc-lat"><span class="ping ${cls}" title="${escAttr(p.detail || "")}">${esc(text)}</span>${bar}</div>`;
+      }
+
+      // 第四列: 该节点上下行 (数字 + 双轨条)
+      const tr = n.traffic || null;
+      const traffic = tr
+        ? `<div class="nc-traffic">
+             <div class="vals">↑${fmtBytes(tr.uplink)} · ↓${fmtBytes(tr.downlink)}</div>
+             <div class="duo">
+               <span class="rail up" title="上行 ${fmtBytes(tr.uplink)}"><i style="width:${barPct(tr.uplink)}%"></i></span>
+               <span class="rail dn" title="下行 ${fmtBytes(tr.downlink)}"><i style="width:${barPct(tr.downlink)}%"></i></span>
+             </div>
+           </div>`
+        : `<div class="nc-traffic"><span class="muted" style="font-size:11.5px">—</span></div>`;
+
+      return `<div class="card node-card">
+        ${left}
+        ${addr}
+        ${lat}
         ${traffic}
-        ${n.note ? `<div class="note">${esc(n.note)}</div>` : ""}
-        <div class="actions" style="margin-top:12px">
+        <div class="actions">
           ${n.share_link
-            ? `<button class="btn ghost small" data-copy="${escAttr(n.id)}">复制链接</button>
-               <button class="btn ghost small" data-qr="${escAttr(n.id)}">二维码</button>`
-            : `<span class="muted" style="font-size:12.5px">节点已关闭</span>`}
+            ? `<button class="btn ghost small" data-copy="${escAttr(n.id)}" title="复制 ${escAttr(n.name)} 的分享链接">复制</button>
+               <button class="btn ghost small" data-qr="${escAttr(n.id)}" title="显示 ${escAttr(n.name)} 的二维码">二维码</button>`
+            : `<span class="muted" style="font-size:12px">已关闭</span>`}
+          <label class="switch" title="${n.enabled ? "点击停用" : "点击启用"}">
+            <input type="checkbox" data-node="${escAttr(n.id)}" ${n.enabled ? "checked" : ""}>
+            <span class="slider"></span></label>
         </div>
       </div>`;
     })
@@ -1049,8 +1399,9 @@ function renderKpis() {
   if (kl) {
     kl.innerHTML = ms.length ? `${Math.round(ms.reduce((a, b) => a + b, 0) / ms.length)}<small> ms</small>` : "—";
     $("#kpi-lat-sub").textContent = ms.length
-      ? `最快 ${Math.min(...ms)}ms · 最慢 ${Math.max(...ms)}ms · ${ms.length}/${on} 个节点有结果`
+      ? `最快 ${Math.min(...ms)} – 最慢 ${Math.max(...ms)}ms · ${ms.length}/${on} 个节点有结果`
       : "点「节点测速」后更新";
+    renderLatSpark(ms);
   }
   const ku = $("#kpi-uptime");
   if (ku) {
@@ -1068,6 +1419,61 @@ function renderKpis() {
     st.innerHTML = `<span class="dot ${bad ? "failed" : dev ? "other" : "running"}"></span>` +
       (bad ? `${bad} 个服务异常` : dev ? "本地开发模式" : "面板运行中");
   }
+  renderSidebar();
+}
+
+/* 侧栏: 管理员 / 主机 / 在线 / 版本 + 各锚点的计数与告警角标 */
+function renderSidebar() {
+  if (!dash) return;
+  const srv = (dash.system && dash.system.server) || {};
+  const set = (sel, text) => { const el = $(sel); if (el) el.textContent = text; };
+  set("#side-user", dash.admin_user || "—");
+  const os = $("#side-os");
+  if (os) {
+    os.textContent = srv.os ? `${srv.os} · ${srv.arch || ""}` : "—";
+    os.title = srv.os ? `${srv.os} · ${srv.arch || ""}` : "";
+  }
+  set("#side-uptime", srv.uptime_s ? fmtUptime(srv.uptime_s) : "—");
+  set("#side-ver", srv.panel_version ? `v${srv.panel_version}` : "—");
+
+  const nodes = dash.nodes || [];
+  const on = nodes.filter((n) => n.enabled).length;
+  set("#nav-nodes", nodes.length ? `${on}/${nodes.length}` : "—");
+  const entries = ((dash.chain || {}).entries) || [];
+  set("#nav-chain", entries.length ? String(entries.length) : "");
+  const up = updateInfo || {};
+  set("#nav-update", up.update_available ? "新" : up.running ? "…" : "");
+
+  const diag = $("#nav-diag");
+  if (diag) {
+    const r = diagRes;
+    diag.textContent = !r ? "" : r.ok ? "✓" : `${(r.checks || []).filter((c) => !c.ok).length}`;
+    diag.style.color = !r ? "" : r.ok ? "var(--ok)" : "var(--err)";
+  }
+}
+
+/* 延迟迷你折线 (KPI 第 3 格): 每个有结果的节点一个采样点。
+ * 用 polyline 而不是曲线, 峰值一眼可读; 只有 1 个点时画一段平线。 */
+function renderLatSpark(ms) {
+  const svg = $("#kpi-lat-spark");
+  if (!svg) return;
+  if (!ms.length) { svg.innerHTML = ""; return; }
+  const W = 120, H = 22, pad = 3;
+  const max = Math.max(...ms), min = Math.min(...ms);
+  const span = max - min || 1;
+  const pts = ms.map((v, i) => {
+    const x = ms.length === 1 ? W : (i / (ms.length - 1)) * W;
+    const y = H - pad - ((max - v) / span) * (H - pad * 2);
+    return [x, y];
+  });
+  const line = pts.map(([x, y]) => `${x.toFixed(1)},${y.toFixed(1)}`).join(" ");
+  const area = `${pts[0][0].toFixed(1)},${H} ${line} ${pts[pts.length - 1][0].toFixed(1)},${H}`;
+  svg.innerHTML =
+    `<polygon points="${area}" fill="var(--accent)" opacity="0.13"></polygon>` +
+    `<polyline points="${line}" fill="none" stroke="var(--accent)" stroke-width="1.6"
+       stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"></polyline>` +
+    `<circle cx="${pts[pts.length - 1][0].toFixed(1)}" cy="${pts[pts.length - 1][1].toFixed(1)}" r="2"
+       fill="var(--accent)"></circle>`;
 }
 
 async function runProbe(force) {
@@ -1076,44 +1482,151 @@ async function runProbe(force) {
   btn.disabled = true;
   const original = btn.textContent;
   btn.textContent = "测速中…";
+  const grid = $("#node-grid");
+  if (grid) grid.classList.add("probing");   // 逐行呼吸, 提示"正在重新握手"
   try {
     probeData = await api("/api/probe?deep=1" + (force ? "&force=1" : ""));
     renderNodes();
   } catch (e) {
     toast("测速失败: " + e.message);
   }
+  if (grid) grid.classList.remove("probing");
   btn.disabled = false;
   btn.textContent = original;
 }
 
 $("#btn-probe").onclick = () => runProbe(true);
 
+/* ---------------- 流量可视化 ----------------
+ * 三块:
+ *   1. 双弧圆环 (上/下行占比, stroke-dasharray 驱动, 值变化时 CSS 自己补间)
+ *   2. 逐节点上下行双轨条 (归一化到全节点峰值, 带流光扫过)
+ *   3. 实时速率曲线 —— 面板自己没有历史数据, 所以由本页每 20s 采一次样,
+ *      在内存里留 24 个点 (≈8 分钟) 画出来; 刷新页面会重新开始采样。 */
+const RING_C = 2 * Math.PI * 50;   // r=50 的周长, 与 <circle r="50"> 对应
+
 function renderTraffic(traffic) {
-  const card = $("#traffic-card");
-  if (!traffic || traffic.available === false || !dash.traffic) {
-    card.innerHTML = `<div class="muted" style="font-size:13px">统计不可用: 需要 Xray 运行中 (生产环境部署完成后自动显示)。</div>`;
+  const empty = $("#traffic-empty");
+  const main = $("#traffic-main");
+  if (!empty || !main) return;
+  const available = !!traffic && traffic.available !== false && !!dash.traffic;
+  empty.classList.toggle("hidden", available);
+  main.classList.toggle("hidden", !available);
+  const note = $("#traffic-note");
+  if (note) note.textContent = available ? `更新于 ${fmtTime(Math.floor(Date.now() / 1000))}` : "Xray 未运行";
+  if (!available) { rateHist.length = 0; return; }
+
+  const up = Number(traffic.uplink) || 0;
+  const dn = Number(traffic.downlink) || 0;
+  const total = Math.max(1, Number(traffic.total) || 0);
+  const upLen = (up / total) * RING_C;
+  const dnLen = (dn / total) * RING_C;
+
+  const arcUp = $("#tr-arc-up"), arcDn = $("#tr-arc-dn");
+  if (arcUp) arcUp.setAttribute("stroke-dasharray", `${upLen.toFixed(2)} ${(RING_C - upLen).toFixed(2)}`);
+  if (arcDn) {
+    arcDn.setAttribute("stroke-dasharray", `${dnLen.toFixed(2)} ${(RING_C - dnLen).toFixed(2)}`);
+    arcDn.setAttribute("stroke-dashoffset", (-upLen).toFixed(2));   // 接在上行弧后面, 不重叠
+  }
+  const tt = $("#tr-total");
+  if (tt) tt.textContent = fmtBytes(up + dn);
+  const tv = (id, v) => { const el = $(id); if (el) el.textContent = v; };
+  tv("#tr-up", fmtBytes(up));
+  tv("#tr-down", fmtBytes(dn));
+
+  const rows = (dash.nodes || []).filter((n) => n.traffic);
+  tv("#tr-nodes", rows.length ? `${rows.length} 个` : "—");
+
+  // 每条 = 一根"上下行分色"的条: 蓝=上行, 青=下行, 灰=剩余。
+  // 归一化基准取"最忙节点的合计流量", 所以蓝+青正好等于该节点占最忙节点的比例 (不虚高)。
+  const peak = Math.max(1, ...rows.map((n) => (n.traffic.uplink || 0) + (n.traffic.downlink || 0)));
+  const bars = $("#tr-bars");
+  if (bars) {
+    bars.innerHTML = rows
+      .map((n) => {
+        const u = n.traffic.uplink || 0, d = n.traffic.downlink || 0;
+        const sum = u + d;
+        const share = Math.round((sum / (Number(traffic.total) || 1)) * 100);
+        const w = (v) => (v > 0 ? Math.max(1.5, Math.round((v / peak) * 1000) / 10) : 0);
+        return `<div class="trow">
+          <span class="nm">${esc(n.name)}</span>
+          <span class="val">↑${fmtBytes(u)} ↓${fmtBytes(d)} · ${share}%</span>
+          <span class="rail" title="上行 ${fmtBytes(u)} / 下行 ${fmtBytes(d)}">
+            <i class="up" style="width:${w(u)}%"></i><i class="dn" style="width:${w(d)}%"></i>
+          </span>
+        </div>`;
+      })
+      .join("");
+  }
+  sampleRate();
+}
+
+/* 采样一次累计流量 → 画实时速率曲线 (本页内存, 不落盘) */
+function sampleRate() {
+  const t = dash && dash.traffic;
+  if (!t || t.available === false) return;
+  const now = Date.now();
+  const total = Math.max(0, Number(t.total) || 0);
+  const last = rateHist[rateHist.length - 1];
+  if (last && total < last.total) rateHist.length = 0;        // Xray 重启, 计数器归零
+  const tail = rateHist[rateHist.length - 1];
+  const sample = { t: now, total, up: Math.max(0, Number(t.uplink) || 0), dn: Math.max(0, Number(t.downlink) || 0) };
+  if (tail && now - tail.t < 12000) Object.assign(tail, sample);   // 12s 内的重复渲染只更新最新值
+  else rateHist.push(sample);
+  if (rateHist.length > 24) rateHist.splice(0, rateHist.length - 24);
+  renderRate();
+}
+
+function renderRate() {
+  const nowEl = $("#rate-now"), hintEl = $("#rate-hint");
+  const lineEl = $("#rate-line"), areaEl = $("#rate-area");
+  if (!nowEl || !lineEl) return;
+  const W = 320, H = 46, padTop = 4, base = H - 3;
+
+  // 相邻两点的差值就是这一段的平均速率 (总 / 上 / 下各一条)
+  const rates = [], ups = [], dns = [];
+  for (let i = 1; i < rateHist.length; i += 1) {
+    const a = rateHist[i - 1], b = rateHist[i];
+    const dt = Math.max(1, (b.t - a.t) / 1000);
+    rates.push(Math.max(0, (b.total - a.total) / dt));
+    ups.push(Math.max(0, ((b.up || 0) - (a.up || 0)) / dt));
+    dns.push(Math.max(0, ((b.dn || 0) - (a.dn || 0)) / dt));
+  }
+  if (!rates.length) {
+    nowEl.textContent = "—";
+    if (hintEl) hintEl.textContent = "本页打开后开始采样, 每 20s 一点";
+    lineEl.setAttribute("d", `M0 ${base} L${W} ${base}`);
+    if (areaEl) areaEl.setAttribute("d", `M0 ${base} L${W} ${base} L${W} ${H} L0 ${H} Z`);
+    const cur = $("#rate-cursor"), head = $("#rate-head");
+    if (cur) cur.setAttribute("opacity", "0");
+    if (head) head.setAttribute("opacity", "0");
     return;
   }
-  const total = Math.max(1, traffic.total);
-  const rows = dash.nodes
-    .filter((n) => n.traffic)
-    .map((n) => {
-      const sum = (n.traffic.uplink || 0) + (n.traffic.downlink || 0);
-      return `<div class="traffic-row">
-        <span class="k">${esc(n.name)}</span>
-        <span class="bar"><i style="width:${Math.round((sum / total) * 100)}%"></i></span>
-        <span class="muted" style="width:120px;text-align:right">↑${fmtBytes(n.traffic.uplink)} ↓${fmtBytes(n.traffic.downlink)}</span>
-      </div>`;
-    })
-    .join("");
-  card.innerHTML =
-    `<div class="row" style="justify-content:space-between">
-       <span>总上行 <b>${fmtBytes(traffic.uplink)}</b></span>
-       <span>总下行 <b>${fmtBytes(traffic.downlink)}</b></span>
-       <span class="muted">合计 ${fmtBytes(traffic.total)}</span>
-     </div>
-     <div class="bar" style="margin-top:10px"><i style="width:100%"></i></div>
-     <div style="margin-top:14px">${rows}</div>`;
+  const peak = Math.max(...rates, 1);
+  const pts = rates.map((v, i) => {
+    const x = rates.length === 1 ? W : (i / (rates.length - 1)) * W;
+    return [x, base - (v / peak) * (base - padTop)];
+  });
+  const d = pts.map(([x, y], i) => `${i ? "L" : "M"}${x.toFixed(1)} ${y.toFixed(1)}`).join(" ");
+  lineEl.setAttribute("d", d);
+  if (areaEl) {
+    areaEl.setAttribute("d", `M${pts[0][0].toFixed(1)} ${base} ${d.slice(1)} L${pts[pts.length - 1][0].toFixed(1)} ${H} L${pts[0][0].toFixed(1)} ${H} Z`);
+  }
+  const lastPt = pts[pts.length - 1];
+  const cur = $("#rate-cursor"), head = $("#rate-head");
+  if (cur) {
+    cur.setAttribute("opacity", "0.6");
+    cur.setAttribute("x1", lastPt[0].toFixed(1)); cur.setAttribute("x2", lastPt[0].toFixed(1));
+    cur.setAttribute("y1", "0"); cur.setAttribute("y2", String(H));
+  }
+  if (head) {
+    head.setAttribute("opacity", "1");
+    head.setAttribute("cx", lastPt[0].toFixed(1)); head.setAttribute("cy", lastPt[1].toFixed(1));
+  }
+  nowEl.textContent = `↑${fmtBytes(ups[ups.length - 1])}/s · ↓${fmtBytes(dns[dns.length - 1])}/s`;
+  if (hintEl) {
+    hintEl.textContent = `${rateHist.length} 点 · 峰值合计 ${fmtBytes(peak)}/s`;
+  }
 }
 
 function renderAdvanced(d) {
@@ -1701,6 +2214,7 @@ $("#btn-diag").onclick = async () => {
   btn.textContent = "一键诊断";
 };
 function renderChecks(res) {
+  diagRes = res;
   $("#diag-list").innerHTML =
     `<div class="muted" style="font-size:12.5px;margin-bottom:6px">${esc(res.summary)}</div>` +
     (res.checks || [])
@@ -1712,6 +2226,7 @@ function renderChecks(res) {
       )
       .join("");
   $("#diag-actions").classList.toggle("hidden", !!res.ok);
+  renderSidebar();
 }
 $("#btn-repair").onclick = async () => {
   const btn = $("#btn-repair");
@@ -1828,6 +2343,7 @@ function renderUpdate() {
   runBtn.textContent = running ? "升级中…" : `一键更新到 v${latest}`;
   $("#btn-update-reload").classList.toggle("hidden", !stale || running);
   topBtn.textContent = running ? "升级中…" : u.update_available ? `一键更新 v${latest}` : "检查更新";
+  renderSidebar();   // 侧栏「程序更新」角标跟着变
 }
 
 /* 升级中的实时清单: 待执行 ○ / 进行中 ⟳ / 已完成 ✓ / 失败 ✗。
@@ -1861,8 +2377,10 @@ function updateStepsHtml(last) {
   const summary = failedAt >= 0
     ? `在第 ${failedAt + 1} 步失败 · 已完成 ${done.length}/${names.length} 步`
     : `已完成 ${done.length}/${names.length} 步`;
+  // 升级进行中给进度条加 `.live` (斜纹跑马), 停下来了就恢复静态 —— 一眼区分"在动"和"卡住"
+  const live = last.state === "running" || last.state === "queued";
   return `<div class="ustep-wrap">${rows}</div>
-    <div class="bar"><i class="${failedAt >= 0 ? "bad" : ""}" style="width:${pct}%"></i></div>
+    <div class="bar${live ? " live" : ""}"><i class="${failedAt >= 0 ? "bad" : ""}" style="width:${pct}%"></i></div>
     <div class="muted" style="font-size:12px;margin-top:6px">${summary}${
       last.started_at ? ` · 已用 ${fmtDuration(Math.max(0, updateNow() - last.started_at))}` : ""
     }</div>`;
