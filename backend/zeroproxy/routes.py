@@ -20,7 +20,6 @@ import itertools
 import json
 import os
 import re
-import shutil
 import socket
 import threading
 import time
@@ -235,21 +234,11 @@ def _ensure_cert(state: dict, timeout: int = 0) -> tuple[bool, str]:
 
     `install_cert` 是在 nginx 80 端口 ACME 校验就绪之后才跑的, 而那份 nginx
     配置本身又引用证书文件 —— 没有这步会陷入「证书要 nginx, nginx 要证书」。
+
+    具体实现与「重新应用配置」共用 (见 apply.ensure_cert_files), 所以证书文件
+    后来被删掉时, 那条路径也能自己补回来。
     """
-    p = paths()
-    cert = state.get("cert") or {}
-    if cert.get("cert_file") and os.path.exists(cert["cert_file"]):
-        return True, "已有证书文件可用"
-    ok, detail = services.generate_self_signed(state["domain"], p["cert_file"], p["cert_key"])
-    if ok:
-        state["cert"] = {
-            "type": "selfsigned",
-            "issuer": "ZeroProxy 自签",
-            "cert_file": p["cert_file"],
-            "key_file": p["cert_key"],
-            "not_after": int(time.time()) + 3650 * 86400,
-        }
-    return ok, detail
+    return apply.ensure_cert_files(state)
 
 
 def _reload_nginx(state: dict, timeout: int = 0) -> tuple[bool, str]:
@@ -909,12 +898,43 @@ def update_settings(payload: SettingsIn, request: Request):
                     return _err(f"端口非法: {port}")
                 new_ports[NODE_BY_ID[node_id]["port_key"]] = port
 
-        # 端口冲突检查 (只检查真正要变化的端口; 面板自身端口由 nginx 占用属正常)
-        for key, port in new_ports.items():
-            if port == state["ports"].get(key):
+        # 端口冲突检查。这里查的是"改完之后"的整份端口表, 而不是逐个探测一个端口:
+        #   * 一次请求把两个节点改成同一个端口 (或挪到另一个节点正在用的端口、挪到
+        #     WS 回环 / Stats API 端口) 当场拦下 —— 以前会一路放行到落地,
+        #     由 `xray -test` 报端口重复, 面板上只看到一句含糊的失败;
+        #   * 两个节点对调端口 (8443 ⇄ 8444) 必须允许: 它们会一起腾空, 而探测
+        #     单个端口时看到的是"自己正在监听"(Linux 上必然 bind 失败), 老写法
+        #     会把正常换端口也拦下来。
+        proto_of = {"hysteria": "udp"}
+        moving = {key for key, port in new_ports.items() if port != state["ports"].get(key)}
+        freed = {int(state["ports"][key]) for key in moving if state["ports"].get(key)}
+        merged = {**state["ports"], **new_ports}
+        seen: dict[tuple[int, str], str] = {}
+        for key in ("reality", "xhttp", "ws_internal", "api", "trojan", "hysteria"):
+            port = int(merged.get(key) or 0)
+            if port <= 0:
                 continue
-            proto = "udp" if key == "hysteria" else "tcp"
-            if not services.port_available(port, proto):
+            proto = proto_of.get(key, "tcp")
+            if (port, proto) in seen:
+                return _err(
+                    f"端口 {port}/{proto} 被 {seen[(port, proto)]} 与 {key} 同时占用, 请换一个"
+                )
+            seen[(port, proto)] = key
+        # 链式代理的入站 / 落地端与 nginx 占着的端口也不允许被节点抢走
+        chain_cfg = state.get("chain") or {}
+        exit_cfg = chain_cfg.get("exit") or {}
+        reserved_tcp = {80, 443, config.PANEL_PORT}
+        if exit_cfg.get("uuid"):
+            reserved_tcp.add(int(exit_cfg.get("port") or chain.DEFAULT_EXIT_PORT))
+        reserved_tcp.update(
+            int(entry["local_port"]) for entry in chain_cfg.get("entries") or [] if entry.get("local_port")
+        )
+        for key, port in new_ports.items():
+            proto = proto_of.get(key, "tcp")
+            if proto == "tcp" and port in reserved_tcp:
+                return _err(f"端口 {port}/tcp 已被 nginx / 链式代理占用, 请换一个")
+            # 本次会腾空的端口 (互换) 不算被占用; 其余真要变化的端口才做绑定探测
+            if key in moving and port not in freed and not services.port_available(port, proto):
                 return _err(f"端口 {port}/{proto} 已被占用, 请换一个")
 
         changed = []
@@ -1146,6 +1166,16 @@ def chain_entry_add(payload: ChainEntryIn, request: Request):
         if not _require_auth(state, request):
             return _err("未登录", 401)
         entries = state.setdefault("chain", {}).setdefault("entries", [])
+        # 探测是在锁外跑的 (起临时客户端 + 真实出网, 好几秒), 期间本机状态可能已经
+        # 变了。落地这一瞬间必须重新确认当初挑的端口还空着, 否则两条链会撞到同一个
+        # 端口, 落地时 `xray -test` 直接失败。
+        if int(local_port) in chain.used_ports(state) or not services.port_available(
+            int(local_port), "tcp"
+        ):
+            try:
+                local_port = chain.pick_port(state)
+            except ValueError as exc:
+                return _err(str(exc))
         label = chain.unique_label(
             entries, payload.label or target["label"] or target["host"], target["host"]
         )
@@ -1453,13 +1483,30 @@ def _diagnose(state: dict) -> list[dict]:
             fixable=True,
         )
 
-    # 5. 端口占用
+    # 5. 端口占用 — 只报"被别的进程抢了"。
+    # 不能只看"能不能 bind": 本机核心自己监听的端口在 Linux 上同样 bind 不上
+    # (INADDR_ANY 的监听 socket 挡住所有本地地址), 只看 bind 会让健康的生产机
+    # 每次都把 4 个节点端口报成冲突。所以还要看占用者是谁。
     if prod:
         busy = []
-        for key, proto in (("reality", "tcp"), ("xhttp", "tcp"), ("trojan", "tcp"), ("hysteria", "udp")):
-            port = state["ports"].get(key)
-            if port and not services.port_available(port, proto):
-                busy.append(f"{port}/{proto}")
+        for key, proto, node_id, service in (
+            ("reality", "tcp", "vless-reality", "xray"),
+            ("xhttp", "tcp", "vless-xhttp", "xray"),
+            ("trojan", "tcp", "trojan", "xray"),
+            ("hysteria", "udp", "hysteria2", "hysteria2"),
+        ):
+            port = int(state["ports"].get(key) or 0)
+            if not port or services.port_available(port, proto):
+                continue
+            owner = services.port_owner(port, proto)
+            if owner in services.OUR_PROCESSES:
+                continue
+            if not owner and state["nodes"].get(node_id) and services.service_state(service) in (
+                "active",
+                "running",
+            ):
+                continue  # 读不到占用者时用"服务正在跑"兜底, 不误报
+            busy.append(f"{port}/{proto}" + (f" ({owner})" if owner else ""))
         add("端口占用", not busy, "无冲突" if not busy else f"被占用: {', '.join(busy)}")
 
     # 6. 伪装目标可达性 (Reality / Trojan fallback 依赖它)
@@ -1679,6 +1726,12 @@ async def restore(request: Request):
     data = payload.get("state")
     if not isinstance(data, dict):
         return _err("备份文件缺少 state 字段")
+    # 顶层结构校验: 备份是外部输入, "是合法 JSON"不代表字段类型都对。例如 reality
+    # 被写成 null 时, 下面的 `restored["reality"].get(...)` 会直接抛异常变成 500;
+    # 这里当场给 400, 并保持现网不变。
+    for key in ("admin", "reality", "cert", "nodes", "ports", "chain"):
+        if key in data and not isinstance(data[key], dict):
+            return _err(f"备份结构不合法: {key} 应为对象")
 
     expected = payload.get("checksum", "")
     candidate = copy.deepcopy(data)

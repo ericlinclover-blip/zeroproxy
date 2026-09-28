@@ -372,6 +372,44 @@ def test_entry_local_port_conflict(client, configured, monkeypatch):
     assert res.status_code == 400 and "占用" in res.json()["error"]
 
 
+def test_entry_revalidates_local_port_after_the_probe(client, configured, monkeypatch):
+    """握手探测跑在锁外 (好几秒), 期间端口可能被别的操作占走。
+
+    构造: 第一次挑端口时挑中 8446, 探测期间"另一条链"落地抢走了 8446;
+    落地前必须重新校验, 最终条目不能落在 8446 上, 否则 `xray -test` 会撞端口失败。
+    """
+    real_pick_port = chain.pick_port
+    picks: list[int] = []
+
+    def fake_pick_port(state, preferred=None):
+        if not picks:  # 第一次挑端口: 假装 8446 当时还空着
+            picks.append(chain.ENTRY_PORT_BASE)
+            return chain.ENTRY_PORT_BASE
+        port = real_pick_port(state, preferred)
+        picks.append(port)
+        return port
+
+    monkeypatch.setattr(chain, "pick_port", fake_pick_port)
+
+    def stealing_probe(target, timeout=10.0):
+        # 模拟探测期间另一条链落地, 抢走 8446
+        with config.locked():
+            state = config.load_state()
+            state.setdefault("chain", {}).setdefault("entries", []).append(
+                {"id": "intruder", "label": "抢端口", "local_port": chain.ENTRY_PORT_BASE}
+            )
+            config.save_state(state)
+        return _ok_probe()(target, timeout)
+
+    monkeypatch.setattr(chain, "probe_target", stealing_probe)
+
+    res = client.post("/api/chain/entries", json={"code": _fake_code(config.load_state())})
+    assert res.status_code == 200, res.text
+    entry = res.json()["chain"]["entries"][-1]
+    assert entry["local_port"] != chain.ENTRY_PORT_BASE, entry["local_port"]
+    assert len(picks) == 2, picks  # 第一次挑中 8446, 落地前又重挑了一次
+
+
 def test_entry_names_stay_unique_in_subscriptions(client, configured, monkeypatch):
     """两条链取同一个名字时, 订阅里的节点名必须自动区分开。
 

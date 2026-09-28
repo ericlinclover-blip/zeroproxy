@@ -244,11 +244,19 @@ def _ensure_dirs() -> None:
 
 
 def _merge(base: dict, extra: dict) -> None:
+    """把 extra 递归合并进 base。
+
+    `base` 里已经是对象的字段只接受同样是对象的值: state.json 或备份文件被外部
+    改坏时 (例如 `"reality": null`), 直接赋值会让之后每一处 `.get()` 都变成 500
+    ("'NoneType' object has no attribute 'get'")。这里保留默认值, 让坏数据退化成
+    "该字段缺失" (由各接口给出 400 / 自愈), 而不是把整个面板打挂。
+    """
     for key, value in extra.items():
-        if key in base and isinstance(base[key], dict) and isinstance(value, dict):
-            _merge(base[key], value)
-        else:
-            base[key] = value
+        if key in base and isinstance(base[key], dict):
+            if isinstance(value, dict):
+                _merge(base[key], value)
+            continue
+        base[key] = value
 
 
 # ---------------------------------------------------------------- 引导令牌

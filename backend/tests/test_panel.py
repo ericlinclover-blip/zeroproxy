@@ -204,6 +204,33 @@ def test_invalid_token_404(client, configured):
     assert client.get("/sub/definitely-wrong-token").status_code == 404
 
 
+def test_subscription_survives_all_nodes_disabled(client, configured):
+    """节点全关时订阅也必须能被客户端加载。
+
+    策略组只能引用真实存在的组: `♻️ 自动选择` 只在有节点时才生成, 而
+    `🚀 节点选择` 曾经无条件引用它 —— mihomo / sing-box 遇到不存在的组会直接
+    拒绝整份订阅, 用户看到的是"把节点全关掉之后订阅就坏了"。
+    """
+    yaml = pytest.importorskip("yaml")
+
+    for node_id in ("vless-reality", "vless-xhttp", "vless-ws", "trojan", "hysteria2"):
+        assert client.post(f"/api/nodes/{node_id}/toggle").status_code == 200
+
+    path = configured["subscription_url"].split("testserver")[-1]
+    clash = yaml.safe_load(client.get(f"{path}?format=clash").text)
+    assert clash["proxies"] == []
+    groups = {g["name"] for g in clash["proxy-groups"]}
+    for group in clash["proxy-groups"]:
+        for member in group["proxies"]:
+            assert member in groups or member in ("DIRECT", "REJECT"), (group["name"], member)
+
+    singbox = json.loads(client.get(f"{path}?format=singbox").text)
+    tags = {o["tag"] for o in singbox["outbounds"]}
+    for out in singbox["outbounds"]:
+        for member in out.get("outbounds", []):
+            assert member in tags, (out["tag"], member)
+
+
 def test_panel_index_revalidates(client):
     """面板首页必须每次回源校验。
 
@@ -431,6 +458,49 @@ def test_settings_rejects_bad_input(client, configured):
     assert client.post("/api/settings", json={"ports": {}}).status_code == 400
 
 
+def test_settings_rejects_duplicate_ports(client, configured):
+    """一次请求把两个节点改成同一个端口必须当场拦下。
+
+    以前只看"单个端口能不能 bind" —— 端口还没被任何进程占用时, 两个节点改成
+    同一个端口都会通过, 直到落地时 `xray -test` 报重复端口, 面板上只剩一句
+    含糊的失败。
+    """
+    same = client.post(
+        "/api/settings", json={"ports": {"vless-reality": 9444, "vless-xhttp": 9444}}
+    )
+    assert same.status_code == 400, same.text
+    assert "同时占用" in same.json()["error"]
+
+    # 挪到别的节点正在用的端口 (对方并没有腾出来) 同样不行 —— dry-run 下没有进程
+    # 在监听, 只能靠"改完之后的整张端口表"发现
+    assert client.post("/api/settings", json={"ports": {"vless-reality": 8445}}).status_code == 400
+    # 也不能抢 WS 回环 / Stats API 的端口
+    assert client.post("/api/settings", json={"ports": {"vless-reality": 6000}}).status_code == 400
+    assert client.post("/api/settings", json={"ports": {"vless-reality": 10085}}).status_code == 400
+    # 失败不能留下半截状态
+    state = config.load_state()
+    assert state["ports"]["reality"] == 8443 and state["ports"]["xhttp"] == 8445
+
+
+def test_settings_allows_swapping_two_node_ports(client, configured, monkeypatch):
+    """两个节点对调端口必须允许 —— 它们会一起腾空。
+
+    探测单个端口时看到的是"自己正在监听" (Linux 上绑在 INADDR_ANY 的监听 socket
+    会挡住任何本地地址的 bind), 老写法会把这种正常换端口也拦下来。这里把
+    port_available 换成"本机节点端口都算被占", 模拟生产环境。
+    """
+    from zeroproxy import services
+
+    listening = {int(port) for port in config.load_state()["ports"].values()}
+    monkeypatch.setattr(
+        services, "port_available", lambda port, proto="tcp": int(port) not in listening
+    )
+    response = client.post("/api/settings", json={"ports": {"vless-reality": 8444, "trojan": 8443}})
+    assert response.status_code == 200, response.text
+    state = config.load_state()
+    assert state["ports"]["reality"] == 8444 and state["ports"]["trojan"] == 8443
+
+
 # ---------------------------------------------------------------- 诊断 / 二维码
 
 def test_diagnose_reports_checks(client, configured):
@@ -440,6 +510,34 @@ def test_diagnose_reports_checks(client, configured):
     assert body["summary"].endswith("项通过")
     xray = [c for c in body["checks"] if c["name"] == "Xray 配置"][0]
     assert xray["ok"] is True
+
+
+def test_diagnose_does_not_flag_own_listening_ports(client, configured, monkeypatch):
+    """生产机上"端口占用"只能报别的进程, 不能把本机核心自己的监听算成冲突。
+
+    Linux 上绑在 INADDR_ANY 的监听 socket 会挡住任何本地地址的 bind, 所以只看
+    `port_available` 的话, 健康的生产机每次诊断都会把 4 个节点端口全报成"被占用"。
+    """
+    from zeroproxy import services
+
+    own_ports = {int(port) for port in config.load_state()["ports"].values()}
+    monkeypatch.setattr(services, "is_prod", lambda: True)
+    monkeypatch.setattr(
+        services, "port_available", lambda port, proto="tcp": int(port) not in own_ports
+    )
+    monkeypatch.setattr(
+        services,
+        "port_owner",
+        lambda port, proto="tcp": "hysteria" if proto == "udp" else "xray",
+    )
+    checks = {c["name"]: c for c in client.get("/api/diagnose").json()["checks"]}
+    assert checks["端口占用"]["ok"] is True, checks["端口占用"]
+
+    # 端口被别的进程抢走时必须报出来 (带上进程名)
+    monkeypatch.setattr(services, "port_owner", lambda port, proto="tcp": "evilproc")
+    checks = {c["name"]: c for c in client.get("/api/diagnose").json()["checks"]}
+    assert checks["端口占用"]["ok"] is False
+    assert "evilproc" in checks["端口占用"]["detail"]
 
 
 def test_repair_regenerates_configs(client, configured):
@@ -647,6 +745,25 @@ def test_apply_reapply_leaves_valid_targets_alone(client, home, configured):
     detail = apply.reapply(state)[0]["detail"]
     assert (state["reality"]["dest"], state["reality"]["server_name"]) == before
     assert "非已知问题值" in detail
+
+
+def test_apply_restores_missing_cert_files(client, home, configured):
+    """证书文件丢了要能自己补回来 —— 否则 nginx -t 必失败 (换机恢复备份的典型场景)。"""
+    from zeroproxy import apply
+
+    state = config.load_state()
+    for key in ("cert_file", "key_file"):
+        os.remove(state["cert"][key])
+    # 备份里留着旧机器的 Let's Encrypt 路径, 但本机没有那份私钥
+    state["cert"]["type"] = "letsencrypt"
+    config.save_state(state)
+
+    steps = apply.reapply(state)
+    assert steps[0]["ok"] is True, steps[0]
+    assert "自签" in steps[0]["detail"], steps[0]
+    assert state["cert"]["type"] == "selfsigned"
+    assert os.path.exists(state["cert"]["cert_file"])
+    assert os.path.exists(state["cert"]["key_file"])
 
 
 @pytest.mark.skipif(not os.environ.get("ZP_XRAY_BIN"), reason="需要真实 xray 二进制 (ZP_XRAY_BIN)")
@@ -1042,6 +1159,43 @@ def test_restore_rejects_foreign_file(client, configured):
     assert client.post("/api/restore", json={"hello": "world"}).status_code == 400
     assert client.post("/api/restore", content=b"{not json").status_code == 400
     assert client.post("/api/restore", content=b'{"format":"other","state":{}}').status_code == 400
+
+
+def test_restore_rejects_malformed_structure(client, configured):
+    """备份校验和过了也不代表结构可用 —— 坏结构必须 400, 而不是 500。"""
+    import copy
+    import hashlib
+
+    payload = client.get("/api/backup").json()
+    payload["state"]["reality"] = None
+    clean = copy.deepcopy(payload["state"])
+    clean.pop("sessions", None)
+    clean.pop("login_failures", None)
+    canonical = json.dumps(clean, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    payload["checksum"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    response = client.post("/api/restore", json=payload)
+    assert response.status_code == 400, response.text
+    assert "结构" in response.json()["error"]
+    # 现网不能被动过
+    assert config.load_state()["reality"]["private_key"]
+
+
+def test_state_load_ignores_broken_nested_types(client, configured, home):
+    """state.json 里某个对象字段被改坏 (null) 时, 保留默认值而不是整块崩掉。"""
+    path = config.paths()["state"]
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    data["reality"] = None
+    data["admin"] = []
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh)
+
+    state = config.load_state()
+    assert isinstance(state["reality"], dict) and state["reality"]["dest"]
+    assert isinstance(state["admin"], dict)
+    # 面板仍然可用 (不是 500)
+    assert client.get("/api/dashboard").status_code == 200
 
 
 # ---------------------------------------------------------------- GeoIP 分流
@@ -1787,17 +1941,24 @@ def test_renew_cert_issues_letsencrypt_when_selfsigned(configured, monkeypatch):
     assert state["cert"]["cert_file"].startswith("/etc/letsencrypt/live/")
 
 
-def test_renew_endpoint_reapplies_configs_when_cert_changes(client, configured, monkeypatch):
+def test_renew_endpoint_reapplies_configs_when_cert_changes(client, home, configured, monkeypatch):
     """拿到正式证书后必须重新生成 nginx / xray 配置, 否则线上仍是自签证书。"""
     from zeroproxy import services
+
+    # 真的造两份证书文件: 换签后的 cert_file 指向一个不存在的路径在现实里不会发生
+    # (certbot 会写盘), 而且那种状态会被"证书文件兜底"正确地判为不可用。
+    cert_file = home / "letsencrypt" / "fullchain.pem"
+    key_file = home / "letsencrypt" / "privkey.pem"
+    cert_file.parent.mkdir(parents=True, exist_ok=True)
+    assert services.generate_self_signed(DOMAIN, str(cert_file), str(key_file))[0]
 
     def fake_renew(state):
         state["cert"] = {
             **state["cert"],
             "type": "letsencrypt",
             "issuer": "Let's Encrypt",
-            "cert_file": "/etc/letsencrypt/live/proxy.example.com/fullchain.pem",
-            "key_file": "/etc/letsencrypt/live/proxy.example.com/privkey.pem",
+            "cert_file": str(cert_file),
+            "key_file": str(key_file),
         }
         return True, "Let's Encrypt 证书已签发"
 

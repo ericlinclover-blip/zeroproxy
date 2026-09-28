@@ -434,6 +434,49 @@ def port_available(port: int, proto: str = "tcp") -> bool:
     return True
 
 
+#: "端口属于本机核心"的进程名 (ss / lsof 报出来的名字), 诊断据此区分"自己"和"别人"
+OUR_PROCESSES = ("xray", "hysteria", "hysteria2", "nginx", "zeroproxy")
+
+
+def port_owner(port: int, proto: str = "tcp") -> str:
+    """占用该端口的进程名; 读不到 (工具缺失 / 没权限) 返回空串。
+
+    为什么需要它: 用"能不能 bind"判断端口占用时, 本机核心自己的监听也会被判成
+    占用 —— Linux 上绑在 INADDR_ANY 的监听 socket 会挡住任何本地地址的 bind
+    (`socket(7)`: "When the listening socket is bound to INADDR_ANY with a
+    specific port then it is not possible to bind to this port for any local
+    address")。因此「一键诊断」在健康的生产机上一定会把 4 个节点端口全报成冲突。
+    要区分"被别的进程抢了"和"本来就是我们在监听", 只能去看占用者是谁。
+    """
+    port = int(port)
+    if proto == "udp":
+        ss_cmd, lsof_cmd = ["ss", "-Hlnpu"], ["lsof", "-nP", f"-iUDP:{port}"]
+    else:
+        ss_cmd, lsof_cmd = ["ss", "-Hlnpt"], ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"]
+    if shutil.which("ss"):
+        ok, out = run(ss_cmd, timeout=10)
+        if ok:
+            matched = False
+            for line in out.splitlines():
+                fields = line.split()
+                # LISTEN 0 4096 0.0.0.0:8443 0.0.0.0:* users:(("xray",pid=1,fd=7))
+                if len(fields) < 4 or fields[3].rsplit(":", 1)[-1] != str(port):
+                    continue
+                matched = True
+                found = re.search(r'users:\(\("([^"]+)"', line)
+                if found:
+                    return found.group(1)
+            if matched:
+                return "未知进程"
+    if shutil.which("lsof"):
+        ok, out = run(lsof_cmd, timeout=10)
+        if ok:
+            rows = [row for row in out.splitlines()[1:] if row.strip()]
+            if rows:
+                return rows[0].split()[0]
+    return ""
+
+
 def open_firewall_port(port: int, proto: str = "tcp") -> str:
     """尽力放行一个新端口 (仅 ufw; 云安全组管不到), 返回给用户看的说明。
 

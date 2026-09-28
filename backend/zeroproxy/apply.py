@@ -83,6 +83,40 @@ def gen_xray(state: dict, timeout: int = 0) -> tuple[bool, str]:
     return True, f"已生成 ({count} 个入站)"
 
 
+def ensure_cert_files(state: dict) -> tuple[bool, str]:
+    """落地前的证书兜底: 引用的证书文件不在时就补一张自签证书。
+
+    nginx 的 443 / 面板 server 与 Trojan 入站都直接引用证书**文件**; 文件不在时
+    `nginx -t` 必失败, 严重时 nginx 连启动都起不来。而面板此前只在「初始化」那一步
+    做过一次兜底, 于是这些场景会直接踩坑: 换机恢复备份 (备份里只有 state.json,
+    没有 /etc/letsencrypt 里的私钥)、磁盘清理、手工删证书。放在生成配置之前跑,
+    Trojan 入站也能一起恢复正常。
+    """
+    p = paths()
+    cert = state.get("cert") or {}
+    cert_file = str(cert.get("cert_file") or "")
+    key_file = str(cert.get("key_file") or "")
+    if (
+        cert.get("type") in ("letsencrypt", "selfsigned")
+        and cert_file
+        and key_file
+        and os.path.exists(cert_file)
+        and os.path.exists(key_file)
+    ):
+        return True, "证书文件就绪"
+    ok, detail = services.generate_self_signed(state["domain"], p["cert_file"], p["cert_key"])
+    if not ok:
+        return False, detail
+    state["cert"] = {
+        "type": "selfsigned",
+        "issuer": "ZeroProxy 自签",
+        "cert_file": p["cert_file"],
+        "key_file": p["cert_key"],
+        "not_after": int(time.time()) + 3650 * 86400,
+    }
+    return True, f"{detail} (原证书文件缺失, 已补自签兜底; 客户端需重新拉取订阅)"
+
+
 def ensure_reality_settings(state: dict, timeout: int = 0) -> tuple[bool, str]:
     """落地前校验两件会让 REALITY 必然失败的东西: 密钥对 与 伪装目标。
 
@@ -433,6 +467,9 @@ def reapply(state: dict, timeout: int = 0, progress=None) -> list[dict]:
     """
     steps = steps_recorder()
     before = _config_digests()
+    # 证书文件兜底要放在生成 Xray / Nginx 之前: 证书不可用时 Trojan 入站会被直接
+    # 跳过, nginx 配置也会指向一个不存在的文件 (见 ensure_cert_files)。
+    _cert_ok, cert_detail = ensure_cert_files(state)
 
     def restart_step(current: dict, t: int = 0) -> tuple[bool, str]:
         after = _config_digests()
@@ -451,6 +488,10 @@ def reapply(state: dict, timeout: int = 0, progress=None) -> list[dict]:
         if progress is not None:
             progress(index, len(plan), name)
         add_step(steps, name, fn, state, timeout=t)
+        if index == 0 and cert_detail != "证书文件就绪":
+            # 证书是兜底补回来的话, 让这一步的说明里能看见 —— 否则用户只会注意到
+            # "证书怎么变成自签了", 找不到原因
+            steps[-1]["detail"] = f"{steps[-1]['detail']}; {cert_detail}"
     state["steps"] = steps
     save_state(state)
     return steps

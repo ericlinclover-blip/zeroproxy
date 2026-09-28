@@ -368,7 +368,11 @@ def clash_profile(state: dict, template: str | None = None) -> str:
 
     tpl = template_of(state, template)
     names = [p["name"] for p in proxies]
-    # 节点全关时也要产出可用的配置: 策略组退化为只含 DIRECT
+    # 节点全关时也要产出可用的配置: 策略组退化为只含 DIRECT。
+    # `♻️ 自动选择` 只在有节点时才定义, 所以候选列表里也必须跟着省掉 —— 以前
+    # 无条件把它写进 `🚀 节点选择`, 于是"节点全关"时 mihomo 会因为引用到一个
+    # 不存在的策略组直接拒绝加载整份订阅。
+    select_members = _dedup(([G_AUTO] if names else []) + names + ["DIRECT"])
     groups: list[dict] = []
     if names:
         groups.append(
@@ -381,7 +385,7 @@ def clash_profile(state: dict, template: str | None = None) -> str:
             }
         )
     groups += [
-        {"name": G_SELECT, "type": "select", "proxies": _dedup([G_AUTO, *names, "DIRECT"])},
+        {"name": G_SELECT, "type": "select", "proxies": select_members},
         {"name": G_DIRECT, "type": "select", "proxies": ["DIRECT", G_SELECT]},
         {"name": G_ADS, "type": "select", "proxies": ["REJECT", "DIRECT"]},
         {
@@ -609,11 +613,13 @@ def singbox_profile(state: dict, template: str | None = None, next_gen: bool = F
                 "interval": "5m",
             }
         )
+    # 同 Clash: 没有节点时 `♻️ 自动选择` 不存在, 选择组里不能引用它 (sing-box 会拒绝启动)
+    select_members = _dedup(([G_AUTO] if tags else []) + tags + ["direct"])
     outbounds.append(
         {
             "type": "selector",
             "tag": G_SELECT,
-            "outbounds": _dedup([G_AUTO, *tags, "direct"]),
+            "outbounds": select_members,
             "default": tags[0] if tags else "direct",
         }
     )
