@@ -117,7 +117,7 @@ rm -f /tmp/hysteria-dl /tmp/hysteria
 
 # ---------------- 6. 面板核心 ----------------
 info "安装面板核心 → $ZP_HOME ..."
-mkdir -p "$ZP_HOME"/{xray,hysteria,data,www,certs,nginx,panel}
+mkdir -p "$ZP_HOME"/{xray,hysteria,data,www,certs,nginx,panel,geo}
 
 if [ -f "$SCRIPT_DIR/backend/zeroproxy/main.py" ]; then
   # 从代码仓库 checkout 直接安装
@@ -146,6 +146,33 @@ info "创建 Python 虚拟环境并安装依赖 ..."
 python3 -m venv "$ZP_HOME/venv"
 "$ZP_HOME/venv/bin/pip" install -q --upgrade pip
 "$ZP_HOME/venv/bin/pip" install -q -r "$ZP_HOME/requirements.txt"
+
+# ---------------- 6b. GeoIP / GeoSite 分流数据 ----------------
+# Xray 在配置构建阶段就要读 geoip.dat / geosite.dat, 配置里有 geo 规则而数据
+# 缺失会让整个 xray 服务起不来。这里预下载, 失败也不阻塞部署; 面板检测到数据
+# 缺失时不会下发 geo 规则, 之后可在面板「高级设置」里一键补齐。
+#
+
+info "下载 GeoIP / GeoSite 分流数据 (约 28 MB) ..."
+GEO_OK=0
+for GEO_MIRROR in \
+  "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release" \
+  "https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release" \
+  "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download"
+do
+  wget -q --timeout=60 --tries=2 -O "$ZP_HOME/geo/geoip.dat" "$GEO_MIRROR/geoip.dat" || continue
+  wget -q --timeout=60 --tries=2 -O "$ZP_HOME/geo/geosite.dat" "$GEO_MIRROR/geosite.dat" || continue
+  GEO_SIZE_IP="$(stat -c%s "$ZP_HOME/geo/geoip.dat" 2>/dev/null || echo 0)"
+  GEO_SIZE_ST="$(stat -c%s "$ZP_HOME/geo/geosite.dat" 2>/dev/null || echo 0)"
+  if [ "$GEO_SIZE_IP" -gt 1000000 ] && [ "$GEO_SIZE_ST" -gt 1000000 ]; then
+    GEO_OK=1
+    ok "GeoIP/GeoSite 就绪 ($(( (GEO_SIZE_IP + GEO_SIZE_ST) / 1048576 )) MB)"
+    break
+  fi
+done
+if [ "$GEO_OK" != "1" ]; then
+  warn "GeoIP 数据下载失败 — 不影响核心功能, 可稍后在面板里重试"
+fi
 
 # ---------------- 7. 占位配置 (面板 setup 之前服务可先启动) ----------------
 cat > "$ZP_HOME/xray/config.json" <<'JSON'

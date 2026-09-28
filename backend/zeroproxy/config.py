@@ -24,7 +24,7 @@ except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
 #: state.json 结构版本 — 新增字段时 +1, `_merge` 会自动补齐缺失键
-STATE_VERSION = 2
+STATE_VERSION = 3
 
 DEFAULT_HOME = "/opt/zeroproxy"
 #: 面板对外端口 (nginx 监听, 默认 8899) — 用于生成订阅/面板链接
@@ -51,6 +51,9 @@ XHTTP_PATH = "/xhttp-zeroproxy"
 
 #: Hysteria 2 伪装目标 (非代理流量会被反代到这里, 技术文档 §4.3)
 DEFAULT_MASQUERADE = "https://www.microsoft.com/"
+
+#: GeoIP / GeoSite 数据自动更新的默认周期 (7 天)
+GEODATA_TTL = 7 * 86400
 
 #: 节点元数据 — id 与 state["nodes"] 的键一致
 NODES = [
@@ -140,6 +143,19 @@ DEFAULTS: dict = {
     },
     "hysteria_hopping": True,   # 端口跳跃 (技术文档 附录 C)
     "hysteria_ports": [30001, 31001, 32001],
+    # GeoIP/GeoSite 数据 (Loyalsoldier/v2ray-rules-dat) 与基于它的分流防护。
+    # 关键: 只要配置里出现 `geoip:*` / `geosite:*` 规则, 而数据文件不存在,
+    # Xray 会直接拒绝启动整份配置 — 因此 `enabled` 只在数据齐备时才允许为真
+    # (见 geodata.usable())。
+    "geodata": {
+        "enabled": False,       # 是否下发 geo 分流规则 (需要数据文件齐备)
+        "block_private": True,  # 阻止客户端访问服务器内网/私有地址
+        "block_ads": True,      # 按 geosite:category-ads-all 屏蔽广告域名
+        "user_set": False,      # 用户是否手动调整过分流开关 (为真则不再自动启用)
+        "updated_at": 0,        # 上次成功更新时间
+        "source": "",           # 实际生效的数据源
+        "files": {},            # 文件名 -> {"size": int, "sha256": str}
+    },
     "nodes": {nid: True for nid in NODE_IDS},
     "cert": {
         "type": "none",  # none | letsencrypt | selfsigned
@@ -180,6 +196,8 @@ def paths() -> dict:
         "hysteria_cert": f"{h}/hysteria/cert.pem",
         "hysteria_key": f"{h}/hysteria/key.pem",
         "cert_dir": f"{h}/certs",
+        # GeoIP/GeoSite 数据目录 — Xray 通过 XRAY_LOCATION_ASSET 指向它
+        "geo_dir": f"{h}/geo",
         "cert_file": f"{h}/certs/cert.pem",
         "cert_key": f"{h}/certs/key.pem",
         # 面板自身的 HTTPS 自签证书 (install.sh 部署时生成; 不存在则面板回退明文 HTTP)
@@ -195,7 +213,9 @@ def paths() -> dict:
 
 def _ensure_dirs() -> None:
     p = paths()
-    for key in ("data_dir", "xray_dir", "hysteria_dir", "cert_dir", "nginx_dir", "www", "panel_dir"):
+    for key in (
+        "data_dir", "xray_dir", "hysteria_dir", "cert_dir", "nginx_dir", "www", "panel_dir", "geo_dir"
+    ):
         os.makedirs(p[key], exist_ok=True)
 
 
@@ -286,6 +306,18 @@ def load_state() -> dict:
         # 结构升级: 缺失键由 _merge 自动补齐, 这里统一标注版本号
         state["version"] = STATE_VERSION
         return state
+
+
+def state_from(data: dict) -> dict:
+    """由外部数据构造完整 state (备份恢复用): DEFAULTS 兜底 + 递归合并 + 版本对齐。
+
+    缺失的新字段会被自动补齐, 因此旧版本备份也能恢复。
+    """
+    state = copy.deepcopy(DEFAULTS)
+    if isinstance(data, dict):
+        _merge(state, data)
+    state["version"] = STATE_VERSION
+    return state
 
 
 def save_state(state: dict) -> None:

@@ -11,6 +11,8 @@
 """
 from __future__ import annotations
 
+import copy
+import hashlib
 import hmac
 import io
 import ipaddress
@@ -19,6 +21,7 @@ import os
 import re
 import shutil
 import socket
+import threading
 import time
 
 import qrcode
@@ -31,18 +34,34 @@ from pydantic import BaseModel
 from . import (
     config,
     crypto,
+    geodata,
     hysteria_config,
     nginx_config,
     services,
     share_links,
     xray_config,
 )
-from .config import NODES, NODE_BY_ID, NODE_IDS, XRAY_NODE_IDS, load_state, paths, save_state
+from .config import (
+    NODES,
+    NODE_BY_ID,
+    NODE_IDS,
+    XRAY_NODE_IDS,
+    load_state,
+    paths,
+    save_state,
+    state_from,
+)
 
 router = APIRouter()
 
 SESSION_COOKIE = "zp_session"
 SESSION_TTL = config.SESSION_TTL
+
+#: 备份文件标识与版本
+BACKUP_FORMAT = "zeroproxy-backup"
+BACKUP_VERSION = 1
+#: 恢复请求体上限 (state.json 只有几 KB, 4 MB 足够且能挡住内存滥用)
+RESTORE_MAX_BYTES = 4 * 1024 * 1024
 
 #: 登录限流: 连续失败 3 次后开始封禁, 时长 2^n 秒, 上限 300s
 LOGIN_FREE_TRIES = 3
@@ -195,7 +214,11 @@ def _gen_xray(state: dict, timeout: int = 0) -> tuple[bool, str]:
     binary = services.bin_path("xray")
     if binary:
         # 只要有 xray 二进制就用它做真实校验 (生产环境 / 指定 ZP_XRAY_BIN 的开发环境)
-        ok, out = services.run([binary, "-test", "-c", paths()["xray_config"]], timeout=60)
+        ok, out = services.run(
+            [binary, "-test", "-c", paths()["xray_config"]],
+            timeout=60,
+            env=services.xray_env(),
+        )
         if not ok:
             return False, f"已生成但 xray -test 未通过: {' '.join(out.split())[:150]}"
         return True, f"已生成 ({count} 个入站, xray -test 通过)"
@@ -499,6 +522,7 @@ def _dashboard_body(state: dict, request: Request, traffic: dict | None = None) 
             "server_name": state["reality"]["server_name"],
             "dest": state["reality"]["dest"],
         },
+        "geodata": geodata.status(state),
         "xhttp": state.get("xhttp", {}),
         "ports": state.get("ports", {}),
         "traffic": traffic,
@@ -577,6 +601,10 @@ class SettingsIn(BaseModel):
     reality_sni: str | None = None
     masquerade_url: str | None = None
     ports: dict[str, int] | None = None
+    # GeoIP 分流开关 (数据文件缺失时规则不会下发, 见 xray_config.geo_rules)
+    geodata_enabled: bool | None = None
+    block_private: bool | None = None
+    block_ads: bool | None = None
 
 
 @router.post("/api/settings")
@@ -634,6 +662,23 @@ def update_settings(payload: SettingsIn, request: Request):
         if "hysteria" in new_ports and state.get("hysteria_hopping"):
             base = new_ports["hysteria"]
             state["hysteria_ports"] = [base, base + 1000, base + 2000]
+
+        # GeoIP 分流开关
+        geo = state.setdefault("geodata", {})
+        if payload.geodata_enabled is not None and bool(payload.geodata_enabled) != bool(
+            geo.get("enabled")
+        ):
+            if payload.geodata_enabled and not geodata.present():
+                return _err("GeoIP 数据尚未下载, 请先点击「下载/更新 GeoIP 数据」")
+            geo["enabled"] = bool(payload.geodata_enabled)
+            geo["user_set"] = True
+            changed.append(f"geodata={'on' if geo['enabled'] else 'off'}")
+        for field, key in (("block_private", "block_private"), ("block_ads", "block_ads")):
+            value = getattr(payload, field)
+            if value is not None and bool(value) != bool(geo.get(key, True)):
+                geo[key] = bool(value)
+                geo["user_set"] = True
+                changed.append(f"{key}={'on' if value else 'off'}")
 
         if not changed:
             return _err("没有需要修改的内容")
@@ -707,6 +752,7 @@ def _diagnose(state: dict) -> list[dict]:
         add("Xray 配置", ok, "xray -test 通过" if ok else f"xray -test 失败: {detail}", fixable=True)
 
     # 3. 入站与节点开关一致
+    cfg: dict = {}
     try:
         with open(config_file, "r", encoding="utf-8") as fh:
             cfg = json.load(fh)
@@ -725,6 +771,23 @@ def _diagnose(state: dict) -> list[dict]:
         )
     except (OSError, json.JSONDecodeError) as exc:
         add("入站与节点开关一致", False, f"读取配置失败: {exc}", fixable=True)
+
+    # 3b. GeoIP 数据与分流规则的一致性 (不一致会让 Xray 整体启动失败)
+    geo = geodata.status(state)
+    rules_text = json.dumps(cfg.get("routing", {}).get("rules", []), ensure_ascii=False)
+    rules_use_geo = ("geoip:" in rules_text) or ("geosite:" in rules_text)
+    if rules_use_geo and not geodata.present():
+        add("GeoIP 数据", False, "配置里有 geo 分流规则但数据文件缺失 — Xray 将无法启动", fixable=True)
+    elif not geo["enabled"]:
+        add("GeoIP 数据", True, "未启用分流 (下载数据后可开启私有地址防护/广告拦截)")
+    else:
+        age = geo["age_days"]
+        add(
+            "GeoIP 数据",
+            geo["active"] and (age <= 30 or age < 0),
+            f"{geo['source'] or '未知来源'} · {age} 天前更新 · "
+            f"{'已启用分流' if geo['active'] else '数据缺失, 规则未下发'}",
+        )
 
     # 4. 证书
     cert = state["cert"]
@@ -804,6 +867,192 @@ def logs(service: str, request: Request, lines: int = 40):
         if not _require_auth(state, request):
             return _err("未登录", 401)
     return {"service": service, "log": services.journal_tail(service, max(5, min(int(lines), 200)))}
+
+
+# ---------------------------------------------------------------- 连通性探测
+
+#: 探测缓存 (探测要握 6 次手, 3 秒内重复点击直接复用结果)
+_PROBE_CACHE: dict = {"at": 0, "body": None}
+_PROBE_LOCK = threading.Lock()
+
+
+@router.get("/api/probe")
+def probe(request: Request, force: int = 0):
+    """节点体检: 对每个本地入站做一次真实握手, 并测量服务器到伪装目标的 RTT。
+
+    这是服务端能给出的最有意义的"延迟" —— 客户端到服务器的 RTT 只能由客户端
+    测量, 服务端无法自测; 但"入站握手是否成功 + 握手耗时"能直接反映节点是否
+    真的可用 (Reality 密钥/SNI/dest 不匹配时握手必然失败)。
+    """
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+
+    now = time.time()
+    with _PROBE_LOCK:
+        cached = _PROBE_CACHE["body"]
+        if cached and not force and now - _PROBE_CACHE["at"] < 3:
+            return cached
+
+    body = services.probe_all(state)
+    with _PROBE_LOCK:
+        _PROBE_CACHE["at"] = time.time()
+        _PROBE_CACHE["body"] = body
+    return body
+
+
+# ---------------------------------------------------------------- 备份 / 恢复
+
+def _canonical(state: dict) -> str:
+    """规范化序列化 (排序键 + 紧凑分隔符) — 校验和必须与序列化方式无关。"""
+    return json.dumps(state, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def _backup_payload(state: dict) -> dict:
+    clean = copy.deepcopy(state)
+    # 会话与登录限流是纯运行时数据, 备份里没有意义, 且不该被复制到别的机器
+    clean.pop("sessions", None)
+    clean.pop("login_failures", None)
+    return {
+        "format": BACKUP_FORMAT,
+        "backup_version": BACKUP_VERSION,
+        "panel_version": __import__("zeroproxy").__version__,
+        "state_version": config.STATE_VERSION,
+        "exported_at": int(time.time()),
+        "checksum": hashlib.sha256(_canonical(clean).encode("utf-8")).hexdigest(),
+        "state": clean,
+    }
+
+
+@router.get("/api/backup")
+def backup(request: Request):
+    """导出完整状态 (含 Reality 私钥 / 口令哈希 / 订阅令牌) — 需登录。"""
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        config.audit(state, "backup", f"domain={state['domain']}", actor=_client_ip(request))
+        save_state(state)
+        payload = _backup_payload(state)
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    return JSONResponse(
+        payload,
+        headers={
+            "content-disposition": f'attachment; filename="zeroproxy-backup-{stamp}.json"',
+            "cache-control": "no-store",
+        },
+    )
+
+
+@router.post("/api/restore")
+async def restore(request: Request):
+    """从备份恢复状态, 然后重新生成全部配置并热重载。
+
+    校验链: 结构 → 校验和 → 必填字段 → 状态版本。任一不过都保持现网不变。
+    """
+    raw = await request.body()
+    if len(raw) > RESTORE_MAX_BYTES:
+        return _err("备份文件过大", 413)
+
+    with config.locked():
+        current = load_state()
+        if not _require_auth(current, request):
+            return _err("未登录", 401)
+
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return _err(f"备份文件不是合法 JSON: {exc}")
+    if not isinstance(payload, dict) or payload.get("format") != BACKUP_FORMAT:
+        return _err("不是 ZeroProxy 备份文件 (缺少 format 标识)")
+
+    data = payload.get("state")
+    if not isinstance(data, dict):
+        return _err("备份文件缺少 state 字段")
+
+    expected = payload.get("checksum", "")
+    candidate = copy.deepcopy(data)
+    candidate.pop("sessions", None)
+    candidate.pop("login_failures", None)
+    actual = hashlib.sha256(_canonical(candidate).encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(str(expected), actual):
+        return _err("备份文件校验和不匹配 (文件被修改或损坏)")
+
+    if int(payload.get("state_version", 0) or 0) > config.STATE_VERSION:
+        return _err(
+            f"备份来自更新的面板 (state v{payload.get('state_version')})，请先升级再恢复"
+        )
+
+    restored = state_from(data)
+    if not restored.get("configured"):
+        return _err("备份不是已初始化状态, 拒绝恢复")
+    for key in ("uuid", "subscription_token", "domain"):
+        if not restored.get(key):
+            return _err(f"备份缺少必填字段: {key}")
+    if not restored["reality"].get("private_key") or not restored["reality"].get("public_key"):
+        return _err("备份缺少 Reality 密钥对")
+    if not restored["admin"].get("username") or not restored["admin"].get("password_hash"):
+        return _err("备份缺少管理员凭据")
+
+    with config.locked():
+        # 恢复是"覆盖"操作: 先记审计再落盘 (审计属于新状态的一部分)
+        restored["sessions"] = {}
+        restored["login_failures"] = {}
+        config.audit(
+            restored,
+            "restore",
+            f"from={payload.get('panel_version', '?')} exported_at={payload.get('exported_at', 0)}",
+            actor=_client_ip(request),
+        )
+        save_state(restored)
+        steps = _reapply(restored, request)
+        body = _dashboard_body(restored, request)
+        body["steps"] = steps
+        response = JSONResponse(body)
+        _issue_session(restored, request, response)
+        save_state(restored)
+    return response
+
+
+# ---------------------------------------------------------------- GeoIP 数据
+
+#: 同一时间只允许一个下载任务 (几十 MB, 不做并发)
+_GEO_UPDATE_LOCK = threading.Lock()
+
+
+@router.post("/api/geodata/update")
+def geodata_update(request: Request):
+    """下载/刷新 GeoIP + GeoSite 数据, 然后重新生成配置并热重载。"""
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+
+    if not _GEO_UPDATE_LOCK.acquire(blocking=False):
+        return _err("已有更新任务在进行中", 409)
+    try:
+        ok, detail, _info = geodata.update(state)
+    finally:
+        _GEO_UPDATE_LOCK.release()
+
+    with config.locked():
+        fresh = load_state()
+        if ok:
+            fresh["geodata"] = state["geodata"]
+        config.audit(
+            fresh,
+            "geodata_update" if ok else "geodata_update_failed",
+            detail[:190],
+            actor=_client_ip(request),
+        )
+        save_state(fresh)
+        body = _dashboard_body(fresh, request)
+        if ok:
+            body["steps"] = _reapply(fresh, request)
+    body["ok"] = ok
+    body["detail"] = detail
+    return body
 
 
 # ---------------------------------------------------------------- 订阅 / 二维码

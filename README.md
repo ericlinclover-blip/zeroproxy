@@ -24,12 +24,15 @@ curl -fsSL https://<raw-host>/install.sh | bash
 | **5 个节点** | VLESS Reality (TCP+Vision)、VLESS XHTTP Reality、VLESS WebSocket、Trojan TLS、Hysteria 2 (QUIC+端口跳跃) |
 | **3 种订阅格式** | 同一订阅地址 `?format=` 切换: Base64 通用 / Clash(mihomo) YAML / sing-box JSON |
 | **引导令牌保护** | 初始化必须带 `?token=`, 公网暴露时别人抢不走你的面板; 初始化成功即作废 |
-| **一键自检自愈** | `/api/diagnose` 检查 7 项 (服务、配置、入站一致性、证书、端口、伪装目标可达性) + `/api/repair` 重新生成并重启 |
+| **一键自检自愈** | `/api/diagnose` 检查 8 项 (服务、配置、入站一致性、GeoIP 一致性、证书、端口、伪装目标可达性) + `/api/repair` 重新生成并重启 |
+| **节点测速** | `/api/probe` 对每个节点做**真实握手** (Reality / Trojan 走完整 TLS, 失败即说明配置不对), 并测服务器到伪装目标的出口延迟 |
+| **GeoIP 分流防护** | 私有地址防护 (阻止客户端借道访问服务器内网) + 广告域名拦截; 数据每周自动更新, 缺失时自动不下发规则 |
+| **备份 / 恢复** | 一键导出含全部密钥与令牌的备份, 换机或重装后一键还原 (校验和校验, 篡改即拒绝) |
 | **流量统计** | 内置 Xray Stats API (仅 127.0.0.1), 仪表盘按节点展示上下行, 并写入订阅的 `subscription-userinfo` 头 |
 | **订阅恒定, 内容动态** | 订阅 URL 永不变; 节点启停 / 端口变更 / 伪装设置都会自动同步到客户端 |
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
-| **可回归验证** | `pytest` 27 项 + `scripts/verify.py` 用真实 Xray / Hysteria / mihomo / sing-box 二进制校验 |
+| **可回归验证** | `pytest` 41 项 + `scripts/verify.py` (53 项) + `scripts/browser_check.cjs` (23 项), 全部用真实二进制 / 真实浏览器 |
 
 竞品与技术调研见 `docs/RESEARCH.md`。
 
@@ -48,16 +51,20 @@ zeroproxy/
 │   ├── tests/                     # pytest 回归测试 (dry-run 全流程 + 安全边界 + 状态迁移)
 │   └── zeroproxy/
 │       ├── main.py                # FastAPI 入口 + 安全响应头中间件
-│       ├── config.py              # 状态模型 (state.json v2) / 文件锁 / 引导令牌 / 审计日志
+│       ├── config.py              # 状态模型 (state.json v3) / 文件锁 / 引导令牌 / 审计日志 / 备份还原
 │       ├── crypto.py              # VLESS UUID 派生 / Reality ed25519 / PBKDF2
 │       ├── xray_config.py         # Xray 配置生成 (Reality / XHTTP / WS / Trojan + Stats API)
+│       ├── geodata.py             # GeoIP/GeoSite 下载与校验 + 分流规则 (硬前置: 数据缺失不下发)
 │       ├── nginx_config.py        # Nginx 生成 (ACME + 443 WS 反代 + 伪装主页 + 8899 面板 TLS)
 │       ├── hysteria_config.py     # Hysteria 2 配置生成 (端口跳跃 + masquerade 伪装)
-│       ├── services.py            # systemctl / certbot / 自签证书 / 流量统计 / 诊断 适配层
+│       ├── services.py            # systemctl / certbot / 自签证书 / 流量统计 / 节点握手探测 / 诊断
 │       ├── share_links.py         # 单节点链接 + Base64 / Clash / sing-box 三种订阅
-│       └── routes.py              # API: setup / login / dashboard / settings / diagnose / sub / qr
+│       └── routes.py              # API: setup / login / dashboard / settings / diagnose / probe / backup / sub / qr
+├── docs/
+│   └── RESEARCH.md                # 竞品与技术调研 (含上游源码一手证据)
 ├── scripts/
-│   └── verify.py                  # 端到端验证: 真实二进制跑通配置生成与订阅解析
+│   ├── verify.py                  # 端到端验证: 真实二进制跑通配置生成 / 订阅解析 / 探测 / 备份 / GeoIP
+│   └── browser_check.cjs          # 真实浏览器 (Playwright) UI 验证与截图
 ├── static/
 │   └── index.html                 # Apple 风格单文件 UI (零构建, 深浅色, 无 CDN)
 └── systemd/
@@ -73,6 +80,7 @@ zeroproxy/
 ├── zeroproxy/ static/ venv/       # 面板代码与虚拟环境
 ├── data/state.json                # 全部可变状态 (0600)
 ├── data/bootstrap_token           # 引导令牌 (0600, 初始化成功后自动删除)
+├── geo/geoip.dat geosite.dat      # GeoIP/GeoSite 分流数据 (由 XRAY_LOCATION_ASSET 指向)
 ├── panel/cert.pem key.pem         # 面板 HTTPS 引导自签证书
 ├── xray/config.json               # 由面板生成
 ├── hysteria/config.yaml + cert.pem/key.pem
@@ -111,6 +119,9 @@ zeroproxy/
   SNI 命中域名用 Let's Encrypt 证书, 其余 (IP / 未知 SNI) 回退自签。
 - **流量统计**: Xray 配置内置 `stats`/`policy`/`api`, API 入站只监听 `127.0.0.1:10085`,
   路由规则把 API 入站交给 `tag=api` 处理器 (写成 `direct` 时 `xray api statsquery` 连不上)。
+- **GeoIP 分流是"硬前置"的**: Xray 在配置构建阶段就要求 `geoip.dat` / `geosite.dat` 存在,
+  缺文件时不是跳过规则而是**整份配置加载失败**。因此本项目把"数据齐备"作为下发 geo 规则的前提
+  (`geodata.usable()`), 数据被删也只会退化成"没有这两条规则", 不会让核心起不来。
 
 ---
 
@@ -158,11 +169,27 @@ GET /sub/{token}?format=singbox    → sing-box 1.14 完整 JSON (mixed 入站 +
 2. `xray -test` 配置合法性
 3. 入站与节点开关是否一致 (改完设置忘记重启会被抓到)
 4. TLS 证书类型、剩余天数、文件是否存在
-5. 对外端口是否被其他进程占用
-6. Reality 伪装目标 (dest) 是否真的可连接
-7. 本地开发环境自动跳过系统级检查
+5. GeoIP 数据与分流规则是否一致 (配置里有 geo 规则但数据缺失 = Xray 必然起不来)
+6. 对外端口是否被其他进程占用
+7. Reality 伪装目标 (dest) 是否真的可连接
+8. 本地开发环境自动跳过系统级检查
 
 `POST /api/repair` 一键自愈: 重新生成 Xray + Nginx + Hysteria 配置 → 重载服务 → 复检并回传结果。
+
+### 6.1 节点测速 (真实握手, 不是 ICMP ping)
+
+`GET /api/probe` (仪表盘「节点测速」, 进入仪表盘时自动跑一次):
+
+| 节点 | 探测方式 | 说明 |
+|---|---|---|
+| VLESS Reality / XHTTP | **完整 TLS 握手** | Reality 会代答握手并转发目标站点证书; 密钥 / SNI / dest 任一不匹配都会失败 |
+| Trojan | **完整 TLS 握手** | 同时验证证书文件与 8444 入站 |
+| VLESS WebSocket | TCP 握手 | TLS 由 nginx 终结, 这里验证回环入站存活 |
+| Hysteria 2 | UDP 监听检测 | QUIC 无法用 TCP 探测; Linux 读 `/proc/net/udp`, macOS 走 `lsof` |
+
+同时测量**服务器到伪装目标的出口 RTT** (真实网络往返)。注意: 客户端到服务器的 RTT
+只能由客户端测量, 服务端自测的数字没有意义 —— 所以这里给的是「握手是否真的成功 + 出口质量」,
+这恰好是判断「节点到底能不能用」最直接的证据。
 
 ---
 
@@ -172,7 +199,7 @@ GET /sub/{token}?format=singbox    → sing-box 1.14 完整 JSON (mixed 入站 +
 用户操作 (开关节点 / 改端口 / 改伪装 / 续期证书)
         │  POST /api/...   (config.locked() 事务)
         ▼
-state.json (唯一事实来源, schema v2, 旧版本自动升级)
+state.json (唯一事实来源, schema v3, 旧版本自动升级)
         │
         ├──► 重新生成 xray/config.json + hysteria/config.yaml + nginx conf
         │            │
@@ -186,7 +213,9 @@ state.json (唯一事实来源, schema v2, 旧版本自动升级)
 
 - 节点关闭 = 订阅中移除该行 + 入站从 Xray 配置移除 + Hysteria 监听收敛回 `127.0.0.1`。
 - 证书续期只换文件 + `reload nginx`; 重复 `/api/apply` 使用 `--keep-until-expiring --expand`, 不会重复签发。
-- state.json 结构升级: 新增字段在读取时由 `_merge` 自动补齐 (v1 → v2 已覆盖测试)。
+- state.json 结构升级: 新增字段在读取时由 `_merge` 自动补齐 (v1 → v2 → v3 已覆盖测试)。
+- GeoIP 数据每 7 天自动更新: 面板后台线程每 6 小时检查一次, 只在数据真的变化时重启 Xray;
+  下载先落到临时目录并通过真实 `xray -test` 校验后才原子替换, 所以不会出现"半个数据集"。
 
 ---
 
@@ -197,8 +226,9 @@ state.json (唯一事实来源, schema v2, 旧版本自动升级)
 - **Apple 风格**: SF 字体栈、18px 圆角卡片、柔和阴影、深浅色自动 + 手动切换。
 - **三步交互**: 初始化 (三输入框 + 部署进度逐步打钩) → 登录 → 仪表盘, 每 20s 静默轮询。
 - **仪表盘卡片**: 订阅三种格式 (各自复制 / 二维码)、5 张节点卡 (协议徽标 / 传输 / 加密 / 状态灯 /
-  开关 / 单节点流量 / 复制链接 / 二维码)、流量总览与节点占比、高级设置 (Reality SNI /
-  Hysteria 伪装站点 / 各节点端口)、诊断与一键修复、证书与系统状态、操作审计。
+  开关 / 单节点流量 / **握手延迟徽标** / 复制链接 / 二维码)、流量总览与节点占比、
+  高级设置 (Reality SNI / Hysteria 伪装站点 / 各节点端口 / **GeoIP 分流开关与数据更新**)、
+  诊断与一键修复、证书与系统状态 (**含备份下载与恢复**)、操作审计。
 
 ---
 
@@ -213,6 +243,10 @@ state.json (唯一事实来源, schema v2, 旧版本自动升级)
 | POST | `/api/nodes/{id}/toggle` | 会话 | 节点启停 → 热重载 |
 | POST | `/api/hysteria/hopping` | 会话 | 端口跳跃开关 → 热重载 |
 | POST | `/api/settings` | 会话 | 改 Reality SNI / Hysteria 伪装站点 / 节点端口 (含端口占用校验) |
+| GET | `/api/probe` | 会话 | 节点真实握手探测 + 服务器出口 RTT (3 秒内复用缓存) |
+| POST | `/api/geodata/update` | 会话 | 下载/刷新 GeoIP + GeoSite 数据并热重载 (互斥, 并发时 409) |
+| GET | `/api/backup` | 会话 | 导出备份 JSON (含密钥与令牌, 带 SHA-256 校验和, 不含会话) |
+| POST | `/api/restore` | 会话 | 从备份恢复并热重载 (校验和/必填字段/版本三重校验) |
 | POST | `/api/apply` | 会话 | 重新生成全部配置并热重载 |
 | POST | `/api/renew` | 会话 | `certbot renew` + reload nginx |
 | GET | `/api/diagnose` / POST `/api/repair` | 会话 | 自检 / 一键自愈 |
@@ -231,8 +265,10 @@ state.json (唯一事实来源, schema v2, 旧版本自动升级)
 | Xray TLS 字段 | — | 25+ 的 `tlsSettings.certificates[]` 只接受 `certificateFile` / `keyFile`; 旧写法 `certificate` / `key` 会导致启动失败 |
 | Xray sniffing | — | `destOverride` 合法值只有 `http` / `tls` / `quic` / `fakedns`, 写 `dns` 会被拒绝启动 |
 | Xray Stats API | — | 路由必须把 api 入站的 `outboundTag` 指向 `api`; 指向 `direct` 时 `xray api statsquery` 连不上 |
+| Xray GeoIP/GeoSite | — | geo 数据在**配置构建阶段**就要读: 写了 `geoip:`/`geosite:` 规则而 `geoip.dat` 缺失时, Xray 不是"跳过规则"而是**整份配置加载失败**。查找路径为可执行文件所在目录或 `XRAY_LOCATION_ASSET` (本项目在 systemd 单元里指向 `/opt/zeroproxy/geo`) |
 | Hysteria 2 | **v2.12.3** | 生成的配置 (含 `masquerade.proxy.url` / `rewriteHost`) 能被真实二进制启动; 多端口 `listen` 仅 Linux 支持 (macOS 会明确报错) |
 | mihomo | **v1.19.31** | Clash 订阅 (含 `network: xhttp` + `xhttp-opts`、hysteria2 `ports` / `hop-interval`) 通过 `mihomo -t` |
+| mihomo geox | — | 订阅里的 `GEOIP` 规则会让 mihomo 首次加载时下载 `geoip.metadb`; 默认指向 GitHub, 受限网络下会超时**导致订阅加载失败**。订阅已内置 `geox-url` 指向可用镜像 |
 | sing-box | **1.14.2** | 订阅 JSON 通过 `sing-box check`; 1.13 起 legacy inbound 字段 (`sniff: true`) 被移除, 已改用 `route.rules[].action: sniff` |
 | certbot | 系统包 | webroot 签发, `--keep-until-expiring --expand` 保证重复应用不重复签发; 失败自动回退自签 (10 年) |
 
@@ -254,6 +290,9 @@ ZP_XRAY_BIN=/path/to/xray python -m pytest tests -q
 ZP_XRAY_BIN=/path/to/xray ZP_HYSTERIA_BIN=/path/to/hysteria \
 ZP_MIHOMO_BIN=/path/to/mihomo ZP_SINGBOX_BIN=/path/to/sing-box \
 python3 scripts/verify.py
+
+# 真实浏览器 UI 验证 (Playwright; 需 node + playwright)
+ZP_NODE_PATH=/path/to/node_modules node scripts/browser_check.cjs
 ```
 
 开发环境可用 `ZP_XRAY_BIN` / `ZP_HYSTERIA_BIN` / `ZP_NGINX_BIN` 指定二进制绝对路径
@@ -265,17 +304,23 @@ python3 scripts/verify.py
 
 在 macOS (Apple Silicon, Python 3.14) 上实测通过:
 
-- `python -m pytest tests -q` → **27 passed** (含 `ZP_XRAY_BIN` 真实 `xray -test` 校验)。
-- `scripts/verify.py` (Xray 26.3.27 + Hysteria 2.12.3 + mihomo 1.19.31 + sing-box 1.14.2) → **30/30 项通过**:
+- `python -m pytest tests -q` → **41 passed, 1 skipped** (带 `ZP_XRAY_BIN` 时 42 passed, 约 8 秒)。
+- `scripts/verify.py` (Xray 26.3.27 + Hysteria 2.12.3 + mihomo 1.19.31 + sing-box 1.14.2) → **53/53 项通过**:
   setup 8 步全绿 / 三种订阅格式可被真实客户端解析 / Xray 真实监听 8443, 8445, 8444, 10085 /
-  面板成功读取 Stats API / Hysteria 真实启动并监听 UDP 30001 / 7 项自检全过 / 一键修复 4 步完成。
+  面板成功读取 Stats API / Hysteria 真实启动并监听 UDP 30001 / 8 项自检全过 / 一键修复 4 步完成 /
+  GeoIP 分流规则被真实 Xray 接受 / 反向证明缺数据或缺 `XRAY_LOCATION_ASSET` 时 Xray 拒绝启动 /
+  备份-恢复往返一致且篡改被拒 / 5 个节点握手探测全部成功 (Reality TLS 134ms, 出口 RTT 62ms)。
+- `scripts/browser_check.cjs` → **23/23 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
+  二维码出图、诊断 8/8、节点测速结果落到卡片、GeoIP 开关与状态、备份下载; 无 console 错误、无失败请求。
 - API 边界: 无令牌 setup 403、重复 setup 409、非法域名 / 弱密码 / 非法用户名 400、
-  无 Cookie dashboard 401、错密码 401 且第 4 次起 429、错误订阅令牌 404、未知节点 404。
-- 前端: 三视图渲染、节点开关热更新、订阅三种格式复制与二维码、诊断面板、高级设置保存。
+  无 Cookie dashboard 401、错密码 401 且第 4 次起 429、错误订阅令牌 404、未知节点 404、
+  备份/探测/GeoIP 接口未登录一律 401、备份校验和不匹配 400。
+- 前端: 三视图渲染、节点开关热更新、订阅三种格式复制与二维码、诊断面板、高级设置保存、测速与备份。
 
 **尚未在真实 Linux 服务器验证的环节** (交付后建议首测): certbot 签发 → nginx 反代 →
 Xray / Hysteria 生产启动 (systemd) → 客户端 App 实连。macOS 无法验证的部分: Hysteria 2
-多端口 listen (Linux 专属)、systemd 服务重载、ufw 规则。
+多端口 listen (Linux 专属)、systemd 服务重载、ufw 规则、`XRAY_LOCATION_ASSET` 在生产
+systemd 单元中的生效 (单元文件已写入该变量, 但只在 Linux 上由 systemd 读取)。
 
 ---
 
@@ -288,8 +333,15 @@ journalctl -u xray -n 50 --no-pager         # 也可用面板 GET /api/logs/xray
 # 升级核心 (也可指定版本回退)
 XRAY_VERSION=24.11.30 bash install.sh       # install.sh 可重复执行
 
-# 备份 / 恢复: 备份整个数据目录即可 (含全部密钥与订阅令牌)
+# 备份 / 恢复 (两种方式任选)
+#   1) 面板「系统 → 下载备份」得到 JSON (带校验和, 换机可一键还原)
+#   2) 命令行: 备份整个数据目录即可 (含全部密钥与订阅令牌)
 tar czf zp-backup.tgz -C /opt/zeroproxy data
+
+# GeoIP 数据手动刷新 (面板也会每 7 天自动做)
+#   面板「高级设置 → 下载/更新 GeoIP 数据」, 或直接调用:
+curl -X POST --cookie 'zp_session=...' https://<域名>:8899/api/geodata/update
+ls -la /opt/zeroproxy/geo/            # geoip.dat / geosite.dat
 
 # 卸载 (保留数据: ZP_KEEP_DATA=1; 保留证书: ZP_KEEP_CERT=1)
 bash /opt/zeroproxy/uninstall.sh
@@ -310,6 +362,12 @@ bash /opt/zeroproxy/uninstall.sh
   老客户端可用其他节点, 或在面板里关掉该节点。
 - **换了域名?** 删除 `/opt/zeroproxy/data/state.json` 后重新运行 `install.sh`, 再走一遍 setup。
 - **想改端口 / 伪装站点?** 仪表盘「高级设置」直接改, 保存后自动重新生成配置并热重载。
+- **「广告域名拦截」打开了但没效果?** 先确认 GeoIP 数据已下载 (高级设置里显示「数据未下载」时,
+  分流规则不会下发); 点「下载 / 更新 GeoIP 数据」即可。
+- **节点测速显示「握手失败」?** 说明该入站真的不可用 (Reality 密钥/SNI/dest 不匹配, 或内核没在跑);
+  点「一键诊断」看具体哪一项不过, 再点「一键修复」。
+- **换服务器怎么迁移?** 新机跑 `install.sh` → 打开面板 → 「系统 → 从备份恢复」→ 选旧机的备份
+  JSON, 密钥、订阅令牌、节点开关全部原样回来。
 
 ---
 
@@ -320,4 +378,7 @@ bash /opt/zeroproxy/uninstall.sh
 - 流量统计依赖 Xray Stats API; Hysteria 2 的流量暂未计入 (上游无同等查询接口)。
 - Hysteria 2 端口跳跃仅 Linux 生效 (上游限制), 非 Linux 环境自动退化为单端口。
 - 订阅文件由面板实时生成, 未做 CDN 缓存与 ETag 协商 (单用户场景无影响)。
-- 尚未内置: 核心二进制自动更新、DNS/ACL 分流订阅、节点延迟测速、多域名与多证书。
+- 节点测速给的是「入站握手是否成功 + 出口 RTT」; 客户端到服务器的 RTT 服务端无法自测。
+- Hysteria 2 无法用 TCP 探测, 只能检测 UDP 端口是否被监听 (Windows 上可能显示「无法主动探测」)。
+- GeoIP 数据自动更新依赖 jsdelivr / GitHub 至少一个可达; 全部不可达时保留旧数据并记录审计。
+- 尚未内置: 核心二进制自动更新、DNS/ACL 分流订阅模板、多域名与多证书、多用户与配额。

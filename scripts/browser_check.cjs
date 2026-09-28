@@ -142,6 +142,31 @@ async function main() {
     const summary = await page.locator("#diag-list .muted").first().innerText();
     check("一键诊断出结果", checks >= 5, `${checks} 项 · ${summary}`);
 
+    console.log("\n[3b] 新增能力 (测速 / GeoIP / 备份)");
+    // 自动测速在进入仪表盘时就跑了一次, 这里等结果落到节点卡片上
+    await page.waitForSelector("#probe-summary .ping", { timeout: 30000 });
+    const probeSummary = (await page.locator("#probe-summary").innerText()).trim();
+    check("节点测速出结果", /出口|握手/.test(probeSummary), probeSummary.slice(0, 60));
+    const pingCount = await page.locator("#node-grid .ping").count();
+    check("节点卡片显示握手结果", pingCount === 5, `${pingCount}/5 张卡片带结果`);
+    await page.click("#btn-probe");
+    await page.waitForFunction(
+      () => !document.querySelector("#btn-probe").disabled, { timeout: 40000 }
+    );
+    check("手动重新测速", true, (await page.locator("#probe-summary").innerText()).trim().slice(0, 60));
+
+    check("GeoIP 分流开关存在", (await page.locator("#geo-private").count()) === 1
+      && (await page.locator("#geo-ads").count()) === 1);
+    const geoStatus = (await page.locator("#geo-status").innerText()).trim();
+    check("GeoIP 数据状态可见", geoStatus.length > 0, geoStatus);
+
+    const backup = await page.request.get(`${base}/api/backup`);
+    const backupBody = await backup.json();
+    check("备份可下载", backup.ok() && !!backupBody.checksum,
+      `${backupBody.format} v${backupBody.backup_version} · ${backupBody.checksum.slice(0, 12)}`);
+    check("恢复入口存在", (await page.locator("#btn-restore").count()) === 1
+      && (await page.locator("#restore-file").count()) === 1);
+
     await page.screenshot({ path: path.join(SHOT_DIR, "dashboard-light.png"), fullPage: true });
     await page.click("#themeBtn");
     await page.waitForTimeout(400);

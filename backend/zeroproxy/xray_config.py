@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import os
 
-from . import config
+from . import config, geodata
 from .config import XHTTP_PATH, WS_PATH, paths
 
 
@@ -164,6 +164,27 @@ def cert_usable(state: dict) -> bool:
     )
 
 
+def geo_rules(state: dict) -> list[dict]:
+    """基于 GeoIP/GeoSite 的分流防护规则。
+
+    硬前置: 只要 geo 数据文件不齐备就返回空列表。原因是 Xray 在配置构建阶段
+    就要求数据文件存在, 缺文件时**整份配置加载失败**(见 geodata.py 顶部),
+    宁可少两条规则也不能让核心起不来。
+    """
+    if not geodata.usable(state):
+        return []
+    geo = state.get("geodata", {})
+    rules: list[dict] = []
+    if geo.get("block_private", True):
+        # 阻止客户端借道服务器访问其内网 / 私有网段 (SSRF 面收窄)
+        rules.append({"type": "field", "outboundTag": "block", "ip": ["geoip:private"]})
+    if geo.get("block_ads", True):
+        rules.append(
+            {"type": "field", "outboundTag": "block", "domain": ["geosite:category-ads-all"]}
+        )
+    return rules
+
+
 def build_xray_config(state: dict) -> dict:
     cfg = {
         "log": {"loglevel": "warning"},
@@ -187,6 +208,12 @@ def build_xray_config(state: dict) -> dict:
             "rules": [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}],
         },
     }
+    # geo 分流规则 (数据缺失时为空列表, 不影响核心启动)
+    extra_rules = geo_rules(state)
+    if extra_rules:
+        cfg["outbounds"].append({"protocol": "blackhole", "tag": "block"})
+        cfg["routing"]["rules"].extend(extra_rules)
+
     nodes = state.get("nodes", {})
     if nodes.get("vless-reality") and state["reality"]["private_key"]:
         cfg["inbounds"].append(_reality_inbound(state))

@@ -183,6 +183,13 @@ code.inline { background: var(--border); padding: 2px 7px; border-radius: 6px; f
 .kv { display: flex; justify-content: space-between; font-size: 13.5px; padding: 5px 0; gap: 12px; }
 .kv .k { color: var(--sub); flex-shrink: 0; }
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.chk { display: flex; align-items: center; gap: 7px; font-size: 13.5px; margin: 0; color: var(--text); cursor: pointer; }
+.chk input { width: auto; padding: 0; margin: 0; accent-color: var(--accent); }
+.ping { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 600; }
+.ping.ok { background: rgba(48, 209, 88, 0.15); color: var(--ok); }
+.ping.bad { background: rgba(255, 69, 58, 0.15); color: var(--err); }
+.ping.other { background: var(--border); color: var(--sub); }
+.divider { height: 1px; background: var(--border); margin: 16px 0 14px; }
 </style>
 </head>
 <body>
@@ -237,6 +244,7 @@ code.inline { background: var(--border); padding: 2px 7px; border-radius: 6px; f
       </div>
       <div class="actions">
         <button class="btn ghost small" id="btn-apply">重新应用配置</button>
+        <button class="btn ghost small" id="btn-probe">节点测速</button>
         <button class="btn ghost small" id="btn-diag">一键诊断</button>
         <button class="btn ghost small danger" id="btn-logout">退出</button>
       </div>
@@ -268,6 +276,7 @@ code.inline { background: var(--border); padding: 2px 7px; border-radius: 6px; f
     </div>
 
     <div class="section-title">节点</div>
+    <div class="row" id="probe-summary" style="margin:-2px 0 12px"></div>
     <div class="grid" id="node-grid"></div>
 
     <div class="section-title">流量</div>
@@ -288,6 +297,19 @@ code.inline { background: var(--border); padding: 2px 7px; border-radius: 6px; f
       <div class="row" style="margin-top:16px">
         <button class="btn small" id="btn-save-adv">保存并应用</button>
         <span class="muted" style="font-size:12.5px">改动会重新生成配置并热重载, 订阅内容自动更新</span>
+      </div>
+      <div class="divider"></div>
+      <div class="row" style="justify-content:space-between">
+        <span style="font-weight:600;font-size:13.5px">GeoIP 分流防护</span>
+        <span class="muted" style="font-size:12.5px" id="geo-status">—</span>
+      </div>
+      <div class="row" style="margin-top:10px;gap:20px">
+        <label class="chk"><input type="checkbox" id="geo-private"> 私有地址防护</label>
+        <label class="chk"><input type="checkbox" id="geo-ads"> 广告域名拦截</label>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button class="btn ghost small" id="btn-geo-update">下载 / 更新 GeoIP 数据</button>
+        <span class="muted" style="font-size:12px">数据源 Loyalsoldier/v2ray-rules-dat, 每 7 天自动更新</span>
       </div>
     </div>
 
@@ -325,7 +347,7 @@ const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const escAttr = esc;
 const PROTO_BADGE = { VLESS: "vless", Trojan: "trojan", "Hysteria 2": "hysteria" };
-let dash = null, refreshTimer = null, bootstrapToken = "";
+let dash = null, refreshTimer = null, bootstrapToken = "", probeData = null, probeRan = false;
 
 /* ---------------- 主题 ---------------- */
 function applyTheme(t) {
@@ -495,6 +517,8 @@ async function loadDash(quiet) {
   }
   clearInterval(refreshTimer);
   refreshTimer = setInterval(() => { if (dash) loadDash(true); }, 20000);
+  // 首次进入仪表盘自动测一次速 (之后由用户点「节点测速」触发)
+  if (!probeRan) { probeRan = true; runProbe(false); }
 }
 
 function renderDash(quiet) {
@@ -508,6 +532,41 @@ function renderDash(quiet) {
   });
 
   /* 节点卡片 */
+  renderNodes();
+  document.querySelectorAll("[data-copy-fmt]").forEach((el) =>
+    (el.onclick = () => copyText(dash.subscription_formats[el.dataset.copyFmt]))
+  );
+  document.querySelectorAll("[data-qr-fmt]").forEach((el) =>
+    (el.onclick = () =>
+      openModal(
+        "订阅二维码",
+        dash.subscription_formats[el.dataset.qrFmt],
+        `/api/subscription/qr?size=8&format=${encodeURIComponent(el.dataset.qrFmt)}`
+      ))
+  );
+
+  renderTraffic(dash.traffic);
+  renderAdvanced(dash);
+  renderSystem(dash);
+  renderAudit(dash.audit);
+  if (!quiet) { $("#diag-list").innerHTML = ""; $("#diag-actions").classList.add("hidden"); }
+}
+
+/* ---------------- 节点卡片 + 测速 ---------------- */
+function pingOf(nodeId) {
+  if (!probeData) return null;
+  return (probeData.nodes || []).find((p) => p.node === nodeId) || null;
+}
+
+function pingHtml(nodeId) {
+  const p = pingOf(nodeId);
+  if (!p) return "";
+  const text = p.ok === true ? (p.ms ? p.ms + "ms" : "可达") : p.ok === false ? "握手失败" : "未知";
+  const cls = p.ok === true ? "ok" : p.ok === false ? "bad" : "other";
+  return ` <span class="ping ${cls}" title="${escAttr(p.detail || "")}">${esc(text)}</span>`;
+}
+
+function renderNodes() {
   $("#node-grid").innerHTML = dash.nodes
     .map((n) => {
       const traffic = n.traffic
@@ -519,7 +578,7 @@ function renderDash(quiet) {
           <label class="switch"><input type="checkbox" data-node="${escAttr(n.id)}" ${n.enabled ? "checked" : ""}><span class="slider"></span></label>
         </div>
         <div class="meta">${esc(n.transport)} · ${esc(n.security)}</div>
-        <div class="addr mono">${esc(n.host)}:${n.port} <span class="dot ${stateClass(n.service_state)}" title="${escAttr(n.service)}"></span> <span class="muted">${STATE_TXT[n.service_state] || esc(n.service_state)}</span></div>
+        <div class="addr mono">${esc(n.host)}:${n.port} <span class="dot ${stateClass(n.service_state)}" title="${escAttr(n.service)}"></span> <span class="muted">${STATE_TXT[n.service_state] || esc(n.service_state)}</span>${pingHtml(n.id)}</div>
         <div class="muted" style="font-size:12.5px">${esc(n.desc || "")}</div>
         ${traffic}
         ${n.note ? `<div class="note">${esc(n.note)}</div>` : ""}
@@ -553,24 +612,40 @@ function renderDash(quiet) {
     const n = dash.nodes.find((x) => x.id === el.dataset.qr);
     el.onclick = () => openModal(`${n.name} 二维码`, n.share_link, `${n.qr_url}?size=8`);
   });
-  document.querySelectorAll("[data-copy-fmt]").forEach((el) =>
-    (el.onclick = () => copyText(dash.subscription_formats[el.dataset.copyFmt]))
-  );
-  document.querySelectorAll("[data-qr-fmt]").forEach((el) =>
-    (el.onclick = () =>
-      openModal(
-        "订阅二维码",
-        dash.subscription_formats[el.dataset.qrFmt],
-        `/api/subscription/qr?size=8&format=${encodeURIComponent(el.dataset.qrFmt)}`
-      ))
-  );
-
-  renderTraffic(dash.traffic);
-  renderAdvanced(dash);
-  renderSystem(dash);
-  renderAudit(dash.audit);
-  if (!quiet) { $("#diag-list").innerHTML = ""; $("#diag-actions").classList.add("hidden"); }
+  renderProbe();
 }
+
+function renderProbe() {
+  const el = $("#probe-summary");
+  if (!el) return;
+  if (!probeData) {
+    el.innerHTML = `<span class="muted" style="font-size:12.5px">点「节点测速」对每个节点做一次真实握手 (Reality/Trojan 走完整 TLS), 并测量服务器到伪装目标的出口延迟。</span>`;
+    return;
+  }
+  const when = fmtTime(probeData.checked_at);
+  const dest = probeData.dest || {};
+  el.innerHTML =
+    `<span class="ping ${dest.ok ? "ok" : "bad"}">出口 ${dest.ms ? dest.ms + "ms" : "不可达"}</span>` +
+    `<span class="muted" style="font-size:12.5px">${esc(probeData.summary)} · 伪装目标 ${esc(dest.address || "")} · ${esc(when)}</span>`;
+}
+
+async function runProbe(force) {
+  const btn = $("#btn-probe");
+  if (!btn || btn.disabled) return;
+  btn.disabled = true;
+  const original = btn.textContent;
+  btn.textContent = "测速中…";
+  try {
+    probeData = await api("/api/probe" + (force ? "?force=1" : ""));
+    renderNodes();
+  } catch (e) {
+    toast("测速失败: " + e.message);
+  }
+  btn.disabled = false;
+  btn.textContent = original;
+}
+
+$("#btn-probe").onclick = () => runProbe(true);
 
 function renderTraffic(traffic) {
   const card = $("#traffic-card");
@@ -613,6 +688,56 @@ function renderAdvanced(d) {
     )
     .join("");
   $("#btn-save-adv").onclick = saveAdvanced;
+  renderGeo(d);
+}
+
+function renderGeo(d) {
+  const g = d.geodata || {};
+  const files = g.files || {};
+  const ready = Object.values(files).filter((f) => f.exists).length;
+  $("#geo-private").checked = g.block_private !== false;
+  $("#geo-ads").checked = g.block_ads !== false;
+  let text;
+  if (!ready) text = "数据未下载 (分流暂不生效)";
+  else if (g.active) text = `${g.age_days >= 0 ? g.age_days + " 天前更新" : "已就绪"} · 分流已启用`;
+  else text = `${g.age_days >= 0 ? g.age_days + " 天前更新" : "已就绪"} · 分流已关闭`;
+  $("#geo-status").textContent = text;
+
+  const save = async (payload, revert) => {
+    try {
+      dash = await api("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      renderDash(true);
+      toast("分流设置已应用");
+    } catch (e) {
+      toast("设置失败: " + e.message);
+      revert();
+    }
+  };
+  // 打开任一开关时顺带启用分流 (数据缺失时后端会明确报错)
+  const withEnable = (extra) => (g.enabled ? extra : { ...extra, geodata_enabled: true });
+  $("#geo-private").onchange = () =>
+    save(withEnable({ block_private: $("#geo-private").checked }), () => renderGeo(dash));
+  $("#geo-ads").onchange = () =>
+    save(withEnable({ block_ads: $("#geo-ads").checked }), () => renderGeo(dash));
+  $("#btn-geo-update").onclick = async () => {
+    const btn = $("#btn-geo-update");
+    btn.disabled = true;
+    btn.textContent = "下载中… (约 28 MB)";
+    try {
+      const res = await api("/api/geodata/update", { method: "POST" });
+      dash = res;
+      renderDash(true);
+      toast(res.ok ? "GeoIP 数据已更新并生效" : "更新失败: " + String(res.detail || "").slice(0, 90));
+    } catch (e) {
+      toast("更新失败: " + e.message);
+    }
+    btn.disabled = false;
+    btn.textContent = "下载 / 更新 GeoIP 数据";
+  };
 }
 
 async function saveAdvanced() {
@@ -680,6 +805,19 @@ function renderSystem(d) {
       <div class="kv"><span class="k">服务器</span><span>${esc(sys.server.os)} · ${esc(sys.server.arch)} · 在线 ${fmtUptime(sys.server.uptime_s)}</span></div>
       <div class="kv"><span class="k">端口跳跃</span><span>${d.hysteria_hopping ? "已启用 (" + d.hysteria_ports.join(" / ") + ")" : "未启用"}</span></div>
       <div class="kv"><span class="k">面板版本</span><span>v${esc(sys.server.panel_version)}</span></div>
+    </div>
+    <div class="card">
+      <div class="top" style="display:flex;justify-content:space-between;align-items:center">
+        <span class="badge vless">备份 / 恢复</span>
+      </div>
+      <div class="muted" style="font-size:12.5px;margin:10px 0 12px;line-height:1.5">
+        导出含全部密钥、口令与订阅令牌, 请妥善保管; 换机 / 重装时可一键还原。
+      </div>
+      <div class="row">
+        <button class="btn ghost small" id="btn-backup">下载备份</button>
+        <button class="btn ghost small" id="btn-restore">从备份恢复</button>
+        <input type="file" id="restore-file" accept="application/json,.json" style="display:none">
+      </div>
     </div>`;
   const renewBtn = $("#btn-renew");
   if (renewBtn) renewBtn.onclick = async () => {
@@ -689,6 +827,39 @@ function renderSystem(d) {
       if (r.ok) loadDash(true);
     } catch (e) { toast("续期失败: " + e.message); }
   };
+
+  // 备份 / 恢复
+  const backupBtn = $("#btn-backup");
+  if (backupBtn) backupBtn.onclick = () => { window.location.href = "/api/backup"; };
+  const restoreBtn = $("#btn-restore");
+  const fileInput = $("#restore-file");
+  if (restoreBtn && fileInput) {
+    restoreBtn.onclick = () => fileInput.click();
+    fileInput.onchange = async () => {
+      const file = fileInput.files && fileInput.files[0];
+      if (!file) return;
+      if (!confirm(`用「${file.name}」覆盖当前配置?\n\n当前节点开关、端口、密钥与管理员口令都会被备份内容替换。`)) {
+        fileInput.value = "";
+        return;
+      }
+      restoreBtn.disabled = true;
+      restoreBtn.textContent = "恢复中…";
+      try {
+        dash = await api("/api/restore", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: await file.text(),
+        });
+        renderDash(true);
+        toast("备份已恢复, 配置已重新生成");
+      } catch (e) {
+        toast("恢复失败: " + e.message);
+      }
+      restoreBtn.disabled = false;
+      restoreBtn.textContent = "从备份恢复";
+      fileInput.value = "";
+    };
+  }
 }
 
 function renderAudit(entries) {

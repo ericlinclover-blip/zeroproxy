@@ -21,6 +21,9 @@ if str(BACKEND) not in sys.path:
 os.environ.setdefault("ZP_PORT", "8899")
 os.environ.setdefault("ZP_BIND_PORT", "9900")
 
+# 关闭后台 GeoIP 自动更新线程: 测试必须离线可跑, 不能偷偷发网络请求
+os.environ.setdefault("ZP_GEODATA_AUTO", "0")
+
 DOMAIN = "proxy.example.com"
 USERNAME = "admin"
 PASSWORD = "s3cretpass"

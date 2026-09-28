@@ -11,6 +11,7 @@ import os
 import platform
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -22,7 +23,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
-from .config import paths
+from .config import NODE_BY_ID, paths
 
 # 服务名 → 二进制 (用于版本探测)
 SERVICES = {
@@ -52,9 +53,13 @@ def is_prod() -> bool:
     return sys.platform.startswith("linux") and shutil.which("systemctl") is not None
 
 
-def run(cmd: list[str], timeout: int = 120) -> tuple[bool, str]:
+def run(cmd: list[str], timeout: int = 120, env: dict | None = None) -> tuple[bool, str]:
+    """执行外部命令。env 为额外环境变量 (叠加在 os.environ 之上)。"""
+    child_env = None
+    if env:
+        child_env = {**os.environ, **env}
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=child_env)
     except FileNotFoundError:
         return False, f"命令不存在: {cmd[0]}"
     except subprocess.TimeoutExpired:
@@ -276,9 +281,16 @@ def xray_stats(state: dict) -> Optional[dict]:
     binary = bin_path("xray")
     if binary is None:
         return None
-    addr = f"127.0.0.1:{state['ports'].get('api', 10085)}"
+    api_port = int(state["ports"].get("api", 10085))
+    # 先做一次 0.4s 的 TCP 预检: 端口没开时 `xray api` 自己要等 2-3 秒才报错,
+    # 而仪表盘每次渲染都会调这里 (20s 轮询), 不预检会白白拖慢整个面板。
+    if not _tcp_reachable("127.0.0.1", api_port, timeout=0.4):
+        return None
+    addr = f"127.0.0.1:{api_port}"
     ok, out = run(
-        [binary, "api", "statsquery", f"--server={addr}", "-pattern", ""], timeout=20
+        [binary, "api", "statsquery", f"--server={addr}", "-pattern", ""],
+        timeout=20,
+        env=xray_env(),
     )
     if not ok:
         return None
@@ -341,5 +353,192 @@ def xray_config_test() -> tuple[bool, str]:
     binary = bin_path("xray")
     if binary is None:
         return True, "跳过 (未安装 xray)"
-    ok, out = run([binary, "-test", "-c", paths()["xray_config"]], timeout=60)
+    ok, out = run(
+        [binary, "-test", "-c", paths()["xray_config"]], timeout=60, env=xray_env()
+    )
     return ok, " ".join(out.split())[:200]
+
+
+# ---------------------------------------------------------------- 连通性探测
+
+def _tcp_reachable(host: str, port: int, timeout: float = 0.5) -> bool:
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+def xray_env() -> dict:
+    """Xray 进程需要的额外环境变量。
+
+    Xray 只从「可执行文件所在目录」或 `XRAY_LOCATION_ASSET` 找 geoip.dat /
+    geosite.dat —— 不设这个变量, 面板生成的 geo 分流规则会让 Xray 直接启动
+    失败 (见 geodata.py 顶部说明)。因此所有 xray 调用都统一带上它。
+    """
+    from .config import paths as _paths
+
+    geo = _paths()["geo_dir"]
+    if os.path.isdir(geo):
+        return {"XRAY_LOCATION_ASSET": geo}
+    return {}
+
+
+def tcp_connect_ms(host: str, port: int, timeout: float = 3.0) -> tuple[bool, float, str]:
+    """TCP 握手耗时 (毫秒)。返回 (可达, ms, 说明)。"""
+    start = time.perf_counter()
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True, (time.perf_counter() - start) * 1000, "TCP 握手成功"
+    except OSError as exc:
+        return False, -1.0, f"{type(exc).__name__}: {exc}"
+
+
+def tls_handshake_ms(
+    host: str, port: int, sni: str = "", timeout: float = 5.0
+) -> tuple[bool, float, str]:
+    """TLS 握手耗时 (毫秒)。
+
+    这是本面板最有价值的节点体检: 对 Reality 入站做一次真实 TLS 握手 — 若
+    dest / serverName / 密钥不匹配, 握手会失败; 对 Trojan / WS 则同时验证了
+    证书链与 nginx 反代是否通。证书校验关闭 (自签 / Reality 会转发目标站点
+    证书, 本机无从建立信任链)。
+    """
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.set_alpn_protocols(["http/1.1"])
+    start = time.perf_counter()
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=sni or host) as tls:
+                tls.version()
+        return True, (time.perf_counter() - start) * 1000, "TLS 握手成功"
+    except (OSError, ssl.SSLError) as exc:
+        return False, -1.0, f"{type(exc).__name__}: {exc}"
+
+
+def udp_port_listening(port: int) -> bool | None:
+    """UDP 端口是否有进程在监听 (Hysteria 2 无法用 TCP 探测)。
+
+    Linux 读 /proc/net/udp*, 其他平台退回 lsof; 都不可用时返回 None (未知)。
+    """
+    hexed = f"{int(port):04X}"
+    for proc_file in ("/proc/net/udp", "/proc/net/udp6"):
+        if not os.path.exists(proc_file):
+            continue
+        try:
+            with open(proc_file, "r", encoding="utf-8") as fh:
+                next(fh, None)  # 跳过表头
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) > 1 and parts[1].rsplit(":", 1)[-1].upper() == hexed:
+                        return True
+            return False
+        except OSError:
+            break
+    if shutil.which("lsof"):
+        ok, out = run(["lsof", "-nP", f"-iUDP:{int(port)}"], timeout=10)
+        if ok and out.strip():
+            return True
+        return False
+    return None
+
+
+def _probe_target(state: dict, node_id: str) -> tuple[str, str, int, str]:
+    """(host, 探测方式, 端口, SNI) — 探测方式 ∈ tcp / tls / udp。"""
+    ports = state.get("ports", {})
+    if node_id == "vless-ws":
+        # WS 入站是明文回环端口, TLS 由 nginx 终结 —— 这里只验证入站存活
+        return "127.0.0.1", "tcp", int(ports.get("ws_internal", 6000)), ""
+    if node_id == "hysteria2":
+        return "127.0.0.1", "udp", int(ports.get("hysteria", 30001)), ""
+    key = NODE_BY_ID[node_id]["port_key"]
+    sni = state["reality"]["server_name"] if key in ("reality", "xhttp") else state.get("domain", "")
+    return "127.0.0.1", "tls", int(ports.get(key, 0)), sni
+
+
+def probe_node(state: dict, node_id: str, timeout: float = 4.0) -> dict:
+    """单节点体检: 握手耗时 + 结论。"""
+    if not state.get("nodes", {}).get(node_id, True):
+        return {"node": node_id, "ok": None, "kind": "off", "ms": None, "detail": "节点已关闭"}
+
+    if node_id == "trojan" and not os.path.exists(state["cert"].get("cert_file") or ""):
+        return {
+            "node": node_id,
+            "ok": False,
+            "kind": "tls",
+            "ms": None,
+            "detail": "证书未就绪, 入站未生效",
+        }
+
+    host, kind, port, sni = _probe_target(state, node_id)
+    if not port:
+        return {"node": node_id, "ok": False, "kind": kind, "ms": None, "detail": "端口未配置"}
+
+    if kind == "tcp":
+        ok, ms, detail = tcp_connect_ms(host, port, timeout)
+    elif kind == "tls":
+        ok, ms, detail = tls_handshake_ms(host, port, sni, timeout)
+    else:
+        listening = udp_port_listening(port)
+        if listening is None:
+            return {
+                "node": node_id,
+                "ok": None,
+                "kind": "udp",
+                "ms": None,
+                "detail": f"UDP {port} 无法主动探测 (环境不支持)",
+            }
+        return {
+            "node": node_id,
+            "ok": listening,
+            "kind": "udp",
+            "ms": None,
+            "detail": f"UDP {port} {'监听中' if listening else '未监听'}",
+        }
+    return {
+        "node": node_id,
+        "ok": bool(ok),
+        "kind": kind,
+        "ms": round(ms, 1) if ok else None,
+        "detail": f"{port} · {detail}",
+    }
+
+
+def probe_all(state: dict, timeout: float = 4.0) -> dict:
+    """全部节点 + 服务器出网 RTT。每个节点独立线程, 最慢一项决定总耗时。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from .config import NODE_IDS
+
+    nodes = list(NODE_IDS)
+    with ThreadPoolExecutor(max_workers=min(6, len(nodes) + 1)) as pool:
+        futures = {nid: pool.submit(probe_node, state, nid, timeout) for nid in nodes}
+        dest = pool.submit(
+            tcp_connect_ms,
+            state["reality"]["dest"].rsplit(":", 1)[0],
+            int(state["reality"]["dest"].rsplit(":", 1)[-1] or 443),
+            max(timeout, 5.0),
+        )
+        results = []
+        for nid in nodes:
+            try:
+                results.append(futures[nid].result())
+            except Exception as exc:  # noqa: BLE001
+                results.append(
+                    {"node": nid, "ok": False, "kind": "?", "ms": None, "detail": f"探测异常: {exc}"}
+                )
+        dest_ok, dest_ms, dest_detail = dest.result()
+
+    ok_count = sum(1 for r in results if r["ok"])
+    return {
+        "checked_at": int(time.time()),
+        "nodes": results,
+        "summary": f"{ok_count}/{len(results)} 个节点握手成功",
+        "dest": {
+            "address": state["reality"]["dest"],
+            "ok": dest_ok,
+            "ms": round(dest_ms, 1) if dest_ok else None,
+            "detail": dest_detail,
+        },
+    }

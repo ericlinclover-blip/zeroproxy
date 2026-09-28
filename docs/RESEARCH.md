@@ -90,6 +90,10 @@
 | 6 | Hysteria 伪装支持 `type: proxy` + `url` / `rewriteHost` / `xForwarded` / `insecure` | `app/cmd/server.go` `serverConfigMasqueradeProxy` | 非代理流量可反代到真实网站 |
 | 7 | sing-box 1.13+ 移除入站 legacy 字段 `sniff: true` | 1.14.2 实测 `check PASS/FAIL` | 旧模板会导致订阅校验失败 |
 | 8 | Clash 的 `ws-opts.headers` 必须是 **map**, 不是字符串 | mihomo `-t` 实测 | 手写序列化会产出非法 YAML |
+| 9 | Xray 在**配置构建阶段**就要加载 geo 数据: 写了 `geoip:` / `geosite:` 规则而 `geoip.dat` 缺失时, 不是"跳过该规则", 而是**整份配置加载失败** (`failed to load GeoIP: cn > failed to open file: geoip.dat`) | 隔离目录实测 (26.3.27): 无 dat → 启动失败; `XRAY_LOCATION_ASSET` 指向含 dat 的目录 → 正常启动 | geo 规则绝不能"无条件下发", 必须与数据文件存在性绑定 |
+| 10 | `geoip:private` 也依赖 `geoip.dat`, **不是**内置常量 | 同上 (隔离目录 + 仅 private 规则 → 同样启动失败) | 连"私有地址防护"这种基础规则都有前置条件 |
+| 11 | Xray 找 geo 文件的顺序: 可执行文件所在目录 → `XRAY_LOCATION_ASSET` | 把二进制复制到空目录后立即失败, 加环境变量后恢复 | 生产必须在 systemd 单元里设置该变量, 面板调用 `xray` 时也要带上 |
+| 12 | mihomo 加载含 `GEOIP` 规则的订阅时会下载 `geoip.metadb`, 默认源是 GitHub | 实测: `GEOIP,CN,DIRECT` → `can't download MMDB ... operation timed out` → 整个订阅 `test failed` | 订阅应内置 `geox-url` 指向可用镜像, 否则受限网络下用户首次导入直接失败 |
 
 ### 3.1 一个反直觉的口令陷阱
 
@@ -113,6 +117,9 @@ Xray 的 VLESS/Trojan 用 `user:pass@` 是 **HTTP Basic 风格的 URI 语法糖*
 | 流量统计 (Stats API) | 3x-ui / Marzban | gRPC StatsService, 每节点上下行 |
 | 订阅链接恒定 | 3x-ui `subId` / Sub-Store | 状态驱动, URL 永不随配置变更而变 |
 | 证书自动续期 | 通用 | certbot `--keep-until-expiring --expand` |
+| 私有地址防护 / 广告拦截 | 3x-ui 的路由模板、Hiddify 的 ACL | `geoip:private` + `geosite:category-ads-all` → `blackhole` |
+| 分流数据库分发 | 商业面板自带 geo 同步 | 多镜像下载 + 真实 `xray -test` 校验 + 原子替换 + 每周自动更新 |
+| 配置备份/迁移 | Marzban / 3x-ui 的备份功能 | 单文件 JSON + SHA-256 校验 + 一键还原 |
 
 **刻意拒绝** (为了守住「0 配置」):
 
@@ -135,15 +142,20 @@ Xray 的 VLESS/Trojan 用 `user:pass@` 是 **HTTP Basic 风格的 URI 语法糖*
 本项目**当前不如**竞品的地方:
 
 1. **无多用户/配额** — 3x-ui / Marzban / Remnawave 的主战场, 本项目不覆盖 (定位差异, 非缺陷)。
-2. **无节点健康/延迟探测** — 竞品能显示每个节点的握手延迟。可考虑接入 Xray
-   `observatory` 或简单 TCP 握手计时。
-3. **无分流规则模板** — Clash 订阅未带 rule-set / proxy-group 自定义。Sub-Store 在此更强。
-4. **无备份/恢复** — 建议加 `state.json` 导入导出。
-5. **无 Docker 交付** — 目前是 Shell 一行部署, 未提供镜像。
-6. **GeoIP/GeoData 未自动更新** — 需要时可加定时拉取。
-7. **IPv6 未专门处理** — 双栈环境需手动确认。
+2. **分流规则模板仍简陋** — 只有"私有地址 + 广告"两条; Clash 订阅未带 rule-set / 自定义
+   proxy-group。Sub-Store 在这一层更强。
+3. **无 Docker 交付** — 目前是 Shell 一行部署, 未提供镜像。
+4. **无多域名/多证书** — 单域名单证书。
+5. **IPv6 未专门处理** — 双栈环境需手动确认。
+6. **无核心二进制自动更新** — Xray / Hysteria 需重跑 `install.sh` 升级。
 
-其中 2 / 4 / 6 是**投入产出比最高**的下一步。
+### 已补齐 (本轮)
+
+| 原差距 | 现状 |
+|---|---|
+| 无节点健康/延迟探测 | `GET /api/probe`: Reality/Trojan 走**完整 TLS 握手**, WS 走 TCP, Hysteria 走 UDP 监听检测, 另测出口 RTT |
+| 无分流数据自动更新 | GeoIP/GeoSite 多镜像下载 + `xray -test` 真机校验 + 原子替换, 面板后台每 6 小时检查、7 天 TTL |
+| 无备份/恢复 | `GET /api/backup` / `POST /api/restore`, 带 SHA-256 校验和与三重校验 |
 
 ---
 
@@ -154,6 +166,8 @@ Xray 的 VLESS/Trojan 用 `user:pass@` 是 **HTTP Basic 风格的 URI 语法糖*
   `transport/internet/splithttp/config.go` (版本 26.3.27)。
 - Hysteria 源码: `app/cmd/client.go` (`isPortHoppingPort`, `fillServerAddr`),
   `app/cmd/server.go` (`serverConfigMasquerade*`), `extras/auth/password.go` (v2.12.3)。
-- 端到端复现: 见仓库 `scripts/verify.py` (真实内核 30/30) 与 `backend/tests/`。
+- GeoIP/GeoSite 数据: [Loyalsoldier/v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat)
+  release 分支 (每日构建); 客户端侧数据源 [MetaCubeX/meta-rules-dat](https://github.com/MetaCubeX/meta-rules-dat)。
+- 端到端复现: 见仓库 `scripts/verify.py` (真实内核 53/53) 与 `backend/tests/` (42 项)。
 
 原始取数结果保存在开发机的 `/tmp/zp-bin/competitors.json` (临时文件, 不入库)。

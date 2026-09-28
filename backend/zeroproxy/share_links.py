@@ -28,6 +28,10 @@ import yaml
 from . import config
 from .config import WS_PATH, XHTTP_PATH
 
+#: 客户端分流数据库镜像 (mihomo geox-url)。GitHub Release 在受限网络下不可达,
+#: 客户端首次导入订阅若拉不到 geoip.metadb 会直接报配置失败, 因此换成可用镜像。
+GEOX_BASE = "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/"
+
 #: 各客户端对 XHTTP 传输的支持情况 — 已用真实二进制验证:
 #: mihomo v1.19.31 接受 network: xhttp + xhttp-opts, sing-box 1.14.2 接受
 #: transport.type=http, 两者配置校验均通过 (scripts/verify.py 可复现)。
@@ -264,6 +268,15 @@ def clash_profile(state: dict) -> str:
         "allow-lan": False,
         "mode": "rule",
         "log-level": "info",
+        # 分流数据库下载地址: mihomo 默认从 GitHub 拉取, 在受限网络下会超时
+        # (实测: 首次拉取失败会导致整个订阅加载失败)。这里改成可用镜像,
+        # 客户端首次导入时仍能自动拿到 geoip/geosite 数据。
+        "geox-url": {
+            "mmdb": GEOX_BASE + "geoip.metadb",
+            "geoip": GEOX_BASE + "geoip.dat",
+            "geosite": GEOX_BASE + "geosite.dat",
+            "asn": GEOX_BASE + "GeoLite2-ASN.mmdb",
+        },
         "proxies": proxies,
         "proxy-groups": [
             {"name": "🚀 节点选择", "type": "select", "proxies": ["♻️ 自动选择", *names, "DIRECT"]},

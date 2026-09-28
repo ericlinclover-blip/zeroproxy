@@ -6,6 +6,9 @@ Wants=network-online.target
 [Service]
 ExecStart=/usr/local/bin/xray run -c /opt/zeroproxy/xray/config.json
 WorkingDirectory=/opt/zeroproxy/xray
+# Xray 只从"可执行文件所在目录"或本变量指定的目录加载 geoip.dat / geosite.dat。
+# 配置里一旦出现 geoip/geosite 规则而数据缺失, Xray 会拒绝启动整份配置。
+Environment=XRAY_LOCATION_ASSET=/opt/zeroproxy/geo
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576

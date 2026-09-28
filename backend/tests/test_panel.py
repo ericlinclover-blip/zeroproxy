@@ -7,6 +7,7 @@ import json
 import pytest
 
 from conftest import DOMAIN, PASSWORD, USERNAME
+from zeroproxy import config, xray_config
 
 
 # ---------------------------------------------------------------- 初始化
@@ -254,7 +255,7 @@ def test_state_file_permissions_and_version(configured, home):
     state_path = home / "data" / "state.json"
     assert oct(state_path.stat().st_mode)[-3:] == "600"
     state = json.loads(state_path.read_text())
-    assert state["version"] == config.STATE_VERSION == 2
+    assert state["version"] == config.STATE_VERSION
     assert "login_failures" in state and "audit" in state
 
 
@@ -269,11 +270,14 @@ def test_state_migrates_v1_layout(home):
                               "hysteria2": True}})
     )
     state = config.load_state()
-    assert state["version"] == 2
+    assert state["version"] == config.STATE_VERSION
     assert state["ports"]["xhttp"] == 8445
     assert state["nodes"]["vless-xhttp"] is True          # 新节点自动补默认值
     assert state["hysteria_masquerade"]["enabled"] is True
     assert state["reality"]["server_name"] == "www.microsoft.com"
+    # v2 → v3 新增的 GeoIP 分流字段同样自动补齐
+    assert state["geodata"]["enabled"] is False
+    assert state["geodata"]["block_private"] is True
 
 
 def test_generated_xray_config_matches_enabled_nodes(client, configured, home):
@@ -308,3 +312,215 @@ def test_xray_config_with_real_binary(client, configured, home, monkeypatch):
     xray_config.write_xray_config(config.load_state())
     ok, detail = services.xray_config_test()
     assert ok, detail
+
+
+# ---------------------------------------------------------------- 节点延迟探测
+
+def test_probe_endpoint_reports_every_node(client, configured):
+    """测速接口: 即使内核没在跑也要给出每个节点的结论, 而不是 500。"""
+    response = client.get("/api/probe?force=1")
+    assert response.status_code == 200
+    body = response.json()
+    assert {n["node"] for n in body["nodes"]} == {
+        "vless-reality",
+        "vless-xhttp",
+        "vless-ws",
+        "trojan",
+        "hysteria2",
+    }
+    # 没有真实内核监听时, 结论必须是"失败"而不是"未定义"
+    for item in body["nodes"]:
+        assert item["ok"] is not None
+        assert item["detail"]
+    assert body["dest"]["address"] == "www.microsoft.com:443"
+
+
+def test_probe_requires_auth(client, configured):
+    client.cookies.clear()
+    assert client.get("/api/probe").status_code == 401
+
+
+def test_probe_skips_disabled_nodes(client, configured):
+    client.post("/api/nodes/hysteria2/toggle")
+    body = client.get("/api/probe?force=1").json()
+    hysteria = next(n for n in body["nodes"] if n["node"] == "hysteria2")
+    assert hysteria["ok"] is None and "关闭" in hysteria["detail"]
+
+
+def test_tcp_connect_probe_helper(home):
+    """本机自连: 起一个临时监听端口, 探测必须成功且给出正数毫秒。"""
+    import socket
+    import threading
+
+    from zeroproxy import services
+
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(8)
+    port = server.getsockname()[1]
+    stop = threading.Event()
+
+    def serve():
+        while not stop.is_set():
+            try:
+                server.settimeout(0.2)
+                conn, _ = server.accept()
+                conn.close()
+            except OSError:
+                pass
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        ok, ms, detail = services.tcp_connect_ms("127.0.0.1", port, timeout=2)
+        assert ok and ms >= 0, detail
+        ok, ms, _ = services.tcp_connect_ms("127.0.0.1", 1, timeout=1)  # 无人监听
+        assert not ok and ms == -1.0
+    finally:
+        stop.set()
+        server.close()
+        thread.join(timeout=2)
+
+
+def test_udp_port_listening_detects_listener(home):
+    import socket
+
+    from zeroproxy import services
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    try:
+        result = services.udp_port_listening(port)
+        # 环境不支持时返回 None (未知), 支持时必须看到监听
+        assert result in (True, None), f"UDP {port} 应被判定为监听中, 实际 {result}"
+    finally:
+        sock.close()
+
+
+# ---------------------------------------------------------------- 备份 / 恢复
+
+def test_backup_and_restore_roundtrip(client, configured):
+    exported = client.get("/api/backup")
+    assert exported.status_code == 200
+    payload = exported.json()
+    assert payload["format"] == "zeroproxy-backup"
+    assert len(payload["checksum"]) == 64
+    # 会话与登录限流属于运行时数据, 不应进备份
+    assert "sessions" not in payload["state"]
+    assert "login_failures" not in payload["state"]
+    # 私钥必须随备份一起走, 否则恢复后所有客户端都要重新导入
+    assert payload["state"]["reality"]["private_key"]
+
+    token = payload["state"]["subscription_token"]
+    client.post("/api/nodes/vless-ws/toggle")
+    client.post("/api/settings", json={"reality_sni": "www.cloudflare.com"})
+
+    restored = client.post("/api/restore", content=exported.content)
+    assert restored.status_code == 200, restored.text
+    state = config.load_state()
+    assert state["nodes"]["vless-ws"] is True           # 节点开关回到备份点
+    assert state["reality"]["server_name"] == "www.microsoft.com"
+    assert state["subscription_token"] == token
+    assert state["geodata"]["enabled"] is False
+    assert any(a["action"] == "restore" for a in state["audit"])
+
+
+def test_backup_requires_auth(client, configured):
+    client.cookies.clear()
+    assert client.get("/api/backup").status_code == 401
+
+
+def test_restore_rejects_tampered_backup(client, configured):
+    payload = client.get("/api/backup").json()
+    payload["state"]["domain"] = "evil.example.com"
+    response = client.post("/api/restore", json=payload)
+    assert response.status_code == 400
+    assert "校验和" in response.json()["error"]
+    assert config.load_state()["domain"] == "proxy.example.com"
+
+
+def test_restore_rejects_foreign_file(client, configured):
+    assert client.post("/api/restore", json={"hello": "world"}).status_code == 400
+    assert client.post("/api/restore", content=b"{not json").status_code == 400
+    assert client.post("/api/restore", content=b'{"format":"other","state":{}}').status_code == 400
+
+
+# ---------------------------------------------------------------- GeoIP 分流
+
+def test_geodata_is_opt_in_by_default(client, configured):
+    """默认不启用: 没有数据文件就绝不能下发 geo 规则 (否则 Xray 起不来)。"""
+    state = config.load_state()
+    assert state["geodata"]["enabled"] is False
+    cfg = xray_config.build_xray_config(state)
+    rules = json.dumps(cfg["routing"]["rules"], ensure_ascii=False)
+    assert "geoip:" not in rules and "geosite:" not in rules
+    assert all(o.get("tag") != "block" for o in cfg["outbounds"])
+
+
+def test_geodata_rules_dropped_when_files_missing(client, configured, home):
+    """开关打开但数据文件被删掉时, 必须自动退化为无 geo 规则 (硬前置)。"""
+    from zeroproxy import geodata
+
+    state = config.load_state()
+    state["geodata"]["enabled"] = True
+    assert geodata.present() is False
+    cfg = xray_config.build_xray_config(state)
+    assert "geoip:" not in json.dumps(cfg["routing"]["rules"])
+
+
+def test_geodata_update_from_local_source(client, configured, home, monkeypatch, tmp_path):
+    """用 file:// 假数据源走完下载流程 (不依赖网络)。"""
+    from zeroproxy import geodata
+
+    source = tmp_path / "geo-src"
+    source.mkdir()
+    for name in geodata.MIN_BYTES:
+        (source / name).write_bytes(b"ZP" * 600_000)  # 1.2 MB, 刚好过体积下限
+    monkeypatch.setattr(
+        geodata, "SOURCES", {name: [(source / name).as_uri()] for name in geodata.MIN_BYTES}
+    )
+
+    state = config.load_state()
+    ok, detail, status = geodata.update(state, validate=False)
+    assert ok, detail
+    assert geodata.present()
+    assert state["geodata"]["enabled"] is True
+    assert state["geodata"]["files"]["geoip.dat"]["size"] == 1_200_000
+    assert status["active"] is True
+
+    # 数据齐备后, 分流规则才会进入 Xray 配置
+    rules = json.dumps(xray_config.build_xray_config(state)["routing"]["rules"])
+    assert "geoip:private" in rules and "geosite:category-ads-all" in rules
+
+
+def test_geodata_rejects_too_small_download(client, configured, home, monkeypatch, tmp_path):
+    """下载到错误页面 (体积过小) 必须被拒绝, 且不破坏已有数据。"""
+    from zeroproxy import geodata
+
+    bogus = tmp_path / "bogus.dat"
+    bogus.write_bytes(b"<!doctype html>404")
+    monkeypatch.setattr(
+        geodata, "SOURCES", {name: [bogus.as_uri()] for name in geodata.MIN_BYTES}
+    )
+    ok, detail, _ = geodata.update(config.load_state(), validate=False)
+    assert not ok and "体积异常" in detail
+    assert geodata.present() is False
+
+
+def test_settings_reject_enabling_geodata_without_data(client, configured):
+    response = client.post("/api/settings", json={"geodata_enabled": True})
+    assert response.status_code == 400
+    assert "GeoIP" in response.json()["error"]
+
+
+def test_geodata_autoupdate_respects_explicit_opt_out(home, monkeypatch, tmp_path):
+    """用户显式关掉分流后, 后台任务不该再自动下载 28MB 数据。"""
+    from zeroproxy import config, geodata
+
+    state = config.load_state()
+    assert geodata.wants_update(state) is True          # 默认: 数据缺失 → 需要更新
+    state["geodata"]["user_set"] = True
+    assert geodata.wants_update(state) is False         # 显式关闭 → 不再更新
+    state["geodata"]["enabled"] = True
+    assert geodata.wants_update(state) is True          # 重新打开 → 恢复更新

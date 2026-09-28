@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import socket
@@ -215,6 +216,155 @@ def main() -> int:
     record("自检", bool(diag["checks"]), diag["summary"])
     repair = client.post("/api/repair").json()
     record("一键修复", all(s["ok"] for s in repair["steps"]), f"{len(repair['steps'])} 步")
+
+    print("\n[7] GeoIP 数据与分流防护")
+    # 数据来源: 显式指定 ZP_GEODATA_DIR (已有 dat 文件的目录), 否则尝试真实下载
+    geo_src = os.environ.get("ZP_GEODATA_DIR", "")
+    geo_dir = home / "geo"
+    geo_dir.mkdir(parents=True, exist_ok=True)
+    have_geo = False
+    if geo_src and (Path(geo_src) / "geoip.dat").exists():
+        for name in ("geoip.dat", "geosite.dat"):
+            shutil.copyfile(Path(geo_src) / name, geo_dir / name)
+        have_geo = True
+        record("准备 GeoIP 数据", True, f"来自 {geo_src}")
+    else:
+        res = client.post("/api/geodata/update").json()
+        have_geo = bool(res.get("ok"))
+        record("下载 GeoIP 数据", have_geo, str(res.get("detail"))[:110])
+
+    if have_geo:
+        from zeroproxy import geodata
+
+        # 数据就绪后开启分流 (设置接口会触发重新生成 + 热重载)
+        client.post("/api/settings", json={"geodata_enabled": True})
+        state = config.load_state()
+        cfg_path = home / "xray" / "config.json"
+        cfg = json.loads(cfg_path.read_text())
+        rules_text = json.dumps(cfg.get("routing", {}).get("rules", []))
+        record("配置含 geoip:private 规则", "geoip:private" in rules_text)
+        record("配置含 geosite:category-ads-all 规则", "geosite:category-ads-all" in rules_text)
+        record("存在 blackhole 出站", any(o.get("tag") == "block" for o in cfg["outbounds"]))
+        record("分流状态 active", geodata.usable(state))
+
+        if xray_bin:
+            # 带 XRAY_LOCATION_ASSET 才能加载数据; 不带则整份配置构建失败
+            ok_env = subprocess.run(
+                [xray_bin, "-test", "-c", str(cfg_path)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={**os.environ, "XRAY_LOCATION_ASSET": str(geo_dir)},
+            )
+            record("有数据 + XRAY_LOCATION_ASSET 时 xray -test 通过", ok_env.returncode == 0)
+            # 注意: xray 也会从"可执行文件所在目录"找 geo 文件, 因此必须把二进制
+            # 复制到隔离目录再测, 否则会因 /tmp 里恰好有 dat 文件而误判。
+            iso_dir = home / "xray-isolated"
+            iso_dir.mkdir(exist_ok=True)
+            iso_bin = iso_dir / "xray"
+            if not iso_bin.exists():
+                shutil.copy2(xray_bin, iso_bin)
+            no_env = subprocess.run(
+                [str(iso_bin), "-test", "-c", str(cfg_path)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            record(
+                "未设 XRAY_LOCATION_ASSET 时 xray 拒绝启动 (证明该变量必需)",
+                no_env.returncode != 0,
+                last_line(no_env.stdout + no_env.stderr),
+            )
+
+        # 反向用例: 数据缺失时 geo 规则必须被丢弃 (否则 Xray 整体起不来)
+        backup_dir = home / "geo-bak"
+        shutil.move(str(geo_dir), str(backup_dir))
+        client.post("/api/apply")
+        cfg2 = json.loads(cfg_path.read_text())
+        record(
+            "数据缺失时不再下发 geo 规则 (硬前置)",
+            "geoip:" not in json.dumps(cfg2.get("routing", {}).get("rules", [])),
+        )
+        if xray_bin:
+            proc = subprocess.run(
+                [str(iso_bin), "-test", "-c", str(cfg_path)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            record("无数据时 xray -test 仍通过", proc.returncode == 0)
+        shutil.move(str(backup_dir), str(geo_dir))
+        client.post("/api/apply")
+
+    print("\n[8] 备份 / 恢复")
+    exported = client.get("/api/backup")
+    payload = exported.json()
+    record("备份导出", exported.status_code == 200, f"{len(exported.content)} 字节")
+    record("备份含校验和", bool(payload.get("checksum")), payload.get("checksum", "")[:16])
+    record(
+        "备份不含会话",
+        "sessions" not in payload.get("state", {}) and "login_failures" not in payload.get("state", {}),
+    )
+    token_before = payload["state"]["subscription_token"]
+
+    # 改点东西, 再用备份覆盖回去
+    client.post("/api/nodes/vless-ws/toggle")
+    assert config.load_state()["nodes"]["vless-ws"] is False
+    restore = client.post("/api/restore", content=exported.content)
+    record("恢复备份", restore.status_code == 200, f"HTTP {restore.status_code}")
+    after = config.load_state()
+    record("恢复后节点开关回到备份点", after["nodes"]["vless-ws"] is True)
+    record("恢复后订阅令牌不变", after["subscription_token"] == token_before)
+
+    tampered = dict(payload)
+    tampered["state"] = {**payload["state"], "domain": "evil.example.com"}
+    bad = client.post("/api/restore", json=tampered)
+    record("校验和不匹配时拒绝恢复", bad.status_code == 400, bad.json().get("error", "")[:60])
+
+    print("\n[9] 连通性探测 (真实握手)")
+    # 需要真实内核在跑: 启一个 xray (+ hysteria) 再探
+    procs: list[subprocess.Popen] = []
+    try:
+        if xray_bin:
+            env = {**os.environ, "XRAY_LOCATION_ASSET": str(geo_dir)}
+            procs.append(
+                subprocess.Popen(
+                    [xray_bin, "run", "-c", str(home / "xray" / "config.json")],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    env=env,
+                )
+            )
+        if hy_bin and config.load_state().get("hysteria_hopping"):
+            client.post("/api/hysteria/hopping")  # macOS 不支持多端口监听
+        if hy_bin:
+            procs.append(
+                subprocess.Popen(
+                    [hy_bin, "server", "-c", str(home / "hysteria" / "config.yaml")],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            )
+        time.sleep(3)
+        probe = client.get("/api/probe?force=1").json()
+        for item in probe["nodes"]:
+            record(
+                f"探测 {item['node']}",
+                bool(item["ok"]) or item["ok"] is None,
+                f"{item['detail']}" + (f" · {item['ms']}ms" if item["ms"] else ""),
+            )
+        record("出站 RTT (Reality dest)", bool(probe["dest"]["ok"]), f"{probe['dest']['ms']}ms")
+        if xray_bin:
+            reality = next(n for n in probe["nodes"] if n["node"] == "vless-reality")
+            record("Reality 真实 TLS 握手成功", bool(reality["ok"]), f"{reality['ms']}ms")
+    finally:
+        for proc in procs:
+            proc.terminate()
+        for proc in procs:
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
     failed = [name for name, ok, _ in results if not ok]
     print(f"\n结论: {len(results) - len(failed)}/{len(results)} 项通过")
