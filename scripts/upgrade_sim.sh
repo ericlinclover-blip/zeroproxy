@@ -151,13 +151,46 @@ run_upgrade() { # run_upgrade <trigger>
     ZP_SIM_TARBALL="${2:-}" ZP_SYSTEMD_DIR="$SIM/systemd-units" bash "$ROOT/upgrade.sh"
 }
 
+# 升级过程中每 50ms 采一次进度文件 —— 用来证明"进度是边跑边写的", 而不是跑完才写一次
+watch_progress() { # watch_progress <间隔秒> <日志文件>
+  ( while :; do
+      if [ -f "$HOME_DIR/data/update.json" ]; then
+        "$PYTHON" - "$HOME_DIR/data/update.json" >> "$2" 2>/dev/null <<'PY' || true
+import json
+import sys
+
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+print(f'{d.get("state")}|{d.get("current")}|{len(d.get("steps") or [])}|{len(d.get("plan") or [])}')
+PY
+      fi
+      sleep "$1"
+    done ) &
+  WATCH_PID=$!
+}
+
 # ---------- 5. 正常升级 ----------
 section "[2] 正常升级 (真实 upgrade.sh)"
+WATCH_LOG="$SIM/progress-samples.txt"
+: > "$WATCH_LOG"
+watch_progress 0.05 "$WATCH_LOG"
 set +e; run_upgrade sim "$SIM/new.tar.gz"; UPGRADE_RC=$?; set -e
+kill "$WATCH_PID" 2>/dev/null || true
+wait "$WATCH_PID" 2>/dev/null || true
 echo "    退出码 $UPGRADE_RC"
 
 section "[断言]"
 [ "$UPGRADE_RC" = "0" ] && ok "upgrade.sh 退出码 0" || bad "upgrade.sh 退出码 $UPGRADE_RC (期望 0)"
+SAMPLES="$(sort -u "$WATCH_LOG" | wc -l | tr -d ' ')"
+MID="$(grep -c '^running|' "$WATCH_LOG" || true)"
+STEPS_SEEN="$(sort -u "$WATCH_LOG" | sed -n 's/^running|.*|\([0-9]*\)|[0-9]*$/\1/p' | sort -n | tr '\n' ' ')"
+if [ "${SAMPLES:-0}" -ge 3 ] && [ "${MID:-0}" -ge 2 ]; then
+  ok "升级进度是边跑边写的 (采样到 $SAMPLES 种快照, $MID 次进行中; 完成步数依次为 ${STEPS_SEEN:-无})"
+else
+  bad "进度没有渐进写入 (只有 $SAMPLES 种状态, running 快照 $MID 次)"
+fi
 [ -f "$HOME_DIR/zeroproxy/apply.py" ] && ok "新代码已就位 (apply.py 存在)" || bad "新代码缺失 (没有 apply.py)"
 [ -x "$HOME_DIR/upgrade.sh" ] && ok "upgrade.sh 随升级装到 ZP_HOME 且可执行" || bad "ZP_HOME/upgrade.sh 缺失或不可执行"
 
@@ -203,7 +236,12 @@ names = [s["name"] for s in data["steps"]]
 assert any("安装新代码" in n for n in names), names
 assert any("重新生成配置" in n for n in names), names
 assert all(s["ok"] for s in data["steps"]), data["steps"]
-print(f"    update.json: {data['message']} · {len(names)} 步全部成功")
+# 面板靠 plan 渲染"待执行 / 进行中 / 已完成", 名字必须和实际步骤一一对应且同序,
+# 否则步骤清单会永远停在"待执行"。收尾时 current 也要清空。
+plan = data.get("plan") or []
+assert plan == names, f"plan 与 steps 对不上:\nplan={plan}\nsteps={names}"
+assert data.get("current") == "", data.get("current")
+print(f"    update.json: {data['message']} · {len(names)} 步全部成功 · plan 与 steps 同序对齐")
 PY
 then
   ok "升级进度写进 data/update.json (面板「程序更新」卡片读它)"

@@ -5,7 +5,7 @@
  *   1. 用带 ?token= 的链接打开面板, 走完「初始化 → 仪表盘」全流程;
  *   2. 断言 5 张节点卡、三种订阅格式、系统卡片都渲染出来;
  *   3. 交互验证: 节点开关热更新、订阅二维码出图、一键诊断出结果;
- *   4. 收集 console 错误与失败请求, 截图留证 (深浅色各一张)。
+ *   4. 收集 console 错误与失败请求, 截图留证 (深浅色各一张 + 升级交互各状态一张)。
  *
  * 用法 (需要 node + playwright, 默认用 Codex 内置运行时):
  *   ZP_NODE=/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node \
@@ -240,6 +240,137 @@ async function main() {
     check("自签证书下可点「申请证书」(不再禁用到没机会补签)",
       (await page.locator("#btn-renew").innerText()).trim() === "申请证书"
       && !(await page.locator("#btn-renew").isDisabled()));
+
+    console.log("\n[3d-2] 升级交互闭环 (确认 → 进度 → 完成/失败)");
+    // 真机上点「一键更新」就是这个弹窗; 本地没有 can_update, 所以直接把 info 摆成可升级再调
+    await page.evaluate(() => {
+      updateInfo = { ...updateInfo, current: "2.3.10", latest: "2.3.11",
+        update_available: true, can_update: true, running: false };
+      renderUpdate();
+      askUpgrade();
+    });
+    const confirmBox = await page.evaluate(() => {
+      const m = document.querySelector("#confirm-mask");
+      return {
+        open: !m.classList.contains("hidden"),
+        title: document.querySelector("#confirm-title").innerText,
+        steps: [...m.querySelectorAll(".confirm-list .ustep")].map((e) => e.innerText.replace(/\s+/g, " ").trim()),
+        keeps: document.querySelector(".confirm-keep").innerText,
+        ok: document.querySelector("#confirm-ok").innerText,
+      };
+    });
+    check("「一键更新」先弹确认框 (不再是浏览器原生 confirm)",
+      confirmBox.open && /确认升级到 v2\.3\.11/.test(confirmBox.title), confirmBox.title);
+    check("确认框逐条列出会做什么",
+      confirmBox.steps.length === 6 && /备份/.test(confirmBox.steps[0]), `共 ${confirmBox.steps.length} 条`);
+    check("确认框写清不会动什么",
+      /节点密钥/.test(confirmBox.keeps) && /订阅令牌/.test(confirmBox.keeps), "");
+    check("确认按钮写清版本跨度",
+      /v2\.3\.10 → v2\.3\.11/.test(confirmBox.ok.replace(/\s+/g, " ")), confirmBox.ok);
+    await page.locator("#confirm-mask").screenshot({ path: path.join(SHOT_DIR, "update-confirm.png") });
+    await page.click("#confirm-cancel");
+    check("取消后弹窗关闭且不会开始升级",
+      (await page.locator("#confirm-mask.hidden").count()) === 1
+      && (await page.locator("#btn-update-run").innerText()).includes("2.3.11"), "");
+
+    const runningView = await page.evaluate(() => {
+      const plan = ["备份代码与 state.json", "下载新版本代码", "安装新代码", "同步 Python 依赖",
+        "重载 systemd 单元", "按 state.json 重新生成配置并热重载", "重启面板进程", "面板已就绪"];
+      updateInfo = {
+        ...updateInfo, running: true, current: "2.3.10",
+        last: {
+          state: "running", from: "2.3.10", to: "2.3.11", trigger: "panel",
+          started_at: Math.round(Date.now() / 1000) - 12, finished_at: 0,
+          current: "同步 Python 依赖", plan,
+          steps: [
+            { name: plan[0], ok: true, detail: "code-20260928-165700" },
+            { name: plan[1], ok: true, detail: "v2.3.10 → v2.3.11" },
+            { name: plan[2], ok: true, detail: "完成" },
+          ],
+        },
+      };
+      renderUpdate();
+      const rows = [...document.querySelectorAll("#update-body .ustep")];
+      return {
+        done: rows.filter((r) => r.classList.contains("done")).length,
+        now: rows.filter((r) => r.classList.contains("now")).length,
+        todo: rows.filter((r) => r.classList.contains("todo")).length,
+        nowName: (rows.find((r) => r.classList.contains("now")) || { innerText: "" }).innerText.replace(/\s+/g, " ").trim(),
+        bar: (document.querySelector("#update-body .bar > i") || { style: {} }).style.width || "",
+        summary: [...document.querySelectorAll("#update-body .muted")].map((e) => e.innerText.trim()).join(" | "),
+      };
+    });
+    check("升级中显示逐步清单 (1 进行中 / 4 待执行)",
+      runningView.done === 3 && runningView.now === 1 && runningView.todo === 4,
+      `✓${runningView.done} ⟳${runningView.now} ○${runningView.todo}`);
+    check("正在执行的那步被标出来", /同步 Python 依赖/.test(runningView.nowName), runningView.nowName);
+    check("进度条按已完成步数推进", /43%/.test(runningView.bar), runningView.bar);
+    check("显示完成步数与已用时间", /已完成 3\/8 步 · 已用 \d+ 秒/.test(runningView.summary),
+      (runningView.summary.match(/已完成[^|]*/) || [""])[0].trim());
+    await page.locator("#update-card").screenshot({ path: path.join(SHOT_DIR, "update-running.png") });
+
+    const successView = await page.evaluate(() => {
+      const plan = ["备份代码与 state.json", "下载新版本代码", "安装新代码"];
+      const t = Math.round(Date.now() / 1000);
+      pageVersion = "2.3.10";   // 假装本页 JS 还是旧版, 好验证「重新加载面板」是否出现
+      updateInfo = {
+        ...updateInfo, running: false, current: "2.3.11", latest: "2.3.11", update_available: false,
+        last: { state: "success", from: "2.3.10", to: "2.3.11", trigger: "panel", started_at: t - 9,
+          finished_at: t, current: "", plan,
+          steps: plan.map((n) => ({ name: n, ok: true, detail: "完成" })), message: "" },
+      };
+      renderUpdate();
+      const banner = document.querySelector("#update-body .banner");
+      return {
+        cls: banner.className,
+        text: banner.innerText.replace(/\s+/g, " ").trim(),
+        reloadVisible: !document.querySelector("#btn-update-reload").classList.contains("hidden"),
+        hint: document.querySelector("#update-hint").innerText.trim(),
+        stepsFolded: !!document.querySelector("#update-body details"),
+      };
+    });
+    check("升级完成给出结论卡 (版本跨度 / 用时 / 触发方式)",
+      successView.cls.includes("good") && /v2\.3\.10 → v2\.3\.11/.test(successView.text)
+      && /用时 9 秒/.test(successView.text), successView.text.slice(0, 70));
+    check("完成态把步骤详情收进折叠区 (卡片不臃肿)", successView.stepsFolded, "");
+    check("本页 JS 落后于服务器时给出「重新加载面板」",
+      successView.reloadVisible && /重新加载后生效/.test(successView.hint), successView.hint);
+    await page.locator("#update-card").screenshot({ path: path.join(SHOT_DIR, "update-success.png") });
+
+    const failedView = await page.evaluate(() => {
+      const plan = ["备份代码与 state.json", "下载新版本代码", "安装新代码"];
+      updateInfo = {
+        ...updateInfo, running: false, current: "2.3.10", latest: "2.3.11", update_available: true,
+        log_tail: "== 安装新代码\ncp: 无法写入",
+        last: { state: "failed", from: "2.3.10", to: "2.3.11", trigger: "panel",
+          started_at: Math.round(Date.now() / 1000) - 5, finished_at: Math.round(Date.now() / 1000),
+          current: "", plan, message: "",
+          steps: [{ name: plan[0], ok: true, detail: "完成" },
+            { name: plan[1], ok: true, detail: "完成" },
+            { name: plan[2], ok: false, detail: "命令执行失败, 详见日志" }] },
+      };
+      renderUpdate();
+      const banner = document.querySelector("#update-body .banner");
+      return {
+        cls: banner.className,
+        text: banner.innerText.replace(/\s+/g, " ").trim(),
+        hasLog: !!document.querySelector("#update-body .log-box"),
+        failedRow: document.querySelectorAll("#update-body .ustep.failed").length,
+        barBad: !!document.querySelector("#update-body .bar > i.bad"),
+        summary: (document.querySelector("#update-body .bar + .muted") || { innerText: "" }).innerText.trim(),
+      };
+    });
+    check("升级失败给出失败步骤 + 自动回滚说明",
+      failedView.cls.includes("bad") && /升级失败: 安装新代码/.test(failedView.text)
+      && /自动回滚/.test(failedView.text), failedView.text.slice(0, 70));
+    check("失败时带日志尾巴", failedView.hasLog && failedView.failedRow === 1, "");
+    check("失败态标出在第几步断的 (进度条转红)", failedView.barBad && /在第 3 步失败/.test(failedView.summary),
+      failedView.summary);
+    await page.locator("#update-card").screenshot({ path: path.join(SHOT_DIR, "update-failed.png") });
+
+    await page.evaluate(() => loadUpdate(false));   // 恢复成真实状态, 不影响后面的检查
+    check("恢复真实状态后卡片回到版本对比",
+      await page.evaluate(() => !document.querySelector("#update-body .banner")), "");
 
     console.log("\n[3e] 初始化 → 域名面板 交接到位");
     // 真机上部署成功后后端会返回 redirect.ready, 前端弹这张"3 秒后跳转"的卡。

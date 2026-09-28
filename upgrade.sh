@@ -47,6 +47,8 @@ fail() { printf '\033[1;31m[ZeroProxy]\033[0m %s\n' "$*"; exit 1; }
 
 # ---------- 进度文件 (面板「程序更新」卡片读它) ----------
 STEPS=()
+PLAN=()
+CURRENT=""
 STATUS_STATE="running"
 STATUS_MSG="升级进行中"
 FROM_VERSION="unknown"
@@ -62,6 +64,33 @@ steps_json() {
   printf '[%s]' "${STEPS[*]-}"
 }
 
+json_array() { # json_array <字符串...> → ["a","b"]
+  local out="" it
+  for it in "$@"; do
+    [ -n "$it" ] || continue          # bash 3.2 下空数组会展开成一个空串, 这里挡掉
+    out="${out:+$out,}\"$(json_escape "$it")\""
+  done
+  printf '[%s]' "$out"
+}
+
+#: 这次升级会依次做哪些事 —— 面板拿它渲染"待执行 / 进行中 / 已完成"的步骤清单。
+#: 名字必须和下面 add_step 用的一字不差, 否则面板对不上号。
+build_plan() {
+  PLAN=("备份代码与 state.json" "下载新版本代码" "安装新代码" "同步 Python 依赖" "重载 systemd 单元")
+  [ "$ZP_UPDATE_CORE" = "1" ] && PLAN+=("升级 Xray Core" "升级 Hysteria 2")
+  if [ -f "$STATE_FILE" ]; then
+    PLAN+=("按 state.json 重新生成配置并热重载")
+  else
+    PLAN+=("跳过配置落地")
+  fi
+  if [ "$ZP_NO_RESTART" = "1" ]; then
+    PLAN+=("重启面板")
+  else
+    PLAN+=("重启面板进程" "面板已就绪")
+  fi
+  return 0
+}
+
 write_status() {
   [ -d "$ZP_HOME/data" ] || return 0
   {
@@ -72,7 +101,9 @@ write_status() {
     printf '  "trigger": "%s",\n' "$(json_escape "$ZP_TRIGGER")"
     printf '  "started_at": %s,\n' "$STARTED_AT"
     printf '  "finished_at": %s,\n' "$FINISHED_AT"
+    printf '  "current": "%s",\n' "$(json_escape "$CURRENT")"
     printf '  "message": "%s",\n' "$(json_escape "$STATUS_MSG")"
+    printf '  "plan": %s,\n' "$(json_array "${PLAN[@]-}")"
     printf '  "steps": %s\n' "$(steps_json)"
     printf '}\n'
   } > "$STATUS_FILE.tmp" 2>/dev/null && mv -f "$STATUS_FILE.tmp" "$STATUS_FILE" 2>/dev/null || true
@@ -81,6 +112,13 @@ write_status() {
 add_step() { # add_step <true|false> <名称> <说明>
   STEPS+=("{\"name\":\"$(json_escape "$2")\",\"ok\":$1,\"detail\":\"$(json_escape "$3")\"}")
   printf '%s %s | %s\n' "$([ "$1" = "true" ] && echo '  OK  ' || echo ' FAIL ')" "$2" "$3" >> "$LOG_FILE"
+  write_status          # 面板每 2.5s 轮询一次, 每完成一步就落盘, 进度才是真的在动
+}
+
+begin_step() { # begin_step <名称>: 标记"正在做这一步"
+  STATUS_MSG="$1"
+  CURRENT="$1"
+  write_status
 }
 
 step() { info "$1"; }
@@ -127,7 +165,7 @@ rollback() {
 
 run_step() { # run_step <名称> <命令...>
   local name="$1"; shift
-  STATUS_MSG="$name"
+  begin_step "$name"
   printf '== %s\n' "$name" >> "$LOG_FILE"
   if "$@" >>"$LOG_FILE" 2>&1; then
     add_step true "$name" "完成"
@@ -167,6 +205,8 @@ if [ "$ZP_CHECK_ONLY" = "1" ]; then
 fi
 
 # ---------- 1. 备份 ----------
+build_plan
+begin_step "备份代码与 state.json"
 CODE_BACKUP="$BACKUP_DIR/code-$STAMP"
 rm -rf "$CODE_BACKUP"          # 保证目录不存在: 否则 cp -r 会套出 zeroproxy/zeroproxy
 mkdir -p "$CODE_BACKUP"
@@ -180,11 +220,13 @@ if ls -1dt "$BACKUP_DIR"/code-* >/dev/null 2>&1; then
   ls -1dt "$BACKUP_DIR"/code-* 2>/dev/null | tail -n +6 | while read -r old; do rm -rf "$old"; done
 fi
 ok "已备份当前代码与 state.json → $CODE_BACKUP"
+add_step true "备份代码与 state.json" "$(basename "$CODE_BACKUP") (最近 5 份自动保留)"
 
 trap on_exit EXIT
 
 # ---------- 2. 下载新代码 ----------
 step_log "从 GitHub 下载面板代码 ($ZP_REPO @ $ZP_REF) ..."
+begin_step "下载新版本代码"
 fetch_tarball() { # fetch_tarball <输出文件>
   local out="$1" url err
   err="$(mktemp)"
@@ -214,9 +256,11 @@ SRC_DIR="$(find /tmp/zp-upgrade-src -mindepth 1 -maxdepth 1 -type d | head -1)"
 TO_VERSION="$(read_version "$SRC_DIR/backend/zeroproxy/__init__.py")"
 TO_VERSION="${TO_VERSION:-unknown}"
 ok "代码已就绪 (v$FROM_VERSION → v$TO_VERSION)"
+add_step true "下载新版本代码" "v$FROM_VERSION → v$TO_VERSION ($ZP_REPO @ $ZP_REF)"
 
 # ---------- 3. 替换代码 ----------
 step_log "安装新代码 → $ZP_HOME ..."
+begin_step "安装新代码"
 rm -rf "$ZP_HOME/zeroproxy" "$ZP_HOME/static"
 cp -r "$SRC_DIR/backend/zeroproxy" "$ZP_HOME/zeroproxy"
 cp -r "$SRC_DIR/backend/static" "$ZP_HOME/static"
@@ -245,6 +289,7 @@ run_step "重载 systemd 单元" systemctl daemon-reload
 if [ "$ZP_UPDATE_CORE" = "1" ]; then
   ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m)"
   step_log "升级 Xray / Hysteria 2 二进制 (ZP_UPDATE_CORE=1) ..."
+  begin_step "升级 Xray Core"
   if curl -fsSL --max-time 120 -o /tmp/xray.zip \
       "$GH/XTLS/Xray-core/releases/latest/download/Xray-linux-$( [ "$ARCH" = "arm64" ] && echo arm64-v8a || echo 64 ).zip"; then
     unzip -oq /tmp/xray.zip -d /usr/local/bin && chmod +x /usr/local/bin/xray
@@ -254,6 +299,7 @@ if [ "$ZP_UPDATE_CORE" = "1" ]; then
     add_step false "升级 Xray Core" "下载失败, 已保留现有版本"
   fi
   rm -f /tmp/xray.zip
+  begin_step "升级 Hysteria 2"
   if curl -fsSL --max-time 120 -o /tmp/hysteria.tar.gz \
       "$GH/apernet/hysteria/releases/latest/download/hysteria-linux-$ARCH.tar.gz"; then
     tar -xzf /tmp/hysteria.tar.gz -C /tmp hysteria && install -m 755 /tmp/hysteria /usr/local/bin/hysteria
@@ -270,15 +316,18 @@ if [ -f "$STATE_FILE" ]; then
   run_step "按 state.json 重新生成配置并热重载" \
     env ZP_HOME="$ZP_HOME" PYTHONPATH="$ZP_HOME" "$VENV/bin/python" -m zeroproxy.apply --quiet
 else
+  begin_step "跳过配置落地"
   add_step true "跳过配置落地" "面板尚未初始化"
 fi
 
 # ---------- 7. 重启面板 ----------
 if [ "$ZP_NO_RESTART" = "1" ]; then
+  begin_step "重启面板"
   add_step true "重启面板" "已按 ZP_NO_RESTART=1 跳过"
 else
   run_step "重启面板进程" systemctl restart zeroproxy
   step_log "等待面板就绪 ..."
+  begin_step "面板已就绪"
   PANEL_READY=0
   for _ in $(seq 1 30); do
     if curl -fsS --max-time 3 "http://127.0.0.1:${ZP_BIND_PORT:-9900}/api/info" >/dev/null 2>&1; then PANEL_READY=1; break; fi
@@ -293,6 +342,7 @@ fi
 
 # ---------- 8. 收尾 ----------
 FINISHED_AT="$(date +%s)"
+CURRENT=""
 if printf '%s' "$(steps_json)" | grep -q '"ok":false'; then
   STATUS_STATE="failed"
   STATUS_MSG="升级完成但有步骤失败, 详见面板「程序更新」卡片"

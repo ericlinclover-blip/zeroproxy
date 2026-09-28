@@ -216,6 +216,23 @@ code.inline { background: var(--border); padding: 2px 7px; border-radius: 6px; f
 .footer { text-align: center; color: var(--sub); font-size: 12px; margin-top: 40px; }
 .bar { height: 6px; border-radius: 999px; background: var(--border); overflow: hidden; margin-top: 8px; }
 .bar > i { display: block; height: 100%; background: var(--ok); border-radius: 999px; }
+.bar > i.bad { background: var(--err); }
+/* 升级步骤清单: 待执行 ○ / 进行中 ⟳ / 已完成 ✓ / 失败 ✗ */
+.ustep-wrap { border: 1px solid var(--border); border-radius: 14px; padding: 9px 14px; background: rgba(127, 127, 127, 0.05); }
+.ustep { display: flex; align-items: center; gap: 9px; padding: 5px 0; font-size: 13px; line-height: 1.5; }
+.ustep .ico { flex-shrink: 0; width: 15px; text-align: center; color: var(--sub); }
+.ustep .udetail { margin-left: auto; padding-left: 10px; color: var(--sub); font-size: 12px; text-align: right; }
+.ustep.done .ico { color: var(--ok); }
+.ustep.now .ico { color: var(--accent); display: inline-block; animation: zp-spin 1.1s linear infinite; }
+.ustep.now .uname { font-weight: 600; }
+.ustep.failed .ico, .ustep.failed .uname { color: var(--err); }
+.ustep.todo .ico, .ustep.todo .uname { color: var(--sub); }
+@keyframes zp-spin { to { transform: rotate(360deg); } }
+.ustep-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-size: 13px; }
+.ustep-head b { font-weight: 600; }
+.confirm-list { text-align: left; margin-top: 6px; }
+.confirm-list .n { flex-shrink: 0; width: 15px; text-align: center; color: var(--accent); font-weight: 600; }
+.confirm-keep { text-align: left; margin-top: 10px; font-size: 12.5px; color: var(--sub); line-height: 1.6; }
 .kv { display: flex; justify-content: space-between; font-size: 13.5px; padding: 5px 0; gap: 12px; }
 .kv .k { color: var(--sub); flex-shrink: 0; }
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
@@ -381,14 +398,15 @@ code.inline { background: var(--border); padding: 2px 7px; border-radius: 6px; f
 
     <div class="section-title">程序更新</div>
     <div class="card" id="update-card">
-      <div class="row" style="justify-content:space-between">
+      <div class="row" style="justify-content:space-between;align-items:flex-start">
         <span style="font-weight:600;font-size:13.5px">面板版本</span>
-        <span class="muted" style="font-size:12.5px" id="update-status-line">—</span>
+        <span class="muted" style="font-size:12.5px;text-align:right" id="update-status-line">—</span>
       </div>
       <div id="update-body" style="margin-top:10px"></div>
       <div class="row" style="margin-top:14px">
         <button class="btn ghost small" id="btn-update-check">检查更新</button>
         <button class="btn small hidden" id="btn-update-run">一键更新</button>
+        <button class="btn small hidden" id="btn-update-reload">重新加载面板</button>
         <span class="muted" style="font-size:12px" id="update-hint">升级只替换程序代码, 密钥 / 订阅令牌 / 节点配置全部保留</span>
       </div>
     </div>
@@ -411,6 +429,16 @@ code.inline { background: var(--border); padding: 2px 7px; border-radius: 6px; f
     </div>
   </div>
 </div>
+<div class="modal-mask hidden" id="confirm-mask">
+  <div class="modal confirm-modal">
+    <h3 id="confirm-title">确认</h3>
+    <div id="confirm-body"></div>
+    <div class="close-row">
+      <button class="btn ghost" id="confirm-cancel">取消</button>
+      <button class="btn" id="confirm-ok">确定</button>
+    </div>
+  </div>
+</div>
 <div class="toast" id="toast"></div>
 
 <script>
@@ -420,6 +448,8 @@ const escAttr = esc;
 const PROTO_BADGE = { VLESS: "vless", Trojan: "trojan", "Hysteria 2": "hysteria" };
 let dash = null, refreshTimer = null, bootstrapToken = "", probeData = null, probeRan = false;
 let updateInfo = null, updateTimer = null, updatePollFailures = 0;
+//: 本页 JS 是哪个版本加载的 (升级后服务器版本会变, 此时必须重新加载页面才会生效)
+let pageVersion = "";
 
 /* ---------------- 主题 ---------------- */
 function applyTheme(t) {
@@ -1192,7 +1222,13 @@ $("#btn-apply").onclick = async () => {
 
 /* ---------------- 一键更新 ----------------
  * 升级由服务器上的 upgrade.sh 完成; 面板只负责按按钮 + 回读进度。
- * 面板进程会在升级过程中重启, 因此轮询要能容忍请求失败。 */
+ * 面板进程会在升级过程中重启, 因此轮询要能容忍请求失败。
+ *
+ * 交互闭环 (之前只有一句 confirm + 一个跳动的徽标):
+ *   检查更新 → 版本对比 → 一键更新 (确认弹窗, 写清会做什么/不动什么)
+ *   → 升级中 (逐步清单: 待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间)
+ *   → 完成 (绿色结论 + 用时 + 一键重新加载) / 失败 (红 + 失败步骤 + 日志 + 重试)。
+ * 步骤清单来自 upgrade.sh 自己写的 plan/steps, 不是前端猜的。 */
 async function loadUpdate(force) {
   try {
     const path = force ? "/api/update?force=1" : "/api/update";
@@ -1200,6 +1236,7 @@ async function loadUpdate(force) {
   } catch (e) {
     return; // 未登录 / 升级中, 静默处理
   }
+  if (!pageVersion && updateInfo.current) pageVersion = updateInfo.current;
   renderUpdate();
   if (updateInfo.running && !updateTimer) startUpdatePolling();
 }
@@ -1227,39 +1264,20 @@ function renderUpdate() {
       )})。<br><span class="muted">面板本身仍可用; 需要升级时可在服务器上执行 README 里的一键升级命令。</span></span></div>`
     );
   }
-  if (last.state) {
-    const map = { queued: "info", running: "info", success: "good", failed: "bad" };
-    const title = {
-      queued: "升级任务已排队",
-      running: "正在升级…",
-      success: `升级完成: v${last.from || "?"} → v${last.to || u.current || "?"}`,
-      failed: "上次升级失败",
-    }[last.state] || `状态: ${last.state}`;
-    const detail = [
-      last.message || "",
-      last.finished_at ? `结束于 ${fmtTime(last.finished_at)}` : last.started_at ? `开始于 ${fmtTime(last.started_at)}` : "",
-      `触发方式: ${last.trigger === "panel" ? "面板按钮" : "命令行"}`,
-    ]
-      .filter(Boolean)
-      .join(" · ");
-    lines.push(
-      `<div class="banner ${map[last.state] || "info"}"><span class="ico">${
-        last.state === "success" ? "✓" : last.state === "failed" ? "✗" : "i"
-      }</span><span><b>${esc(title)}</b>${detail ? `<br><span class="muted">${esc(detail)}</span>` : ""}</span></div>`
-    );
+  if (last.state) lines.push(updateResultHtml(u, last));
+  else if (!u.check_ok) {
+    lines.push(`<div class="muted" style="font-size:12.5px">还没跑过升级。</div>`);
   }
-  if ((last.steps || []).length) {
-    lines.push(
-      `<div style="margin-top:10px">${(last.steps || [])
-        .map(
-          (s) => `<div class="check"><span class="ico ${s.ok ? "ok" : "bad"}">${s.ok ? "✓" : "✗"}</span>
-            <span class="name">${esc(s.name || "")}</span><span class="detail">${esc(s.detail || "")}</span></div>`
-        )
-        .join("")}</div>`
-    );
-  }
-  if (u.running || last.state === "running") {
-    $("#update-hint").textContent = "升级进行中: 面板重启后本页会自动回到正常状态";
+  lines.push(
+    `<div class="muted" style="font-size:12px;margin-top:10px">更新源 github.com/${esc(u.repo || "")} @ ${esc(u.ref || "main")}</div>`
+  );
+
+  const running = !!u.running;
+  const stale = !!pageVersion && !!u.current && pageVersion !== u.current;   // 本页 JS 落后于服务器
+  if (running) {
+    $("#update-hint").textContent = "升级进行中: 面板会在最后重启一次, 本页会在几秒内自动恢复";
+  } else if (stale) {
+    $("#update-hint").textContent = `服务器已是 v${u.current}, 本页还是 v${pageVersion} 的界面 — 重新加载后生效`;
   } else if (!u.can_update) {
     $("#update-hint").textContent = u.prod
       ? "服务器上还没有 upgrade.sh — 先执行 README 里的一键升级命令装好它, 之后就能在面板里一键更新"
@@ -1267,16 +1285,86 @@ function renderUpdate() {
   } else {
     $("#update-hint").textContent = "升级只替换程序代码, 密钥 / 订阅令牌 / 节点配置全部保留";
   }
-  if (u.log_tail) lines.push(`<div class="log-box">${esc(u.log_tail)}</div>`);
   $("#update-body").innerHTML = lines.join("");
 
   const runBtn = $("#btn-update-run");
   const topBtn = $("#btn-update");
-  runBtn.classList.toggle("hidden", !u.update_available || !u.can_update || !!u.running);
-  runBtn.disabled = !!u.running;
-  runBtn.textContent = u.running ? "升级中…" : `一键更新到 v${latest}`;
-  topBtn.textContent = u.running ? "升级中…" : u.update_available ? `一键更新 v${latest}` : "检查更新";
+  runBtn.classList.toggle("hidden", !u.update_available || !u.can_update || running);
+  runBtn.disabled = running;
+  runBtn.textContent = running ? "升级中…" : `一键更新到 v${latest}`;
+  $("#btn-update-reload").classList.toggle("hidden", !stale || running);
+  topBtn.textContent = running ? "升级中…" : u.update_available ? `一键更新 v${latest}` : "检查更新";
 }
+
+/* 升级中的实时清单: 待执行 ○ / 进行中 ⟳ / 已完成 ✓ / 失败 ✗。
+ * 清单来自 upgrade.sh 写的 plan + steps (前端不猜步骤), 每 2.5s 刷新一次。 */
+function updateStepsHtml(last) {
+  const done = last.steps || [];
+  const plan = last.plan || [];
+  if (!plan.length && !done.length) return "";
+  const byName = new Map(done.map((s) => [s.name, s]));
+  const current = last.current || "";
+  // 兜底步骤 (如「升级中断」) 不在 plan 里, 追加到清单尾部, 免得失败原因看不见
+  const names = plan.concat(done.filter((s) => !plan.includes(s.name)).map((s) => s.name));
+  const rows = names
+    .map((name) => {
+      const s = byName.get(name);
+      if (s) {
+        const cls = s.ok ? "done" : "failed";
+        return `<div class="ustep ${cls}"><span class="ico">${s.ok ? "✓" : "✗"}</span>
+          <span class="uname">${esc(name)}</span><span class="udetail">${esc(s.detail || "")}</span></div>`;
+      }
+      if (name === current) {
+        return `<div class="ustep now"><span class="ico">⟳</span><span class="uname">${esc(name)}</span>
+          <span class="udetail">进行中…</span></div>`;
+      }
+      return `<div class="ustep todo"><span class="ico">○</span><span class="uname">${esc(name)}</span></div>`;
+    })
+    .join("");
+  const pending = current && !byName.has(current) ? 0.45 : 0;
+  const pct = Math.min(100, Math.round(((done.length + pending) / names.length) * 100));
+  const failedAt = names.findIndex((n) => (byName.get(n) || {}).ok === false);
+  const summary = failedAt >= 0
+    ? `在第 ${failedAt + 1} 步失败 · 已完成 ${done.length}/${names.length} 步`
+    : `已完成 ${done.length}/${names.length} 步`;
+  return `<div class="ustep-wrap">${rows}</div>
+    <div class="bar"><i class="${failedAt >= 0 ? "bad" : ""}" style="width:${pct}%"></i></div>
+    <div class="muted" style="font-size:12px;margin-top:6px">${summary}${
+      last.started_at ? ` · 已用 ${fmtDuration(Math.max(0, updateNow() - last.started_at))}` : ""
+    }</div>`;
+}
+
+function updateResultHtml(u, last) {
+  const state = last.state;
+  const steps = updateStepsHtml(last);
+  const elapsed = last.started_at && last.finished_at
+    ? `用时 ${fmtDuration(Math.max(0, last.finished_at - last.started_at))} · ` : "";
+  const trigger = `触发方式: ${last.trigger === "panel" ? "面板按钮" : "命令行"}`;
+  if (state === "running" || state === "queued") {
+    const title = state === "queued" ? "升级任务已排队, 正在准备…" : `正在升级: v${esc(last.from || "")} → v${esc(last.to || "…")}`;
+    return `<div class="banner info"><span class="ico">⟳</span><span><b>${title}</b>
+      <br><span class="muted">别关这个页面; 面板重启期间本页会自动重连。</span></span></div>
+      ${steps ? `<div style="margin-top:12px">${steps}</div>` : ""}`;
+  }
+  if (state === "success") {
+    const failed = (last.steps || []).filter((s) => !s.ok);
+    return `<div class="banner good"><span class="ico">✓</span><span><b>升级完成: v${
+      esc(last.from || "?")} → v${esc(last.to || "?")}</b>
+      <br><span class="muted">${esc(elapsed)}结束于 ${esc(fmtTime(last.finished_at))} · ${esc(trigger)}${
+        failed.length ? ` · ${failed.length} 步有告警` : ""}</span></span></div>
+      <details style="margin-top:12px"><summary class="muted" style="font-size:12.5px;cursor:pointer">查看步骤详情</summary>
+      <div style="margin-top:8px">${steps || "<span class='muted'>—</span>"}</div></details>`;
+  }
+  const first = (last.steps || []).find((s) => !s.ok) || {};
+  return `<div class="banner bad"><span class="ico">✗</span><span><b>升级失败: ${esc(first.name || last.message || "未知步骤")}</b>
+    <br><span class="muted">${esc(first.detail || last.message || "")} · 代码已自动回滚到升级前版本 · ${esc(trigger)}</span></span></div>
+    ${steps ? `<div style="margin-top:12px">${steps}</div>` : ""}
+    ${u.log_tail ? `<details style="margin-top:10px" open><summary class="muted" style="font-size:12.5px;cursor:pointer">升级日志</summary>
+      <div class="log-box">${esc(u.log_tail)}</div></details>` : ""}`;
+}
+
+const updateNow = () => Math.round(Date.now() / 1000);
+const fmtDuration = (s) => (s >= 60 ? `${Math.floor(s / 60)} 分 ${s % 60} 秒` : `${s} 秒`);
 
 function startUpdatePolling() {
   clearInterval(updateTimer);
@@ -1289,10 +1377,11 @@ function startUpdatePolling() {
       if (!updateInfo.running && updateInfo.last && updateInfo.last.state === "success") {
         clearInterval(updateTimer); updateTimer = null;
         if (updateInfo.last.to && updateInfo.last.to !== updateInfo.current) {
-          toast("升级完成, 正在刷新页面…");
-          setTimeout(() => location.reload(), 1500);
+          // 新版本的前端要重新加载才生效; 卡片里留了「重新加载面板」按钮, 这里再自动跳一次
+          toast(`升级完成: v${updateInfo.last.from} → v${updateInfo.last.to}`);
+          setTimeout(() => location.reload(), 4000);
         } else {
-          toast("升级完成");
+          toast(`升级完成: v${updateInfo.last.from} → v${updateInfo.last.to}`);
           loadDash(true);
         }
       } else if (!updateInfo.running && updateInfo.last && updateInfo.last.state === "failed") {
@@ -1308,13 +1397,66 @@ function startUpdatePolling() {
   }, 2500);
 }
 
+/* 通用确认弹窗: 代替浏览器原生 confirm(), 好把"会做什么 / 不动什么"写清楚 */
+let confirmAction = null;
+function openConfirm({ title, html, okLabel, onOk }) {
+  $("#confirm-title").textContent = title;
+  $("#confirm-body").innerHTML = html;
+  $("#confirm-ok").textContent = okLabel || "确定";
+  confirmAction = onOk;
+  $("#confirm-mask").classList.remove("hidden");
+}
+function closeConfirm() {
+  $("#confirm-mask").classList.add("hidden");
+  confirmAction = null;
+}
+$("#confirm-cancel").onclick = closeConfirm;
+$("#confirm-mask").onclick = (e) => { if (e.target.id === "confirm-mask") closeConfirm(); };
+$("#confirm-ok").onclick = async () => {
+  const fn = confirmAction;
+  closeConfirm();
+  if (fn) await fn();
+};
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("#confirm-mask").classList.contains("hidden")) closeConfirm();
+});
+
+/* 升级确认: 一步步写清会做什么, 以及什么不会被碰 */
+function askUpgrade() {
+  const u = updateInfo || {};
+  const from = u.current || "当前版本";
+  const to = u.latest || "最新版";
+  const plan = [
+    ["1", "备份当前代码与 state.json", "异常自动回滚"],
+    ["2", `从 GitHub 下载 v${esc(to)} 代码`, esc(u.repo || "")],
+    ["3", "替换面板程序代码", "只换代码, 不动数据"],
+    ["4", "同步 Python 依赖 + 重载 systemd 单元", ""],
+    ["5", "按 state.json 重新生成配置并热重载", "xray / nginx / hysteria"],
+    ["6", "重启面板进程", "本页失联约 10 秒后自动恢复"],
+  ];
+  openConfirm({
+    title: `确认升级到 v${to}?`,
+    okLabel: `开始升级 v${esc(from)} → v${to}`,
+    html: `<div class="qr-sub" style="text-align:left">当前 v${esc(from)} → 最新 v${esc(to)}</div>
+      <div class="confirm-list">${plan
+        .map(
+          ([n, name, detail]) => `<div class="ustep"><span class="n">${n}</span>
+            <span class="uname">${name}</span>${detail ? `<span class="udetail">${detail}</span>` : ""}</div>`
+        )
+        .join("")}</div>
+      <div class="confirm-keep">不会动的部分: 节点密钥 / 订阅令牌 / 管理员账号 / 节点开关与端口设置。
+      升级过程中面板会重启一次, 页面会在几秒内自动恢复。</div>`,
+    onOk: doUpdate,
+  });
+}
+
 async function doUpdate() {
   const btn = $("#btn-update-run");
   btn.disabled = true;
   btn.textContent = "启动中…";
   try {
     const res = await api("/api/update", { method: "POST" });
-    toast(res.detail || "升级已开始");
+    toast("升级已开始, 正在执行…");
     updateInfo = res.status || updateInfo;
     startUpdatePolling();
     renderUpdate();
@@ -1334,12 +1476,10 @@ $("#btn-update-check").onclick = async () => {
   else if (updateInfo && updateInfo.update_available) toast(`发现新版本 v${updateInfo.latest}`);
   else toast("已是最新版本");
 };
-$("#btn-update-run").onclick = () => {
-  if (!confirm("升级会替换程序代码并重启面板 (密钥与配置保留), 现在开始?")) return;
-  doUpdate();
-};
+$("#btn-update-run").onclick = askUpgrade;
+$("#btn-update-reload").onclick = () => location.reload();
 $("#btn-update").onclick = () => {
-  if (updateInfo && updateInfo.update_available && updateInfo.can_update && !updateInfo.running) doUpdate();
+  if (updateInfo && updateInfo.update_available && updateInfo.can_update && !updateInfo.running) askUpgrade();
   else $("#btn-update-check").click();
 };
 
