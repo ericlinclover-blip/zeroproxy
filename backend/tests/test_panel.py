@@ -613,6 +613,36 @@ def test_deep_probe_client_config_covers_every_tcp_node(home):
     assert services.client_config(state, "hysteria2", 12345) is None
 
 
+def test_deep_probe_never_emits_removed_allowinsecure(client, configured, home):
+    """Xray 26 已移除 allowInsecure (26.3 上直接拒绝加载配置), 自签场景必须用
+    pinnedPeerCertSha256 —— 否则深度体检起不来, 而且真机上没人会去查日志。"""
+    from zeroproxy import config as cfg, services
+
+    state = cfg.load_state()
+    state["cert"]["type"] = "self-signed"
+    assert os.path.exists(state["cert"]["cert_file"])            # fixture 已生成自签证书
+    for node_id in ("vless-ws", "trojan"):
+        settings = services.client_config(state, node_id, 1)["outbounds"][0]["streamSettings"]["tlsSettings"]
+        assert "allowInsecure" not in settings
+        assert len(settings["pinnedPeerCertSha256"]) == 64      # 自签 → 固定指纹
+        assert settings["serverName"] == state["domain"]
+    assert services._cert_sha256_hex(state["cert"]["cert_file"]) == settings["pinnedPeerCertSha256"]
+
+    # 真实 CA 证书 (Let's Encrypt) → 正常校验, 不需要 pinning
+    state["cert"]["type"] = "letsencrypt"
+    settings = services.client_config(state, "trojan", 1)["outbounds"][0]["streamSettings"]["tlsSettings"]
+    assert settings == {"serverName": state["domain"]}
+
+
+def test_client_tls_settings_survives_missing_cert(home):
+    """证书文件缺失时不能抛异常 (体检要给出可读结论)。"""
+    from zeroproxy import config as cfg, services
+
+    state = cfg.load_state()
+    state["cert"]["cert_file"] = str(home / "nope.crt")
+    assert services.client_tls_settings(state) == {"serverName": state["domain"]}
+
+
 def test_deep_probe_is_unavailable_without_xray_binary(client, configured, home, monkeypatch):
     """没有 xray 二进制时给出"无法体检"而不是谎报成功/失败。"""
     from zeroproxy import services

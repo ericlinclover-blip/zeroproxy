@@ -64,7 +64,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 83 项 (79 passed + 4 skipped; 带 `ZP_XRAY_BIN` 时 83 全通过) + `scripts/verify.py` (74 项) + `scripts/browser_check.cjs` (33 项) + `scripts/upgrade_sim.sh` (13 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 85 项 (81 passed + 4 skipped; 带 `ZP_XRAY_BIN` 时 85 全通过) + `scripts/verify.py` (74 项) + `scripts/browser_check.cjs` (33 项) + `scripts/upgrade_sim.sh` (13 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 
 竞品与技术调研见 `docs/RESEARCH.md`。
 
@@ -391,11 +391,12 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 
 在 macOS (Apple Silicon, Python 3.14) 上实测通过:
 
-- `python -m pytest tests -q` → **79 passed, 4 skipped** (带 `ZP_XRAY_BIN` 时 **83 passed**, 约 20 秒);
+- `python -m pytest tests -q` → **81 passed, 4 skipped** (带 `ZP_XRAY_BIN` 时 **85 passed**, 约 20 秒);
   含 `/api/update` 鉴权与版本比较、`apply` 的"写不进 /etc/nginx 即失败"语义、CLI 退出码、以及
   `install.sh` 重跑不覆盖已初始化配置 / `upgrade.sh` 随包发布 / 自签证书可补签 Let's Encrypt /
   `systemctl` 参数顺序的回归断言 / Reality 密钥必须是成对的 X25519 (Ed25519 必须判无效) /
-  旧默认伪装目标 (证书链超 8KB) 自动迁移 / 深度体检客户端配置真的带齐各节点参数。
+  旧默认伪装目标 (证书链超 8KB) 自动迁移 / 深度体检客户端配置真的带齐各节点参数 /
+  深度体检客户端在自签场景下不发已被 Xray 26 移除的 `allowInsecure` (改用 `pinnedPeerCertSha256`)。
 - `scripts/verify.py` (Xray 26.3.27 + Hysteria 2.12.3 + mihomo 1.19.31 + sing-box 1.14.2) → **74/74 项通过**:
   setup 8 步全绿 / 三种订阅格式可被真实客户端解析 / 三档分流模板分别被 `mihomo -t` 与
   `sing-box check` 通过 / **用真实 sing-box 实跑** 5 份订阅 (通用 + 1.14+ 写法 × 智能/全局/直连) 全部启动成功,
@@ -418,10 +419,44 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   备份/探测/GeoIP 接口未登录一律 401、备份校验和不匹配 400。
 - 前端: 三视图渲染、节点开关热更新、订阅三种格式复制与二维码、诊断面板、高级设置保存、测速与备份。
 
-**尚未在真实 Linux 服务器验证的环节** (交付后建议首测): certbot 签发 → nginx 反代 →
-Xray / Hysteria 生产启动 (systemd) → 客户端 App 实连。macOS 无法验证的部分: Hysteria 2
-多端口 listen (Linux 专属)、systemd 服务重载、ufw 规则、`XRAY_LOCATION_ASSET` 在生产
-systemd 单元中的生效 (单元文件已写入该变量, 但只在 Linux 上由 systemd 读取)。
+### 12.1 真实服务器验证 (2026-09-28, Ubuntu 24.04 / 1 vCPU / 1GB, Xray 26.3.27 + Hysteria 2.12.3)
+
+这一轮把"只能在 Linux 上验证"的部分全部跑通, 也把两个**只在真机上才会暴露**的根因抓了出来
+(本地 `pytest` / `verify.py` 全绿却救不了它们 —— 见下面第 3、4 条):
+
+1. **部署链路**: `install.sh` → 面板初始化 → certbot 签发 `hkk.i3.pub` 的 Let's Encrypt 证书
+   (有效期至 2026-12-27, `certbot.timer` enabled, 证书出现后 `/api/renew` 会自动重新生成
+   nginx/xray 配置并热重载) → nginx 监听 80/443/8899、xray 监听 8443/8445/8444 +
+   127.0.0.1:6000、hysteria2 监听 30001/31001/32001 (UDP 端口跳跃)。
+2. **一键升级真机实测**: `upgrade.sh` 连升 v2.3.2 → v2.3.3 → v2.3.4 → v2.3.5, 每次 6 步全绿
+   (备份 → 换代码 → 按 `state.json` 重新落地三份配置 → 重载服务 → 复查端口监听),
+   `data/update.json` 记 success, 旧代码 + `state.json` 备份保留最近 5 份;
+   面板「程序更新 → 一键更新」走 systemd 瞬时单元, 面板自身重启不打断升级。
+3. **根因一: Reality 密钥用错曲线**。`crypto.new_reality_keys()` 从第一版起用 Ed25519 生成,
+   而 REALITY 只认 X25519 → 服务端私钥与订阅下发的 `pbk` 对不上, 每次握手都被判为
+   "收到真证书 (疑似 MITM)", 客户端回落到伪装站点。证据链: `xray x25519 -i <服务器私钥>`
+   反推的公钥与 `state.json` 里的 `public_key` 不一致 (前者 `1DJGvr…`, 后者 `J0k9Dm…`)。
+   修复: X25519 + `reality_key_valid()` 逐对校验, 落地时自动迁移。
+4. **根因二: 伪装目标的证书链超过 REALITY 的 8KB 缓冲**。`xtls/reality` 的服务端握手把目标
+   站点的握手报文读进固定 8192 字节缓冲 (`tls.go: size = 8192`, `if handshakeLen > size { break f }`),
+   而旧默认目标 `www.microsoft.com` 的 Certificate 报文是 **8273** 字节 → 服务端直接放弃握手,
+   客户端只看到 `Connection reset by peer`。真机 `show: true` 实拍: 读到 `Certificate: 8273`
+   后 `isHandshakeComplete: false`; 服务端日志 `REALITY: processed invalid connection from …:
+   handshake did not complete successfully`。筛选实测 (本机 + 服务器各跑一遍):
+   `www.microsoft.com` 8273 ✗ / `www.bing.com` ServerHello 9876 ✗ / `www.cloudflare.com` ✓ /
+   `dl.google.com` ✓ / `www.python.org` 4352 ✓ / `www.samsung.com` 4700 ✓ / `cdn.jsdelivr.net` ✓。
+   修复: 默认目标换成 `www.cloudflare.com` + 落地时自动迁移旧默认值。
+5. **端到端 (真实客户端, 不是面板自测)**: 用本机 Xray 26.3.27 客户端拉面板订阅, 4 个 TCP 节点
+   全部 `http 200`, 出口 IP = 服务器 IP (8443 Reality / 8445 XHTTP Reality / 443 WS+TLS /
+   8444 Trojan TLS); hysteria2 用官方 hysteria 2.12.3 客户端 (订阅里的端口跳跃写法) 同样出口 IP 一致。
+6. **面板自测能力补强**: 旧 `/api/probe` 只做裸 TLS 握手 —— Reality 认证失败时服务端会**回落到
+   真实伪装站点**, 裸握手照样成功, 这正是"面板 1/5 通、服务全绿"的来源。现在 `?deep=1` 会用临时
+   Xray 客户端经 SOCKS5 隧道对伪装目标做一次真实 TLS 往返 (生产环境面板默认走它), 并把
+   `allowInsecure` 换成 Xray 26 要求的 `pinnedPeerCertSha256` (Xray 25 起 `allowInsecure` 已移除,
+   26.3 上直接拒绝加载配置 —— 这一点也是真机联调时才踩到的)。
+
+macOS 上仍无法覆盖的只有: ufw/云安全组规则、systemd 单元里的 `XRAY_LOCATION_ASSET` 生效细节
+(单元文件已写入该变量, 真机 `xray -test` 与启动均通过) 与不同客户端 App 的导入行为。
 
 ---
 

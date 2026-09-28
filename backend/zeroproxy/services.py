@@ -514,6 +514,37 @@ def _socks5_tls_probe(proxy_port: int, host: str, port: int, timeout: float = 8.
                 pass
 
 
+def _cert_sha256_hex(cert_file: str) -> str:
+    """叶子证书 DER 的 SHA256 (十六进制) —— Xray 26 的 `pinnedPeerCertSha256` 格式。"""
+    try:
+        with open(cert_file, "rb") as fh:
+            data = fh.read()
+        leaf = x509.load_pem_x509_certificate(data)   # fullchain 的第一张就是叶子
+        digest = hashes.Hash(hashes.SHA256())
+        digest.update(leaf.public_bytes(serialization.Encoding.DER))
+        return digest.finalize().hex()
+    except (OSError, ValueError):
+        return ""
+
+
+def client_tls_settings(state: dict) -> dict:
+    """Xray 26 客户端可用的 TLS 设置。
+
+    坑: Xray 25 起 `allowInsecure` 已被移除 (26.3 上直接拒绝加载配置, 报
+    "The feature allowInsecure has been removed and migrated to pinnedPeerCertSha256"),
+    自签证书场景必须改成固定对端证书指纹; 真实 CA 证书 (Let's Encrypt) 正常校验即可。
+    """
+    domain = state.get("domain", "")
+    cert = state.get("cert", {})
+    cert_file = cert.get("cert_file") or ""
+    settings: dict = {"serverName": domain}
+    if cert.get("type") != "letsencrypt" and cert_file:
+        pin = _cert_sha256_hex(cert_file)
+        if pin:
+            settings["pinnedPeerCertSha256"] = pin
+    return settings
+
+
 def client_config(state: dict, node_id: str, socks_port: int) -> dict | None:
     """把一个节点渲染成最小可用的 Xray 客户端配置 (含本地 SOCKS 入站)。
 
@@ -559,7 +590,7 @@ def client_config(state: dict, node_id: str, socks_port: int) -> dict | None:
                                     "users": [{"id": uuid, "encryption": "none", "flow": ""}]}]},
             "streamSettings": {"network": "ws", "security": "tls",
                                "wsSettings": {"path": WS_PATH, "headers": {"Host": domain}},
-                               "tlsSettings": {"serverName": domain, "allowInsecure": True}},
+                               "tlsSettings": client_tls_settings(state)},
         }
     elif node_id == "trojan":
         outbound = {
@@ -567,7 +598,7 @@ def client_config(state: dict, node_id: str, socks_port: int) -> dict | None:
             "settings": {"servers": [{"address": domain, "port": int(ports["trojan"]),
                                       "password": state.get("trojan_password", "")}]},
             "streamSettings": {"network": "tcp", "security": "tls",
-                               "tlsSettings": {"serverName": domain, "allowInsecure": True}},
+                               "tlsSettings": client_tls_settings(state)},
         }
 
     if outbound is None:
