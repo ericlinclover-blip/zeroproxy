@@ -327,6 +327,46 @@ else
   bad "备份目录不符合预期: ${BACKUP:-无}"
 fi
 
+# ---------- 5d. apply 步骤内部失败: 失败原因必须写进 update.json ----------
+# apply 自己还会再分几步 (生成 / 校验 / 重载 / 端口复查)。它失败时, 面板横幅引用的是
+# update.json 里那一步的 detail —— 如果这里只写"命令执行失败, 详见日志", 用户就得去
+# 翻日志里的那行 JSON。造一个坏 state 让 apply 内部某一步失败, 断言 detail 说得清。
+section "[2c] apply 内部失败时, 失败原因写进 update.json"
+cp -f "$HOME_DIR/data/state.json" "$SIM/state-keep.json"
+"$PYTHON" - "$HOME_DIR/data/state.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+data = json.load(open(path, encoding="utf-8"))
+data["hysteria_password"] = 12345      # 非字符串 → 生成 Hysteria 2 配置必然抛异常
+json.dump(data, open(path, "w", encoding="utf-8"), ensure_ascii=False)
+PY
+set +e; run_upgrade sim-applyfail "$SIM/new.tar.gz" panel >/dev/null 2>&1; APPLYFAIL_RC=$?; set -e
+echo "    退出码 $APPLYFAIL_RC"
+
+section "[断言]"
+[ "$APPLYFAIL_RC" != "0" ] && ok "apply 内部失败时升级返回非 0 ($APPLYFAIL_RC)" || bad "apply 内部失败却返回 0"
+APPLYFAIL_REASON="$("$PYTHON" - "$HOME_DIR/data/update.json" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+assert data["state"] == "failed", data
+for step in data["steps"]:
+    if not step["ok"] and step["name"] == "按 state.json 重新生成配置并热重载":
+        print(step.get("detail") or "")
+        break
+PY
+)"
+case "$APPLYFAIL_REASON" in
+  *重新生成*|*校验*|*重载*|*端口*)
+    ok "失败原因写进 update.json (面板横幅直接引用): $APPLYFAIL_REASON" ;;
+  *)
+    bad "update.json 没带内部失败步骤, detail='${APPLYFAIL_REASON:-空}'" ;;
+esac
+cp -f "$SIM/state-keep.json" "$HOME_DIR/data/state.json"   # 还原, 不影响后面的演练
+
 # ---------- 6. 故障演练: 下载失败 ----------
 section "[3] 故障演练: 代码下载失败 (桩 curl 返回 22)"
 VERSION_BEFORE_FAIL="$(sed -n 's/^__version__ *= *"\([^"]*\)".*/\1/p' "$HOME_DIR/zeroproxy/__init__.py")"

@@ -1475,21 +1475,54 @@ def test_verify_listeners_accepts_a_converged_state(client, configured, monkeypa
     assert "8443" in detail   # 明确列出被确认关闭的端口
 
 
-def test_verify_listeners_checks_every_hopping_port(client, configured, monkeypatch):
-    """端口跳跃是 3 个 UDP 端口: 只验主端口会漏掉"跳跃端口没起来"的半残状态。"""
+def test_verify_listeners_does_not_require_sockets_for_hopping_ports(client, configured, monkeypatch):
+    """回归 (v2.6.5 真机事故): 端口跳跃的额外端口**没有自己的 socket**。
+
+    Linux 上 hysteria 是把它们的 UDP 包用 nftables / iptables REDIRECT 到主端口
+    (上游 app/internal/firewall.SetupUDPPortRedirect), 所以按"端口在监听"去验跳跃
+    端口, 会把完全正常的跳跃配置判成失败 —— 真机升级就是这么挂在第 6 步的。
+    """
     from zeroproxy import apply
 
     state = config.load_state()
+    state["hysteria_hopping"] = True
     state["hysteria_ports"] = [40001, 41001, 42001]
+    state["ports"]["hysteria"] = 40001
+    # 只有主端口有 socket, 跳跃端口一个都没有 → 仍然必须算通过
     _fake_listener_probe(monkeypatch, {8443, 8445, 8444, 6000, 443}, {40001})
 
     ok, detail = apply.verify_listeners(state, timeout=0.01)
-    assert ok is False, detail
-    assert "41001" in detail and "42001" in detail, detail
-
-    _fake_listener_probe(monkeypatch, {8443, 8445, 8444, 6000, 443}, {40001, 41001, 42001})
-    ok, detail = apply.verify_listeners(state, timeout=0.01)
     assert ok is True, detail
+
+
+def test_hop_redirect_note_reports_kernel_forwarding(configured, monkeypatch):
+    """跳跃端口只能靠内核转发规则来确认: 读得到就说明, 读不到就说读不到。"""
+    from zeroproxy import apply, services
+
+    state = config.load_state()
+    state["hysteria_hopping"] = True
+    state["hysteria_ports"] = [30001, 31001, 32001]
+    state["ports"]["hysteria"] = 30001
+
+    rules = "udp dport 31001 redirect to :30001\nudp dport 32001 redirect to :30001"
+    monkeypatch.setattr(services, "run", lambda cmd, timeout=120, env=None: (True, rules))
+    note = apply._hop_redirect_note(state)
+    assert "已由内核转发" in note and "30001" in note, note
+
+    # 规则里缺了 32001 → 如实说"未见转发规则", 但这不是一个失败
+    partial = "udp dport 31001 redirect to :30001"
+    monkeypatch.setattr(services, "run", lambda cmd, timeout=120, env=None: (True, partial))
+    note = apply._hop_redirect_note(state)
+    assert "32001" in note and "未见内核转发规则" in note, note
+
+    # 本机问不到 (非 root / 没有 nft 和 iptables) → 返回空串, 不做任何判断
+    monkeypatch.setattr(services, "run", lambda cmd, timeout=120, env=None: (False, "命令不存在"))
+    assert apply._hop_redirect_note(state) == ""
+
+    # 跳跃关着 → 不插话
+    state["hysteria_hopping"] = False
+    monkeypatch.setattr(services, "run", lambda cmd, timeout=120, env=None: (True, rules))
+    assert apply._hop_redirect_note(state) == ""
 
 
 def test_apply_gen_nginx_is_hard_failure_without_etc_write(client, configured, home, monkeypatch):

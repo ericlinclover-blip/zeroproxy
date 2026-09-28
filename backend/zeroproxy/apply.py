@@ -192,13 +192,12 @@ def _wanted_ports(state: dict) -> list[tuple[int, str, str]]:
     if nodes.get("vless-ws") and ports.get("ws_internal"):
         want.append((int(ports["ws_internal"]), "tcp", "VLESS WebSocket (回环)"))
     if nodes.get("hysteria2") and ports.get("hysteria"):
-        # 端口跳跃开着时是 3 个 UDP 端口一起监听, 也要一起验 (只验主端口会漏掉
-        # "主端口起来了、跳跃端口没起来"这种半残状态)。
-        if state.get("hysteria_hopping"):
-            for hop_port in state.get("hysteria_ports") or []:
-                want.append((int(hop_port), "udp", f"Hysteria 2 (跳跃 {hop_port})"))
-        else:
-            want.append((int(ports["hysteria"]), "udp", "Hysteria 2"))
+        # 只验主端口。端口跳跃的另外几个端口**没有自己的 socket**: Linux 上
+        # hysteria 是把它们的 UDP 包用 nftables / iptables REDIRECT 到主端口
+        # (上游 app/internal/firewall.SetupUDPPortRedirect), 所以拿"端口在不在监听"
+        # 去验跳跃端口, 会把正常的跳跃配置判成失败 —— v2.6.5 真机升级就是这么挂在
+        # 第 6 步的。转发规则另用 `_hop_redirect_note` 尽力确认, 只作说明不影响成败。
+        want.append((int(ports["hysteria"]), "udp", "Hysteria 2"))
     # 链式代理的两端都是真实对外端口, 同样要验证真的起来了
     chain_cfg = state.get("chain") or {}
     exit_cfg = chain_cfg.get("exit") or {}
@@ -250,6 +249,42 @@ def _ports_that_must_be_closed(state: dict) -> list[tuple[int, str, str]]:
     return out
 
 
+def _hop_redirect_note(state: dict) -> str:
+    """尽力确认「端口跳跃」的额外 UDP 端口有没有被内核转发到主端口。
+
+    为什么不能按端口监听来验: Linux 上 hysteria 端口跳跃是把额外端口的 UDP 包
+    用 nftables (优先) 或 iptables REDIRECT 到首个端口 (上游
+    `app/internal/firewall.SetupUDPPortRedirect`), 内核里根本没有这些端口的
+    socket —— 只有主端口在 listen。
+
+    这里读一下本机 NAT 规则, 能读到就给出结论; 读不到 (非 root / 没有 nft 与
+    iptables) 就返回空串 —— 只作说明, 绝不因此判失败。
+    """
+    ports = [int(p) for p in state.get("hysteria_ports") or []]
+    base = int((state.get("ports") or {}).get("hysteria") or 0)
+    hops = [p for p in ports if p != base]
+    if not state.get("hysteria_hopping") or not hops or not base:
+        return ""
+    dump = ""
+    for cmd in (
+        ["nft", "list", "ruleset"],
+        ["iptables", "-t", "nat", "-S"],
+        ["ip6tables", "-t", "nat", "-S"],
+    ):
+        ok, out = services.run(cmd, timeout=10)
+        if ok:
+            dump += out + "\n"
+    if not dump:
+        return ""
+    missing = [p for p in hops if str(p) not in dump]
+    if missing:
+        return (
+            "跳跃端口 " + "/".join(str(p) for p in missing) + " 未见内核转发规则"
+            "(不影响配置落地, 但请用客户端实测跳跃是否生效)"
+        )
+    return f"跳跃端口 {'/'.join(str(p) for p in hops)} 已由内核转发到 {base}"
+
+
 def verify_listeners(state: dict, timeout: int = 0) -> tuple[bool, str]:
     """重启后确认端口状态真的和新配置一致 —— 「服务活着但节点不通」的照妖镜。
 
@@ -293,6 +328,9 @@ def verify_listeners(state: dict, timeout: int = 0) -> tuple[bool, str]:
         detail += "; 已停用端口已关闭: " + ", ".join(
             f"{port}/{proto}" for port, proto, _ in closed
         )
+    note = _hop_redirect_note(state)
+    if note:
+        detail += "; " + note
     return True, detail
 
 

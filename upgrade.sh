@@ -189,11 +189,24 @@ run_step() { # run_step <名称> <命令...>
   local name="$1"; shift
   begin_step "$name"
   printf '== %s\n' "$name" >> "$LOG_FILE"
-  if "$@" >>"$LOG_FILE" 2>&1; then
+  local out rc
+  if out="$("$@" 2>&1)"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  printf '%s\n' "$out" >> "$LOG_FILE"
+  if [ "$rc" -eq 0 ]; then
     add_step true "$name" "完成"
     return 0
   fi
-  add_step false "$name" "命令执行失败, 详见日志"
+  # 命令内部往往还会再分几步 (apply 的 生成 → 校验 → 重载 → 端口复查)。失败时把
+  # 第一条 `FAIL ...` 行挑出来写进 update.json —— 面板的失败横幅就能直接说清卡在
+  # 哪一步、为什么, 不用让人去日志里翻那行 JSON。
+  local reason
+  reason="$(printf '%s\n' "$out" | sed -n 's/^ *FAIL *\(.*\)$/\1/p' | head -1 | cut -c1-200)"
+  [ -n "$reason" ] || reason="命令执行失败 (退出码 $rc), 详见日志"
+  add_step false "$name" "$reason"
   tail -n 5 "$LOG_FILE" | sed 's/^/    /' >&2
   return 1
 }
@@ -336,8 +349,9 @@ fi
 
 # ---------- 6. 按现有配置重新落地 ----------
 if [ -f "$STATE_FILE" ]; then
+  # 不加 --quiet: 日志里留下逐步骤的 OK / FAIL 行 (失败时面板横幅直接引用 FAIL 行)
   run_step "按 state.json 重新生成配置并热重载" \
-    env ZP_HOME="$ZP_HOME" PYTHONPATH="$ZP_HOME" "$VENV/bin/python" -m zeroproxy.apply --quiet
+    env ZP_HOME="$ZP_HOME" PYTHONPATH="$ZP_HOME" "$VENV/bin/python" -m zeroproxy.apply
 else
   begin_step "跳过配置落地"
   add_step true "跳过配置落地" "面板尚未初始化"

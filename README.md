@@ -66,7 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 124 项 (119 passed + 5 skipped; 带 `ZP_XRAY_BIN` 时 124 全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (88 项) + `scripts/upgrade_sim.sh` (21 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 125 项 (120 passed + 5 skipped; 带 `ZP_XRAY_BIN` 时 125 全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (88 项) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 | **看得懂的界面 (v2.6.0)** | 控制台布局: 左侧锚点导航 (带计数角标 + 滚动高亮) + 顶部指标条 (健康节点 / 落地出口 IP / 平均延迟 + 迷你折线 / 运行时长) + 节点密集表格 (名称 / 地址状态 / **握手延迟条** / **上下行双轨** / 开关与复制) + **流量卡 (双弧圆环 + 实时速率曲线 + 逐节点双色流量条)** + 链式链路拓扑 (你的设备 → 本机入口 → 落地端) + 程序更新闭环; 动效全部走 `transform`/自绘 rAF 并受 `prefers-reduced-motion` 约束 |
 
@@ -157,8 +157,9 @@ zeroproxy/
   `www.cloudflare.com` (ECDSA 链 4KB 出头, 实测通过); 换目标后请点「节点测速」验证 ——
   它现在用真实客户端穿一次外网, 而不是只看端口是否监听。
 - **XHTTP**: Vision flow 只能用于 TCP, 因此 XHTTP 入站 `flow` 为空; 与 Reality 叠加后同样免证书。
-- **端口跳跃默认开启**: Hysteria 2 同时监听 3 个 UDP 端口, 封锁单端口不影响服务; 订阅链接把端口
-  写在 host 位置 (`host:30001,31001,32001`), 官方客户端据此启用 udphop。
+- **端口跳跃默认开启**: 主端口 `30001/udp` 真的 listen, 另两个端口由 Hysteria 2 自己装进
+  nftables / iptables 的 REDIRECT 规则转到主端口 (Linux 独有, 见 8.4), 封锁单端口不影响服务;
+  订阅链接把端口写在 host 位置 (`host:30001,31001,32001`), 官方客户端据此启用 udphop。
 - **Hysteria masquerade**: 非代理流量反代到一个真实网站 (`type=proxy` + `rewriteHost`),
   复用 QUIC 端口, 不额外占用 TCP 端口。
 - **443 伪装主页**: nginx 对非代理路径返回中性网页。
@@ -410,8 +411,8 @@ state.json (唯一事实来源, schema v4, 旧版本自动升级)
    回环, UDP 分不出回环与公网, 不在此判)。
 3. **端口跳跃区间会跟着主端口漂移。** 改过 Hysteria 主端口后再打开跳跃, 区间还停在上一轮
    的 `+0/+1000/+2000`, 面板显示的端口和实际监听的对不上。现在开关与端口变更都会按当前主
-   端口重排区间; 端口校验也会逐一验证**每一个**跳跃端口 (以前只验主端口, 漏掉"主端口起来了、
-   跳跃端口没起来"的半残状态)。
+   端口重排区间。(当时顺带加了一条"逐个跳跃端口也要验"的检查 —— 那一条在真机上是错的,
+   见 8.4。)
 4. **面板里没有端口跳跃开关。** 高级设置补上"Hysteria 2 端口跳跃"复选框, 并显示当前 3 个
    UDP 端口; 打开时顺带 `ufw allow` 这三个端口 (逐个放行, 不会把中间 2000 个端口一起打开)。
 5. **改端口后防火墙没跟上。** `install.sh` 只按默认端口写了放行规则, 换了端口而 ufw 还挡着
@@ -424,9 +425,35 @@ state.json (唯一事实来源, schema v4, 旧版本自动升级)
    还在"。缓存键现在带上 `updated_at`, 任何写操作都会让旧探测结果立即作废。
 
 每一条都补了回归断言 (`tests/test_panel.py` 的 `test_restart_services_restarts_even_when_all_nodes_are_off` /
-`test_verify_listeners_flags_a_disabled_node_that_still_listens` / `test_verify_listeners_checks_every_hopping_port` /
+`test_verify_listeners_flags_a_disabled_node_that_still_listens` /
 `test_toggle_hopping_realigns_ports_after_a_port_change` / `test_settings_port_change_also_opens_the_firewall`
 等, `scripts/verify.py` 里"停用后端口真的关闭", `scripts/browser_check.cjs` 里草稿保护与跳跃开关)。
+
+### 8.4 v2.6.6: 端口跳跃的额外端口是内核转发, 不是 socket (v2.6.5 的真机事故)
+
+v2.6.5 推上去之后, 线上服务器点「一键更新」在第 6 步 (按 state.json 重新生成配置并热重载)
+挂了 —— 更糟的是面板只给了一句"命令执行失败, 详见日志", 真正的原因藏在日志那一行 JSON 的中间。
+
+**根因**: v2.6.5 给端口校验加了一条"跳跃端口也必须处于监听"。但 Hysteria 2 的端口跳跃在
+Linux 上走的是**内核转发**: 只有主端口真的 listen, 其余端口是它装进 nftables (优先) 或
+iptables 的 REDIRECT 规则转到主端口 (上游 `app/internal/firewall.SetupUDPPortRedirect`)。
+换句话说那三个端口里只有第一个有 socket —— 按"端口在不在监听"去验, 在**任何**开了跳跃的
+Linux 机器上都必然判失败 (本地 macOS 测不出来: 多端口监听在 macOS 直接报错, 走不到这一步)。
+
+**修法**:
+
+1. 跳跃端口不再按 socket 验 (只验主端口); 转发规则改成**尽力确认**: 读得到
+   `nft list ruleset` / `iptables -t nat -S` 就说"N 个跳跃端口已由内核转发到 <主端口>",
+   读不到 (非 root / 没装这两个命令) 就什么都不说 —— 绝不因此判失败。
+2. 补上这次真正缺的东西: **失败原因要能看见**。`upgrade.sh` 的每一步现在会把命令输出里
+   第一条 `FAIL ...` 行 (如 `重新生成 Hysteria 2 配置 | 异常: ...`) 写进 `update.json` 的
+   步骤详情, 面板的失败横幅直接引用它 —— 不用再去翻日志里那行 JSON。
+3. 面板的"已完成 n/N 步"原来把失败步骤也算成"已完成"(第 6 步失败却显示 7/9); 现在只数
+   成功的步骤, 并额外标出没成功的步数。
+
+回归: `tests/test_panel.py` 的 `test_verify_listeners_does_not_require_sockets_for_hopping_ports` /
+`test_hop_redirect_note_reports_kernel_forwarding`, 以及 `scripts/upgrade_sim.sh` 新增的
+「apply 内部失败时把失败原因写进 update.json」场景 (造一个坏 state 真跑一遍 upgrade.sh)。
 
 ---
 
@@ -518,7 +545,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 
 在 macOS (Apple Silicon, Python 3.14) 上实测通过:
 
-- `python -m pytest tests -q` → **119 passed, 5 skipped** (带 `ZP_XRAY_BIN` 时 **124 passed**, 约 30 秒);
+- `python -m pytest tests -q` → **120 passed, 5 skipped** (带 `ZP_XRAY_BIN` 时 **125 passed**, 约 30 秒);
   含 `/api/update` 鉴权与版本比较、`apply` 的"写不进 /etc/nginx 即失败"语义、CLI 退出码、以及
   `install.sh` 重跑不覆盖已初始化配置 / `upgrade.sh` 随包发布 / 自签证书可补签 Let's Encrypt /
   `systemctl` 参数顺序的回归断言 / Reality 密钥必须是成对的 X25519 (Ed25519 必须判无效) /
@@ -526,9 +553,10 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   深度体检客户端在自签场景下不发已被 Xray 26 移除的 `allowInsecure` (改用 `pinnedPeerCertSha256`) /
   深度体检必须把 SOCKS5 回复读满 (只读 4 字节会让 TLS 报 `WRONG_VERSION_NUMBER`) /
   服务版本探测要跳过 Hysteria 2 的块字符 banner (否则面板挂一串花屏方块)。
-  端口一致性另有 7 项 (v2.6.5): 节点全关也要重启服务 / 没装的服务不硬重启 / 已停用却仍在
-  监听的端口要报红 / 端口跳跃的 3 个端口逐一验证 / 改主端口后再开跳跃区间跟着走 / 改端口
-  自动放行 ufw。
+  端口一致性另有 8 项 (v2.6.5 / v2.6.6): 节点全关也要重启服务 / 没装的服务不硬重启 / 已停用
+  却仍在监听的端口要报红 / 改主端口后再开跳跃区间跟着走 / 改端口自动放行 ufw /
+  **端口跳跃的额外端口是内核转发而非 socket, 不能按端口监听去验 (v2.6.5 的真机事故)** /
+  跳跃转发规则读得到就说、读不到不判失败。
   链式代理另有 21 项 (`tests/test_chain.py`): 配对码往返与 8 类坏码的中文报错 /
   落地端生成-轮换-关闭与端口冲突 / **探测不通必须拦一下 (400 + needs_force), 只有 `force=1` 才硬加** /
   环境不支持探测 (无 xray 二进制) 时不该拦住用户 / 拒绝"配对码指向本机自己"与重复添加 /
@@ -570,10 +598,13 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   **v2.5.0 → v2.6.0 的两次界面改版 (Bento → 控制台侧栏 + 密集表格 + 流量可视化) 都只动布局与样式,
   这 81 条断言 (当时总数) 一条没改**: 节点表格从磁贴换成五列 grid 行、延迟与流量改成条形/双轨、
   流量卡整块重写成圆环 + 速率曲线之后, 仍然 81/81 全绿 —— 改版守住的是 id / class 契约。
-- `scripts/upgrade_sim.sh` → **21/21 项通过**: 在模拟的"已部署机器"上真跑 `upgrade.sh` ——
+- `scripts/upgrade_sim.sh` → **23/23 项通过**: 在模拟的"已部署机器"上真跑 `upgrade.sh` ——
   备份 → 换代码 → 按 `state.json` 重新落地配置 (把占位配置修回真实配置) → 写 `update.json` /
   `update.log`; 并覆盖失败路径: 下载失败时非 0 退出、代码自动回滚到升级前版本、状态记为 failed、
   现有部署与 `state.json` 的密钥 / 订阅令牌一字未动。
+  另有一条 v2.6.6 补的断言: 造一个坏 `state.json` 让 apply 内部某一步失败, 断言 `update.json`
+  里那一步的 `detail` 是**内部失败步骤** (如 `重新生成 Hysteria 2 配置 | 异常: ...`), 而不是
+  一句 "命令执行失败, 详见日志" —— 面板的失败横幅就靠它说清卡在哪。
   还专门断言**进度是边跑边写的** (50ms 采样 `update.json`: 观察到 12 种中间快照、17 次
   `running` 态, 完成步数从 1 一路涨到 8), 以及 `plan` 与 `steps` 同序对齐、收尾 `current` 为空 ——
   面板的逐步清单就靠这两条。
@@ -593,7 +624,8 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 1. **部署链路**: `install.sh` → 面板初始化 → certbot 签发 `hkk.i3.pub` 的 Let's Encrypt 证书
    (有效期至 2026-12-27, `certbot.timer` enabled, 证书出现后 `/api/renew` 会自动重新生成
    nginx/xray 配置并热重载) → nginx 监听 80/443/8899、xray 监听 8443/8445/8444 +
-   127.0.0.1:6000、hysteria2 监听 30001/31001/32001 (UDP 端口跳跃)。
+   127.0.0.1:6000、hysteria2 监听 30001/udp (31001/32001 由它自己装的内核转发规则转过来,
+   即端口跳跃 —— 见 8.4: 这两个端口没有自己的 socket)。
 2. **一键升级真机实测**: `upgrade.sh` 连升 v2.3.2 → … → v2.3.7, 每次 6 步全绿
    (备份 → 换代码 → 按 `state.json` 重新落地三份配置 → 重载服务 → 复查端口监听),
    `data/update.json` 记 success, 旧代码 + `state.json` 备份保留最近 5 份;
@@ -769,7 +801,10 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 - 单用户设计: 没有多用户 / 配额 / 到期时间 (那是 Marzban、3x-ui 的战场); 若要多人共享,
   建议保留本面板做「节点与订阅的自动化底座」, 由上游面板做用户管理。
 - 流量统计依赖 Xray Stats API; Hysteria 2 的流量暂未计入 (上游无同等查询接口)。
-- Hysteria 2 端口跳跃仅 Linux 生效 (上游限制), 非 Linux 环境自动退化为单端口。
+- Hysteria 2 端口跳跃仅 Linux 生效 (上游限制): 只有主端口 listen, 其余端口靠 Hysteria 自己
+  装的 nftables / iptables REDIRECT 规则转过来 (见 8.4), 非 Linux 环境自动退化为单端口。
+  面板对这几个转发端口只能"尽力确认"(读得到 nft/iptables 就说, 读不到不判失败) —— 跳跃
+  到底可不可用, 最终要用客户端实测。
 - 订阅文件由面板实时生成, 未做 CDN 缓存与 ETag 协商 (单用户场景无影响)。
 - 节点测速给的是「入站握手是否成功 + 出口 RTT」; 客户端到服务器的 RTT 服务端无法自测。
 - Hysteria 2 无法用 TCP 探测, 只能检测 UDP 端口是否被监听 (Windows 上可能显示「无法主动探测」)。

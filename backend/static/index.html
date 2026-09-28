@@ -2475,11 +2475,15 @@ function updateStepsHtml(last) {
     })
     .join("");
   const pending = current && !byName.has(current) ? 0.45 : 0;
-  const pct = Math.min(100, Math.round(((done.length + pending) / names.length) * 100));
+  // "已完成"只数真正成功的步骤: 失败的那一步和"升级中断"兜底步不该算成已完成
+  const okCount = done.filter((s) => s.ok).length;
+  const failCount = done.filter((s) => !s.ok).length;
+  const pct = Math.min(100, Math.round(((okCount + pending) / names.length) * 100));
   const failedAt = names.findIndex((n) => (byName.get(n) || {}).ok === false);
   const summary = failedAt >= 0
-    ? `在第 ${failedAt + 1} 步失败 · 已完成 ${done.length}/${names.length} 步`
-    : `已完成 ${done.length}/${names.length} 步`;
+    ? `在第 ${failedAt + 1} 步失败 · 已完成 ${okCount}/${names.length} 步${
+        failCount > 1 ? ` · ${failCount} 步未成功` : ""}`
+    : `已完成 ${okCount}/${names.length} 步`;
   // 升级进行中给进度条加 `.live` (斜纹跑马), 停下来了就恢复静态 —— 一眼区分"在动"和"卡住"
   const live = last.state === "running" || last.state === "queued";
   return `<div class="ustep-wrap">${rows}</div>
