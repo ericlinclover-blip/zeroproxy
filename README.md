@@ -64,7 +64,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 85 项 (81 passed + 4 skipped; 带 `ZP_XRAY_BIN` 时 85 全通过) + `scripts/verify.py` (74 项) + `scripts/browser_check.cjs` (33 项) + `scripts/upgrade_sim.sh` (13 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 88 项 (84 passed + 4 skipped; 带 `ZP_XRAY_BIN` 时 88 全通过) + `scripts/verify.py` (74 项) + `scripts/browser_check.cjs` (33 项) + `scripts/upgrade_sim.sh` (13 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 
 竞品与技术调研见 `docs/RESEARCH.md`。
 
@@ -391,12 +391,13 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 
 在 macOS (Apple Silicon, Python 3.14) 上实测通过:
 
-- `python -m pytest tests -q` → **81 passed, 4 skipped** (带 `ZP_XRAY_BIN` 时 **85 passed**, 约 20 秒);
+- `python -m pytest tests -q` → **84 passed, 4 skipped** (带 `ZP_XRAY_BIN` 时 **88 passed**, 约 20 秒);
   含 `/api/update` 鉴权与版本比较、`apply` 的"写不进 /etc/nginx 即失败"语义、CLI 退出码、以及
   `install.sh` 重跑不覆盖已初始化配置 / `upgrade.sh` 随包发布 / 自签证书可补签 Let's Encrypt /
   `systemctl` 参数顺序的回归断言 / Reality 密钥必须是成对的 X25519 (Ed25519 必须判无效) /
   旧默认伪装目标 (证书链超 8KB) 自动迁移 / 深度体检客户端配置真的带齐各节点参数 /
-  深度体检客户端在自签场景下不发已被 Xray 26 移除的 `allowInsecure` (改用 `pinnedPeerCertSha256`)。
+  深度体检客户端在自签场景下不发已被 Xray 26 移除的 `allowInsecure` (改用 `pinnedPeerCertSha256`) /
+  深度体检必须把 SOCKS5 回复读满 (只读 4 字节会让 TLS 报 `WRONG_VERSION_NUMBER`)。
 - `scripts/verify.py` (Xray 26.3.27 + Hysteria 2.12.3 + mihomo 1.19.31 + sing-box 1.14.2) → **74/74 项通过**:
   setup 8 步全绿 / 三种订阅格式可被真实客户端解析 / 三档分流模板分别被 `mihomo -t` 与
   `sing-box check` 通过 / **用真实 sing-box 实跑** 5 份订阅 (通用 + 1.14+ 写法 × 智能/全局/直连) 全部启动成功,
@@ -421,14 +422,14 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 
 ### 12.1 真实服务器验证 (2026-09-28, Ubuntu 24.04 / 1 vCPU / 1GB, Xray 26.3.27 + Hysteria 2.12.3)
 
-这一轮把"只能在 Linux 上验证"的部分全部跑通, 也把两个**只在真机上才会暴露**的根因抓了出来
-(本地 `pytest` / `verify.py` 全绿却救不了它们 —— 见下面第 3、4 条):
+这一轮把"只能在 Linux 上验证"的部分全部跑通, 也把三个**只在真机上才会暴露**的根因抓了出来
+(本地 `pytest` / `verify.py` 全绿却救不了它们 —— 见下面第 3、4、6 条):
 
 1. **部署链路**: `install.sh` → 面板初始化 → certbot 签发 `hkk.i3.pub` 的 Let's Encrypt 证书
    (有效期至 2026-12-27, `certbot.timer` enabled, 证书出现后 `/api/renew` 会自动重新生成
    nginx/xray 配置并热重载) → nginx 监听 80/443/8899、xray 监听 8443/8445/8444 +
    127.0.0.1:6000、hysteria2 监听 30001/31001/32001 (UDP 端口跳跃)。
-2. **一键升级真机实测**: `upgrade.sh` 连升 v2.3.2 → v2.3.3 → v2.3.4 → v2.3.5, 每次 6 步全绿
+2. **一键升级真机实测**: `upgrade.sh` 连升 v2.3.2 → v2.3.3 → v2.3.4 → v2.3.5 → v2.3.6, 每次 6 步全绿
    (备份 → 换代码 → 按 `state.json` 重新落地三份配置 → 重载服务 → 复查端口监听),
    `data/update.json` 记 success, 旧代码 + `state.json` 备份保留最近 5 份;
    面板「程序更新 → 一键更新」走 systemd 瞬时单元, 面板自身重启不打断升级。
@@ -449,7 +450,15 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 5. **端到端 (真实客户端, 不是面板自测)**: 用本机 Xray 26.3.27 客户端拉面板订阅, 4 个 TCP 节点
    全部 `http 200`, 出口 IP = 服务器 IP (8443 Reality / 8445 XHTTP Reality / 443 WS+TLS /
    8444 Trojan TLS); hysteria2 用官方 hysteria 2.12.3 客户端 (订阅里的端口跳跃写法) 同样出口 IP 一致。
-6. **面板自测能力补强**: 旧 `/api/probe` 只做裸 TLS 握手 —— Reality 认证失败时服务端会**回落到
+6. **根因三: 深度体检只读了 SOCKS5 回复的前 4 字节**。Xray 的 SOCKS 入站成功回复是 10 字节
+   (`05 00 00 01` + BND.ADDR `0.0.0.0` + BND.PORT `0`), 而探测代码 `recv(4)` 只取头部,
+   剩下 6 个 `00` 留在接收缓冲区 → 紧接着 TLS 客户端把它们当成记录头, 报
+   `SSLError: WRONG_VERSION_NUMBER`。这个 bug 只在**生产环境**生效 (`?deep=1` 仅在 Linux
+   生产路径启用, 本地 `pytest` / `verify.py` 走的是浅探测), 真机上的表现就是
+   "面板 4 个节点全部握手失败" —— 于是没人再敢信面板的结论。
+   修复: `_socks5_open()` 按 ATYP 把回复**读满** (IPv4 / IPv6 / 域名三种都覆盖) 再进 TLS;
+   回归测试用一个只回 10 字节的假 SOCKS5 服务端钉死"缓冲区必须是空的"。
+7. **面板自测能力补强**: 旧 `/api/probe` 只做裸 TLS 握手 —— Reality 认证失败时服务端会**回落到
    真实伪装站点**, 裸握手照样成功, 这正是"面板 1/5 通、服务全绿"的来源。现在 `?deep=1` 会用临时
    Xray 客户端经 SOCKS5 隧道对伪装目标做一次真实 TLS 往返 (生产环境面板默认走它), 并把
    `allowInsecure` 换成 Xray 26 要求的 `pinnedPeerCertSha256` (Xray 25 起 `allowInsecure` 已移除,

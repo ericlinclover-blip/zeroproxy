@@ -476,6 +476,53 @@ def _free_port() -> int:
         return int(s.getsockname()[1])
 
 
+def _recv_exact(sock: socket.socket, n: int) -> bytes:
+    """读满 n 字节 (或对端关闭/超时)。"""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            break
+        buf += chunk
+    return bytes(buf)
+
+
+def _socks5_open(sock: socket.socket, host: str, port: int) -> tuple[bool, str]:
+    """在已连上的 socket 上完成 SOCKS5 协商 + CONNECT, 返回 (是否成功, 说明)。
+
+    坑 (真机踩到过): 必须把**整个回复**读完 —— Xray 的 SOCKS 入站回的是 10 字节
+    (`05 00 00 01` + BND.ADDR `0.0.0.0` + BND.PORT `0`), 只读 4 字节会把剩下的 6 字节
+    留在接收缓冲区里, 紧接着的 TLS 记录头就被读成 `000000000000` → 客户端报
+    `WRONG_VERSION_NUMBER`, 面板上表现为"节点全部握手失败", 而这 4 个节点其实完全正常。
+    """
+    sock.sendall(b"\x05\x01\x00")
+    greeting = _recv_exact(sock, 2)
+    if len(greeting) < 2 or greeting[0] != 5 or greeting[1] != 0:
+        return False, "SOCKS5 协商失败"
+    addr = host.encode()
+    if len(addr) > 255:
+        return False, "SOCKS5 目标域名过长"
+    sock.sendall(b"\x05\x01\x00\x03" + bytes([len(addr)]) + addr + int(port).to_bytes(2, "big"))
+    head = _recv_exact(sock, 4)
+    if len(head) < 4 or head[0] != 5:
+        return False, "SOCKS5 回复不完整"
+    if head[1] != 0:
+        return False, f"SOCKS5 连接被拒 (code={head[1]})"
+    atyp = head[3]
+    if atyp == 1:      # IPv4
+        tail = 4 + 2
+    elif atyp == 4:    # IPv6
+        tail = 16 + 2
+    else:              # 域名: 1 字节长度 + 域名 + 端口
+        n = _recv_exact(sock, 1)
+        if not n:
+            return False, "SOCKS5 回复不完整"
+        tail = n[0] + 2
+    if len(_recv_exact(sock, tail)) < tail:
+        return False, "SOCKS5 回复不完整"
+    return True, "已建立隧道"
+
+
 def _socks5_tls_probe(proxy_port: int, host: str, port: int, timeout: float = 8.0) -> tuple[bool, float, str]:
     """经本地 SOCKS5 隧道对目标做一次真实 TLS 握手 —— 节点深度体检的判据。
 
@@ -489,14 +536,9 @@ def _socks5_tls_probe(proxy_port: int, host: str, port: int, timeout: float = 8.
     try:
         sock = socket.create_connection(("127.0.0.1", proxy_port), timeout=timeout)
         sock.settimeout(timeout)
-        sock.sendall(b"\x05\x01\x00")
-        if sock.recv(2) != b"\x05\x00":
-            return False, -1.0, "SOCKS5 协商失败"
-        addr = host.encode()
-        sock.sendall(b"\x05\x01\x00\x03" + bytes([len(addr)]) + addr + int(port).to_bytes(2, "big"))
-        resp = sock.recv(4)
-        if len(resp) < 2 or resp[1] != 0:
-            return False, -1.0, f"SOCKS5 连接被拒 (code={resp[1] if len(resp) > 1 else '?'})"
+        ok, detail = _socks5_open(sock, host, port)
+        if not ok:
+            return False, -1.0, detail
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE

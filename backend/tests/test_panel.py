@@ -643,6 +643,114 @@ def test_client_tls_settings_survives_missing_cert(home):
     assert services.client_tls_settings(state) == {"serverName": state["domain"]}
 
 
+def _fake_socks5_server(reply: bytes, expect_host: bytes = b"example.com"):
+    """起一个只做一次握手的假 SOCKS5 服务端, 返回 (端口, 线程, 关闭函数)。"""
+    import socket
+    import threading
+
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    seen = []
+
+    def recv_exact(conn, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = conn.recv(n - len(buf))
+            if not chunk:
+                break
+            buf += chunk
+        return buf
+
+    def serve():
+        conn, _ = server.accept()
+        try:
+            seen.append(recv_exact(conn, 3))
+            conn.sendall(b"\x05\x00")
+            seen.append(recv_exact(conn, 4 + 1 + len(expect_host) + 2))
+            conn.sendall(reply)
+            threading.Event().wait(0.6)   # 保持连接, 让调用方看到"缓冲区还剩什么"
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return server.getsockname()[1], thread, seen, server
+
+
+def test_socks5_open_consumes_the_whole_reply(home):
+    """Xray 的 SOCKS5 成功回复是 10 字节 (`05 00 00 01` + BND `0.0.0.0:0`)。
+
+    真机踩到过: 只读 4 字节时剩下 6 个 0 会被 TLS 当成记录头 → 客户端报
+    `WRONG_VERSION_NUMBER`, 面板上表现为"4 个节点全部握手失败", 而节点其实完全正常。
+    这里用假服务端钉死"回复必须读干净"。
+    """
+    import socket
+
+    from zeroproxy import services
+
+    reply = b"\x05\x00\x00\x01" + b"\x7f\x00\x00\x01" + (0x1234).to_bytes(2, "big")
+    port, _thread, seen, server = _fake_socks5_server(reply)
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=3)
+        sock.settimeout(3)
+        ok, detail = services._socks5_open(sock, "example.com", 443)
+        assert ok, detail
+        assert seen[0] == b"\x05\x01\x00"
+        assert seen[1][:4] == b"\x05\x01\x00\x03"        # 用域名 (ATYP=3) 寻址
+        assert seen[1][5:] == b"example.com" + (443).to_bytes(2, "big")
+        sock.settimeout(0.3)
+        with pytest.raises(TimeoutError):                # 缓冲区必须是空的
+            sock.recv(16)
+        sock.close()
+    finally:
+        server.close()
+
+
+def test_socks5_open_handles_domain_reply_and_refusal(home):
+    """回复的 ATYP 可能是域名 (变长), 拒绝码要如实转述而不是当成成功。"""
+    import socket
+
+    from zeroproxy import services
+
+    domain_reply = b"\x05\x00\x00\x03" + bytes([5]) + b"proxy" + (8080).to_bytes(2, "big")
+    port, _thread, _seen, server = _fake_socks5_server(domain_reply)
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=3)
+        sock.settimeout(0.3)
+        ok, detail = services._socks5_open(sock, "example.com", 443)
+        assert ok, detail
+        with pytest.raises(TimeoutError):
+            sock.recv(16)
+        sock.close()
+    finally:
+        server.close()
+
+    port, _thread, _seen, server = _fake_socks5_server(b"\x05\x05\x00\x01" + b"\x00\x00\x00\x00\x00\x00")
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=3)
+        sock.settimeout(3)
+        ok, detail = services._socks5_open(sock, "example.com", 443)
+        assert ok is False and "code=5" in detail
+        sock.close()
+    finally:
+        server.close()
+
+
+def test_socks5_tls_probe_reports_tunnel_failure(home):
+    """SOCKS5 阶段就失败时, 深度体检要给出可读原因 (而不是 TLS 层的怪错误)。"""
+    from zeroproxy import services
+
+    port, _thread, _seen, server = _fake_socks5_server(b"\x05\x02\x00\x01" + b"\x00\x00\x00\x00\x00\x00")
+    try:
+        ok, ms, detail = services._socks5_tls_probe(port, "www.cloudflare.com", 443, timeout=3)
+        assert ok is False and ms == -1.0 and "code=2" in detail
+    finally:
+        server.close()
+
+
 def test_deep_probe_is_unavailable_without_xray_binary(client, configured, home, monkeypatch):
     """没有 xray 二进制时给出"无法体检"而不是谎报成功/失败。"""
     from zeroproxy import services
