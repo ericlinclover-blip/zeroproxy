@@ -20,6 +20,7 @@ import itertools
 import json
 import os
 import re
+import secrets
 import socket
 import threading
 import time
@@ -36,6 +37,7 @@ from pydantic import BaseModel
 from . import (
     apply,
     chain,
+    chain_quic,
     config,
     crypto,
     geodata,
@@ -710,9 +712,11 @@ def _chain_view(state: dict) -> dict:
     chain_cfg = state.get("chain") or {}
     exit_cfg = chain_cfg.get("exit") or {}
     code = chain.exit_code(state)
+    procs = chain_quic.status(state)
     entries = []
     for entry in chain_cfg.get("entries") or []:
         probe = entry.get("last_probe") or {}
+        transport = entry.get("transport") or "reality"
         entries.append(
             {
                 "id": entry.get("id", ""),
@@ -722,6 +726,18 @@ def _chain_view(state: dict) -> dict:
                 "port": entry.get("port", 0),
                 "local_port": entry.get("local_port", 0),
                 "sni": entry.get("sni", ""),
+                "transport": transport,
+                # QUIC 内层的本地客户端进程活没活 (面板据此把"链路在跑但内层没起来"
+                # 这种情况显示出来, 而不是只显示"运行中")
+                "hy_ready": (
+                    True
+                    if transport != "hysteria2"
+                    else bool(procs.get(f"entry-{entry.get('id', '')}"))
+                ),
+                "hy_bw": int(entry.get("hy_bw") or 0),
+                "hy_port": int(entry.get("hy_port") or 0),
+                "hy_socks_port": int(entry.get("hy_socks_port") or 0),
+                "has_quic": bool(entry.get("hy_port") and entry.get("hy_pw")),
                 "enabled": bool(entry.get("enabled", True)),
                 "default_out": bool(entry.get("default_out")),
                 "created_at": int(entry.get("created_at") or 0),
@@ -736,6 +752,11 @@ def _chain_view(state: dict) -> dict:
             "created_at": int(exit_cfg.get("created_at") or 0),
             "code": code,
             "credential": (exit_cfg.get("uuid") or "")[:8],  # 只给前 8 位, 够用来认"是不是同一份"
+            # 内层 QUIC (Hysteria 2) 可选: 给入口端用的 UDP 通道
+            "hy_enabled": bool(exit_cfg.get("hy_enabled")),
+            "hy_port": int(exit_cfg.get("hy_port") or chain_quic.DEFAULT_PORT),
+            "hy_running": bool(procs.get("exit")),
+            "hy_available": bool(chain_quic.binary()),
         },
         "entries": entries,
         "default_out": next((e["id"] for e in entries if e["default_out"]), ""),
@@ -1089,10 +1110,18 @@ def update_settings(payload: SettingsIn, request: Request):
 
 # ---------------------------------------------------------------- 链式代理
 
+def _random_password(length: int = 24) -> str:
+    """给专用凭据用的随机密码 (与面板密码无关, 泄露了只影响这一条链)。"""
+    return secrets.token_urlsafe(length)[:length]
+
+
 class ChainExitIn(BaseModel):
     action: str = "generate"      # generate | rotate | disable
     port: int | None = None
     label: str | None = None
+    #: 是否额外开放「内层 QUIC」(Hysteria 2)。None = 不动这一项
+    hy_enabled: bool | None = None
+    hy_port: int | None = None
 
 
 @router.post("/api/chain/exit")
@@ -1125,6 +1154,7 @@ def chain_exit(payload: ChainExitIn, request: Request):
             # 关闭 = 连凭据一起作废: 否则重新开启后, 之前发出去的旧配对码会"复活"
             # (端口保留, 所以 _ports_that_must_be_closed 仍会盯着这个端口确认已关闭)
             exit_cfg["uuid"] = str(uuid_mod.uuid4())
+            exit_cfg["hy_password"] = ""   # QUIC 内层那半截同样作废
             changed = ["关闭落地端 (入站已下线, 配对码作废且不会复用)"]
         else:
             changed = []
@@ -1148,6 +1178,37 @@ def chain_exit(payload: ChainExitIn, request: Request):
             exit_cfg["port"] = port
             exit_cfg["enabled"] = True
             exit_cfg["created_at"] = int(exit_cfg.get("created_at") or time.time())
+
+            # 内层 QUIC (Hysteria 2): 独立 UDP 端口 + 独立密码 + 按 SNI 自签的证书。
+            # 关掉时把密码一并作废 —— 否则重新打开后, 旧配对码里的那半截还能用。
+            if payload.hy_enabled is not None:
+                want_hy = bool(payload.hy_enabled)
+                if want_hy != bool(exit_cfg.get("hy_enabled")) or action == "rotate":
+                    changed.append("开放内层 QUIC (Hysteria 2)" if want_hy else "关闭内层 QUIC")
+                exit_cfg["hy_enabled"] = want_hy
+                if want_hy:
+                    exit_cfg["hy_sni"] = chain_quic.exit_sni(state)
+                else:
+                    # 关掉 = 那半截凭据当场作废: 否则重新打开时旧配对码的 QUIC 部分
+                    # 会"复活"(Reality 那半截在关闭落地端时也是这么处理的)
+                    exit_cfg["hy_password"] = ""
+            if payload.hy_port is not None and int(payload.hy_port) != int(exit_cfg.get("hy_port") or 0):
+                hy_port = int(payload.hy_port)
+                if not 1 <= hy_port <= 65535:
+                    return _err("QUIC 端口需在 1-65535 之间")
+                if hy_port != int(exit_cfg.get("port") or 0) and hy_port in chain.used_ports(state):
+                    return _err(f"QUIC 端口 {hy_port} 已被本机其它节点/链式条目占用, 换一个")
+                if not services.port_available(hy_port, "udp"):
+                    return _err(f"端口 {hy_port}/udp 已被系统里其它进程占用, 换一个")
+                exit_cfg["hy_port"] = hy_port
+                changed.append(f"QUIC 端口 {hy_port}/udp")
+            if exit_cfg.get("hy_enabled"):
+                if not exit_cfg.get("hy_password") or action == "rotate":
+                    exit_cfg["hy_password"] = _random_password()
+                    changed.append("QUIC 专用密码已生成" if action != "rotate" else "QUIC 密码已轮换")
+                ok_cert, cert_detail = chain_quic.ensure_exit_cert(state)
+                if not ok_cert:
+                    return _err(f"QUIC 内层证书生成失败: {cert_detail}")
             if payload.label is not None:
                 label = payload.label.strip()[:40]
                 if label != (exit_cfg.get("label") or ""):
@@ -1161,7 +1222,7 @@ def chain_exit(payload: ChainExitIn, request: Request):
         def open_exit_port() -> list[dict]:
             if not exit_cfg.get("enabled"):
                 return []
-            return [
+            rows = [
                 {
                     "name": "放行落地端端口",
                     "ok": True,
@@ -1169,6 +1230,17 @@ def chain_exit(payload: ChainExitIn, request: Request):
                     "ms": 0,
                 }
             ]
+            if exit_cfg.get("hy_enabled"):
+                # QUIC 内层是 UDP: 与主 Hysteria 2 节点一样, 没放行的话客户端一直超时
+                rows.append(
+                    {
+                        "name": "放行落地端 QUIC 端口 (UDP)",
+                        "ok": True,
+                        "detail": services.open_firewall_port(exit_cfg["hy_port"], "udp"),
+                        "ms": 0,
+                    }
+                )
+            return rows
 
         return _landing_body(state, request, after=open_exit_port)
 
@@ -1178,6 +1250,8 @@ class ChainEntryIn(BaseModel):
     label: str | None = None
     local_port: int | None = None
     default_out: bool = False
+    #: 内层传输: reality (默认) | hysteria2 —— 后者要求配对码里有 QUIC 凭据
+    transport: str | None = None
     #: 探测不通时是否仍然强行添加 (面板会二次确认)
     force: bool = False
 
@@ -1197,6 +1271,20 @@ def chain_entry_add(payload: ChainEntryIn, request: Request):
         except chain.CodeError as exc:
             return _err(str(exc))
 
+        # 内层传输: 默认 Reality; 选 QUIC 时必须真的有 QUIC 凭据 + 本机有 hysteria
+        transport = (payload.transport or "reality").strip().lower()
+        if transport not in ("reality", "hysteria2"):
+            return _err(f"不支持的内层传输: {transport}")
+        if transport == "hysteria2":
+            if not target.get("hy_port"):
+                return _err(
+                    "这份配对码里没有 QUIC 凭据 (落地端还没开「内层 QUIC」); "
+                    "请让落地端打开后再复制一次配对码, 或者这次先用 Reality 内层"
+                )
+            if not chain_quic.binary():
+                return _err("本机没有 hysteria 二进制, 用不了 QUIC 内层 (重跑 install.sh 可装上)")
+        target["transport"] = transport
+
         entries = state.setdefault("chain", {}).setdefault("entries", [])
         for entry in entries:
             if (entry.get("host"), int(entry.get("port") or 0)) == (target["host"], target["port"]):
@@ -1213,6 +1301,10 @@ def chain_entry_add(payload: ChainEntryIn, request: Request):
             local_port = chain.pick_port(state, payload.local_port)
         except ValueError as exc:
             return _err(str(exc))
+        try:
+            hy_socks_port = chain_quic.pick_socks_port(state) if transport == "hysteria2" else 0
+        except ValueError as exc:
+            return _err(f"本机找不到空闲的回环端口给 QUIC 客户端: {exc}")
 
     # 探测放在锁外面: 起临时客户端 + 真实出网要好几秒, 不该把整个面板卡住
     probe = chain.probe_target(target)
@@ -1239,6 +1331,13 @@ def chain_entry_add(payload: ChainEntryIn, request: Request):
                 local_port = chain.pick_port(state)
             except ValueError as exc:
                 return _err(str(exc))
+        if transport == "hysteria2" and (
+            not hy_socks_port or not services.port_available(int(hy_socks_port), "tcp")
+        ):
+            try:
+                hy_socks_port = chain_quic.pick_socks_port(state)
+            except ValueError as exc:
+                return _err(str(exc))
         label = chain.unique_label(
             entries, payload.label or target["label"] or target["host"], target["host"]
         )
@@ -1252,6 +1351,13 @@ def chain_entry_add(payload: ChainEntryIn, request: Request):
             "sid": target["sid"],
             "sni": target["sni"],
             "flow": target["flow"],
+            "transport": transport,
+            # QUIC 内层用到的参数 (Reality 内层时为 0/空)
+            "hy_port": int(target.get("hy_port") or 0),
+            "hy_pw": target.get("hy_pw") or "",
+            "hy_sni": target.get("hy_sni") or "",
+            "hy_socks_port": int(hy_socks_port or 0),
+            "hy_bw": 0,
             "local_port": local_port,
             "enabled": True,
             "default_out": bool(payload.default_out),
@@ -1261,6 +1367,7 @@ def chain_entry_add(payload: ChainEntryIn, request: Request):
                 "ok": bool(probe.get("ok")),
                 "probe_ok": bool(probe.get("probe_ok", True)),
                 "ms": probe.get("ms"),
+                "tcp_ms": probe.get("tcp_ms"),
                 "exit_ip": probe.get("exit_ip") or "",
                 "detail": probe.get("detail") or "",
             },
@@ -1270,7 +1377,11 @@ def chain_entry_add(payload: ChainEntryIn, request: Request):
                 other["default_out"] = False
         entries.append(entry)
         config.audit(
-            state, "chain_add", f"{label} → {entry['host']}:{entry['port']}", actor=_client_ip(request)
+            state,
+            "chain_add",
+            f"{label} ({'内层 QUIC' if transport == 'hysteria2' else '内层 Reality'}) "
+            f"→ {entry['host']}:{entry['port']}",
+            actor=_client_ip(request),
         )
 
         def after_landing() -> list[dict]:
@@ -1298,6 +1409,10 @@ class ChainEntryPatch(BaseModel):
     enabled: bool | None = None
     default_out: bool | None = None
     label: str | None = None
+    #: 切换内层传输 (reality / hysteria2); 需要配对码里有 QUIC 凭据
+    transport: str | None = None
+    #: Brutal 拥塞控制的声明带宽 (Mbps); 0 = 回到 QUIC + BBR 默认
+    hy_bw: int | None = None
 
 
 def _find_chain_entry(state: dict, entry_id: str) -> dict | None:
@@ -1346,10 +1461,40 @@ def chain_entry_update(entry_id: str, payload: ChainEntryPatch, request: Request
             if new_label and new_label != (entry.get("label") or ""):
                 entry["label"] = new_label
                 changed.append(f"名称改为「{new_label}」")
+        if payload.transport is not None:
+            want = payload.transport.strip().lower()
+            if want not in ("reality", "hysteria2"):
+                return _err(f"不支持的内层传输: {want}")
+            if want != (entry.get("transport") or "reality"):
+                if want == "hysteria2":
+                    if not entry.get("hy_port") or not entry.get("hy_pw"):
+                        return _err(
+                            "这条链的配对码里没有 QUIC 凭据 (落地端当时没开内层 QUIC); "
+                            "请让落地端打开后用新配对码重新接一次"
+                        )
+                    if not chain_quic.binary():
+                        return _err("本机没有 hysteria 二进制, 用不了 QUIC 内层")
+                    if not entry.get("hy_socks_port"):
+                        try:
+                            entry["hy_socks_port"] = chain_quic.pick_socks_port(state)
+                        except ValueError as exc:
+                            return _err(str(exc))
+                entry["transport"] = want
+                changed.append(
+                    "内层改为 QUIC (Hysteria 2)" if want == "hysteria2" else "内层改回 Reality"
+                )
+        if payload.hy_bw is not None:
+            bw = max(0, min(int(payload.hy_bw), 10000))
+            if bw != int(entry.get("hy_bw") or 0):
+                entry["hy_bw"] = bw
+                changed.append(
+                    f"Brutal 带宽 {bw} Mbps (重启内核生效)" if bw else "Brutal 已关闭 (回到 BBR)"
+                )
         if not changed:
             return _err("没有需要修改的内容")
 
-        config.audit(state, "chain_update", "; ".join(changed), actor=_client_ip(request))
+        action = "chain_update" if payload.transport is None else "chain_transport"
+        config.audit(state, action, "; ".join(changed), actor=_client_ip(request))
         return _landing_body(state, request)
 
 
@@ -1379,6 +1524,7 @@ def chain_entry_probe(entry_id: str, request: Request):
             "ok": bool(probe.get("ok")),
             "probe_ok": bool(probe.get("probe_ok", True)),
             "ms": probe.get("ms"),
+            "tcp_ms": probe.get("tcp_ms"),
             "exit_ip": probe.get("exit_ip") or "",
             "detail": probe.get("detail") or "",
         }

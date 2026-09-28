@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -25,7 +26,16 @@ import sys
 import threading
 import time
 
-from . import config, crypto, hysteria_config, nginx_config, services, xray_config
+from . import (
+    chain,
+    chain_quic,
+    config,
+    crypto,
+    hysteria_config,
+    nginx_config,
+    services,
+    xray_config,
+)
 from .config import XRAY_NODE_IDS, load_state, paths, save_state
 
 #: 落地闭环的六个步骤 —— 顺序即面板进度条的顺序。改这里 = 改面板显示的步骤。
@@ -239,8 +249,25 @@ def restart_services(
         jobs.append(("hysteria2", services.restart_service, timeout or 90))
     if needed("nginx", "nginx", True):
         jobs.append(("nginx", services.reload_service, timeout or 60))
+
+    # 链式内层的 QUIC 进程 (Hysteria 2) 由面板自己托管, 必须**在 Xray 之前**对齐:
+    # 那条链的出站指向它的本地 SOCKS 端口, 端口还没开就重启 Xray, 起来后的头几批
+    # 连接会直接失败。这一步在有 QUIC 内层时才说话, 不用它的机器看不到任何变化。
+    quic_note = ""
+    try:
+        quic_ok, quic_note = chain_quic.sync(state)
+        if quic_note and not quic_ok:
+            quic_note = "✗ " + quic_note
+        elif quic_note:
+            quic_note = "✓ " + quic_note
+    except Exception as exc:  # noqa: BLE001 - 内层 QUIC 不能拖垮整次落地
+        quic_note = f"✗ 内层 QUIC 同步异常: {exc}"
+
     if not jobs:
-        return True, "三份配置都没有变化, 无需重启 (服务都在正常运行)"
+        return (not quic_note.startswith("✗")), (
+            "三份配置都没有变化, 无需重启 (服务都在正常运行)"
+            + (f"; {quic_note}" if quic_note else "")
+        )
 
     results: dict[str, str] = {}
 
@@ -261,7 +288,25 @@ def restart_services(
     for thread in threads:
         thread.join()
 
+    # Xray 重启后第一次握手要 ~5 秒 (Reality 冷启动, 真机实测连回环都复现)。以前
+    # 这 5 秒算在用户头上 —— 刚改完配置, 第一条连接就是"卡住不动"。这里在后台
+    # 先自己穿一遍把冷启动吃掉; 不 join, 所以"重载服务"这一步不会为此多转 5 秒。
+    xray_row = results.get("xray", "")
+    if xray_row and "✗" not in xray_row:
+        # 预热是锦上添花, 绝不能影响落地结果 (chain.warmup_in_background 自己也保证不抛)。
+        with contextlib.suppress(Exception):
+            chain.warmup_in_background(state)
+
     ordered = [results.get(name, f"{name} ✗ 没有结果") for name, _, _ in jobs]
+    if quic_note:
+        # 挂在 Xray 那一行 (QUIC 进程就是给它当出站用的); 这一轮没重启 Xray 时
+        # (比如只改了落地端的 QUIC 开关) 就单独占一行, 免得状态被吞掉。
+        if "xray" in results:
+            ordered = [
+                (row + "; " + quic_note) if row == results["xray"] else row for row in ordered
+            ]
+        else:
+            ordered.append(quic_note)
     failed = any("✗" in row for row in ordered)
     return (not failed), "; ".join(ordered)
 

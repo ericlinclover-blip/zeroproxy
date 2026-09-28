@@ -1262,12 +1262,61 @@ def test_geodata_rejects_too_small_download(client, configured, home, monkeypatc
 
 
 def _geo_local_sources(tmp_path, size: int = 1_200_000) -> dict:
-    """file:// 假数据源 (不依赖网络)。"""
+    """file:// 假数据源 (不依赖网络), 但要是**合法的** geoip/geosite 数据。
+
+    以前这里写的是几 MB 的随机字节 —— 不装 xray 时看不出问题, 一旦带上真实的
+    `ZP_XRAY_BIN` 跑 (conftest 里那条推荐命令), `geodata._validate` 会用真 xray
+    校验, 结果是"数据可被加载" 直接不成立, 5 个用例一起红。这里手工编一份最小
+    的 protobuf: geoip 里带 PRIVATE、geosite 里带 CATEGORY-ADS-ALL (xray 会把
+    `geoip:private` / `geosite:category-ads-all` 都转成大写再查表), 再按体积补齐
+    无意义但合法的条目。
+    """
     source = tmp_path / "geo-src-live"
     source.mkdir()
-    for name in ("geoip.dat", "geosite.dat"):
-        (source / name).write_bytes(b"ZP" * (size // 2))
+    (source / "geoip.dat").write_bytes(_fake_geodat(size, kind="geoip"))
+    (source / "geosite.dat").write_bytes(_fake_geodat(size, kind="geosite"))
     return {name: [(source / name).as_uri()] for name in ("geoip.dat", "geosite.dat")}
+
+
+def _fake_geodat(size: int, kind: str) -> bytes:
+    """按 V2Ray 的 geoip/geosite protobuf 结构编一份能被真 xray 读进去的数据。"""
+    import os as _os
+
+    def varint(value: int) -> bytes:
+        out = bytearray()
+        while True:
+            chunk = value & 0x7F
+            value >>= 7
+            out.append(chunk | (0x80 if value else 0))
+            if not value:
+                return bytes(out)
+
+    def f_bytes(field: int, payload: bytes) -> bytes:
+        return varint((field << 3) | 2) + varint(len(payload)) + payload
+
+    def f_varint(field: int, value: int) -> bytes:
+        return varint(field << 3) + varint(value)
+
+    if kind == "geoip":
+        # GeoIP: country_code + repeated CIDR{ip, prefix}
+        body = f_bytes(1, b"PRIVATE")
+        body += f_bytes(2, f_bytes(1, bytes([10, 0, 0, 0])) + f_varint(2, 8))
+        while len(body) < size - 400:
+            body += f_bytes(2, f_bytes(1, _os.urandom(4)) + f_varint(2, 24))
+    else:
+        # GeoSite: country_code + repeated Domain{type, value} (type=0 普通域名后缀)
+        body = f_bytes(1, b"CATEGORY-ADS-ALL")
+        body += f_bytes(2, f_varint(1, 0) + f_bytes(2, b"doubleclick.net"))
+        while len(body) < size - 400:
+            body += f_bytes(2, f_varint(1, 0) + f_bytes(2, b"x%d.example" % len(body)))
+    out = f_bytes(1, body)
+    # 精确补齐到目标体积: 顶层 field 1 是可重复的, 再追加一条只有 code 的条目
+    # (没人引用它, 但 protobuf 完全合法), 长度按 1 字节步进调到位。
+    for pad in range(400):
+        filler = f_bytes(1, f_bytes(1, b"P" * pad))
+        if len(out) + len(filler) == size:
+            return out + filler
+    raise AssertionError("补不齐体积")
 
 
 def _wait_job(client, job_id: str, timeout: float = 30.0) -> dict:

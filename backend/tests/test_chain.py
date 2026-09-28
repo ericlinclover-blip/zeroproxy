@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import time
 import uuid as uuid_mod
 from urllib.parse import unquote
 
@@ -632,3 +633,266 @@ def test_xray_config_with_real_binary_includes_chain(client, configured, monkeyp
     xray_config.write_xray_config(config.load_state())
     ok, detail = services.xray_config_test()
     assert ok, detail
+
+
+# ---------------------------------------------------------------- TCP 层调优 (v2.6.17)
+
+def test_inbound_and_outbound_carry_tcp_sockopt(client, configured, monkeypatch):
+    """TFO / tcpNoDelay / keepAlive 必须真的落到配置里。
+
+    链式那条出站是整条链的瓶颈 (每条新连接都要跨洋握手一次), 少一个 sockopt
+    就等于把 TFO 省下的那一个 RTT 又丢回去。
+    """
+    _add_entry(client, monkeypatch)
+    cfg = xray_config.build_xray_config(config.load_state())
+    inbound = next(i for i in cfg["inbounds"] if i["tag"] == "vless-reality")
+    sockopt = inbound["streamSettings"]["sockopt"]
+    assert sockopt["tcpFastOpen"] is True
+    assert sockopt["tcpNoDelay"] is True
+    assert sockopt["tcpKeepAliveInterval"] == 15
+    outbound = next(o for o in cfg["outbounds"] if str(o["tag"]).startswith("chain-out-"))
+    assert outbound["streamSettings"]["sockopt"]["tcpFastOpen"] is True
+
+
+def test_probe_uses_one_total_budget(monkeypatch):
+    """三个回显服务不能各给一份超时 —— 那样面板上一次测速最长要等 18 秒。"""
+    from zeroproxy import chain as chain_mod
+    from zeroproxy import services
+
+    calls: list[float] = []
+
+    def slow(*args, **kwargs):
+        calls.append(timeout := args[4] if len(args) > 4 else 6.0)
+        time.sleep(timeout)          # 每个回显服务都"用满"自己的那份
+        return "", "超时"
+
+    monkeypatch.setattr(services, "socks5_http_get", slow)
+    started = time.monotonic()
+    ip, detail = chain_mod.read_exit_ip(1080, timeout=3.0)
+    cost = time.monotonic() - started
+    assert ip == "" and detail
+    assert cost < 6.0, f"总耗时 {cost:.1f}s, 说明超时没有被当成整段预算"
+    assert len(calls) <= 2, f"试了 {len(calls)} 个回显服务, 预算没生效"
+
+
+def test_warmup_targets_cover_main_and_enabled_entries(client, configured, monkeypatch):
+    """预热要盖住"客户端连的那一侧": 主力 Reality 入站 + 每条启用中的链式入站。"""
+    from zeroproxy import chain as chain_mod
+
+    entry = _add_entry(client, monkeypatch)
+    state = config.load_state()
+    ports = [t["port"] for t in chain_mod.warmup_targets(state)]
+    assert state["ports"]["reality"] in ports
+    assert entry["local_port"] in ports
+    # 目标是回环: 冷启动在服务端, 与客户端在哪无关
+    assert {t["host"] for t in chain_mod.warmup_targets(state)} == {"127.0.0.1"}
+
+    state["chain"]["entries"][0]["enabled"] = False
+    assert entry["local_port"] not in [t["port"] for t in chain_mod.warmup_targets(state)]
+    # 主力节点也关掉时就没有可预热的东西
+    state["nodes"]["vless-reality"] = False
+    assert chain_mod.warmup_targets(state) == []
+
+
+def test_warmup_records_result_in_audit(client, configured, monkeypatch):
+    """预热在后台线程里跑, 结果落进操作记录 (不能默默失败)。"""
+    from zeroproxy import chain as chain_mod
+    from zeroproxy import services
+
+    monkeypatch.setattr(services, "bin_path", lambda name: "/fake/xray" if name == "xray" else None)
+    monkeypatch.setattr(chain_mod, "warmup", lambda state, timeout=0: (True, "8443 ✓ 0.1s (读到出口 IP)"))
+    chain_mod.warmup_in_background(config.load_state())
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        rows = config.load_state()["audit"]
+        if rows and rows[-1]["action"] == "chain_warmup":
+            break
+        time.sleep(0.05)
+    assert rows[-1]["action"] == "chain_warmup"
+    assert "8443" in rows[-1]["detail"]
+
+
+# ---------------------------------------------------------------- 内层 QUIC (Hysteria 2)
+
+def _v2_code(state: dict, host: str = "203.0.113.9", **over) -> str:
+    reality = state["reality"]
+    fields = {
+        "host": host,
+        "port": 8447,
+        "uuid": str(uuid_mod.uuid4()),
+        "pbk": reality["public_key"],
+        "sid": reality["short_id"],
+        "sni": reality["server_name"],
+        "flow": "xtls-rprx-vision",
+        "label": "美国落地",
+        "hy_port": 8448,
+        "hy_password": "quic-secret-1234",
+        "hy_sni": "us.example.com",
+    }
+    fields.update(over)
+    return chain.make_code(**fields)
+
+
+def test_code_v2_carries_quic_credentials(client, configured):
+    code = _v2_code(config.load_state())
+    parsed = chain.parse_code(code)
+    assert parsed["hy_port"] == 8448 and parsed["hy_pw"] == "quic-secret-1234"
+    assert parsed["hy_sni"] == "us.example.com"
+    assert parsed["port"] == 8447 and parsed["label"] == "美国落地"
+    payload = json.loads(base64.urlsafe_b64decode(code.split("~")[1] + "=="))
+    assert payload["v"] == 2 and payload["y"]["p"] == 8448 and payload["r"]["p"] == 8447
+
+    # v1 (老版本生成的码) 照样认, QUIC 字段为空 —— 面板据此把选项置灰
+    v1 = chain.parse_code(_fake_code(config.load_state()))
+    assert v1["hy_port"] == 0 and v1["hy_pw"] == "" and v1["hy_sni"] == ""
+
+
+@pytest.mark.parametrize(
+    "bad, hint",
+    [
+        ({"p": 0, "w": "x", "n": "us.example.com"}, "QUIC 端口"),
+        ({"p": 70000, "w": "x", "n": "us.example.com"}, "QUIC 端口"),
+        ({"p": 8448, "w": "", "n": "us.example.com"}, "QUIC 密码"),
+        ({"p": 8448, "w": "x", "n": "not a sni!"}, "QUIC SNI"),
+    ],
+)
+def test_code_v2_rejects_broken_quic_fields(client, configured, bad, hint):
+    """坏字段要在粘贴的那一刻说清楚, 不能等落地后客户端一直超时。"""
+    reality = config.load_state()["reality"]
+    payload = {
+        "v": 2,
+        "h": "203.0.113.9",
+        "n": reality["server_name"],
+        "l": "",
+        "r": {
+            "p": 8447,
+            "u": str(uuid_mod.uuid4()),
+            "k": reality["public_key"],
+            "s": reality["short_id"],
+            "f": "xtls-rprx-vision",
+        },
+        "y": bad,
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    code = chain.CODE_SEP.join((chain.CODE_PREFIX, chain._b64e(raw), chain._checksum(raw)))
+    with pytest.raises(chain.CodeError) as exc:
+        chain.parse_code(code)
+    assert hint in str(exc.value)
+
+
+def test_exit_quic_toggle(client, configured):
+    """落地端可以单独开关内层 QUIC; 配对码随之从 v1 变 v2, 关掉时密码一并作废。"""
+    from zeroproxy import chain_quic
+
+    body = client.post(
+        "/api/chain/exit",
+        json={"action": "generate", "port": 8666, "hy_enabled": True, "hy_port": 8667},
+    ).json()
+    ex = body["chain"]["exit"]
+    assert ex["enabled"] and ex["hy_enabled"] and ex["hy_port"] == 8667
+    assert ex["hy_available"] is (chain_quic.binary() is not None)
+    first = chain.parse_code(ex["code"])
+    assert first["hy_port"] == 8667 and first["hy_pw"]
+    # 证书按配对码里的 SNI 现签: 两端对不上时 hysteria 服务端会直接 TLS 告警
+    assert first["hy_sni"] == chain_quic.exit_sni(config.load_state())
+    assert os.path.exists(paths_of()["chain_quic_cert"])
+    # 放行步骤里要有 UDP 端口, 否则用户会一直以为是别的问题
+    assert any("UDP" in s["name"] for s in body["steps"])
+
+    off = client.post("/api/chain/exit", json={"action": "generate", "hy_enabled": False}).json()
+    assert off["chain"]["exit"]["hy_enabled"] is False
+    assert chain.parse_code(off["chain"]["exit"]["code"])["hy_port"] == 0
+
+    again = client.post("/api/chain/exit", json={"action": "generate", "hy_enabled": True}).json()
+    assert chain.parse_code(again["chain"]["exit"]["code"])["hy_pw"] != first["hy_pw"]
+
+
+def paths_of():
+    from zeroproxy.config import paths
+
+    return paths()
+
+
+def test_entry_quic_transport_wiring(client, configured, monkeypatch):
+    """选 QUIC 内层: 入口出站变成本地 socks (交给面板托管的 hysteria 客户端)。"""
+    from zeroproxy import chain_quic
+
+    monkeypatch.setattr(chain_quic, "binary", lambda: "/usr/local/bin/hysteria")
+    monkeypatch.setattr(chain, "probe_target", _ok_probe("203.0.113.9"))
+    response = client.post(
+        "/api/chain/entries",
+        json={"code": _v2_code(config.load_state()), "transport": "hysteria2"},
+    )
+    assert response.status_code == 200, response.text
+    entry = response.json()["chain"]["entries"][-1]
+    assert entry["transport"] == "hysteria2" and entry["hy_socks_port"] > 0
+
+    cfg = xray_config.build_xray_config(config.load_state())
+    outbound = next(o for o in cfg["outbounds"] if o["tag"] == f"chain-out-{entry['id']}")
+    assert outbound["protocol"] == "socks"
+    assert outbound["settings"]["servers"][0]["port"] == entry["hy_socks_port"]
+    assert outbound["settings"]["servers"][0]["address"] == "127.0.0.1"
+    # 入口入站照旧是 VLESS Reality (客户端那一段不变)
+    inbound = next(i for i in cfg["inbounds"] if i["tag"] == f"chain-{entry['id']}")
+    assert inbound["streamSettings"]["security"] == "reality"
+
+    # 切回 Reality: 出站变回 VLESS, 本地 socks 端口不再被引用
+    back = client.post(
+        f"/api/chain/entries/{entry['id']}", json={"transport": "reality"}
+    ).json()
+    same = back["chain"]["entries"][-1]
+    assert same["transport"] == "reality"
+    outbound = next(
+        o for o in xray_config.build_xray_config(config.load_state())["outbounds"]
+        if o["tag"] == f"chain-out-{entry['id']}"
+    )
+    assert outbound["protocol"] == "vless"
+
+
+def test_entry_quic_needs_credentials_and_binary(client, configured, monkeypatch):
+    from zeroproxy import chain_quic
+
+    monkeypatch.setattr(chain, "probe_target", _ok_probe())
+    # 配对码是 v1 (落地端没开 QUIC) → 明确拒绝, 而不是落一条注定不通的链
+    no_creds = client.post(
+        "/api/chain/entries",
+        json={"code": _fake_code(config.load_state(), host="203.0.113.20"), "transport": "hysteria2"},
+    )
+    assert no_creds.status_code == 400 and "QUIC" in no_creds.json()["error"]
+
+    monkeypatch.setattr(chain_quic, "binary", lambda: None)
+    no_binary = client.post(
+        "/api/chain/entries",
+        json={"code": _v2_code(config.load_state(), host="203.0.113.21"), "transport": "hysteria2"},
+    )
+    assert no_binary.status_code == 400 and "hysteria" in no_binary.json()["error"]
+
+
+HAVE_HYSTERIA = bool(os.environ.get("ZP_HYSTERIA2_BIN"))
+
+
+@pytest.mark.skipif(not HAVE_HYSTERIA, reason="需要真实 hysteria 二进制 (ZP_HYSTERIA2_BIN)")
+def test_quic_processes_start_and_stop(client, configured, monkeypatch):
+    """真机路径: 面板托管的两个 hysteria 进程按配置起来 / 按配置停掉。"""
+    from zeroproxy import chain_quic
+
+    monkeypatch.setattr(chain, "probe_target", _ok_probe("203.0.113.9"))
+    client.post("/api/chain/exit", json={"action": "generate", "port": 8666, "hy_enabled": True, "hy_port": 8667})
+    entry = client.post(
+        "/api/chain/entries",
+        json={"code": _v2_code(config.load_state()), "transport": "hysteria2"},
+    ).json()["chain"]["entries"][-1]
+    try:
+        ok, note = chain_quic.sync(config.load_state())
+        assert ok, note
+        assert chain_quic.running("exit") and chain_quic.running(f"entry-{entry['id']}")
+        # 端口没被占: 落地端的证书也应该已经按 SNI 生成
+        assert os.path.exists(paths_of()["chain_quic_cert"])
+
+        client.post(f"/api/chain/entries/{entry['id']}", json={"enabled": False})
+        ok, _ = chain_quic.sync(config.load_state())
+        assert ok
+        assert not chain_quic.running(f"entry-{entry['id']}")
+        assert chain_quic.running("exit")          # 落地端不受影响
+    finally:
+        chain_quic.stop_all()

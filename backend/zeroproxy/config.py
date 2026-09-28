@@ -172,8 +172,25 @@ DEFAULTS: dict = {
     # 链式代理 (中转 → 落地)。两台机器各装一份本程序: 落地端生成配对码, 中转端粘贴即连。
     #   exit    — 本机作为落地端时的专用凭据 (独立 UUID + 独立端口, 可与订阅凭据分开吊销)
     #   entries — 本机作为中转端时已连接的落地端清单 (每条 = 一个入站 + 一个出站 + 一条路由)
+    #
+    # 内层传输 (两跳之间那一层) 有两种, 由落地端决定、随配对码一起交给入口端:
+    #   reality   VLESS + TCP + Reality + Vision (默认; 免证书, 抗封锁最强)
+    #   hysteria2 Hysteria 2 (QUIC/UDP): 跨洋链路上"TCP over TCP"会互相拖累,
+    #             换 UDP 能绕开 (见 chain_quic.py 顶部)。需要落地端多开一个 UDP 端口,
+    #             且 hysteria 二进制必须存在 —— 两端都是按需启停, 不占用 systemd。
     "chain": {
-        "exit": {"enabled": False, "port": 8447, "uuid": "", "label": "", "created_at": 0},
+        "exit": {
+            "enabled": False,
+            "port": 8447,
+            "uuid": "",
+            "label": "",
+            "created_at": 0,
+            # QUIC 内层 (可选): 独立 UDP 端口 + 独立密码, 与主 Hysteria 2 节点互不影响
+            "hy_enabled": False,
+            "hy_port": 8448,
+            "hy_password": "",
+            "hy_sni": "",       # 客户端必须用这个 SNI (本机自签证书的 SAN 就是它)
+        },
         "entries": [],
     },
     "cert": {
@@ -216,6 +233,10 @@ def paths() -> dict:
         "hysteria_config": f"{h}/hysteria/config.yaml",
         "hysteria_cert": f"{h}/hysteria/cert.pem",
         "hysteria_key": f"{h}/hysteria/key.pem",
+        # 链式代理的内层 QUIC (Hysteria 2) — 配置 / 进程日志 / 临时测速都放这里
+        "chain_quic_dir": f"{h}/data/chain-quic",
+        "chain_quic_cert": f"{h}/data/chain-quic/cert.pem",
+        "chain_quic_key": f"{h}/data/chain-quic/key.pem",
         "cert_dir": f"{h}/certs",
         # GeoIP/GeoSite 数据目录 — Xray 通过 XRAY_LOCATION_ASSET 指向它
         "geo_dir": f"{h}/geo",
@@ -240,7 +261,8 @@ def paths() -> dict:
 def _ensure_dirs() -> None:
     p = paths()
     for key in (
-        "data_dir", "xray_dir", "hysteria_dir", "cert_dir", "nginx_dir", "www", "panel_dir", "geo_dir"
+        "data_dir", "xray_dir", "hysteria_dir", "cert_dir", "nginx_dir", "www", "panel_dir",
+        "geo_dir", "chain_quic_dir",
     ):
         os.makedirs(p[key], exist_ok=True)
 
@@ -400,6 +422,9 @@ AUDIT_ACTIONS: dict[str, tuple[str, str]] = {
     "chain_update": ("修改落地端", "chain"),
     "chain_probe": ("落地端测速", "chain"),
     "chain_delete": ("断开落地端", "chain"),
+    "chain_warmup": ("预热入口链路", "chain"),
+    "chain_warmup_failed": ("链路预热失败", "chain"),
+    "chain_transport": ("切换内层传输", "chain"),
     "geodata_update": ("更新 GeoIP 数据", "data"),
     "geodata_update_failed": ("GeoIP 更新失败", "data"),
     "geodata_auto": ("自动更新 GeoIP", "data"),

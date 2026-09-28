@@ -194,6 +194,6 @@ Xray 的 VLESS/Trojan 用 `user:pass@` 是 **HTTP Basic 风格的 URI 语法糖*
   release 分支 (每日构建); 客户端侧数据源 [MetaCubeX/meta-rules-dat](https://github.com/MetaCubeX/meta-rules-dat)。
 - sing-box 源码: `option/route.go` / `option/options.go` / `option/http.go` (v1.14.2),
   `docs/configuration/route/*` 与 `docs/configuration/shared/http-client*` (字段版本号与语义)。
-- 端到端复现: 见仓库 `scripts/verify.py` (真实内核 **74/74**) 与 `backend/tests/` (**162 项**: 157 通过 / 5 跳过, 跳过多为 Linux 专属校验)。
+- 端到端复现: 见仓库 `scripts/verify.py` (真实内核 **77/77**) 与 `backend/tests/` (**175 项**: 169 通过 / 6 跳过, 跳过多为 Linux 专属校验或需要真实内核二进制)。
 
 原始取数结果保存在开发机的 `/tmp/zp-bin/competitors.json` (临时文件, 不入库)。

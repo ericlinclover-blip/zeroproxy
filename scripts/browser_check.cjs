@@ -52,8 +52,14 @@ function retargetCode(code, host) {
   const [prefix, payload] = code.split("~");
   const raw = JSON.parse(Buffer.from(payload.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8"));
   raw.h = host;
-  raw.p = 8447;
   raw.l = "美国落地";
+  // v2 配对码把 Reality 那组参数 (含端口) 挪进了 r, 端口要改在 r.p 上;
+  // 落地地址 h 与名称 l 仍在顶层 (v1 的端口就是顶层 p)。
+  if (raw.r && typeof raw.r === "object") {
+    raw.r.p = 8447;
+  } else {
+    raw.p = 8447;
+  }
   const raw2 = Buffer.from(JSON.stringify(raw), "utf8");
   const b64 = raw2.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   const sum = crypto.createHash("sha256").update(raw2).digest("hex").slice(0, 6);
@@ -529,6 +535,13 @@ async function main() {
     check("未开启时落地端卡片给出「生成配对码」入口",
       (await page.locator("#btn-chain-exit-gen").count()) === 1
       && /未开启/.test(await page.locator("#chain-exit-card").innerText()));
+    // v2.6.17: 落地端可以额外开放一条 QUIC (Hysteria 2) 内层 —— 跨洋链路走 UDP
+    // 没有 TCP over TCP, 是这一版提速的主开关。控件要能选, 且要写清要放行 UDP。
+    check("落地端卡片能选「内层 QUIC」(端口 + 开关 + 说明) (v2.6.17)",
+      (await page.locator("#chain-exit-hyport").count()) === 1
+      && (await page.locator("#chain-exit-hy").count()) === 1
+      && /内层 QUIC/.test(await page.locator("#chain-exit-card").innerText()),
+      await page.inputValue("#chain-exit-hyport"));
 
     // 落地端: 生成配对码 (专用凭据 = 独立 UUID + 独立端口)
     await page.fill("#chain-exit-port", "8666");
@@ -546,6 +559,47 @@ async function main() {
       /8666/.test(exitCard.text) && /专用凭据/.test(exitCard.text)
       && /配对码等同凭据/.test(exitCard.text) && /重新生成/.test(exitCard.text), "");
     await page.locator("#chain-exit-card").screenshot({ path: path.join(SHOT_DIR, "chain-exit.png") });
+
+    // v2.6.17: 入口端多了一个「内层传输」下拉。能不能选 QUIC 由配对码决定 (v2 带
+    // QUIC 凭据才放行), 前端只做"预览", 真正校验仍在服务端。
+    check("入口端有「内层传输」下拉 (Reality / QUIC) (v2.6.17)",
+      (await page.locator("#chain-transport").count()) === 1
+      && (await page.locator("#chain-transport option").count()) === 2,
+      await page.locator("#chain-transport-hint").innerText());
+    await page.fill("#chain-code", exitCard.code);   // 这份是 v1 码 (没勾内层 QUIC)
+    const v1Gate = await page.evaluate(() => ({
+      disabled: document.querySelector("#chain-transport-quic").disabled,
+      value: document.querySelector("#chain-transport").value,
+      hint: document.querySelector("#chain-transport-hint").innerText,
+    }));
+    check("v1 配对码下 QUIC 选项置灰, 并说清是落地端没开 (v2.6.17)",
+      v1Gate.disabled && v1Gate.value === "reality" && /没有 QUIC 凭据/.test(v1Gate.hint),
+      v1Gate.hint.slice(0, 34));
+    const detect = await page.evaluate(() => {
+      const b64 = (o) => btoa(JSON.stringify(o)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      const v1 = chainCodeInfo(`ZPC1~${b64({ v: 1, h: "1.2.3.4", p: 8447, l: "x" })}~abc123`);
+      const v2 = chainCodeInfo(
+        `ZPC1~${b64({ v: 2, h: "1.2.3.4", n: "sni.example.com", l: "x", r: { p: 8447 }, y: { p: 8448, w: "pw", n: "sni.example.com" } })}~abc123`);
+      return {
+        v1: !!(v1 && v1.v === 1), v2: !!(v2 && v2.v === 2 && v2.y && v2.y.p === 8448),
+        junk: chainCodeInfo("粘贴一坨不是配对码的东西") === null,
+      };
+    });
+    check("前端能解出配对码版本 (v1 无 QUIC / v2 带 QUIC 凭据 / 非码返回 null) (v2.6.17)",
+      detect.v1 && detect.v2 && detect.junk, JSON.stringify(detect));
+    await page.evaluate(() => {
+      const b64 = (o) => btoa(JSON.stringify(o)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      const box = document.querySelector("#chain-code");
+      box.value = `ZPC1~${b64({ v: 2, h: "1.2.3.4", n: "sni.example.com", l: "x", r: { p: 8447 }, y: { p: 8448, w: "pw", n: "sni.example.com" } })}~abc123`;
+      box.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    const v2Gate = await page.evaluate(() => ({
+      disabled: document.querySelector("#chain-transport-quic").disabled,
+      hint: document.querySelector("#chain-transport-hint").innerText,
+    }));
+    check("v2 配对码下 QUIC 可选, 且提示「跨洋建议选它」 (v2.6.17)",
+      !v2Gate.disabled && /QUIC|UDP/.test(v2Gate.hint), v2Gate.hint.slice(0, 34));
+    await page.fill("#chain-code", "");   // 清掉, 下面走真实那条(不通的)配对码
 
     await page.click("#btn-chain-exit-qr");
     await page.waitForSelector("#qr-mask:not(.hidden)");
@@ -591,6 +645,8 @@ async function main() {
         hasToggle: !!card.querySelector(".switch .slider"),
         hasDefault: !!card.querySelector("[data-chain-default]"),
         hasDelete: !!card.querySelector("[data-chain-del]"),
+        hasTransportBtn: !!card.querySelector("[data-chain-transport]"),
+        meta: (card.querySelector(".meta") || {}).innerText || "",
         toggled: !!card.querySelector("input:checked"),
       };
     });
@@ -598,6 +654,10 @@ async function main() {
       /203\.0\.113\.9:8447/.test(entryCard.text) && /运行中/.test(entryCard.text)
       && entryCard.hasToggle && entryCard.hasDefault && entryCard.hasDelete && entryCard.toggled,
       entryCard.text.split("\n").slice(0, 3).join(" · "));
+    // v1 配对码 = 落地端没开内层 QUIC → 没有 QUIC 凭据, 不该出现「改用 QUIC 内层」
+    // 这个按了也没用的按钮。
+    check("内层传输标在卡片上 (Reality/TCP), v1 码不给 QUIC 切换按钮 (v2.6.17)",
+      /内层 Reality\/TCP/.test(entryCard.meta) && !entryCard.hasTransportBtn, entryCard.meta);
 
     // v2.6.13: 这张卡原来复用节点表的 .node-card (5 列固定列宽), 结果"出口 IP …· …ms"
     // 那个药丸在 116px 的列里折成三行, 三个按钮塞不进 176px 的列往左压到结果文字上。
@@ -660,6 +720,25 @@ async function main() {
     check("链式测速失败会如实标红 (不假装成功)",
       probeResp.status() === 200 && /不通/.test(await page.locator("#chain-entries").innerText()),
       `HTTP ${probeResp.status()}`);
+
+    // v2.6.17: 面板原来只显示"整段探测耗时" (含起临时客户端 + 经链问一次回显服务,
+    // 天然是秒级), 用户会把几秒当成延迟。现在把「链路 RTT (入口→落地这一次 TCP
+    // 握手)」单独拎出来 —— 这条链不通时量不到 tcp_ms, 所以这里直接喂一份探测结果
+    // 渲染, 单独钉住这两个数字不会再混成一个。
+    const splitProbe = await page.evaluate(() => {
+      dash.chain.entries[0].last_probe = {
+        ts: Math.floor(Date.now() / 1000), ok: true, probe_ok: true,
+        exit_ip: "198.51.100.7", tcp_ms: 187.4, ms: 3120.5, detail: "经链路读回出口 IP",
+      };
+      renderChain(dash);
+      const card = document.querySelector("#chain-entries .chain-entry");
+      const pills = Array.from(card.querySelectorAll(".ping")).map((n) => n.textContent.trim());
+      return { pills, text: card.innerText.replace(/\s+/g, " ") };
+    });
+    check("链路 RTT 与探测总耗时分开显示 (不再拿秒级数字当延迟) (v2.6.17)",
+      splitProbe.pills.some((t) => /^出口 IP 198\.51\.100\.7$/.test(t))
+      && splitProbe.pills.some((t) => /链路 187ms/.test(t))
+      && /探测用时 3\.1s/.test(splitProbe.text), splitProbe.pills.join(" / "));
 
     // 断开 → 卡片与订阅里的节点一起消失
     await page.click(`[data-chain-del='${entryCard.id}']`);

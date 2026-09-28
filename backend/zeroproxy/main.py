@@ -17,7 +17,7 @@ from fastapi import FastAPI
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__, config, geodata, routes, services
+from . import __version__, chain_quic, config, geodata, routes, services
 
 #: GeoIP 数据自动更新的检查间隔 (6 小时检查一次; 是否真的下载由 TTL 决定)
 GEODATA_CHECK_INTERVAL = 6 * 3600
@@ -69,10 +69,16 @@ def _geodata_loop(stop: threading.Event) -> None:
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
-    """后台维护任务: GeoIP/GeoSite 数据自动更新 (0 配置的一部分)。"""
+    """后台维护任务: GeoIP/GeoSite 自动更新 + 链式内层 QUIC 进程看门。"""
     stop = threading.Event()
     worker = threading.Thread(target=_geodata_loop, args=(stop,), daemon=True, name="zp-geodata")
     worker.start()
+    # 链式内层 QUIC (Hysteria 2) 的进程由面板托管: systemd 重启面板会把子进程一起
+    # 收走, 这里在启动时对齐一次 (并把上次崩溃留下的孤儿清掉), 之后由看门线程兜底。
+    keeper = threading.Thread(
+        target=chain_quic.supervisor_loop, args=(stop,), daemon=True, name="zp-chain-quic"
+    )
+    keeper.start()
     try:
         yield
     finally:

@@ -30,6 +30,18 @@ def _sniffing() -> dict:
     return {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": False}
 
 
+def _sockopt() -> dict:
+    """TCP 层调优 (入站与出站共用)。
+
+    - `tcpFastOpen`: 有 TFO cookie 时把三次握手压掉一个 RTT。链式代理要连两跳,
+      每条新连接省下的这一个 RTT 就是实打实的体感 (香港→美国那一跳约 170ms);
+      服务端也已由 install.sh 打开 `net.ipv4.tcp_fastopen = 3`。
+    - `tcpNoDelay`: 关掉 Nagle, 小包立刻发 (面板/网页这类请求-响应最受益)。
+    - `tcpKeepAliveInterval`: 长连接定期探活, 运营商悄悄断流时能自己恢复。
+    """
+    return {"tcpFastOpen": True, "tcpNoDelay": True, "tcpKeepAliveInterval": 15}
+
+
 def _reality_inbound(state: dict) -> dict:
     r = state["reality"]
     return {
@@ -45,6 +57,7 @@ def _reality_inbound(state: dict) -> dict:
         "streamSettings": {
             "network": "tcp",
             "security": "reality",
+            "sockopt": _sockopt(),
             "tcpSettings": {"header": {"type": "none"}},
             "realitySettings": {
                 "show": False,
@@ -80,6 +93,7 @@ def _xhttp_inbound(state: dict) -> dict:
         "streamSettings": {
             "network": "xhttp",
             "security": "reality",
+            "sockopt": _sockopt(),
             "xhttpSettings": {
                 "host": host,
                 "path": x.get("path") or XHTTP_PATH,
@@ -111,6 +125,7 @@ def _ws_inbound(state: dict) -> dict:
         "streamSettings": {
             "network": "websocket",
             "security": "none",  # TLS 由 nginx (443 + Let's Encrypt) 终结
+            "sockopt": _sockopt(),
             "wsSettings": {"path": WS_PATH},
         },
         "sniffing": _sniffing(),
@@ -132,6 +147,7 @@ def _trojan_inbound(state: dict) -> dict:
         "streamSettings": {
             "network": "tcp",
             "security": "tls",
+            "sockopt": _sockopt(),
             "tlsSettings": {
                 "serverName": state["domain"] if _is_domain(state["domain"]) else "",
                 # Xray 25+ 的 TLSCertConfig 里 `certificate`/`key` 已改为 []string
@@ -209,6 +225,7 @@ def _reality_stream(state: dict) -> dict:
     return {
         "network": "tcp",
         "security": "reality",
+        "sockopt": _sockopt(),
         "tcpSettings": {"header": {"type": "none"}},
         "realitySettings": {
             "show": False,
@@ -257,7 +274,26 @@ def _chain_entry_inbound(state: dict, entry: dict) -> dict:
 
 
 def chain_entry_outbound(entry: dict) -> dict:
-    """中转端出站: 以 VLESS Reality 客户端身份连落地端。"""
+    """中转端出站: 连落地端。
+
+    内层传输由落地端的配对码决定 (入口端按条选):
+
+      * `reality` (默认) —— 本进程直接以 VLESS Reality 客户端身份连过去;
+      * `hysteria2` —— 交给本机那个托管的小 hysteria 客户端 (它把 SOCKS5 开在
+        127.0.0.1 上), 我们只做一次 socks 出站。QUIC 客户端是独立进程, 这样
+        不需要 Xray 侧支持 Hysteria 2 (它并不支持), 也不必为此退化成明文。
+    """
+    if (entry.get("transport") or "reality") == "hysteria2":
+        return {
+            "tag": f"chain-out-{entry['id']}",
+            "protocol": "socks",
+            "settings": {
+                "servers": [
+                    {"address": "127.0.0.1", "port": int(entry.get("hy_socks_port") or 0)}
+                ]
+            },
+            "streamSettings": {"network": "tcp", "sockopt": _sockopt()},
+        }
     return {
         "tag": f"chain-out-{entry['id']}",
         "protocol": "vless",
@@ -279,6 +315,8 @@ def chain_entry_outbound(entry: dict) -> dict:
         "streamSettings": {
             "network": "tcp",
             "security": "reality",
+            # 内层这一跳是整条链的瓶颈所在: TFO 省掉新连接的一个 RTT (跨洋约 170ms)
+            "sockopt": _sockopt(),
             "tcpSettings": {"header": {"type": "none"}},
             "realitySettings": {
                 "serverName": entry["sni"],

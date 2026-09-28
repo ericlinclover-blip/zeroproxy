@@ -1642,7 +1642,7 @@ function renderNodes() {
           ${
             n.chain && n.last_probe && n.last_probe.exit_ip
               ? `<div class="muted" style="font-size:11.5px;margin-top:2px">落地出口 IP ${esc(n.last_probe.exit_ip)}${
-                  n.last_probe.ms ? " · " + n.last_probe.ms + "ms" : ""
+                  n.last_probe.tcp_ms ? " · 链路 " + Math.round(n.last_probe.tcp_ms) + "ms" : ""
                 }</div>`
               : ""
           }
@@ -1759,7 +1759,9 @@ function chainEgress() {
     entries.find((e) => ((e.last_probe || {}).exit_ip || "").trim());
   if (!hit) return null;
   const p = hit.last_probe || {};
-  return { ip: p.exit_ip, label: hit.label || hit.host, ms: p.ms || 0 };
+  // tcp_ms 才是"入口→落地"这一跳的链路延迟; ms 是整段探测的总耗时 (起临时客户端 +
+  // 问一次回显服务), 拿它当延迟显示会把人吓到 (跨洋实测能到 1 秒以上)。
+  return { ip: p.exit_ip, label: hit.label || hit.host, ms: p.ms || 0, tcp_ms: p.tcp_ms || 0 };
 }
 
 function renderKpis() {
@@ -1782,7 +1784,7 @@ function renderKpis() {
     const e = chainEgress();
     eg.textContent = e ? e.ip : "—";
     $("#kpi-egress-sub").textContent = e
-      ? `链式 · ${e.label}${e.ms ? " · " + e.ms + "ms" : ""}`
+      ? `链式 · ${e.label}${e.tcp_ms ? " · 链路 " + Math.round(e.tcp_ms) + "ms" : ""}`
       : ((dash.chain && dash.chain.exit && dash.chain.exit.enabled) ? "本机是落地端, 等对方接入" : "链式代理未启用");
   }
   const kl = $("#kpi-lat");
@@ -2548,8 +2550,8 @@ function renderChainPath(d) {
   const exitHop = e
     ? `<div class="hop"><span class="who">落地 · ${esc(e.label || "出口")}</span><span class="id">${esc(e.host)}:${e.port}</span>
         <span class="meta">出口 IP ${esc(probe.exit_ip || "未探测")}${
-          probe.ms ? " · " + probe.ms + "ms" : ""
-        }${e.default_out ? " · 已设为默认出口" : ""}</span></div>`
+          probe.tcp_ms ? " · 链路 " + Math.round(probe.tcp_ms) + "ms" : ""
+        } · 内层 ${e.transport === "hysteria2" ? "QUIC" : "Reality"}${e.default_out ? " · 已设为默认出口" : ""}</span></div>`
     : `<div class="hop empty"><span class="who">落地 · 出口</span><span class="id">—</span>
         <span class="meta">${ex.enabled ? "本机可当别人的出口, 端口 " + ex.port : "本机既没接入也没开启落地端"}</span></div>`;
 
@@ -2557,7 +2559,11 @@ function renderChainPath(d) {
     client +
     `<div class="wire${e ? "" : " off"}"><i></i><span>${e ? "VLESS Reality" : "未接链"}</span><span class="mono">${e ? e.local_port + "/tcp" : ""}</span></div>` +
     entry +
-    `<div class="wire${e ? "" : " off"}"><i></i><span>专用凭据</span><span class="mono">${e ? e.port + "/tcp" : ""}</span></div>` +
+    `<div class="wire${e ? "" : " off"}"><i></i><span>${
+      e && e.transport === "hysteria2" ? "QUIC/UDP" : "专用凭据"
+    }</span><span class="mono">${
+      e ? (e.transport === "hysteria2" ? e.hy_port + "/udp" : e.port + "/tcp") : ""
+    }</span></div>` +
     exitHop;
 }
 
@@ -2579,6 +2585,16 @@ function chainExitCard(d, ex) {
           <input id="chain-exit-label" value="${escAttr(ex.label || "")}"
             placeholder="${escAttr(d.domain)}" spellcheck="false"></div>
       </div>
+      <div class="adv-grid">
+        <div class="field"><label>内层 QUIC 端口 (UDP, 可留空)</label>
+          <input class="mono" id="chain-exit-hyport" value="${ex.hy_port || 8448}" inputmode="numeric"></div>
+        <div class="field"><label>内层传输</label>
+          <label class="chk" style="margin:0"><input type="checkbox" id="chain-exit-hy"
+            ${ex.hy_enabled ? "checked" : ""}> 同时开放内层 QUIC (Hysteria 2)</label></div>
+      </div>
+      <div class="muted" style="font-size:12px;margin:-4px 0 10px;line-height:1.6">
+        内层 QUIC 是给跨洋链路的: 默认的 Reality 内层是 TCP over TCP, 长肥管道上
+        拥塞窗口爬得慢; 换 UDP 后没有双层重传互相拖累 (需要在安全组放行这个 UDP 端口)。</div>
       <div class="row" style="margin-top:4px">
         <button class="btn small" id="btn-chain-exit-gen">生成配对码</button>
         <span class="muted" style="font-size:12px">生成后把配对码贴到入口端服务器</span>
@@ -2598,12 +2614,27 @@ function chainExitCard(d, ex) {
     </div>
     <div class="divider"></div>
     <div class="kv"><span class="k">落地端口</span><span class="mono">${ex.port} / tcp</span></div>
+    <div class="kv"><span class="k">内层 QUIC</span><span class="mono">${
+      ex.hy_enabled
+        ? ex.hy_port + " / udp · " + (ex.hy_running ? "监听中" : "未在监听")
+        : "未开启 (内层走 Reality/TCP)"
+    }${ex.hy_enabled ? ` <button class="btn ghost small" id="btn-chain-exit-hy-off">关闭</button>` : ""}</span></div>
     <div class="kv"><span class="k">专用凭据</span><span class="mono">${esc(ex.credential || "")}… <span class="muted">与订阅凭据分开, 可单独作废</span></span></div>
     ${ex.label ? `<div class="kv"><span class="k">名称</span><span>${esc(ex.label)}</span></div>` : ""}
     <div class="kv"><span class="k">开启时间</span><span>${esc(fmtTime(ex.created_at))}</span></div>
+    ${
+      ex.hy_enabled
+        ? ""
+        : `<div class="row" style="margin-top:10px">
+      <input class="mono" id="chain-exit-hyport" value="${ex.hy_port || 8448}" inputmode="numeric"
+        style="width:110px">
+      <button class="btn ghost small" id="btn-chain-exit-hy-on">开放内层 QUIC (UDP)</button>
+      <span class="muted" style="font-size:12px">开启后要重新把配对码贴到入口端</span>
+    </div>`
+    }
     <div class="note">配对码等同凭据: 谁拿到都能把本机当出口用, 别公开发布; 万一泄露点「重新生成」即可
       (旧码立即作废, 你自己的订阅完全不受影响)。对方连不上, 多半是云安全组没放行
-      <span class="mono">${ex.port}/tcp</span>。</div>
+      <span class="mono">${ex.port}/tcp</span>${ex.hy_enabled ? ` 或 <span class="mono">${ex.hy_port}/udp</span>` : ""}。</div>
   </div>`;
 }
 
@@ -2624,6 +2655,14 @@ function chainPeerCard(d, entries) {
         <input id="chain-label" placeholder="例如 美国落地" spellcheck="false"></div>
       <div class="field"><label>本机对外端口 (留空自动分配)</label>
         <input class="mono" id="chain-local-port" placeholder="自动" inputmode="numeric"></div>
+    </div>
+    <div class="field"><label>内层传输 (两台服务器之间那一跳)</label>
+      <select id="chain-transport">
+        <option value="reality">Reality / TCP (默认, 免证书抗封锁)</option>
+        <option value="hysteria2" id="chain-transport-quic">QUIC / Hysteria 2 (UDP, 跨洋更快)</option>
+      </select>
+      <div class="muted" id="chain-transport-hint" style="font-size:11.5px;margin-top:5px">
+        粘贴配对码后这里会告诉你能不能选 QUIC。</div>
     </div>
     <label class="chk" style="margin-top:4px"><input type="checkbox" id="chain-default-out">
       设为默认出口: 本机所有节点整体改走这条链 (客户端不用换节点)</label>
@@ -2647,11 +2686,17 @@ function chainEntryCard(d, e) {
       }</span>`;
   } else {
     const cls = p.ok ? "ok" : "bad";
-    const head = p.ok
-      ? `出口 IP ${esc(p.exit_ip || "?")}${p.ms ? " · " + p.ms + "ms" : ""}`
-      : "不通";
-    probe = `<span class="ping ${cls}">${esc(head)}</span>
-      <span class="muted" style="font-size:12px">${esc(p.detail || "")}${p.ts ? " · " + esc(fmtTime(p.ts)) : ""}</span>`;
+    const head = p.ok ? `出口 IP ${esc(p.exit_ip || "?")}` : "不通";
+    // 链路 RTT (入口→落地这一次 TCP 握手) 与"整段探测耗时"分开: 前者才是用户
+    // 体感的那一跳, 后者含起临时客户端 + 经链问一次回显服务, 天然是秒级。
+    const rtt = p.tcp_ms
+      ? `<span class="ping other" title="入口→落地这一跳的 TCP 握手耗时">链路 ${Math.round(p.tcp_ms)}ms</span>`
+      : "";
+    const cost = p.ms ? ` · 探测用时 ${(p.ms / 1000).toFixed(1)}s` : "";
+    probe = `<span class="ping ${cls}">${esc(head)}</span>${rtt}
+      <span class="muted" style="font-size:12px">${esc(p.detail || "")}${cost}${
+        p.ts ? " · " + esc(fmtTime(p.ts)) : ""
+      }</span>`;
   }
   return `<div class="card chain-entry">
     <div class="top">
@@ -2662,7 +2707,16 @@ function chainEntryCard(d, e) {
         e.enabled ? "checked" : ""
       }><span class="slider"></span></label>
     </div>
-    <div class="meta">经落地 ${esc(e.host)}:${e.port} · SNI ${esc(e.sni || "")}</div>
+    <div class="meta">经落地 ${esc(e.host)}:${e.port} · 内层 ${
+      e.transport === "hysteria2"
+        ? `QUIC/UDP ${e.hy_port}${e.hy_bw ? " · Brutal " + e.hy_bw + "M" : ""}`
+        : "Reality/TCP"
+    } · SNI ${esc(e.sni || "")}</div>
+    ${
+      e.enabled && e.transport === "hysteria2" && e.hy_ready === false
+        ? `<div class="note">内层 QUIC 客户端没在跑 —— 点「重新应用」或看程序日志; 这条链现在多半是断的。</div>`
+        : ""
+    }
     <div class="addr mono">${esc(d.domain)}:${e.local_port} <span class="dot ${
       e.enabled ? "running" : "other"
     }"></span> <span class="muted">${e.enabled ? "运行中" : "已停用"}</span>${
@@ -2672,6 +2726,13 @@ function chainEntryCard(d, e) {
       <div class="ce-probe">${probe}</div>
       <div class="actions">
         <button class="btn ghost small" data-chain-probe="${escAttr(e.id)}">测速</button>
+        ${
+          e.has_quic || e.transport === "hysteria2"
+            ? `<button class="btn ghost small" data-chain-transport="${escAttr(e.id)}">${
+                e.transport === "hysteria2" ? "改回 Reality 内层" : "改用 QUIC 内层"
+              }</button>`
+            : ""
+        }
         <button class="btn ghost small" data-chain-default="${escAttr(e.id)}" data-on="${
           e.default_out ? "1" : "0"
         }">${e.default_out ? "取消默认出口" : "设为默认出口"}</button>
@@ -2730,9 +2791,34 @@ function bindChainExit(ex) {
       action: "generate",
       port: parseInt($("#chain-exit-port").value, 10) || undefined,
       label: $("#chain-exit-label").value.trim(),
+      hy_enabled: $("#chain-exit-hy").checked,
+      hy_port: parseInt($("#chain-exit-hyport").value, 10) || undefined,
     }, btn, "生成中…");
     return;
   }
+  // 已经开着落地端时, 内层 QUIC 可以单独开关 (不轮换凭据, 只是多一个 UDP 监听 /
+  // 少一个 UDP 监听)。开了之后配对码会从 v1 变 v2, 得重新贴到入口端才生效。
+  const hyOn = $("#btn-chain-exit-hy-on");
+  if (hyOn)
+    hyOn.onclick = () =>
+      applyAction(
+        "POST",
+        "/api/chain/exit",
+        { action: "generate", hy_enabled: true, hy_port: parseInt($("#chain-exit-hyport").value, 10) || undefined },
+        hyOn,
+        "开启中…"
+      );
+  const hyOff = $("#btn-chain-exit-hy-off");
+  if (hyOff)
+    hyOff.onclick = () =>
+      openConfirm({
+        title: "关闭内层 QUIC?",
+        okLabel: "关闭 (QUIC 密码作废)",
+        html: `<div class="qr-sub" style="text-align:left">落地端的 UDP 监听会下线, 用 QUIC 内层的入口端
+          会立刻断链 (改回 Reality 内层即可恢复)。<br>本机的 Reality 落地入站与自己的订阅完全不受影响。</div>`,
+        onOk: () =>
+          applyAction("POST", "/api/chain/exit", { action: "generate", hy_enabled: false }, hyOff, "关闭中…"),
+      });
   const code = ex.code || "";
   $("#btn-chain-exit-copy").onclick = () => copyText(code);
   $("#btn-chain-exit-qr").onclick = () =>
@@ -2774,6 +2860,7 @@ async function connectChain(force) {
     code,
     label: $("#chain-label").value.trim(),
     local_port: Number.isNaN(localPort) ? null : localPort,
+    transport: $("#chain-transport") ? $("#chain-transport").value : "reality",
     default_out: $("#chain-default-out").checked,
     force: !!force,
   };
@@ -2844,6 +2931,45 @@ async function connectChain(force) {
 function bindChainPeer() {
   const btn = $("#btn-chain-connect");
   if (btn) btn.onclick = () => connectChain(false);
+  const box = $("#chain-code");
+  if (box) {
+    box.addEventListener("input", updateChainTransportHint);
+    updateChainTransportHint();
+  }
+}
+
+/* 配对码的前端"预览": 只用来判断落地端有没有开内层 QUIC, 决定下拉框能不能选。
+ * 真正的校验仍然在服务端 (checksum / 字段合法性)。 */
+function chainCodeInfo(code) {
+  const parts = (code || "").trim().split("~");
+  if (parts.length !== 3 || parts[0] !== "ZPC1") return null;
+  try {
+    const b64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    const bytes = Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
+    const info = JSON.parse(new TextDecoder().decode(bytes));
+    return info && typeof info === "object" ? info : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function updateChainTransportHint() {
+  const sel = $("#chain-transport");
+  const hint = $("#chain-transport-hint");
+  const opt = $("#chain-transport-quic");
+  if (!sel || !hint || !opt) return;
+  const info = chainCodeInfo($("#chain-code").value);
+  const quic = !!(info && info.y && info.y.p && info.y.w);
+  opt.disabled = !quic;
+  if (quic) {
+    hint.textContent = "落地端开了内层 QUIC —— 跨洋链路建议选它 (UDP, 没有 TCP over TCP)。";
+  } else {
+    if (sel.value === "hysteria2") sel.value = "reality";
+    hint.textContent = info
+      ? "这份配对码里没有 QUIC 凭据 (落地端没开内层 QUIC), 只能走 Reality。"
+      : "";
+  }
 }
 
 function bindChainEntries(entries) {
@@ -2854,6 +2980,31 @@ function bindChainEntries(entries) {
   document.querySelectorAll("[data-chain-probe]").forEach((el) =>
     (el.onclick = () =>
       applyAction("POST", `/api/chain/entries/${el.dataset.chainProbe}/probe`, {}, el, "测速中…"))
+  );
+  document.querySelectorAll("[data-chain-transport]").forEach((el) =>
+    (el.onclick = () => {
+      const entry = entries.find((e) => e.id === el.dataset.chainTransport) || {};
+      const toQuic = entry.transport !== "hysteria2";
+      const doIt = () =>
+        applyAction(
+          "POST",
+          `/api/chain/entries/${el.dataset.chainTransport}`,
+          { transport: toQuic ? "hysteria2" : "reality" },
+          el,
+          "切换中…"
+        );
+      openConfirm({
+        title: toQuic ? `把「${entry.label || entry.host}」的内层换成 QUIC?` : `把内层换回 Reality?`,
+        okLabel: toQuic ? "改用 QUIC 内层" : "改回 Reality 内层",
+        html: toQuic
+          ? `<div class="qr-sub" style="text-align:left">这两台机器之间那一跳改成 <b>Hysteria 2 (QUIC/UDP)</b>:
+              跨洋链路上不再有两层 TCP 互相拖累, 单流速度通常明显好于 Reality 内层。<br>
+              落地端要放行配对码里的那个 UDP 端口; 切换会重启内核, 客户端连接会瞬断。</div>`
+          : `<div class="qr-sub" style="text-align:left">换回 <b>Reality (TCP)</b> 内层: 免证书、
+              抗封锁更强, 但跨洋长链路上单流速度不如 QUIC。切换会重启内核。</div>`,
+        onOk: doIt,
+      });
+    })
   );
   document.querySelectorAll("[data-chain-default]").forEach((el) =>
     (el.onclick = () => {
