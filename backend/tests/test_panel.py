@@ -204,6 +204,17 @@ def test_invalid_token_404(client, configured):
     assert client.get("/sub/definitely-wrong-token").status_code == 404
 
 
+def test_panel_index_revalidates(client):
+    """面板首页必须每次回源校验。
+
+    只带 Last-Modified/ETag 而不带 Cache-Control 时浏览器会启发式缓存, 升级后
+    面板可能还在跑旧版前端 —— 表现就是"明明修了按钮还是卡"。
+    """
+    response = client.get("/")
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-cache"
+
+
 # ---------------------------------------------------------------- 分流模板
 
 def _sub(client, configured, fmt="clash", extra=""):

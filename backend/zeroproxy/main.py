@@ -118,7 +118,11 @@ def create_app() -> FastAPI:
     def index():
         target = os.path.join(static_dir, "index.html")
         if os.path.exists(target):
-            return FileResponse(target)
+            # 前端必须跟随后端一起升级: 只带 Last-Modified/ETag 而没有 Cache-Control 时,
+            # 浏览器会做"启发式缓存" (最长可到文件年龄的 10%), 升级后面板可能还在跑几天
+            # 前那份 index.html —— 界面是旧的, 于是"明明修了按钮还是卡"。这里强制每次
+            # 都用 ETag 回源校验 (命中就是 304, 代价极小)。
+            return FileResponse(target, headers={"cache-control": "no-cache"})
         return JSONResponse(
             {"name": "ZeroProxy", "version": __version__, "hint": "static/index.html 缺失"},
             status_code=200,
