@@ -64,7 +64,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 68 项 (66 passed + 2 skipped) + `scripts/verify.py` (74 项) + `scripts/browser_check.cjs` (32 项) + `scripts/upgrade_sim.sh` (13 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 74 项 (72 passed + 2 skipped) + `scripts/verify.py` (74 项) + `scripts/browser_check.cjs` (33 项) + `scripts/upgrade_sim.sh` (13 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 
 竞品与技术调研见 `docs/RESEARCH.md`。
 
@@ -298,7 +298,8 @@ state.json (唯一事实来源, schema v3, 旧版本自动升级)
 - **仪表盘卡片**: 订阅三种格式 (各自复制 / 二维码)、5 张节点卡 (协议徽标 / 传输 / 加密 / 状态灯 /
   开关 / 单节点流量 / **握手延迟徽标** / 复制链接 / 二维码)、流量总览与节点占比、
   高级设置 (Reality SNI / Hysteria 伪装站点 / 各节点端口 / **GeoIP 分流开关与数据更新**)、
-  诊断与一键修复、证书与系统状态 (**含备份下载与恢复**)、**程序更新 (版本 / 一键更新 / 进度日志)**、操作审计。
+  诊断与一键修复、证书与系统状态 (**含证书申请 / 续期, 备份下载与恢复**)、
+  **程序更新 (版本 / 一键更新 / 进度日志)**、操作审计。
 - **失败不装成功**: 「一键生成」「保存并应用」「一键修复」的每一步失败都会顶到仪表盘顶部标红
   (含具体原因), 而不是只弹一句「完成」。
 
@@ -384,9 +385,10 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 
 在 macOS (Apple Silicon, Python 3.14) 上实测通过:
 
-- `python -m pytest tests -q` → **66 passed, 2 skipped** (带 `ZP_XRAY_BIN` 时 **68 passed**, 约 15 秒);
+- `python -m pytest tests -q` → **72 passed, 2 skipped** (带 `ZP_XRAY_BIN` 时 **74 passed**, 约 15 秒);
   含 `/api/update` 鉴权与版本比较、`apply` 的"写不进 /etc/nginx 即失败"语义、CLI 退出码、以及
-  `install.sh` 重跑不覆盖已初始化配置 / `upgrade.sh` 随包发布的回归断言。
+  `install.sh` 重跑不覆盖已初始化配置 / `upgrade.sh` 随包发布 / 自签证书可补签 Let's Encrypt /
+  `systemctl` 参数顺序的回归断言。
 - `scripts/verify.py` (Xray 26.3.27 + Hysteria 2.12.3 + mihomo 1.19.31 + sing-box 1.14.2) → **74/74 项通过**:
   setup 8 步全绿 / 三种订阅格式可被真实客户端解析 / 三档分流模板分别被 `mihomo -t` 与
   `sing-box check` 通过 / **用真实 sing-box 实跑** 5 份订阅 (通用 + 1.14+ 写法 × 智能/全局/直连) 全部启动成功,
@@ -396,7 +398,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   **启动期自愈闭环**: 配置带 geo 规则 + 数据文件消失 → 原样启动被 Xray 拒绝 (复现) → `geodata guard`
   重新生成 (已移除 geo 规则) → 再自检通过 / 备份-恢复往返一致且篡改被拒 /
   5 个节点握手探测全部成功 (Reality TLS 136ms, 出口 RTT 54ms)。
-- `scripts/browser_check.cjs` → **32/32 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
+- `scripts/browser_check.cjs` → **33/33 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
   二维码出图、诊断 8/8、节点测速结果落到卡片、GeoIP 开关与状态、**分流模板选择器 (切换 → 订阅内容
   真的变化 → 切回)**、备份下载、**程序更新卡片 (版本行 / 检查更新 / 非生产环境隐藏一键更新)**;
   无 console 错误、无失败请求。
@@ -482,7 +484,8 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 - **提示「引导令牌无效」?** 必须用安装完成时终端打印的、带 `?token=` 的链接打开面板。令牌文件在
   `/opt/zeroproxy/data/bootstrap_token`, 初始化成功后自动删除。
 - **certbot 申请失败?** 面板自动回退自签证书, WS / Trojan 节点带 `allowInsecure=1` 仍可用;
-  确认域名解析与 80 端口后点「续期」可切回 Let's Encrypt。
+  确认域名解析与 80 端口后, 在「系统 → TLS 证书」点「申请证书」再试一次 —— 自签状态下面板
+  也会真的去申请 (成功后会重新生成引用正式证书的 nginx / xray 配置并热重载, 不用重装)。
 - **Hysteria 2 连不上?** 检查 UDP 30001-32001 是否放行; 部分网络封 UDP, 改用前四个 TCP 节点。
 - **XHTTP 节点连不上?** 需要客户端支持 (mihomo 1.19+ / sing-box 1.11+ / 较新 v2rayN 系列);
   老客户端可用其他节点, 或在面板里关掉该节点。

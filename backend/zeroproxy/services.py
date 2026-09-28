@@ -250,13 +250,26 @@ def generate_hysteria_cert(host: str) -> tuple[bool, str]:
 
 
 def renew_cert(state: dict) -> tuple[bool, str]:
-    if state["cert"]["type"] != "letsencrypt" or not is_prod() or not shutil.which("certbot"):
-        return False, "无可续期的 Let's Encrypt 证书"
-    ok, out = run(["certbot", "renew", "--non-interactive", "--quiet"], timeout=300)
-    if ok:
+    """续期已有证书; 当前还是自签证书时, 补签一次 Let's Encrypt。
+
+    「部署时申请失败 → 回退自签 → 之后再也没有机会拿到正式证书」是个死角:
+    过去这里只要证书不是 letsencrypt 就直接拒绝, 而 /api/setup 又只能跑一次。
+    """
+    if not is_prod():
+        return False, "跳过 (非生产环境, 无 systemd)"
+    if not shutil.which("certbot"):
+        return False, "certbot 未安装 (apt-get install -y certbot 后重试)"
+    if (state.get("cert") or {}).get("type") == "letsencrypt":
+        ok, out = run(["certbot", "renew", "--non-interactive", "--quiet"], timeout=300)
+        if not ok:
+            return False, f"续期失败: {out[:200]}"
         ok2, _ = reload_service("nginx")
         return ok2, "证书已续期"
-    return False, f"续期失败: {out[:200]}"
+    ok, detail, cert_state = install_cert(state["domain"])
+    state["cert"] = cert_state
+    if cert_state.get("type") == "letsencrypt":
+        return True, detail
+    return False, detail or "Let's Encrypt 申请失败 (域名未解析? 80 端口未开放?)"
 
 
 def _cert_not_after(cert_file: str) -> int:

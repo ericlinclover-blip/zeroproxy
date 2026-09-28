@@ -725,10 +725,17 @@ def renew(request: Request):
         state = load_state()
         if not _require_auth(state, request):
             return _err("未登录", 401)
+        before = (state.get("cert") or {}).get("cert_file", "")
         ok, detail = services.renew_cert(state)
         config.audit(state, "renew_cert", detail, actor=_client_ip(request))
-        save_state(state)
-    return {"ok": ok, "detail": detail}
+        steps: list[dict] = []
+        if ok and (state.get("cert") or {}).get("cert_file", "") != before:
+            # 首次拿到 Let's Encrypt 证书: nginx / xray 里写的还是自签证书路径,
+            # 必须重新生成配置并热重载, 否则浏览器 / 客户端仍看到自签证书。
+            steps = _reapply(state, request)
+        else:
+            save_state(state)
+    return {"ok": ok, "detail": detail, "steps": steps}
 
 
 # ---------------------------------------------------------------- 诊断 / 自愈

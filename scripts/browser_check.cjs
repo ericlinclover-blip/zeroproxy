@@ -199,6 +199,9 @@ async function main() {
     check("检查更新按钮存在", (await page.locator("#btn-update-check").count()) === 1);
     check("非生产环境不显示一键更新按钮",
       await page.locator("#btn-update-run").isHidden());
+    check("自签证书下可点「申请证书」(不再禁用到没机会补签)",
+      (await page.locator("#btn-renew").innerText()).trim() === "申请证书"
+      && !(await page.locator("#btn-renew").isDisabled()));
 
     await page.screenshot({ path: path.join(SHOT_DIR, "dashboard-light.png"), fullPage: true });
     await page.click("#themeBtn");

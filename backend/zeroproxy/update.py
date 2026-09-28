@@ -26,12 +26,15 @@ from .config import paths
 DEFAULT_REPO = os.environ.get("ZP_REPO", "ericlinclover-blip/zeroproxy")
 DEFAULT_REF = os.environ.get("ZP_UPDATE_REF", "main")
 
-#: 版本号检查的多个镜像 (国内直连 GitHub 经常不通, 按顺序回退)
+#: 版本号检查的多个镜像 (国内直连 GitHub 经常不通, 按顺序回退)。
+#: 顺序很重要: jsDelivr 是 CDN, 命中缓存时会把旧版本号当"最新"返回 (实测发布后
+#: fastly.jsdelivr 仍返回上一版的号), 而 raw / gh-proxy 拿到的是仓库当前内容 ——
+#: 所以权威源在前, CDN 只作最后兜底。
 _MIRRORS = (
-    "https://fastly.jsdelivr.net/gh/{repo}@{ref}/backend/zeroproxy/__init__.py",
-    "https://cdn.jsdelivr.net/gh/{repo}@{ref}/backend/zeroproxy/__init__.py",
-    "https://gh-proxy.com/https://raw.githubusercontent.com/{repo}/{ref}/backend/zeroproxy/__init__.py",
     "https://raw.githubusercontent.com/{repo}/{ref}/backend/zeroproxy/__init__.py",
+    "https://gh-proxy.com/https://raw.githubusercontent.com/{repo}/{ref}/backend/zeroproxy/__init__.py",
+    "https://cdn.jsdelivr.net/gh/{repo}@{ref}/backend/zeroproxy/__init__.py",
+    "https://fastly.jsdelivr.net/gh/{repo}@{ref}/backend/zeroproxy/__init__.py",
 )
 
 _VERSION_RE = re.compile(r"""__version__\s*=\s*["']([0-9][^"']*)["']""")

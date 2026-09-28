@@ -806,6 +806,17 @@ def test_version_compare_helpers():
     assert update.is_newer("v2.2", "2.3.0") is False
 
 
+def test_update_mirrors_put_authoritative_sources_first():
+    """jsDelivr 是 CDN, 缓存未过期时会返回旧版本号 (实测发布后仍报上一版) ——
+    权威源必须排在前面, 否则面板会一直说"已是最新"。"""
+    from zeroproxy import update
+
+    hosts = [url.split("/")[2] for url in update._MIRRORS]
+    assert hosts[0] == "raw.githubusercontent.com"
+    assert hosts.index("raw.githubusercontent.com") < hosts.index("cdn.jsdelivr.net")
+    assert hosts.index("raw.githubusercontent.com") < hosts.index("fastly.jsdelivr.net")
+
+
 # ---------------------------------------------------------------- 配置落地闭环
 
 def test_apply_verify_listeners_skips_in_dev(client, configured):
@@ -887,6 +898,72 @@ def test_apply_cli_refuses_before_setup(home):
     from zeroproxy import apply
 
     assert apply._main([]) == 2
+
+
+# ---------------------------------------------------------------- 证书申请 / 续期
+
+def test_renew_requires_auth(client, home):
+    assert client.post("/api/renew").status_code == 401
+
+
+def test_renew_reports_skip_in_dev(client, configured):
+    """非生产环境没有 systemd / certbot, 明确说"跳过", 不假装成功。"""
+    body = client.post("/api/renew").json()
+    assert body["ok"] is False and "跳过" in body["detail"]
+    assert body["steps"] == []
+
+
+def test_renew_cert_issues_letsencrypt_when_selfsigned(configured, monkeypatch):
+    """自签证书的部署再点一次「申请证书」要真的去申请 —— 过去这里只会回一句"无可续期"。"""
+    import time
+
+    from zeroproxy import services
+
+    state = config.load_state()
+    assert state["cert"]["type"] == "selfsigned"
+    monkeypatch.setattr(services, "is_prod", lambda: True)
+    monkeypatch.setattr(services.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        services,
+        "install_cert",
+        lambda host: (
+            True,
+            "Let's Encrypt 证书已签发 (90 天, 自动续期)",
+            {
+                "type": "letsencrypt",
+                "issuer": "Let's Encrypt",
+                "cert_file": f"/etc/letsencrypt/live/{host}/fullchain.pem",
+                "key_file": f"/etc/letsencrypt/live/{host}/privkey.pem",
+                "not_after": int(time.time()) + 90 * 86400,
+            },
+        ),
+    )
+    ok, detail = services.renew_cert(state)
+    assert ok is True, detail
+    assert state["cert"]["type"] == "letsencrypt"
+    assert state["cert"]["cert_file"].startswith("/etc/letsencrypt/live/")
+
+
+def test_renew_endpoint_reapplies_configs_when_cert_changes(client, configured, monkeypatch):
+    """拿到正式证书后必须重新生成 nginx / xray 配置, 否则线上仍是自签证书。"""
+    from zeroproxy import services
+
+    def fake_renew(state):
+        state["cert"] = {
+            **state["cert"],
+            "type": "letsencrypt",
+            "issuer": "Let's Encrypt",
+            "cert_file": "/etc/letsencrypt/live/proxy.example.com/fullchain.pem",
+            "key_file": "/etc/letsencrypt/live/proxy.example.com/privkey.pem",
+        }
+        return True, "Let's Encrypt 证书已签发"
+
+    monkeypatch.setattr(services, "renew_cert", fake_renew)
+    body = client.post("/api/renew").json()
+    assert body["ok"] is True, body
+    assert body["steps"], body
+    assert all(s["ok"] for s in body["steps"]), body["steps"]
+    assert config.load_state()["cert"]["type"] == "letsencrypt"
 
 
 # ---------------------------------------------------------------- 升级脚本 / 文档
