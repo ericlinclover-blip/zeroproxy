@@ -2303,6 +2303,149 @@ def test_renew_endpoint_reapplies_configs_when_cert_changes(client, home, config
     assert config.load_state()["cert"]["type"] == "letsencrypt"
 
 
+# ---------------------------------------------------------------- 操作记录 (审计日志)
+
+def test_audit_ids_are_monotonic_and_repeats_coalesce(home):
+    """id 单调递增 (面板按它游标分页); 同一件事在窗口内重复只合并计数。
+
+    合并计数是为被扫描时准备的: 几百条一模一样的 login_failed 会把 500 条的
+    环形缓冲刷满, 把真正重要的操作挤出去。
+    """
+    state = config.load_state()
+    config.audit(state, "login", "user=admin", actor="1.2.3.4")
+    assert state["audit"][-1]["id"] == 1 and state["audit"][-1]["count"] == 1
+
+    config.audit(state, "login", "user=admin", actor="1.2.3.4")   # 立刻重复 → 合并
+    assert len(state["audit"]) == 1, "窗口内的重复不应该新增条目"
+    assert state["audit"][-1]["count"] == 2
+
+    # 出了 60 秒窗口 → 另起一条, id 继续递增而不是复用
+    state["audit"][-1]["ts"] -= config.AUDIT_COALESCE_S + 5
+    config.audit(state, "login", "user=admin", actor="1.2.3.4")
+    assert [e["id"] for e in state["audit"]] == [1, 2]
+
+    # 动作/来源不同就不会互相吞掉
+    config.audit(state, "login", "user=root", actor="1.2.3.4")
+    config.audit(state, "backup", "domain=a.example.com", actor="9.9.9.9")
+    assert [e["id"] for e in state["audit"]] == [1, 2, 3, 4]
+    assert [e["action"] for e in state["audit"]] == ["login", "login", "login", "backup"]
+
+
+def test_audit_query_paginates_by_cursor_without_gaps(home):
+    """游标分页 (before=上一页最后一条 id) 要又不重又不漏。"""
+    state = config.load_state()
+    for i in range(7):
+        config.audit(state, "login", f"user=u{i}", actor="1.2.3.4")
+
+    page1 = config.audit_query(state, limit=3)
+    assert [e["id"] for e in page1["entries"]] == [7, 6, 5]
+    assert page1["total"] == 7 and page1["has_more"] is True
+    assert page1["next_before"] == 5
+
+    page2 = config.audit_query(state, limit=3, before=page1["next_before"])
+    assert [e["id"] for e in page2["entries"]] == [4, 3, 2]
+
+    page3 = config.audit_query(state, limit=3, before=page2["next_before"])
+    assert [e["id"] for e in page3["entries"]] == [1]
+    assert page3["has_more"] is False
+
+    seen = [e["id"] for page in (page1, page2, page3) for e in page["entries"]]
+    assert seen == [7, 6, 5, 4, 3, 2, 1]
+
+
+def test_audit_query_filters_but_facets_stay_global(home):
+    """筛选只影响条目列表; 分类按钮上的数字是存量统计, 不随点击跳来跳去。"""
+    state = config.load_state()
+    config.audit(state, "login", "user=admin", actor="1.2.3.4")
+    config.audit(state, "login_failed", "user=admin", actor="9.9.9.9")
+    config.audit(state, "backup", "domain=a.example.com", actor="1.2.3.4")
+    config.audit(state, "chain_add", "chain-x", actor="1.2.3.4")
+
+    auth = config.audit_query(state, category="auth")
+    assert {e["action"] for e in auth["entries"]} == {"login", "login_failed"}
+    counts = {f["id"]: f["count"] for f in auth["facets"]}
+    assert counts["auth"] == 2 and counts["data"] == 1 and counts["chain"] == 1
+
+    failed = config.audit_query(state, only_failed=True)
+    assert [e["action"] for e in failed["entries"]] == ["login_failed"]
+
+    assert [e["action"] for e in config.audit_query(state, q="domain=")["entries"]] == ["backup"]
+
+    both = config.audit_query(state, category="auth", q="domain=")
+    assert both["entries"] == [] and both["total"] == 0, "分类与关键字是叠加的"
+
+
+def test_audit_overflow_archives_to_log_file(home):
+    """超过 AUDIT_MAX 的老记录滚进 data/audit.log, 不再无声丢弃。"""
+    state = config.load_state()
+    for i in range(config.AUDIT_MAX + 5):
+        config.audit(state, "login", f"user=u{i}", actor="1.2.3.4")
+
+    assert len(state["audit"]) == config.AUDIT_MAX
+    assert state["audit_dropped"] == 5
+
+    log = config.audit_log_path()
+    assert os.path.exists(log)
+    with open(log, encoding="utf-8") as fh:
+        archived = [json.loads(line) for line in fh]
+    assert [e["id"] for e in archived] == [1, 2, 3, 4, 5], "滚出去的按原顺序进归档"
+
+    stats = config.audit_query(state)["stats"]
+    assert stats["retained"] == config.AUDIT_MAX and stats["dropped"] == 5
+    assert stats["log"] == log
+
+
+def test_load_state_backfills_ids_for_legacy_audit(home):
+    """v2.6.15 之前的老 state 只有 ts/action/detail, 加载时要补 id 才能游标分页。"""
+    state = config.load_state()
+    state["audit"] = [
+        {"ts": 100, "action": "login", "detail": "user=admin", "actor": "1.2.3.4", "count": 1},
+        {"ts": 200, "action": "backup", "detail": "domain=a.example.com", "actor": "1.2.3.4", "count": 1},
+    ]
+    state["audit_seq"] = 0
+    config.save_state(state)
+
+    fresh = config.load_state()
+    assert [e["id"] for e in fresh["audit"]] == [1, 2]
+    assert fresh["audit_seq"] == 2
+
+    config.audit(fresh, "login", "user=admin", actor="1.2.3.4")
+    assert fresh["audit"][-1]["id"] == 3, "补号之后新记录要接着往下排"
+
+
+def test_audit_view_flags_risk_and_failure(home):
+    """风险动作单独标一下; 失败判定要认 `_failed` 之外那几个写法不规则的。"""
+    risky = config.audit_view({"id": 1, "ts": 0, "action": "restore", "count": 1})
+    assert risky["risk"] is True and risky["ok"] is True
+    assert risky["label"] == "从备份恢复" and risky["category"] == "data"
+
+    assert config.audit_view({"action": "login_failed"})["ok"] is False
+    assert config.audit_view({"action": "geodata_update_failed"})["ok"] is False
+
+    unknown = config.audit_view({"action": "brand_new_thing"})
+    assert unknown["category"] == "other" and unknown["label"] == "brand_new_thing"
+
+
+def test_audit_api_requires_auth(client, configured):
+    client.post("/api/logout")
+    assert client.get("/api/audit").status_code == 401
+    assert client.get("/api/audit?category=auth&q=x&failed=1").status_code == 401
+
+
+def test_audit_api_and_dashboard_expose_view_shape(client, configured):
+    """仪表盘顺带下发首屏的几条 + 分类数字; 更早的走独立接口。"""
+    dash = client.get("/api/dashboard").json()
+    assert dash["audit"], "初始化本身就该留下一条 setup 记录"
+    assert {"retained", "failed", "dropped", "max"} <= set(dash["audit_stats"])
+    fields = {"id", "ts", "action", "label", "category", "detail", "actor", "count", "ok", "risk"}
+    assert all(set(e) == fields for e in dash["audit"])
+    assert all(set(f) == {"id", "label", "count"} for f in dash["audit_facets"])
+
+    page = client.get("/api/audit?limit=5").json()
+    assert {"entries", "total", "has_more", "next_before", "facets", "stats"} <= set(page)
+    assert page["stats"]["retained"] >= 1
+
+
 # ---------------------------------------------------------------- 升级脚本 / 文档
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

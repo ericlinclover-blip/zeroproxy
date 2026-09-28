@@ -691,11 +691,24 @@ async function main() {
     await page.waitForSelector("#view-dash:not(.hidden)", { timeout: 20000 });
     check("用刚设置的凭据可登录", (await page.locator("#node-grid .node-card").count()) === 5, "");
 
+    await page.waitForTimeout(500);   // 等入场动画走完 (stagger 最多 400ms), 否则整页还是透明的
+    const themeA = await page.evaluate(() => ({
+      theme: document.documentElement.dataset.theme,
+      bg: getComputedStyle(document.body).backgroundColor,
+      card: getComputedStyle(document.querySelector("#sec-audit")).backgroundColor,
+    }));
     await page.screenshot({ path: path.join(SHOT_DIR, "dashboard-light.png"), fullPage: true });
     await page.click("#themeBtn");
-    await page.waitForTimeout(400);
+    await page.waitForTimeout(600);
+    const themeB = await page.evaluate(() => ({
+      theme: document.documentElement.dataset.theme,
+      bg: getComputedStyle(document.body).backgroundColor,
+      card: getComputedStyle(document.querySelector("#sec-audit")).backgroundColor,
+    }));
     await page.screenshot({ path: path.join(SHOT_DIR, "dashboard-dark.png"), fullPage: true });
-    check("深浅色切换 + 截图留存", true, SHOT_DIR);
+    check("深浅色切换真的换了主题与配色 (页面底色 + 卡片底色都变)",
+      themeA.theme !== themeB.theme && themeA.bg !== themeB.bg && themeA.card !== themeB.card,
+      `${themeA.theme} ${themeA.bg} → ${themeB.theme} ${themeB.bg} · 截图 ${SHOT_DIR}`);
 
     console.log("\n[3h] 后台落地任务的实时进度 (v2.6.9)");
     // 改配置 = 重新生成三份配置 → 重启内核 → 验端口, 真机上 2~4 秒, 而重启 Xray 会
@@ -722,6 +735,77 @@ async function main() {
       await page.evaluate(() => document.querySelector("#apply-strip").classList.contains("hidden")),
       ""
     );
+
+    console.log("\n[3i] 操作记录");
+    check("操作记录卡片渲染出条目",
+      (await page.locator("#audit-list .audit-row").count()) > 0,
+      `${await page.locator("#audit-list .audit-row").count()} 条`);
+    const auditText = (await page.locator("#audit-list").innerText()).trim();
+    check("动作显示成「中文名 + 代号」而不是一串英文",
+      /初始化部署/.test(auditText) && /setup/.test(auditText), auditText.split("\n").slice(0, 2).join(" / "));
+    check("记录按天分组", (await page.locator("#audit-list .audit-day").count()) > 0,
+      (await page.locator("#audit-list .audit-day").first().innerText()).trim());
+
+    // 造两条一模一样的失败: 错密码登录 —— 面板要记 login_failed, 并且 **合并计数**
+    // (被扫登录失败时, 几百条重复记录会把环形缓冲刷满, 把真正的操作挤出去)
+    const loginErrMark = consoleErrors.length;
+    const badLogin = () => page.evaluate(() => fetch("/api/login", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "admin", password: "definitely-wrong" }),
+    }).then((r) => r.status));
+    const firstBad = await badLogin();
+    await badLogin();
+    for (let i = consoleErrors.length - 1; i >= loginErrMark; i -= 1) {
+      if (/401 \(Unauthorized\)/.test(consoleErrors[i])) consoleErrors.splice(i, 1);   // 故意的错误密码
+    }
+    check("错密码被拒绝 (401)", firstBad === 401, `HTTP ${firstBad}`);
+
+    await page.click("#btn-audit-refresh");
+    await page.waitForFunction(
+      () => document.querySelector("#audit-list").innerText.includes("登录失败"),
+      { timeout: 10000 }
+    );
+    check("失败的动作合并计数 (×2) 而不是刷满列表",
+      /×2/.test(await page.locator("#audit-list").innerText()), "");
+
+    await page.check("#audit-failed");
+    await page.waitForFunction(() => {
+      const rows = [...document.querySelectorAll("#audit-list .audit-row")];
+      return rows.length > 0 && rows.every((r) => r.classList.contains("bad"));
+    }, { timeout: 10000 });
+    check("「只看失败」只剩失败项, 且都标红",
+      /登录失败/.test(await page.locator("#audit-list").innerText()),
+      `${await page.locator("#audit-list .audit-row").count()} 条`);
+    await page.uncheck("#audit-failed");
+
+    await page.click('#audit-chips .chip[data-cat="auth"]');
+    await page.waitForFunction(() => {
+      const rows = [...document.querySelectorAll("#audit-list .audit-row")];
+      return rows.length > 0 && rows.every((r) => /login|logout/.test(r.innerText));
+    }, { timeout: 10000 });
+    check("按分类筛选 (安全) 只留认证类动作",
+      /安全/.test(await page.locator("#audit-chips .chip.on").innerText()), "");
+
+    // 关键字搜索要穿过详情: 先回到「全部」—— 分类和搜索是叠加的, 停在"安全"分类
+    // 时 "domain=" 只在 setup/backup 的详情里, 永远搜不到 (这是面板本来的语义)。
+    await page.click('#audit-chips .chip[data-cat=""]');
+    await page.fill("#audit-q", "domain=");
+    await page.waitForFunction(() => {
+      const rows = [...document.querySelectorAll("#audit-list .audit-row")];
+      return rows.length > 0 && rows.every((r) => r.innerText.includes("domain="));
+    }, { timeout: 10000 });
+    check("关键字搜索能穿透到详情", true,
+      (await page.locator("#audit-list .audit-row").first().innerText()).replace(/\s+/g, " ").slice(0, 70));
+
+    await page.click("#btn-audit-refresh");     // 有筛选时它是「回到最近」
+    await page.waitForFunction(() => {
+      const on = document.querySelector("#audit-chips .chip.on");
+      return on && !on.dataset.cat && document.querySelector("#audit-q").value === "";
+    }, { timeout: 10000 });
+    check("「回到最近」清掉筛选并恢复默认视图",
+      (await page.locator("#audit-list .audit-row").count()) > 0, "");
 
     console.log("\n[4] 控制台与请求");
     check("无 console 错误", consoleErrors.length === 0, consoleErrors.slice(0, 3).join(" | "));

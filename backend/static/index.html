@@ -505,6 +505,74 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
 .reveal { opacity: 0; transform: translateY(8px); }
 .reveal.in { opacity: 1; transform: none; transition: opacity 0.4s var(--ease), transform 0.4s var(--ease); }
 
+/* ---------- 操作记录 ----------
+ * 一条记录 = 一个点 (成/败) + 时间 + 动作 (中文名 + 代号) + 详情 + 来源。
+ * 网格列宽固定, 详情列吃掉剩余空间并省略号收缩 —— 长 detail 不该把行撑成两行。 */
+.audit-tools { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+.audit-tools input[type="search"] {
+  width: auto; flex: 1 1 190px; margin: 0; padding: 7px 11px;
+  font-size: 12.5px; border-radius: 9px;
+}
+.audit-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip {
+  display: inline-flex; align-items: center; gap: 5px; cursor: pointer;
+  padding: 4px 10px; border-radius: 999px; font-size: 11.5px; font-weight: 600;
+  border: 1px solid var(--border); background: var(--card); color: var(--sub);
+  transition: background 0.18s, color 0.18s, border-color 0.18s;
+}
+.chip:hover { color: var(--text); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
+.chip.on {
+  background: color-mix(in srgb, var(--accent) 13%, transparent);
+  color: var(--accent); border-color: transparent;
+}
+.chip .n { font-variant-numeric: tabular-nums; opacity: 0.75; }
+.audit-list {
+  max-height: 396px; overflow: auto; overscroll-behavior: contain;
+  border: 1px solid var(--border-soft); border-radius: var(--radius); background: var(--card-2);
+}
+.audit-day {
+  position: sticky; top: 0; z-index: 1; padding: 6px 12px; font-size: 11px; font-weight: 650;
+  color: var(--sub); letter-spacing: 0.03em;
+  background: color-mix(in srgb, var(--card-2) 86%, transparent); backdrop-filter: blur(6px);
+  border-bottom: 1px solid var(--border-soft);
+}
+.audit-row {
+  display: grid; gap: 4px 10px; align-items: center; padding: 7px 12px;
+  grid-template-columns: 10px 64px minmax(120px, 1fr) minmax(0, 1.6fr) auto;
+  border-bottom: 1px solid var(--border-soft); font-size: 12.5px;
+}
+.audit-row:last-child { border-bottom: 0; }
+.audit-row:hover { background: var(--card); }
+.audit-row.bad { background: color-mix(in srgb, var(--err) 6%, transparent); }
+.audit-row .t {
+  font-family: var(--mono); font-size: 11.5px; color: var(--sub);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.audit-row .what { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.audit-row .what b { font-weight: 600; white-space: nowrap; }
+.audit-row .code {
+  font-family: var(--mono); font-size: 10.5px; color: var(--sub); opacity: 0.75;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.audit-row .detail {
+  color: var(--sub); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.audit-row .who {
+  font-family: var(--mono); font-size: 11px; color: var(--sub);
+  white-space: nowrap; max-width: 40vw; overflow: hidden; text-overflow: ellipsis;
+}
+.audit-row .times {
+  display: inline-block; min-width: 20px; padding: 1px 6px; border-radius: 6px;
+  background: var(--border-soft); color: var(--sub); font-size: 10.5px; font-weight: 650;
+}
+.audit-row .risk { color: var(--warn); font-size: 11px; }
+.audit-empty { padding: 22px 12px; text-align: center; color: var(--sub); font-size: 12.5px; }
+/* 窄屏: 一行放不下 5 列就落成"时间+来源" / "动作 + 详情"两行 */
+@media (max-width: 760px) {
+  .audit-row { grid-template-columns: 10px auto 1fr; }
+  .audit-row .detail { grid-column: 2 / -1; white-space: normal; word-break: break-all; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
   .reveal { opacity: 1; transform: none; }
@@ -570,6 +638,7 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
           <a href="#sec-adv"><span class="ic">⑃</span>高级 / 分流</a>
           <a href="#diag-card"><span class="ic">✓</span>诊断<span class="cnt" id="nav-diag">—</span></a>
           <a href="#sec-sys"><span class="ic">⚙</span>系统</a>
+          <a href="#sec-audit"><span class="ic">≡</span>操作记录<span class="cnt" id="nav-audit"></span></a>
           <a href="#update-card"><span class="ic">↑</span>程序更新<span class="cnt" id="nav-update"></span></a>
         </nav>
         <div class="side-foot">
@@ -783,10 +852,28 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
     </section>
 
     <section class="card reveal" id="sec-sys">
-      <div class="tile-head"><h2>系统</h2><span class="hint">服务版本 / 主机 / 操作记录</span></div>
+      <div class="tile-head"><h2>系统</h2><span class="hint">服务版本 / 主机 / 证书 / 备份</span></div>
       <div class="grid" id="sys-grid"></div>
-      <div class="divider"></div>
-      <div class="kv"><span class="k">操作记录</span><span class="muted" style="font-size:12.5px;text-align:right" id="audit-tail">—</span></div>
+    </section>
+
+    <section class="card reveal" id="sec-audit">
+      <div class="tile-head">
+        <h2>操作记录</h2>
+        <span class="hint">谁 · 什么时候 · 做了什么 · 结果</span>
+        <span class="grow"></span>
+        <span class="muted" style="font-size:11.5px" id="audit-summary">—</span>
+      </div>
+      <div class="audit-tools">
+        <div class="audit-chips" id="audit-chips"></div>
+        <input id="audit-q" type="search" placeholder="搜索动作 / 详情 / 来源" spellcheck="false" autocomplete="off">
+        <label class="chk"><input type="checkbox" id="audit-failed"> 只看失败</label>
+        <button class="btn ghost small" id="btn-audit-refresh">刷新</button>
+      </div>
+      <div class="audit-list" id="audit-list"></div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn ghost small hidden" id="btn-audit-more">加载更早的记录</button>
+        <span class="muted" style="font-size:11.5px" id="audit-note"></span>
+      </div>
     </section>
 
     <section class="card reveal" id="update-card">
@@ -1398,7 +1485,7 @@ function renderDash(quiet) {
   renderAdvanced(dash);
   renderChain(dash);
   renderSystem(dash);
-  renderAudit(dash.audit);
+  renderAudit(dash.audit, dash.audit_facets, dash.audit_stats, dash.audit_more);
   renderKpis();
   renderDashboardBanner();
   if (!updateInfo) loadUpdate(false);
@@ -1752,6 +1839,18 @@ function renderSidebar() {
     const r = diagRes;
     diag.textContent = !r ? "" : r.ok ? "✓" : `${(r.checks || []).filter((c) => !c.ok).length}`;
     diag.style.color = !r ? "" : r.ok ? "var(--ok)" : "var(--err)";
+  }
+
+  // 操作记录: 有失败就标红并只显示失败数, 否则显示保留的条数
+  const au = dash.audit_stats || {};
+  const navAudit = $("#nav-audit");
+  if (navAudit) {
+    const bad = au.failed || 0;
+    navAudit.textContent = bad ? String(bad) : (au.retained ? String(au.retained) : "");
+    navAudit.style.color = bad ? "var(--err)" : "";
+    navAudit.title = bad
+      ? `${bad} 条失败 / 共保留 ${au.retained || 0} 条`
+      : `共保留 ${au.retained || 0} 条操作记录`;
   }
 }
 
@@ -2228,13 +2327,172 @@ function renderSystem(d) {
   }
 }
 
-function renderAudit(entries) {
-  const el = $("#audit-tail");
-  if (!entries || !entries.length) { el.textContent = "—"; return; }
-  el.textContent = entries
-    .slice(0, 4)
-    .map((e) => `${fmtTime(e.ts)} ${e.action}${e.detail ? " (" + e.detail + ")" : ""}`)
-    .join("  |  ");
+/* ---------------- 操作记录 ----------------
+ * 谁 · 什么时候 · 做了什么 · 结果。这块的状态独立维护, 因为仪表盘每 20 秒会整块重画:
+ *   - 默认视图 (没筛选、没翻页) 直接用仪表盘顺带下发的那 20 条 + 各分类条数, 零额外请求;
+ *     自动刷新时跟着一起更新。
+ *   - 一旦筛选 / 搜索 / 翻页, 就切成"自己按 id 游标拉 /api/audit", 并且不再让仪表盘的重画
+ *     覆盖它 (清空筛选或点「刷新」即回到默认视图)。
+ *   - 分页用 id 游标而不是 offset: 翻页期间随时会来新记录, offset 会让第二页混进已看过的条目。
+ */
+const AUDIT_LIMIT = 30;
+let auditSt = {
+  category: "", q: "", failed: false, paged: false, userDriven: false,
+  before: 0, entries: [], facets: [], stats: {}, more: false,
+};
+
+function auditWhen(ts) {
+  const d = Math.max(0, Math.floor(Date.now() / 1000) - ts);
+  if (d < 60) return "刚刚";
+  if (d < 3600) return `${Math.floor(d / 60)} 分钟前`;
+  if (d < 86400) return `${Math.floor(d / 3600)} 小时前`;
+  if (d < 86400 * 7) return `${Math.floor(d / 86400)} 天前`;
+  return fmtTime(ts).slice(0, 10);
+}
+
+const auditClock = (ts) => new Date(ts * 1000).toLocaleTimeString("zh-CN", { hour12: false });
+
+function auditDay(ts) {
+  const d = new Date(ts * 1000), now = new Date();
+  const same = (a, b) =>
+    a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
+  if (same(d, now)) return "今天";
+  if (same(d, new Date(now.getTime() - 86400000))) return "昨天";
+  return d.toLocaleDateString("zh-CN", { year: "numeric", month: "long", day: "numeric" });
+}
+
+function auditRow(e) {
+  const times = e.count > 1
+    ? `<span class="times" title="短时间内重复 ${e.count} 次, 已合并计数">×${e.count}</span>` : "";
+  const risk = e.risk ? '<span class="risk" title="影响面较大的操作">◆</span>' : "";
+  const who = e.actor
+    ? `<span class="who" title="来源: ${escAttr(e.actor)}">${esc(e.actor)}</span>`
+    : '<span class="who">—</span>';
+  const tip = escAttr(`${fmtTime(e.ts)} · ${auditWhen(e.ts)} · ${e.ok ? "成功" : "失败"}`);
+  return `<div class="audit-row${e.ok ? "" : " bad"}">
+    <span class="dot ${e.ok ? "running" : "failed"}" title="${e.ok ? "成功" : "失败"}"></span>
+    <span class="t" title="${tip}">${esc(auditClock(e.ts))}</span>
+    <span class="what"><b>${esc(e.label)}</b>${risk}${times}<span class="code">${esc(e.action)}</span></span>
+    <span class="detail" title="${escAttr(e.detail)}">${esc(e.detail) || "—"}</span>
+    ${who}
+  </div>`;
+}
+
+function renderAuditView() {
+  const chips = $("#audit-chips");
+  const list = $("#audit-list");
+  if (!chips || !list) return;
+  const st = auditSt.stats || {};
+  const opts = [`<button class="chip${auditSt.category ? "" : " on"}" data-cat="">全部<span class="n">${st.retained || 0}</span></button>`]
+    .concat((auditSt.facets || []).map(
+      (f) => `<button class="chip${auditSt.category === f.id ? " on" : ""}" data-cat="${escAttr(f.id)}">${esc(f.label)}<span class="n">${f.count}</span></button>`
+    ));
+  chips.innerHTML = opts.join("");
+  chips.querySelectorAll(".chip").forEach((b) => {
+    b.onclick = () => {
+      auditSt.category = b.dataset.cat || "";
+      auditSt.paged = false;
+      auditMark();
+      auditLoad(true);
+    };
+  });
+
+  if (!auditSt.entries.length) {
+    list.innerHTML = `<div class="audit-empty">${auditSt.userDriven
+      ? "没有匹配的记录 (换个分类或关键字试试)"
+      : "还没有操作记录 — 登录、改配置、升级这些动作都会记在这里"}</div>`;
+  } else {
+    let html = "", day = "";
+    auditSt.entries.forEach((e) => {
+      const key = auditDay(e.ts);
+      if (key !== day) { day = key; html += `<div class="audit-day">${esc(key)}</div>`; }
+      html += auditRow(e);
+    });
+    list.innerHTML = html;
+  }
+
+  const parts = [];
+  if (st.retained) parts.push(`保留 ${st.retained} 条`);
+  if (st.failed) parts.push(`失败 ${st.failed}`);
+  if (st.dropped) parts.push(`已归档 ${st.dropped} 条`);
+  $("#audit-summary").textContent = parts.join(" · ") || "—";
+  $("#audit-note").textContent = st.dropped && st.log
+    ? `更早的记录滚动保存在服务器 ${st.log}` : "";
+  $("#btn-audit-more").classList.toggle("hidden", !auditSt.more);
+  const refresh = $("#btn-audit-refresh");
+  if (refresh) refresh.textContent = auditSt.userDriven ? "回到最近" : "刷新";
+}
+
+function auditMark() {
+  auditSt.userDriven = !!(auditSt.category || auditSt.q || auditSt.failed || auditSt.paged);
+}
+
+function bindAudit() {
+  if (bindAudit.done) return;
+  const q = $("#audit-q");
+  if (!q) return;
+  bindAudit.done = true;
+  let timer = null;
+  q.addEventListener("input", () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      auditSt.q = q.value.trim();
+      auditSt.paged = false;
+      auditMark();
+      auditLoad(true);
+    }, 260);
+  });
+  $("#audit-failed").addEventListener("change", (e) => {
+    auditSt.failed = e.target.checked;
+    auditSt.paged = false;
+    auditMark();
+    auditLoad(true);
+  });
+  $("#btn-audit-more").addEventListener("click", () => {
+    auditSt.paged = true;
+    auditMark();
+    auditLoad(false);
+  });
+  $("#btn-audit-refresh").addEventListener("click", () => {
+    if (!auditSt.userDriven) { auditSt.paged = false; auditMark(); auditLoad(true); return; }
+    // 有筛选时它是"回到最近": 清掉筛选与搜索框, 回到默认视图
+    auditSt.category = ""; auditSt.q = ""; auditSt.failed = false; auditSt.paged = false;
+    q.value = "";
+    $("#audit-failed").checked = false;
+    auditMark();
+    auditLoad(true);
+  });
+}
+
+async function auditLoad(reset) {
+  const qs = new URLSearchParams({ limit: String(AUDIT_LIMIT) });
+  if (auditSt.category) qs.set("category", auditSt.category);
+  if (auditSt.q) qs.set("q", auditSt.q);
+  if (auditSt.failed) qs.set("failed", "1");
+  if (!reset && auditSt.before) qs.set("before", String(auditSt.before));
+  try {
+    const body = await api("/api/audit?" + qs.toString());
+    auditSt.entries = reset ? (body.entries || []) : auditSt.entries.concat(body.entries || []);
+    auditSt.facets = body.facets || [];
+    auditSt.stats = body.stats || {};
+    auditSt.more = !!body.has_more;
+    auditSt.before = body.next_before || 0;
+    renderAuditView();
+  } catch (e) {
+    toast("读操作记录失败: " + e.message);
+  }
+}
+
+/** 仪表盘下发的那 20 条 (默认视图)。用户在用筛选时不要覆盖他的结果。 */
+function renderAudit(entries, facets, stats, more) {
+  bindAudit();
+  if (auditSt.userDriven) return;
+  auditSt.entries = entries || [];
+  auditSt.facets = facets || [];
+  auditSt.stats = stats || {};
+  auditSt.more = !!more;
+  auditSt.before = auditSt.entries.length ? auditSt.entries[auditSt.entries.length - 1].id : 0;
+  renderAuditView();
 }
 
 /* ---------------- 链式代理 ----------------

@@ -762,6 +762,8 @@ def _dashboard_body(state: dict, request: Request, traffic: dict | None = None) 
     if traffic is None:
         traffic = services.xray_stats(state)
     sub = share_links.subscription_url(request, state)
+    # 面板首屏要的只有"最近这几条 + 各分类的条数", 更早的走 /api/audit 按需拉
+    audit = config.audit_query(state, limit=20)
     return {
         "configured": state["configured"],
         "domain": state["domain"],
@@ -795,7 +797,10 @@ def _dashboard_body(state: dict, request: Request, traffic: dict | None = None) 
         "xhttp": state.get("xhttp", {}),
         "ports": state.get("ports", {}),
         "traffic": traffic,
-        "audit": list(reversed(state.get("audit", [])))[:20],
+        "audit": audit["entries"],
+        "audit_facets": audit["facets"],
+        "audit_stats": audit["stats"],
+        "audit_more": audit["has_more"],
         "system": _system_view(state),
     }
 
@@ -822,6 +827,34 @@ def dashboard(request: Request):
         body = _dashboard_body(state, request)
         body["steps"] = state.get("steps", [])
     return body
+
+
+@router.get("/api/audit")
+def audit_list(
+    request: Request,
+    limit: int = 50,
+    before: int = 0,
+    category: str = "",
+    q: str = "",
+    failed: int = 0,
+):
+    """操作记录的一页 (新的在前)。
+
+    为什么要有独立接口: 仪表盘每 20 秒拉一次, 把 500 条记录塞进去纯属浪费; 而
+    "翻到更早的记录 / 按分类和关键字筛"只有用户真去看的时候才需要。分页用 id 游标
+    而不是 offset —— 翻页期间随时会来新记录, offset 会让第二页混进已看过的条目。
+    """
+    state = load_state()
+    if not _require_auth(state, request):
+        return _err("未登录", 401)
+    return config.audit_query(
+        state,
+        limit=limit,
+        before=before or None,
+        category=category.strip(),
+        q=q.strip(),
+        only_failed=bool(failed),
+    )
 
 
 # ---------------------------------------------------------------- 配置修改

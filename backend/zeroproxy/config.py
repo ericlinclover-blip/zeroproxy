@@ -187,8 +187,10 @@ DEFAULTS: dict = {
     "sessions": {},
     # 登录失败限流: ip -> {"n": 连续失败次数, "until": 解封时间戳}
     "login_failures": {},
-    # 审计日志 (最近 200 条)
+    # 审计日志 (最近 500 条; 更老的滚动到 data/audit.log, 见 audit())
     "audit": [],
+    "audit_seq": 0,      # 审计记录的单调递增 id (面板按它做游标分页)
+    "audit_dropped": 0,  # 累计滚出缓冲区的条数 (面板如实显示"更早的已归档")
     "created_at": 0,
     "updated_at": 0,
     "steps": [],
@@ -337,6 +339,7 @@ def load_state() -> dict:
                 pass
         # 结构升级: 缺失键由 _merge 自动补齐, 这里统一标注版本号
         state["version"] = STATE_VERSION
+        ensure_audit_ids(state)      # 老记录的 id 补齐后才能按游标分页
         return state
 
 
@@ -370,10 +373,221 @@ def save_state(state: dict) -> None:
             pass
 
 
+# ---------------------------------------------------------------- 审计日志
+#
+# 面板上的「操作记录」是运维时最有用的一块信息 (谁在什么时候改了什么)。这里做四件事:
+#   1. 每条记录带**单调递增的 id** —— 面板按游标分页, 新记录不断进来也不会让翻页错位;
+#   2. 动作名 → 中文名 + 分类登记在**服务端** (AUDIT_ACTIONS): 面板只负责画, 新增一个
+#      动作不会留下"面板上还是一串英文代号"的尾巴;
+#   3. 同一条记录在窗口内重复发生就**合并计数** —— 被扫登录失败时, 几百条一模一样的
+#      login_failed 会把环形缓冲刷满, 把真正重要的操作挤出去;
+#   4. 滚出缓冲区的记录落到 data/audit.log (NDJSON), 不再无声丢弃。
+
+#: 动作 → (中文名, 分类)。分类决定面板上的筛选分组。
+AUDIT_ACTIONS: dict[str, tuple[str, str]] = {
+    "setup": ("初始化部署", "config"),
+    "login": ("登录面板", "auth"),
+    "login_failed": ("登录失败", "auth"),
+    "logout": ("退出登录", "auth"),
+    "logout_all": ("吊销全部会话", "auth"),
+    "settings": ("修改设置", "config"),
+    "toggle_node": ("启停节点", "config"),
+    "toggle_hopping": ("端口跳跃", "config"),
+    "apply": ("重新应用配置", "config"),
+    "repair": ("一键修复", "config"),
+    "chain_exit": ("落地端设置", "chain"),
+    "chain_add": ("接入落地端", "chain"),
+    "chain_update": ("修改落地端", "chain"),
+    "chain_probe": ("落地端测速", "chain"),
+    "chain_delete": ("断开落地端", "chain"),
+    "geodata_update": ("更新 GeoIP 数据", "data"),
+    "geodata_update_failed": ("GeoIP 更新失败", "data"),
+    "geodata_auto": ("自动更新 GeoIP", "data"),
+    "backup": ("导出备份", "data"),
+    "restore": ("从备份恢复", "data"),
+    "update": ("升级面板", "system"),
+    "renew_cert": ("证书续期", "system"),
+}
+
+#: 分类 → 中文名。字典顺序就是面板上筛选按钮的顺序。
+AUDIT_CATEGORIES: dict[str, str] = {
+    "auth": "安全",
+    "config": "配置",
+    "chain": "链路",
+    "data": "数据",
+    "system": "程序",
+    "other": "其它",
+}
+
+#: 失败的动作: 除了 `*_failed` 这个约定, 还有这几个写法不规则的。
+AUDIT_FAILING = {"login_failed", "geodata_update_failed"}
+
+#: 不可逆 / 影响面大的动作: 面板上单独标一下, 方便回看"谁动过这一下"。
+AUDIT_RISK = {"setup", "restore", "update", "logout_all", "chain_delete"}
+
+AUDIT_MAX = 500             # state.json 里保留的条数 (再老的滚进 audit.log)
+AUDIT_COALESCE_S = 60       # 同一条记录在这个窗口内重复出现就合并计数
+AUDIT_LOG_MAX = 1_000_000   # data/audit.log 超过 1 MB 时轮转一次 (audit.log.1)
+
+
+def audit_log_path() -> str:
+    return os.path.join(paths()["data_dir"], "audit.log")
+
+
+def _archive_audit(entries: list[dict]) -> None:
+    """把滚出环形的记录追加到 data/audit.log (每行一条 JSON)。
+
+    只写不读: 面板里查的是最近 500 条, 更早的用这个文件查 (grep / 直接下载)。
+    任何写失败都不能影响主流程 —— 审计是"尽量留痕", 不该让一次登录失败因为它报 500。
+    """
+    path = audit_log_path()
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > AUDIT_LOG_MAX:
+            os.replace(path, path + ".1")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.writelines(json.dumps(e, ensure_ascii=False) + "\n" for e in entries)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def ensure_audit_ids(state: dict) -> None:
+    """给老版本留下的、没有 id 的审计记录补上序号。
+
+    v2.6.15 之前的记录只有 ts/action/detail/actor; 没有 id 就没法按游标分页
+    (新记录一进来, 按条数翻页会错位)。这里按现有顺序补号并推进 audit_seq。
+    """
+    entries = state.get("audit")
+    if not isinstance(entries, list) or not entries:
+        return
+    if all(isinstance(e, dict) and int(e.get("id") or 0) > 0 for e in entries):
+        return
+    seq = int(state.get("audit_seq") or 0)
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        own = int(entry.get("id") or 0)
+        if own > seq:
+            seq = own
+            continue
+        seq += 1
+        entry["id"] = seq
+    state["audit_seq"] = seq
+
+
 def audit(state: dict, action: str, detail: str = "", actor: str = "") -> None:
     """追加一条审计记录 (仅改内存态, 由调用方决定何时 save_state)。"""
     entries = state.setdefault("audit", [])
+    now = int(time.time())
+    detail = detail[:200]
+    actor = actor[:64]
+
+    last = entries[-1] if entries else None
+    if (
+        isinstance(last, dict)
+        and last.get("action") == action
+        and last.get("detail") == detail
+        and last.get("actor") == actor
+        and now - int(last.get("ts") or 0) <= AUDIT_COALESCE_S
+    ):
+        # 同一件事在窗口内又发生了一次 (最典型的是被扫登录失败): 只加计数, 不再
+        # 追加新条目 —— 否则几百条重复记录会把 500 条的缓冲刷满, 把真正的操作挤出去
+        last["ts"] = now
+        last["count"] = int(last.get("count") or 1) + 1
+        return
+
+    # 只在真正追加时推进 id —— 被合并掉的那次不占号, 面板上的 id 才是连续的
+    seq = int(state.get("audit_seq") or 0) + 1
+    state["audit_seq"] = seq
     entries.append(
-        {"ts": int(time.time()), "action": action, "detail": detail[:200], "actor": actor[:64]}
+        {
+            "id": seq,
+            "ts": now,
+            "action": action[:48],
+            "detail": detail,
+            "actor": actor,
+            "count": 1,
+        }
     )
-    del entries[:-200]  # 只保留最近 200 条
+    overflow = len(entries) - AUDIT_MAX
+    if overflow > 0:
+        state["audit_dropped"] = int(state.get("audit_dropped") or 0) + overflow
+        _archive_audit(entries[:overflow])
+        del entries[:overflow]
+
+
+def audit_view(entry: dict) -> dict:
+    """把一条原始记录补成面板要的形态 (中文名 / 分类 / 成功与否 / 是否敏感)。"""
+    action = str(entry.get("action") or "")
+    label, category = AUDIT_ACTIONS.get(action, (action or "未知操作", "other"))
+    return {
+        "id": int(entry.get("id") or 0),
+        "ts": int(entry.get("ts") or 0),
+        "action": action,
+        "label": label,
+        "category": category,
+        "detail": str(entry.get("detail") or ""),
+        "actor": str(entry.get("actor") or ""),
+        "count": max(1, int(entry.get("count") or 1)),
+        "ok": not (action.endswith("_failed") or action in AUDIT_FAILING),
+        "risk": action in AUDIT_RISK,
+    }
+
+
+def audit_query(
+    state: dict,
+    *,
+    limit: int = 50,
+    before: int | None = None,
+    category: str = "",
+    q: str = "",
+    only_failed: bool = False,
+) -> dict:
+    """按条件取一页审计记录 (新的在前)。
+
+    `before` 是上一页最后一条的 id (游标): 用 id 而不是 offset, 是因为分页期间
+    随时可能来新记录 —— 用 offset 会让第二页里混进已看过的条目。
+    `facets` 统计的是**未经筛选**的存量, 这样筛选按钮上的数字不会随着点击跳来跳去。
+    """
+    limit = max(1, min(int(limit or 50), 200))
+    views = [
+        audit_view(e) for e in state.get("audit", []) if isinstance(e, dict)
+    ][::-1]
+
+    facets: list[dict] = []
+    for cid, cname in AUDIT_CATEGORIES.items():
+        n = sum(1 for v in views if v["category"] == cid)
+        if n:
+            facets.append({"id": cid, "label": cname, "count": n})
+
+    failed = sum(1 for v in views if not v["ok"])
+    rows = views
+    if category:
+        rows = [v for v in rows if v["category"] == category]
+    if only_failed:
+        rows = [v for v in rows if not v["ok"]]
+    if q:
+        needle = q.lower()
+        rows = [
+            v
+            for v in rows
+            if needle
+            in f"{v['action']} {v['label']} {v['detail']} {v['actor']} {v['category']}".lower()
+        ]
+    if before:
+        rows = [v for v in rows if v["id"] < int(before)]
+
+    page = rows[:limit]
+    return {
+        "entries": page,
+        "total": len(rows),
+        "has_more": len(rows) > len(page),
+        "next_before": page[-1]["id"] if page else 0,
+        "facets": facets,
+        "stats": {
+            "retained": len(views),
+            "failed": failed,
+            "dropped": int(state.get("audit_dropped") or 0),
+            "max": AUDIT_MAX,
+            "log": audit_log_path() if int(state.get("audit_dropped") or 0) else "",
+        },
+    }

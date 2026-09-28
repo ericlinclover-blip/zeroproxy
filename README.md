@@ -66,7 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 154 项 (149 passed + 5 skipped; 带 `ZP_XRAY_BIN` 时 154 全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (100 项) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 162 项 (157 passed + 5 skipped; 带 `ZP_XRAY_BIN` 时 162 全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (109 项) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 | **看得懂的界面 (v2.6.0)** | 控制台布局: 左侧锚点导航 (带计数角标 + 滚动高亮) + 顶部指标条 (健康节点 / 落地出口 IP / 平均延迟 + 迷你折线 / 运行时长) + 节点密集表格 (名称 / 地址状态 / **握手延迟条** / **上下行双轨** / 开关与复制) + **流量卡 (双弧圆环 + 实时速率曲线 + 逐节点双色流量条)** + 链式链路拓扑 (你的设备 → 本机入口 → 落地端) + 程序更新闭环; 动效全部走 `transform`/自绘 rAF 并受 `prefers-reduced-motion` 约束 |
 
@@ -223,7 +223,7 @@ GET /sub/{token}?format=singbox-next  → 同上, 但用 1.14+ 的 http_clients 
 | 文件 | `state.json` / 私钥 / 令牌均 0600; 状态写盘走「临时文件 + fsync + rename」原子替换 |
 | 并发 | `config.locked()` = 进程内 RLock + `fcntl.flock`, 读-改-写事务化 |
 | HTTP 头 | CSP (禁外域脚本与 iframe 嵌入)、`X-Content-Type-Options`、`X-Frame-Options: DENY`、`Referrer-Policy`、`Permissions-Policy`; 不开放 CORS 通配 |
-| 审计 | 最近 200 条操作记录 (setup / login / login_failed / settings / toggle / apply / repair / renew) |
+| 操作记录 (审计) | 最近 500 条 (更老的滚进 `data/audit.log` 归档); 每条带单调递增 id 供游标分页, 动作名与分类在服务端登记 (面板显示中文名), 同一件事 60 秒内重复只合并计数 |
 
 ---
 
@@ -758,6 +758,45 @@ overlay 层), 于是 `os.replace()` 直接从 `/tmp` 搬到 `/opt/zeroproxy/geo`
 中断残留会被清掉 + `atomic_install` 的 EXDEV 兜底 + 抛异常也要落进 state 与诊断); 同一条
 `scripts/geo_slow_check.cjs` 复跑不变。
 
+### 8.13 v2.6.16: 「操作记录」板块 —— 中文动作名 / 分类筛选 / 游标分页 / 合并计数 / 归档
+
+原来的「操作记录」只是仪表盘上跟在系统卡后面的一行文本: 一长串英文代号 (setup / apply /
+login_failed …), 混在一起不分类, 看不出哪条失败、哪条影响面大, 条数一多也没有翻页 —— 更早的
+还直接从 200 条的环形缓冲里被挤掉, 无声无息。这一版把这块做成一个独立的、能查的板块。
+
+**技术逻辑 (服务端)**
+
+* **id 游标分页**: 每条记录带一个单调递增的 `id` (`state.audit_seq`)。面板翻页用
+  `GET /api/audit?before=<上一页最后一条 id>`, 而不是 offset —— 翻页期间随时会来新记录, offset 会
+  让第二页里混进已看过的条目 / 漏掉新条目; 老的 `state.json` 里没有 id 的记录在 `load_state()`
+  时由 `ensure_audit_ids()` 按原顺序补齐 (补号只推进缺口, 新记录接着往下排)。
+* **动作登记在服务端** (`config.AUDIT_ACTIONS`): 22 个动作 → `(中文名, 分类)`。面板只负责画, 以后
+  新增动作不会在界面上留一串看不懂的英文代号。
+* **合并计数**: 同一条记录 (同一 action + detail + actor) 在 60 秒窗口内重复只累加 `count`, 不再
+  追加新条目 —— 被扫描时几百条一模一样的 `login_failed` 会把 500 条的缓冲刷满, 把真正重要的操作
+  挤出去。被合并掉的那次不占 id, 面板上的序号才是连续的。
+* **溢出归档**: 超过 500 条的老记录不再无声丢弃, 按原顺序逐行写进 `data/audit.log` (NDJSON; 超过
+  1 MB 轮转成 `.1`), `audit_dropped` 如实计数, 面板提示"更早的记录滚动保存在服务器 <路径>"。写归档
+  失败不影响主流程 —— 审计是"尽量留痕", 不该让一次登录失败因为它报 500。
+* **分类 / 关键字 / 只看失败**: `facets` (各分类条数) 统计的是**未筛选**的存量, 所以筛选按钮上的
+  数字不会随点击跳来跳去; 分类与关键字是叠加的。失败判定认 `*_failed` 之外那几个写法不规则的
+  (`login_failed` / `geodata_update_failed`); `setup` / `restore` / `update` / `logout_all` /
+  `chain_delete` 这些不可逆动作单独标 `risk`。
+
+**显示 (前端)**
+
+* 独立的「操作记录」卡片 (侧栏导航带角标: 有失败就显示失败数, 否则显示保留条数): 分类 chip (带条数) +
+  关键字搜索框 + 「只看失败」勾选 + 刷新 / 回到最近 + 分页「加载更早」。
+* 列表按**天**分组 (今天 / 昨天 / 具体日期, 日期条 sticky), 每行 5 列: 成败点 · 时间 · 「**中文名** ◆风险 ×N `英文代号`」· 详情 · 来源。
+* 默认视图直接用仪表盘顺带下发的 20 条 + 条数 (零额外请求, 跟着 20 秒自动刷新走); 一旦筛选 / 搜索 /
+  翻页就切成自己按 id 游标拉 `/api/audit`, 并且**不被自动刷新覆盖** (点「回到最近」清掉筛选回默认)。
+
+**回归**: `pytest` 154 → **162 项** (157 passed + 5 skipped, 新增 8 条: id 单调递增且窗口内重复
+合并计数 / 游标分页不重不漏 / 筛选只影响条目而 facets 保持存量 / 溢出滚进 `audit.log` 且计数正确 /
+老 state 加载补 id / 风险与失败标记 / `/api/audit` 未登录 401 / 仪表盘与独立接口的视图字段);
+`scripts/browser_check.cjs` 100 → **109 项** (新增 [3i] 操作记录: 中文名 + 代号 / 按天分组 /
+×2 合并计数 / 只看失败 / 分类筛选 / 关键字穿透详情 / 回到最近)。
+
 ---
 
 ## 9. API
@@ -768,6 +807,7 @@ overlay 层), 于是 `os.replace()` 直接从 `/tmp` 搬到 `/opt/zeroproxy/geo`
 | POST | `/api/setup` | 引导令牌 | `{domain, username, password, token}` → 完整部署流水线 |
 | POST | `/api/login` / `/api/logout` / `/api/logout-all` | — / 会话 | 会话 Cookie (72h, 登录限流) |
 | GET | `/api/dashboard` | 会话 | 节点 / 证书 / 系统 / 订阅 / 流量 / 审计 全量视图 |
+| GET | `/api/audit` | 会话 | 操作记录分页 (`?limit=&before=&category=&q=&failed=`) → `{entries, total, has_more, next_before, facets, stats}`。`before` 是上一页最后一条的 id (游标分页, 翻页期间来新记录也不会错位 / 漏项); `facets` 是**未筛选**的分类存量, 按钮上的数字不随点击跳动; 仪表盘只顺带下发最近 20 条 + facets, 更早的按需拉这里 |
 | POST | `/api/nodes/{id}/toggle` | 会话 | 节点启停 → 热重载 |
 | POST | `/api/hysteria/hopping` | 会话 | 端口跳跃开关 → 热重载 |
 | POST | `/api/settings` | 会话 | 改 Reality SNI / Hysteria 伪装站点 / 节点端口 / 分流模板 (含端口占用校验; 只改模板时不重载服务) |
@@ -854,7 +894,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 
 在 macOS (Apple Silicon, Python 3.14) 上实测通过:
 
-- `python -m pytest tests -q` → **149 passed, 5 skipped** (带 `ZP_XRAY_BIN` 时 **154 passed**, 约 31 秒);
+- `python -m pytest tests -q` → **157 passed, 5 skipped** (带 `ZP_XRAY_BIN` 时 **162 passed**, 约 31 秒);
   含 `/api/update` 鉴权与版本比较、`apply` 的"写不进 /etc/nginx 即失败"语义、CLI 退出码、以及
   `install.sh` 重跑不覆盖已初始化配置 / `upgrade.sh` 随包发布 / 自签证书可补签 Let's Encrypt /
   `systemctl` 参数顺序的回归断言 / Reality 密钥必须是成对的 X25519 (Ed25519 必须判无效) /
@@ -891,6 +931,11 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   v2.6.15 再补 4 项 (见 8.12): 下载的 staging 必须建在 geo 目录里 (跨文件系统 rename 会 Errno 18) /
   中断的下载残留会被下一次下载清掉 / `atomic_install` 跨盘时的拷贝兜底 / `update()` 抛异常时失败原因
   也要落进 state 与「一键诊断」。
+  v2.6.16 再补 8 项 (见 8.13, 操作记录): 审计 id 单调递增且 60 秒窗口内重复只合并计数 (被合并的那次
+  不占号) / `before` 游标分页不重不漏 / 分类与关键字只筛条目而 facets 保持**未筛选**存量 /
+  超 500 条滚进 `data/audit.log` 且 `audit_dropped` 计数正确 / 老 state 加载时补 id /
+  风险动作标 `risk`、失败动作 (`_failed` 与写法不规则的) 标 `ok=False` / `/api/audit` 未登录 401 /
+  仪表盘与独立接口下发的视图字段齐全。
 - `scripts/verify.py` (Xray 26.3.27 + Hysteria 2.12.3 + mihomo 1.19.31 + sing-box 1.14.2) → **77/77 项通过**:
   setup 8 步全绿 / 三种订阅格式可被真实客户端解析 / 三档分流模板分别被 `mihomo -t` 与
   `sing-box check` 通过 / **用真实 sing-box 实跑** 5 份订阅 (通用 + 1.14+ 写法 × 智能/全局/直连) 全部启动成功,
@@ -906,7 +951,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   出站指向落地端 `127.0.0.1:8666`; 客户端拿中转端凭据连进去, **真的从落地端出网并读回出口 IP**;
   反向用例: 把落地端的专用 UUID 换掉 (等价于配对码被轮换) 后同一条链立刻读不到 IP —— 证明确实是
   链路上的每一跳在起作用, 而不是"随便走哪条路都能出网"。
-- `scripts/browser_check.cjs` → **98/98 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
+- `scripts/browser_check.cjs` → **109/109 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
   诊断 8/8、节点测速结果落到卡片、GeoIP 开关与状态、**分流模板选择器 (切换 → 订阅内容
   真的变化 → 切回)**、备份下载、**程序更新卡片 (版本行 / 检查更新 / 非生产环境隐藏一键更新)**、
   **自动刷新不吞草稿 (正在编辑的 SNI / 端口在重渲染后原样保留、光标不丢、放弃后回到服务器值) /
@@ -927,7 +972,10 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   **连接中断不跳登录 (v2.6.8 的真机事故: 改配置重启内核会掐断走本机链路的浏览器) ——
   连接中断时留在仪表盘并给「正在重连」提示 / 重连后自动恢复 / 面板明确回 401 时才回登录页**;
   **后台落地任务的实时进度 (v2.6.9) —— 点「重新应用配置」立刻出现进度条 (第 n/6 步 + 步骤名 +
-  已用秒数, 接口不再阻塞) / 任务跑完给出结论 / 结论留几秒后自动收起**;
+ 已用秒数, 接口不再阻塞) / 任务跑完给出结论 / 结论留几秒后自动收起**;
+  **操作记录 (v2.6.16) —— 动作显示成「中文名 + 代号」而不是一串英文 / 按天分组 / 短时间内重复的
+  记录合并成 ×N 而不是刷满列表 / 「只看失败」只剩失败项且标红 / 按分类筛选 / 关键字搜索能穿透到
+  详情 (如 `domain=`) / 「回到最近」清掉筛选恢复默认视图**;
   无 console 错误、无失败请求。
   **v2.5.0 → v2.6.0 的两次界面改版 (Bento → 控制台侧栏 + 密集表格 + 流量可视化) 都只动布局与样式,
   这 81 条断言 (当时总数) 一条没改**: 节点表格从磁贴换成五列 grid 行、延迟与流量改成条形/双轨、
