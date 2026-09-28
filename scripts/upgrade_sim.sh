@@ -52,6 +52,12 @@ mkdir -p "$HOME_DIR/zeroproxy" "$HOME_DIR/static"
 cp -r "$OLD_SRC/backend/zeroproxy/." "$HOME_DIR/zeroproxy/"
 cp -r "$OLD_SRC/backend/static/." "$HOME_DIR/static/"
 cp "$OLD_SRC/backend/requirements.txt" "$HOME_DIR/requirements.txt"
+# 线上机器上 upgrade.sh 是装在 ZP_HOME 里、就地从那儿被拉起来的 —— 演练必须照做,
+# 否则测不出「脚本在运行中把自己覆盖掉」这类只在真机上炸的坑 (v2.3.11 就是这么炸的)
+git -C "$ROOT" show HEAD:upgrade.sh > "$HOME_DIR/upgrade.sh"
+chmod +x "$HOME_DIR/upgrade.sh"
+[ "$(git -C "$ROOT" show HEAD:uninstall.sh 2>/dev/null | head -c 2)" = "#!" ] \
+  && git -C "$ROOT" show HEAD:uninstall.sh > "$HOME_DIR/uninstall.sh" || true
 # 假机器也要有 venv: 优先直接借用项目 venv (依赖齐全); 否则造一个假的 venv/bin
 if [ -d "$ROOT/.venv" ]; then
   ln -s "$ROOT/.venv" "$HOME_DIR/venv"
@@ -146,9 +152,33 @@ exit 0
 SH
 chmod +x "$BIN_DIR"/*
 
-run_upgrade() { # run_upgrade <trigger>
-  PATH="$BIN_DIR:$PATH" ZP_HOME="$HOME_DIR" ZP_TRIGGER="$1" \
-    ZP_SIM_TARBALL="${2:-}" ZP_SYSTEMD_DIR="$SIM/systemd-units" bash "$ROOT/upgrade.sh"
+run_upgrade() { # run_upgrade <trigger> [tarball] [panel|file]
+  # 跑的一律是 ZP_HOME 里那份 (线上就是它); 输出留档, 好在断言里查"脚本有没有报语法错"
+  #   panel = 面板的起法 (脚本从 stdin 喂给 bash)
+  #   file  = 命令行就地起法 (bash /opt/zeroproxy/upgrade.sh)
+  local trigger="$1" tarball="${2:-}" mode="${3:-file}"
+  local -a runner
+  local self_dir=""
+  if [ "$mode" = "panel" ]; then
+    # 面板起法 (update.py stage_script): 先把脚本复制到私有临时目录, 再跑那份副本。
+    # 副本必须换个 inode —— 就地执行 / `bash -s < 原文件` 都会因为脚本覆盖自己而读出语法错。
+    STAGE="$(mktemp -d "${TMPDIR:-/tmp}/zeroproxy-update-sim.XXXXXX")"
+    cp "$HOME_DIR/upgrade.sh" "$STAGE/upgrade.sh"
+    chmod +x "$STAGE/upgrade.sh"
+    runner=(/bin/bash "$STAGE/upgrade.sh")
+    self_dir="$STAGE"
+  else
+    runner=(/bin/bash "$HOME_DIR/upgrade.sh")
+  fi
+  PATH="$BIN_DIR:$PATH" ZP_HOME="$HOME_DIR" ZP_TRIGGER="$trigger" \
+    ZP_SIM_TARBALL="$tarball" ZP_SYSTEMD_DIR="$SIM/systemd-units" ZP_SELF_DIR="$self_dir" \
+    "${runner[@]}" 2>&1 | tee "$SIM/upgrade-$trigger-$mode.log"
+  return "${PIPESTATUS[0]}"
+}
+
+#: 跑完一次升级后, 机器上的 upgrade.sh 已经是新版本了 —— 用来断言"脚本覆盖自己也不会炸"
+no_script_error() { # no_script_error <日志>
+  ! grep -qE "syntax error|unexpected token" "$1"
 }
 
 # 升级过程中每 50ms 采一次进度文件 —— 用来证明"进度是边跑边写的", 而不是跑完才写一次
@@ -172,11 +202,11 @@ PY
 }
 
 # ---------- 5. 正常升级 ----------
-section "[2] 正常升级 (真实 upgrade.sh)"
+section "[2] 正常升级 (真实 upgrade.sh, 面板起法: 从私有临时副本启动)"
 WATCH_LOG="$SIM/progress-samples.txt"
 : > "$WATCH_LOG"
 watch_progress 0.05 "$WATCH_LOG"
-set +e; run_upgrade sim "$SIM/new.tar.gz"; UPGRADE_RC=$?; set -e
+set +e; run_upgrade sim "$SIM/new.tar.gz" panel; UPGRADE_RC=$?; set -e
 kill "$WATCH_PID" 2>/dev/null || true
 wait "$WATCH_PID" 2>/dev/null || true
 echo "    退出码 $UPGRADE_RC"
@@ -193,6 +223,47 @@ else
 fi
 [ -f "$HOME_DIR/zeroproxy/apply.py" ] && ok "新代码已就位 (apply.py 存在)" || bad "新代码缺失 (没有 apply.py)"
 [ -x "$HOME_DIR/upgrade.sh" ] && ok "upgrade.sh 随升级装到 ZP_HOME 且可执行" || bad "ZP_HOME/upgrade.sh 缺失或不可执行"
+no_script_error "$SIM/upgrade-sim-panel.log" \
+  && ok "升级全程无脚本错误 (老机器上的旧 upgrade.sh 也不炸 —— 跑的是副本, 不是会被覆盖的那份)" \
+  || bad "升级过程里脚本报错: $(grep -m1 -E 'syntax error|unexpected token' "$SIM/upgrade-sim-panel.log")"
+
+# ---------- 5b. 再就地升一次 (脚本会在运行中覆盖自己) ----------
+section "[2b] 就地再升级一次 (bash /opt/zeroproxy/upgrade.sh)"
+set +e; run_upgrade sim "$SIM/new.tar.gz" file; INPLACE_RC=$?; set -e
+echo "    退出码 $INPLACE_RC"
+
+section "[断言]"
+[ "$INPLACE_RC" = "0" ] && ok "就地升级退出码 0" || bad "就地升级退出码 $INPLACE_RC (期望 0)"
+no_script_error "$SIM/upgrade-sim-file.log" \
+  && ok "就地执行也没被「覆盖自己」打断 (脚本先整份读进内存再跑)" \
+  || bad "就地执行被自我覆盖打断: $(grep -m1 -E 'syntax error|unexpected token' "$SIM/upgrade-sim-file.log")"
+if "$PYTHON" - "$HOME_DIR/data/update.json" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+assert data["state"] == "success", data
+assert data["current"] == "", data
+assert data["plan"] == [s["name"] for s in data["steps"]], (data["plan"], data["steps"])
+PY
+then
+  ok "就地升级后状态是 success 且 plan 与 steps 同序对齐"
+else
+  bad "就地升级后 update.json 内容不符合预期"
+fi
+
+# ---------- 5c. 新脚本再走一次面板方式 (验证临时副本会自己收尾) ----------
+section "[2c] 面板方式再升一次 (新脚本: 副本应自己清掉)"
+set +e; run_upgrade sim "$SIM/new.tar.gz" panel; PANEL2_RC=$?; set -e
+echo "    退出码 $PANEL2_RC"
+
+section "[断言]"
+[ "$PANEL2_RC" = "0" ] && ok "面板方式升级退出码 0" || bad "面板方式升级退出码 $PANEL2_RC (期望 0)"
+no_script_error "$SIM/upgrade-sim-panel.log" \
+  && ok "新脚本走面板方式也无脚本错误" \
+  || bad "新脚本走面板方式报错: $(grep -m1 -E 'syntax error|unexpected token' "$SIM/upgrade-sim-panel.log")"
+[ ! -d "$STAGE" ] && ok "临时副本已随升级收尾清掉 ($STAGE)" \
+  || bad "临时副本残留: $STAGE"
 
 cp "$HOME_DIR/data/state.json" "$SIM/state-after.json"
 if "$PYTHON" - "$SIM/state-before.json" "$SIM/state-after.json" <<'PY'

@@ -5,6 +5,7 @@
     所以面板内升级与 README 里那条 curl 命令走的是**同一条代码路径**;
   * 升级脚本会重启面板进程, 因此不能在请求线程里同步执行: 用 systemd 的
     瞬时单元 (systemd-run) 把它放到独立 cgroup 里跑, 面板重启不会杀掉它;
+  * 脚本永远**从临时副本**启动而不是就地执行 —— 见 `stage_script()`;
   * 进度落在 `$ZP_HOME/data/update.json` + `data/update.log`, 面板重启后照常
     能读到「上次升级做了什么、结果是成功还是失败」。
 """
@@ -15,6 +16,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -119,6 +121,45 @@ def upgrade_script() -> str:
     return ""
 
 
+def stage_script(script: str) -> str:
+    """把 upgrade.sh 复制到一个私有临时目录, 返回副本路径 (面板执行的是副本)。
+
+    bash 是**按文件偏移增量读取**脚本的, 而 upgrade.sh 会在「安装新代码」那步把自己
+    就地覆盖成新版本 (同一个 inode) —— 覆盖之后 bash 从"新文件"的同一偏移继续读, 读到的
+    是另一段代码, 于是 `syntax error near unexpected token` 把整次升级打断
+    (真机 v2.3.10 → v2.3.11 就是这么炸的, 靠自动回滚兜住)。
+
+    从副本启动就完全没有这个问题 (副本是另一个 inode, 谁来覆盖 ZP_HOME 里那份都无所谓),
+    于是**连还没打补丁的旧 upgrade.sh 也能被面板安全升级** —— 用户不必先去命令行换脚本。
+    注: `bash -s < 原文件` 不算数, 那个 fd 指向的还是同一个 inode。新版本脚本自己也做了
+    一份「先整份读进内存」的兜底 (命令行就地执行时靠它), 见仓库里的 upgrade.sh。
+    """
+    staged_dir = tempfile.mkdtemp(prefix="zeroproxy-update-")
+    staged = os.path.join(staged_dir, "upgrade.sh")
+    shutil.copyfile(script, staged)
+    os.chmod(staged, 0o755)
+    return staged
+
+
+def prune_staged(max_age: float = 86400.0) -> None:
+    """清掉过期的暂存目录 (老脚本不会自己删, 正常路径由新脚本的 ZP_SELF_DIR 收尾)。"""
+    root = tempfile.gettempdir()
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return
+    now = time.time()
+    for name in entries:
+        if not name.startswith("zeroproxy-update-"):
+            continue
+        path = os.path.join(root, name)
+        try:
+            if now - os.path.getmtime(path) > max_age:
+                shutil.rmtree(path, ignore_errors=True)
+        except OSError:
+            continue
+
+
 def is_running() -> bool:
     status = _read_status()
     if status.get("state") not in ("queued", "running"):
@@ -179,6 +220,8 @@ def start(trigger: str = "panel", timeout: int = 30) -> tuple[bool, str]:
         return False, "已有升级任务在进行中"
 
     os.makedirs(os.path.dirname(paths()["update_log"]), exist_ok=True)
+    prune_staged()
+    staged = stage_script(script)
     _write_status(
         {
             "state": "queued",
@@ -201,6 +244,7 @@ def start(trigger: str = "panel", timeout: int = 30) -> tuple[bool, str]:
         "ZP_TRIGGER": trigger,
         "ZP_REPO": DEFAULT_REPO,
         "ZP_REF": DEFAULT_REF,
+        "ZP_SELF_DIR": os.path.dirname(staged),
     }
     runner = shutil.which("systemd-run")
     if runner:
@@ -215,11 +259,12 @@ def start(trigger: str = "panel", timeout: int = 30) -> tuple[bool, str]:
             f"--setenv=ZP_TRIGGER={trigger}",
             f"--setenv=ZP_REPO={DEFAULT_REPO}",
             f"--setenv=ZP_REF={DEFAULT_REF}",
+            f"--setenv=ZP_SELF_DIR={os.path.dirname(staged)}",
             "/bin/bash",
-            script,
+            staged,
         ]
     else:  # pragma: no cover - 极老系统兜底 (面板重启可能打断升级)
-        cmd = ["/bin/bash", script]
+        cmd = ["/bin/bash", staged]
 
     try:
         proc = subprocess.run(

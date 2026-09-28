@@ -65,7 +65,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 93 项 (89 passed + 4 skipped; 带 `ZP_XRAY_BIN` 时 93 全通过) + `scripts/verify.py` (74 项) + `scripts/browser_check.cjs` (66 项) + `scripts/upgrade_sim.sh` (14 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 94 项 (90 passed + 4 skipped; 带 `ZP_XRAY_BIN` 时 94 全通过) + `scripts/verify.py` (74 项) + `scripts/browser_check.cjs` (66 项) + `scripts/upgrade_sim.sh` (21 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 
 竞品与技术调研见 `docs/RESEARCH.md`。
@@ -435,7 +435,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 
 在 macOS (Apple Silicon, Python 3.14) 上实测通过:
 
-- `python -m pytest tests -q` → **89 passed, 4 skipped** (带 `ZP_XRAY_BIN` 时 **93 passed**, 约 20 秒);
+- `python -m pytest tests -q` → **90 passed, 4 skipped** (带 `ZP_XRAY_BIN` 时 **94 passed**, 约 20 秒);
   含 `/api/update` 鉴权与版本比较、`apply` 的"写不进 /etc/nginx 即失败"语义、CLI 退出码、以及
   `install.sh` 重跑不覆盖已初始化配置 / `upgrade.sh` 随包发布 / 自签证书可补签 Let's Encrypt /
   `systemctl` 参数顺序的回归断言 / Reality 密钥必须是成对的 X25519 (Ed25519 必须判无效) /
@@ -443,6 +443,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   深度体检客户端在自签场景下不发已被 Xray 26 移除的 `allowInsecure` (改用 `pinnedPeerCertSha256`) /
   深度体检必须把 SOCKS5 回复读满 (只读 4 字节会让 TLS 报 `WRONG_VERSION_NUMBER`) /
   服务版本探测要跳过 Hysteria 2 的块字符 banner (否则面板挂一串花屏方块)。
+  **升级脚本必须从临时副本启动** (脚本会在运行中覆盖自己, 就地执行会被 bash 读出语法错)。
 - `scripts/verify.py` (Xray 26.3.27 + Hysteria 2.12.3 + mihomo 1.19.31 + sing-box 1.14.2) → **74/74 项通过**:
   setup 8 步全绿 / 三种订阅格式可被真实客户端解析 / 三档分流模板分别被 `mihomo -t` 与
   `sing-box check` 通过 / **用真实 sing-box 实跑** 5 份订阅 (通用 + 1.14+ 写法 × 智能/全局/直连) 全部启动成功,
@@ -464,13 +465,16 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   那一步 / 进度条按已完成步数推进 / 「已完成 n/N 步 · 已用 X 秒」/ 完成态版本跨度与用时并折叠步骤 /
   本页 JS 落后时给出「重新加载面板」/ 失败态标出断在第几步 + 进度条转红 + 日志尾巴)**;
   无 console 错误、无失败请求。
-- `scripts/upgrade_sim.sh` → **14/14 项通过**: 在模拟的"已部署机器"上真跑 `upgrade.sh` ——
+- `scripts/upgrade_sim.sh` → **21/21 项通过**: 在模拟的"已部署机器"上真跑 `upgrade.sh` ——
   备份 → 换代码 → 按 `state.json` 重新落地配置 (把占位配置修回真实配置) → 写 `update.json` /
   `update.log`; 并覆盖失败路径: 下载失败时非 0 退出、代码自动回滚到升级前版本、状态记为 failed、
   现有部署与 `state.json` 的密钥 / 订阅令牌一字未动。
   还专门断言**进度是边跑边写的** (50ms 采样 `update.json`: 观察到 12 种中间快照、17 次
   `running` 态, 完成步数从 1 一路涨到 8), 以及 `plan` 与 `steps` 同序对齐、收尾 `current` 为空 ——
   面板的逐步清单就靠这两条。
+  另外演练现在**从 `ZP_HOME` 里那份脚本启动** (原来跑的是工作区里的副本, 于是漏掉了"脚本把自己
+   覆盖掉"这条真机才炸的路径), 并分三种起法各跑一遍: 面板起法 (从私有临时副本启动 → 连旧脚本也不炸)、
+  就地起法 (脚本先整份读进内存再跑)、新脚本再走一次面板起法 (断言临时副本会自己清掉)。
 - API 边界: 无令牌 setup 403、重复 setup 409、非法域名 / 弱密码 / 非法用户名 400、
   无 Cookie dashboard 401、错密码 401 且第 4 次起 429、错误订阅令牌 404、未知节点 404、
   备份/探测/GeoIP 接口未登录一律 401、备份校验和不匹配 400。
@@ -478,8 +482,8 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 
 ### 12.1 真实服务器验证 (2026-09-28, Ubuntu 24.04 / 1 vCPU / 1GB, Xray 26.3.27 + Hysteria 2.12.3)
 
-这一轮把"只能在 Linux 上验证"的部分全部跑通, 也把三个**只在真机上才会暴露**的根因抓了出来
-(本地 `pytest` / `verify.py` 全绿却救不了它们 —— 见下面第 3、4、6 条):
+这一轮把"只能在 Linux 上验证"的部分全部跑通, 也把四个**只在真机上才会暴露**的根因抓了出来
+(本地 `pytest` / `verify.py` 全绿却救不了它们 —— 见下面第 3、4、6、11 条):
 
 1. **部署链路**: `install.sh` → 面板初始化 → certbot 签发 `hkk.i3.pub` 的 Let's Encrypt 证书
    (有效期至 2026-12-27, `certbot.timer` enabled, 证书出现后 `/api/renew` 会自动重新生成
@@ -536,6 +540,17 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
     ✓/⟳/○ 清单 + 进度条 + 已用时间; 确认弹窗、完成/失败结论卡与"重新加载面板"补成完整闭环
     (详见 8.2)。回归上同时钉住两件事: `browser_check.cjs` 断言各状态的渲染, `upgrade_sim.sh`
     用 50ms 采样证明进度确实是边跑边写的。
+11. **根因四: 升级脚本在运行中把自己覆盖掉**。`upgrade.sh` 的「安装新代码」那步会把新版本的
+    `upgrade.sh` 拷到 `$ZP_HOME/upgrade.sh` —— 也就是**正在执行的那个文件**。bash 是**按文件偏移
+    增量读取**脚本的: 覆盖之后它继续从"新文件"的同一偏移往下读, 读到的是另一段代码, 于是
+    `upgrade.sh: line 233: syntax error near unexpected token 'then'` 直接把整次升级打断
+    (v2.3.10 → v2.3.11 真机就是这样, 靠自动回滚保住了部署)。这个坑在本机永远复现不了 ——
+    演练脚本跑的是工作区里的副本, 线上跑的是 `$ZP_HOME` 里那份。修复分两层: 面板改成先把脚本
+    复制到私有临时目录 (`stage_script()`) 再执行, 于是**连没打补丁的旧脚本也能被面板安全升级**;
+    新脚本自己再兜一层 (开头把整份脚本读进内存, 命令行就地执行时也炸不了)。回归: `pytest` 断言
+    面板跑的是副本, `upgrade_sim.sh` 直接从 `$ZP_HOME` 起脚本、三种起法各跑一遍并检查日志里
+    没有 `syntax error` / `unexpected token` (注: `bash -s < 原文件` 不算修好, 那个 fd 指向的
+    仍是会被覆盖的同一个 inode)。
 
 macOS 上仍无法覆盖的只有: ufw/云安全组规则、systemd 单元里的 `XRAY_LOCATION_ASSET` 生效细节
 (单元文件已写入该变量, 真机 `xray -test` 与启动均通过) 与不同客户端 App 的导入行为。

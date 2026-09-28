@@ -23,6 +23,17 @@
 # ============================================================
 set -Eeuo pipefail
 
+# ---------- 先把自己整份读进内存, 再开始干活 ----------
+# bash 是**按文件偏移增量读取**脚本的, 而这个脚本在「安装新代码」那步会把自己覆盖成新版本:
+# 覆盖之后 bash 继续从"新文件"的同一偏移往下读, 读到的就是另一段代码 → 解析错乱。
+# 真机上的样子 (v2.3.10 升 v2.3.11): 打完「安装新代码」就
+#   upgrade.sh: line 233: syntax error near unexpected token `then'
+# 然后整次升级白跑 (好在有自动回滚)。这里先用内存里的那份继续执行, 从根上免疫覆盖自己。
+# 只有"以文件方式执行"时才重入; `curl | bash` (脚本走 stdin) 和 `source` 都不受影响。
+if [ "${ZP_SELF_IN_MEMORY:-0}" != "1" ] && [ -f "$0" ] && [ "${BASH_SOURCE[0]:-}" = "$0" ]; then
+  ZP_SELF_IN_MEMORY=1 exec bash -c "$(<"$0")" "$0" "$@"
+fi
+
 ZP_HOME="${ZP_HOME:-/opt/zeroproxy}"
 ZP_REPO="${ZP_REPO:-ericlinclover-blip/zeroproxy}"
 ZP_REF="${ZP_REF:-main}"
@@ -133,9 +144,20 @@ parse_version() { # 输出 "002 003 000" 便于字符串比较
 }
 
 #: 只在「意外退出」时兜底 (正常路径会自己把状态写成 success / failed)
+#: 面板升级时脚本是从私有临时副本起的 (update.py 的 stage_script), 收尾要把那份副本删掉。
+#: 只认自己的目录名样式, 免得环境变量被写坏时误删别的东西。
+cleanup_self_dir() {
+  [ -n "${ZP_SELF_DIR:-}" ] || return 0
+  case "$ZP_SELF_DIR" in
+    /tmp/zeroproxy-update-*|"${TMPDIR:-/tmp}"/zeroproxy-update-*) rm -rf "$ZP_SELF_DIR" 2>/dev/null || true ;;
+  esac
+  return 0
+}
+
 SKIP_STATUS="${SKIP_STATUS:-0}"
 on_exit() {
   local code=$?
+  cleanup_self_dir
   if [ "$SKIP_STATUS" = "1" ] || [ "$STATUS_STATE" != "running" ]; then
     return 0
   fi
@@ -201,6 +223,7 @@ if [ "$ZP_CHECK_ONLY" = "1" ]; then
   info "当前版本: v$FROM_VERSION"
   info "远端分支: $ZP_REPO@$ZP_REF ${REMOTE_SHA:+(${REMOTE_SHA:0:7})}"
   info "面板内也可直接查看: 仪表盘 → 程序更新"
+  cleanup_self_dir
   exit 0
 fi
 

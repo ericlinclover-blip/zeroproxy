@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import shutil
 
 import pytest
 
@@ -1228,6 +1229,46 @@ def test_update_start_writes_queued_status(client, configured, home, monkeypatch
     assert status["state"] in ("queued", "running")
     assert status["trigger"] == "panel"
     assert status["from"] == update.current_version()
+
+
+def test_update_runs_a_staged_copy(client, configured, home, monkeypatch):
+    """回归: 面板必须跑 upgrade.sh 的**临时副本**, 不能就地执行 ZP_HOME 里那一份。
+
+    bash 是按文件偏移增量读取脚本的, 而 upgrade.sh 会在「安装新代码」那步把自己就地
+    覆盖成新版本 —— 就地执行时 bash 从"新文件"的同一偏移继续读, 直接
+    `syntax error near unexpected token` (真机 v2.3.10 → v2.3.11 就是这么炸的)。
+    """
+    from zeroproxy import services, update
+
+    monkeypatch.setattr(services, "is_prod", lambda: True)
+    script = home / "upgrade.sh"
+    script.write_text("#!/usr/bin/env bash\nexit 0\n")
+    monkeypatch.setattr(update.shutil, "which", lambda name: None)  # 走无 systemd-run 的兜底
+
+    captured = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs.get("env") or {}
+        return _Proc()
+
+    monkeypatch.setattr(update.subprocess, "run", fake_run)
+    ok, detail = update.start(trigger="panel")
+    assert ok is True, detail
+
+    staged = captured["cmd"][-1]
+    assert captured["cmd"][0] == "/bin/bash"
+    assert staged != str(script)                       # 不是就地执行
+    assert os.path.basename(staged) == "upgrade.sh"
+    assert open(staged, encoding="utf-8").read() == script.read_text()   # 内容一致
+    assert os.stat(staged).st_mode & 0o777 == 0o755
+    assert captured["env"]["ZP_SELF_DIR"] == os.path.dirname(staged)     # 让脚本能自删副本
+    shutil.rmtree(os.path.dirname(staged), ignore_errors=True)
 
 
 def test_version_compare_helpers():
