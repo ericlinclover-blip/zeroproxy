@@ -39,6 +39,30 @@ SERVICES = {
 TRAFFIC_TAGS = ("vless-reality", "vless-xhttp", "vless-ws", "trojan")
 
 
+def chain_entries(state: dict) -> list[dict]:
+    """链式条目 (中转端配置; 落地端凭据不在这个列表里)。"""
+    return list((state.get("chain") or {}).get("entries") or [])
+
+
+def chain_entry(state: dict, node_id: str) -> dict | None:
+    """按节点 id (`chain-<短id>`) 找链式条目。"""
+    if not node_id.startswith("chain-"):
+        return None
+    short = node_id[len("chain-"):]
+    for entry in chain_entries(state):
+        if entry.get("id") == short:
+            return entry
+    return None
+
+
+def traffic_tags(state: dict) -> tuple[str, ...]:
+    """参与流量统计的 Xray 入站 tag: 4 个主力节点 + 启用中的链式入口节点。"""
+    extra = tuple(
+        f"chain-{e['id']}" for e in chain_entries(state) if e.get("id") and e.get("enabled", True)
+    )
+    return TRAFFIC_TAGS + extra
+
+
 def bin_path(name: str) -> str | None:
     """二进制路径。
 
@@ -369,7 +393,7 @@ def xray_stats(state: dict) -> Optional[dict]:
     except json.JSONDecodeError:
         return None
 
-    by_node: dict[str, dict] = {tag: {"uplink": 0, "downlink": 0} for tag in TRAFFIC_TAGS}
+    by_node: dict[str, dict] = {tag: {"uplink": 0, "downlink": 0} for tag in traffic_tags(state)}
     uplink = downlink = 0
     for item in data.get("stat", []):
         name = item.get("name", "")
@@ -408,6 +432,26 @@ def port_available(port: int, proto: str = "tcp") -> bool:
         except OSError:
             return False
     return True
+
+
+def open_firewall_port(port: int, proto: str = "tcp") -> str:
+    """尽力放行一个新端口 (仅 ufw; 云安全组管不到), 返回给用户看的说明。
+
+    链式代理要用到主力节点之外的新端口 (落地端入站 / 中转端入站), install.sh 里
+    那 5 条放行规则覆盖不到, 所以这里在端口启用时顺手补一条 —— 否则用户会看到
+    "面板说配好了, 客户端却连不上"。
+    """
+    target = f"{int(port)}/{proto}"
+    ufw = shutil.which("ufw")
+    if not ufw:
+        return f"本机没有 ufw; 请确认云安全组已放行 {target}"
+    ok, status = run([ufw, "status"], timeout=10)
+    if not ok or "Status: active" not in status:
+        return f"ufw 未启用; 请确认云安全组已放行 {target}"
+    ok, out = run([ufw, "allow", target], timeout=15)
+    if ok:
+        return f"ufw 已放行 {target}"
+    return f"ufw 放行 {target} 失败: {' '.join(out.split())[:80]}"
 
 
 def journal_tail(name: str, lines: int = 40) -> str:
@@ -517,6 +561,10 @@ def udp_port_listening(port: int) -> bool | None:
 def _probe_target(state: dict, node_id: str) -> tuple[str, str, int, str]:
     """(host, 探测方式, 端口, SNI) — 探测方式 ∈ tcp / tls / udp。"""
     ports = state.get("ports", {})
+    entry = chain_entry(state, node_id)
+    if entry is not None:
+        # 链式入口节点: 本机新入站 (Reality), 与主力节点同一套密钥/SNI
+        return "127.0.0.1", "tls", int(entry.get("local_port") or 0), state["reality"]["server_name"]
     if node_id == "vless-ws":
         # WS 入站是明文回环端口, TLS 由 nginx 终结 —— 这里只验证入站存活
         return "127.0.0.1", "tcp", int(ports.get("ws_internal", 6000)), ""
@@ -613,6 +661,59 @@ def _socks5_tls_probe(proxy_port: int, host: str, port: int, timeout: float = 8.
                 pass
 
 
+def socks5_http_get(
+    proxy_port: int, host: str, port: int = 80, path: str = "/", timeout: float = 8.0
+) -> tuple[str, str]:
+    """经本地 SOCKS5 隧道发一次 HTTP/1.1 GET, 返回 (正文, 说明)。
+
+    链式代理"落地出口 IP"就是靠这个读回来的 —— 走的是真实数据面, 因此顺带
+    把整条链 (客户端 → 本机入站 → 落地端 → 目标站) 都验证了一遍。
+    """
+    sock = None
+    try:
+        sock = socket.create_connection(("127.0.0.1", int(proxy_port)), timeout=timeout)
+        sock.settimeout(timeout)
+        ok, detail = _socks5_open(sock, host, int(port))
+        if not ok:
+            return "", detail
+        request = (
+            f"GET {path or '/'} HTTP/1.1\r\nHost: {host}\r\n"
+            "User-Agent: curl/8\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+        )
+        sock.sendall(request.encode("ascii"))
+        chunks: list[bytes] = []
+        total = 0
+        while total < 8192:
+            try:
+                chunk = sock.recv(4096)
+            except (socket.timeout, OSError):
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if b"\r\n\r\n" in b"".join(chunks):
+                body_head = b"".join(chunks).split(b"\r\n\r\n", 1)
+                # 有 Content-Length 或已读到正文起始就够判断了
+                if len(body_head) == 2 and body_head[1].strip():
+                    break
+        raw = b"".join(chunks)
+        if not raw:
+            return "", "隧道已建立, 但对端没有返回数据"
+        head, _, body = raw.partition(b"\r\n\r\n")
+        if b"200" not in head.split(b"\r\n", 1)[0]:
+            return "", f"目标站返回异常: {head.split(b'\r\n', 1)[0].decode('latin1')}"
+        return body.decode("utf-8", "replace").strip(), "HTTP 往返成功"
+    except OSError as exc:
+        return "", f"{type(exc).__name__}: {exc}"
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:  # pragma: no cover
+                pass
+
+
 def _cert_sha256_hex(cert_file: str) -> str:
     """叶子证书 DER 的 SHA256 (十六进制) —— Xray 26 的 `pinnedPeerCertSha256` 格式。"""
     try:
@@ -658,7 +759,34 @@ def client_config(state: dict, node_id: str, socks_port: int) -> dict | None:
     common = {"serverName": reality["server_name"], "fingerprint": "chrome"}
     outbound: dict | None = None
 
-    if node_id == "vless-reality":
+    chain = chain_entry(state, node_id)
+    if chain is not None:
+        # 链式入口节点: 客户端连本机新入站 (Reality), 本机再把流量交给落地端。
+        # 深度体检走的就是这条完整链路 —— 落地端不通 / 参数不对会在这里暴露。
+        outbound = {
+            "protocol": "vless",
+            "settings": {
+                "vnext": [
+                    {
+                        "address": "127.0.0.1",
+                        "port": int(chain.get("local_port") or 0),
+                        "users": [{"id": uuid, "encryption": "none", "flow": "xtls-rprx-vision"}],
+                    }
+                ]
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "tcpSettings": {"header": {"type": "none"}},
+                "realitySettings": {
+                    **common,
+                    "publicKey": reality["public_key"],
+                    "shortId": reality["short_id"],
+                    "spiderX": "/",
+                },
+            },
+        }
+    elif node_id == "vless-reality":
         outbound = {
             "protocol": "vless",
             "settings": {"vnext": [{"address": "127.0.0.1", "port": int(ports["reality"]),
@@ -722,7 +850,11 @@ def deep_probe_node(state: dict, node_id: str, timeout: float = 9.0) -> dict:
 
     from .config import NODE_BY_ID
 
-    if not state.get("nodes", {}).get(node_id, True):
+    chain = chain_entry(state, node_id)
+    if chain is not None:
+        if not chain.get("enabled", True):
+            return {"node": node_id, "ok": None, "kind": "off", "ms": None, "detail": "链式节点已停用"}
+    elif not state.get("nodes", {}).get(node_id, True):
         return {"node": node_id, "ok": None, "kind": "deep", "ms": None, "detail": "节点已关闭"}
 
     if node_id == "trojan" and not os.path.exists(state["cert"].get("cert_file") or ""):
@@ -759,13 +891,20 @@ def deep_probe_node(state: dict, node_id: str, timeout: float = 9.0) -> dict:
             return {"node": node_id, "ok": False, "kind": "deep", "ms": None,
                     "detail": "临时客户端 SOCKS 端口未就绪"}
         ok, ms, detail = _socks5_tls_probe(socks_port, host, int(port or 443), timeout=timeout)
-        port_label = NODE_BY_ID[node_id]["port_key"]
-        shown = 443 if node_id in ("vless-ws",) else state["ports"].get(port_label, "")
+        if chain is not None:
+            shown = chain.get("local_port", "")
+            via = f" · 经落地 {chain.get('host')}:{chain.get('port')}"
+        else:
+            port_label = NODE_BY_ID[node_id]["port_key"]
+            shown = 443 if node_id in ("vless-ws",) else state["ports"].get(port_label, "")
+            via = ""
         if ok:
             return {"node": node_id, "ok": True, "kind": "deep", "ms": round(ms, 1),
-                    "detail": f"{shown} · 深度握手 + 真实出口往返 ({state['reality']['dest']}) 通过"}
+                    "detail": f"{shown}{via} · 深度握手 + 真实出口往返 ({state['reality']['dest']}) 通过"}
         return {"node": node_id, "ok": False, "kind": "deep", "ms": None,
-                "detail": f"{shown} · {detail} (Reality 密钥/SNI/伪装目标 或传输层不匹配)"}
+                "detail": f"{shown}{via} · {detail}" + (" (落地端不可达 / 凭据失效?)"
+                                                       if chain is not None
+                                                       else " (Reality 密钥/SNI/伪装目标 或传输层不匹配)")}
     finally:
         proc.terminate()
         try:
@@ -777,7 +916,11 @@ def deep_probe_node(state: dict, node_id: str, timeout: float = 9.0) -> dict:
 
 def probe_node(state: dict, node_id: str, timeout: float = 4.0) -> dict:
     """单节点体检: 握手耗时 + 结论。"""
-    if not state.get("nodes", {}).get(node_id, True):
+    chain = chain_entry(state, node_id)
+    if chain is not None:
+        if not chain.get("enabled", True):
+            return {"node": node_id, "ok": None, "kind": "off", "ms": None, "detail": "链式节点已停用"}
+    elif not state.get("nodes", {}).get(node_id, True):
         return {"node": node_id, "ok": None, "kind": "off", "ms": None, "detail": "节点已关闭"}
 
     if node_id == "trojan" and not os.path.exists(state["cert"].get("cert_file") or ""):
@@ -826,7 +969,10 @@ def probe_node(state: dict, node_id: str, timeout: float = 4.0) -> dict:
 def deep_probe_all(state: dict, timeout: float = 9.0) -> list[dict]:
     """对 4 个 TCP 节点逐个做深度体检 (串行: 单核小内存 VPS 上别同时起 4 个内核)。"""
     results = []
-    for nid in ("vless-reality", "vless-xhttp", "vless-ws", "trojan"):
+    targets = ("vless-reality", "vless-xhttp", "vless-ws", "trojan") + tuple(
+        f"chain-{e['id']}" for e in chain_entries(state) if e.get("id") and e.get("enabled", True)
+    )
+    for nid in targets:
         try:
             results.append(deep_probe_node(state, nid, timeout))
         except Exception as exc:  # noqa: BLE001 — 体检异常不能让接口 500
@@ -845,7 +991,9 @@ def probe_all(state: dict, timeout: float = 4.0, deep: bool = False) -> dict:
 
     from .config import NODE_IDS
 
-    nodes = list(NODE_IDS)
+    nodes = list(NODE_IDS) + [
+        f"chain-{e['id']}" for e in chain_entries(state) if e.get("id")
+    ]
     dest_host, dest_port = state["reality"]["dest"].rsplit(":", 1)
     if deep and is_prod() and bin_path("xray") is not None:
         results = deep_probe_all(state, max(timeout, 9.0))

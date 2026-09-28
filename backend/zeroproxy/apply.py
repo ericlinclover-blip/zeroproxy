@@ -177,6 +177,14 @@ def _wanted_ports(state: dict) -> list[tuple[int, str, str]]:
         want.append((int(ports["ws_internal"]), "tcp", "VLESS WebSocket (回环)"))
     if nodes.get("hysteria2") and ports.get("hysteria"):
         want.append((int(ports["hysteria"]), "udp", "Hysteria 2"))
+    # 链式代理的两端都是真实对外端口, 同样要验证真的起来了
+    chain_cfg = state.get("chain") or {}
+    exit_cfg = chain_cfg.get("exit") or {}
+    if exit_cfg.get("enabled") and exit_cfg.get("uuid") and exit_cfg.get("port"):
+        want.append((int(exit_cfg["port"]), "tcp", "链式落地端入站"))
+    for entry in chain_cfg.get("entries") or []:
+        if entry.get("enabled", True) and entry.get("local_port"):
+            want.append((int(entry["local_port"]), "tcp", f"链式中转入站 ({entry.get('label') or entry.get('id')})"))
     if state.get("domain"):
         want.append((443, "tcp", "Nginx 443 (WS 入口)"))
     return want

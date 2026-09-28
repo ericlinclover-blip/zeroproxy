@@ -123,6 +123,23 @@ def _node_name(node_id: str) -> str:
     return f"ZeroProxy {meta['name']}" if meta else node_id
 
 
+def chain_entry_of(state: dict, node_id: str) -> dict | None:
+    """`chain-<短id>` → 链式条目 (不是链式节点则返回 None)。"""
+    if not node_id.startswith("chain-"):
+        return None
+    short = node_id[len("chain-"):]
+    for entry in (state.get("chain") or {}).get("entries") or []:
+        if entry.get("id") == short:
+            return entry
+    return None
+
+
+def chain_node_name(entry: dict) -> str:
+    """订阅里显示的名字: 中转链路对客户端只是一个普通节点, 名字里标出落地在哪。"""
+    label = (entry.get("label") or "").strip() or entry.get("host", "")
+    return f"ZeroProxy 链式 · {label}"
+
+
 def _hysteria_ports(state: dict) -> list[int]:
     """Hysteria 2 实际监听的 UDP 端口列表。"""
     if state.get("nodes", {}).get("hysteria2") and state.get("hysteria_hopping", False):
@@ -195,15 +212,30 @@ def share_links(state: dict) -> dict[str, str]:
         f"#{_q(_node_name('hysteria2'))}"
     )
 
+    # 链式中转节点: 地址/密钥是**本机**的 (客户端连本机), 出口在落地服务器那一侧 ——
+    # 因此对客户端来说它就是"多了个普通 Reality 节点", 中转链路完全透明。
+    for entry in (state.get("chain") or {}).get("entries") or []:
+        if not entry.get("enabled", True) or not entry.get("local_port"):
+            continue
+        links[f"chain-{entry['id']}"] = (
+            f"vless://{uuid}@{host}:{int(entry['local_port'])}"
+            f"?encryption=none&flow=xtls-rprx-vision&security=reality&type=tcp"
+            f"&pbk={_pbk(r['public_key'])}&sid={r['short_id']}"
+            f"&sni={_q(r['server_name'])}&fp=chrome"
+            f"#{_q(chain_node_name(entry))}"
+        )
+
     return links
 
 
 def enabled_links(state: dict) -> list[tuple[str, str]]:
-    """[(node_id, link)] — 仅包含启用中的节点, 顺序与 NODES 一致。"""
+    """[(node_id, link)] — 仅包含启用中的节点: 先是 5 个主力节点, 再是链式中转节点。"""
     links = share_links(state)
     nodes = state.get("nodes", {})
     order = [n["id"] for n in config.NODES]
-    return [(nid, links[nid]) for nid in order if nodes.get(nid, True) and links.get(nid)]
+    out = [(nid, links[nid]) for nid in order if nodes.get(nid, True) and links.get(nid)]
+    out += [(nid, link) for nid, link in links.items() if nid.startswith("chain-")]
+    return out
 
 
 # ---------------------------------------------------------------- 订阅: base64
@@ -225,6 +257,23 @@ def _clash_proxy(state: dict, node_id: str) -> dict | None:
     r = state["reality"]
     x = state.get("xhttp") or {}
 
+    entry = chain_entry_of(state, node_id)
+    if entry is not None:
+        # 链式中转节点: 客户端连本机 (Reality + Vision), 出网走落地端
+        return {
+            "name": chain_node_name(entry),
+            "type": "vless",
+            "server": host,
+            "port": int(entry["local_port"]),
+            "uuid": state["uuid"],
+            "udp": True,
+            "tls": True,
+            "flow": "xtls-rprx-vision",
+            "servername": r["server_name"],
+            "client-fingerprint": "chrome",
+            "network": "tcp",
+            "reality-opts": {"public-key": _pbk(r["public_key"]), "short-id": r["short_id"]},
+        }
     if node_id == "vless-reality":
         return {
             "name": _node_name(node_id),
@@ -405,6 +454,28 @@ def _singbox_outbound(state: dict, node_id: str) -> dict | None:
     x = state.get("xhttp") or {}
     tag = _node_name(node_id)
 
+    entry = chain_entry_of(state, node_id)
+    if entry is not None:
+        # 链式中转节点: 客户端连本机, 落地在对方那一侧
+        return {
+            "type": "vless",
+            "tag": chain_node_name(entry),
+            "server": host,
+            "server_port": int(entry["local_port"]),
+            "uuid": state["uuid"],
+            "flow": "xtls-rprx-vision",
+            "packet_encoding": "xudp",
+            "tls": {
+                "enabled": True,
+                "server_name": r["server_name"],
+                "utls": {"enabled": True, "fingerprint": "chrome"},
+                "reality": {
+                    "enabled": True,
+                    "public_key": _pbk(r["public_key"]),
+                    "short_id": r["short_id"],
+                },
+            },
+        }
     if node_id == "vless-reality":
         return {
             "type": "vless",

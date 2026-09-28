@@ -23,6 +23,7 @@ import shutil
 import socket
 import threading
 import time
+import uuid as uuid_mod
 
 import qrcode
 import qrcode.constants
@@ -34,6 +35,7 @@ from pydantic import BaseModel
 
 from . import (
     apply,
+    chain,
     config,
     crypto,
     geodata,
@@ -426,6 +428,9 @@ def logout_all(request: Request):
 
 def _port_for(state: dict, node_id: str) -> int:
     """节点对外端口: vless-ws 固定走 nginx 443, 其余取配置端口。"""
+    entry = share_links.chain_entry_of(state, node_id)
+    if entry is not None:
+        return int(entry.get("local_port") or 0)
     if node_id == "vless-ws":
         return 443
     return state["ports"][NODE_BY_ID[node_id]["port_key"]]
@@ -457,6 +462,40 @@ def _node_view(state: dict, traffic: dict | None) -> dict:
                 "traffic": by_node.get(nid, {"uplink": 0, "downlink": 0}) if traffic else None,
             }
         )
+    # 链式中转节点 (客户端连本机, 出网走落地端) —— 对面板就是"多了一张普通节点卡"
+    for entry in (state.get("chain") or {}).get("entries") or []:
+        nid = f"chain-{entry['id']}"
+        enabled = bool(entry.get("enabled", True))
+        probe = entry.get("last_probe") or {}
+        label = (entry.get("label") or "").strip() or entry.get("host", "")
+        out.append(
+            {
+                "id": nid,
+                "name": f"链式 · {label}",
+                "protocol": "VLESS",
+                "transport": "链式中转 (TCP + Vision)",
+                "security": f"经落地 {entry.get('host')}:{entry.get('port')}",
+                "service": "xray",
+                "desc": (
+                    f"客户端连本机 {state['domain']}:{entry.get('local_port')}, "
+                    f"出口 IP 是落地服务器 {entry.get('host')}"
+                    + (" · 已设为默认出口 (本机所有节点都走它)" if entry.get("default_out") else "")
+                ),
+                "chain": True,
+                "via": f"{entry.get('host')}:{entry.get('port')}",
+                "default_out": bool(entry.get("default_out")),
+                "last_probe": probe,
+                "enabled": enabled,
+                "host": state["domain"],
+                "port": int(entry.get("local_port") or 0),
+                "editable_port": False,
+                "service_state": states.get("xray", "unknown"),
+                "share_link": links.get(nid) if enabled else None,
+                "note": None,
+                "qr_url": f"/api/nodes/{nid}/qr" if enabled else None,
+                "traffic": by_node.get(nid, {"uplink": 0, "downlink": 0}) if traffic else None,
+            }
+        )
     return out
 
 
@@ -483,6 +522,43 @@ def _post_setup_redirect(state: dict, request: Request) -> dict:
                 "reason": "证书不是 Let's Encrypt (域名可能还没解析到本机, 或 80 端口被挡)"}
     ok, detail = services.probe_public_panel(domain, config.PANEL_PORT)
     return {"ready": ok, "url": url, "reason": detail}
+
+
+def _chain_view(state: dict) -> dict:
+    """链式代理卡片的数据: 本机作为落地端的配对码 + 已连接的中转条目。"""
+    chain_cfg = state.get("chain") or {}
+    exit_cfg = chain_cfg.get("exit") or {}
+    code = chain.exit_code(state)
+    entries = []
+    for entry in chain_cfg.get("entries") or []:
+        probe = entry.get("last_probe") or {}
+        entries.append(
+            {
+                "id": entry.get("id", ""),
+                "node_id": f"chain-{entry.get('id', '')}",
+                "label": entry.get("label", ""),
+                "host": entry.get("host", ""),
+                "port": entry.get("port", 0),
+                "local_port": entry.get("local_port", 0),
+                "sni": entry.get("sni", ""),
+                "enabled": bool(entry.get("enabled", True)),
+                "default_out": bool(entry.get("default_out")),
+                "created_at": int(entry.get("created_at") or 0),
+                "last_probe": probe,
+            }
+        )
+    return {
+        "exit": {
+            "enabled": bool(exit_cfg.get("enabled")) and bool(exit_cfg.get("uuid")),
+            "port": int(exit_cfg.get("port") or chain.DEFAULT_EXIT_PORT),
+            "label": exit_cfg.get("label", ""),
+            "created_at": int(exit_cfg.get("created_at") or 0),
+            "code": code,
+            "credential": (exit_cfg.get("uuid") or "")[:8],  # 只给前 8 位, 够用来认"是不是同一份"
+        },
+        "entries": entries,
+        "default_out": next((e["id"] for e in entries if e["default_out"]), ""),
+    }
 
 
 def _system_view(state: dict) -> dict:
@@ -534,6 +610,7 @@ def _dashboard_body(state: dict, request: Request, traffic: dict | None = None) 
             "dest": state["reality"]["dest"],
         },
         "geodata": geodata.status(state),
+        "chain": _chain_view(state),
         "xhttp": state.get("xhttp", {}),
         "ports": state.get("ports", {}),
         "traffic": traffic,
@@ -570,19 +647,25 @@ def dashboard(request: Request):
 
 @router.post("/api/nodes/{node_id}/toggle")
 def toggle_node(node_id: str, request: Request):
-    if node_id not in NODE_IDS:
+    is_chain = node_id.startswith("chain-")
+    if not is_chain and node_id not in NODE_IDS:
         return _err("未知节点", 404)
     with config.locked():
         state = load_state()
         if not _require_auth(state, request):
             return _err("未登录", 401)
-        state["nodes"][node_id] = not state["nodes"].get(node_id, True)
-        config.audit(
-            state,
-            "toggle_node",
-            f"{node_id}={'on' if state['nodes'][node_id] else 'off'}",
-            actor=_client_ip(request),
-        )
+        if is_chain:
+            entry = share_links.chain_entry_of(state, node_id)
+            if entry is None:
+                return _err("未知的链式节点", 404)
+            entry["enabled"] = not entry.get("enabled", True)
+            if not entry["enabled"]:
+                entry["default_out"] = False   # 停用的节点不能继续当默认出口
+            label = f"{node_id}={'on' if entry['enabled'] else 'off'}"
+        else:
+            state["nodes"][node_id] = not state["nodes"].get(node_id, True)
+            label = f"{node_id}={'on' if state['nodes'][node_id] else 'off'}"
+        config.audit(state, "toggle_node", label, actor=_client_ip(request))
         steps = _reapply(state, request)
         body = _dashboard_body(state, request)
         body["steps"] = steps
@@ -729,6 +812,312 @@ def update_settings(payload: SettingsIn, request: Request):
         return body
 
 
+# ---------------------------------------------------------------- 链式代理
+
+class ChainExitIn(BaseModel):
+    action: str = "generate"      # generate | rotate | disable
+    port: int | None = None
+    label: str | None = None
+
+
+@router.post("/api/chain/exit")
+def chain_exit(payload: ChainExitIn, request: Request):
+    """本机作为落地端: 生成 / 轮换配对码, 改端口, 或直接关闭。
+
+    凭据是**专用的** (独立 UUID + 独立端口), 与订阅里那份完全分开 ——
+    所以把配对码给出去、或随时「重新生成」作废旧的, 都不影响自己的用户。
+    """
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        if not state.get("configured"):
+            return _err("请先完成初始化", 409)
+        if not state["reality"].get("private_key"):
+            return _err("本机 Reality 密钥未就绪, 请先在「高级设置 → 保存并应用」生成", 409)
+
+        exit_cfg = state.setdefault("chain", {}).setdefault(
+            "exit", {"enabled": False, "port": chain.DEFAULT_EXIT_PORT, "uuid": "", "label": "", "created_at": 0}
+        )
+        action = (payload.action or "generate").strip().lower()
+        if action not in ("generate", "rotate", "disable"):
+            return _err(f"不支持的操作: {action}")
+
+        if action == "disable":
+            if not exit_cfg.get("enabled"):
+                return _err("落地端当前就是关闭的")
+            exit_cfg["enabled"] = False
+            changed = ["关闭落地端 (入站已下线, 配对码作废)"]
+        else:
+            changed = []
+            port = int(payload.port or exit_cfg.get("port") or chain.DEFAULT_EXIT_PORT)
+            if not 1 <= port <= 65535:
+                return _err("端口需在 1-65535 之间")
+            if port != int(exit_cfg.get("port") or 0):
+                occupied = chain.used_ports(state) - {int(exit_cfg.get("port") or 0)}
+                if port in occupied:
+                    return _err(f"端口 {port} 已被本机其它节点/链式条目占用, 换一个")
+                if not services.port_available(port, "tcp"):
+                    return _err(f"端口 {port}/tcp 已被系统里其它进程占用, 换一个")
+                changed.append(f"落地端端口 {port}")
+            if action == "rotate" or not exit_cfg.get("uuid"):
+                exit_cfg["uuid"] = str(uuid_mod.uuid4())
+                changed.append("生成新的专用凭据" if action != "rotate" else "轮换凭据 (旧配对码立即作废)")
+            exit_cfg["port"] = port
+            exit_cfg["enabled"] = True
+            exit_cfg["created_at"] = int(exit_cfg.get("created_at") or time.time())
+            if payload.label is not None:
+                label = payload.label.strip()[:40]
+                if label != (exit_cfg.get("label") or ""):
+                    exit_cfg["label"] = label
+                    changed.append(f"名称改为「{label}」")
+            if not changed:
+                changed.append("落地端已是最新状态")
+
+        config.audit(state, "chain_exit", "; ".join(changed), actor=_client_ip(request))
+        steps = _reapply(state, request)
+        if exit_cfg.get("enabled"):
+            steps.append(
+                {
+                    "name": "放行落地端端口",
+                    "ok": True,
+                    "detail": services.open_firewall_port(exit_cfg["port"], "tcp"),
+                    "ms": 0,
+                }
+            )
+        body = _dashboard_body(state, request)
+        body["steps"] = steps
+        return body
+
+
+class ChainEntryIn(BaseModel):
+    code: str = ""
+    label: str | None = None
+    local_port: int | None = None
+    default_out: bool = False
+    #: 探测不通时是否仍然强行添加 (面板会二次确认)
+    force: bool = False
+
+
+@router.post("/api/chain/entries")
+def chain_entry_add(payload: ChainEntryIn, request: Request):
+    """中转端: 粘贴落地端的配对码 → 校验 → 真实握手 → 落地成新节点。"""
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        if not state.get("configured"):
+            return _err("请先完成初始化", 409)
+
+        try:
+            target = chain.parse_code(payload.code)
+        except chain.CodeError as exc:
+            return _err(str(exc))
+
+        entries = state.setdefault("chain", {}).setdefault("entries", [])
+        for entry in entries:
+            if (entry.get("host"), int(entry.get("port") or 0)) == (target["host"], target["port"]):
+                return _err(
+                    f"这个落地端已经连过了 ({target['host']}:{target['port']}); "
+                    "要换凭据请先删除那条再重新添加"
+                )
+        if target["host"] in (state["domain"], "127.0.0.1", "localhost") and target["port"] in (
+            chain.used_ports(state)
+        ):
+            return _err("配对码指向的是本机自己的端口, 落地端应当是另一台服务器")
+
+        try:
+            local_port = chain.pick_port(state, payload.local_port)
+        except ValueError as exc:
+            return _err(str(exc))
+
+    # 探测放在锁外面: 起临时客户端 + 真实出网要好几秒, 不该把整个面板卡住
+    probe = chain.probe_target(target)
+    if not probe.get("ok") and probe.get("probe_ok", True) and not payload.force:
+        return JSONResponse(
+            {"error": probe.get("detail") or "链路测试没通过", "probe": probe, "needs_force": True},
+            status_code=400,
+        )
+
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        entries = state.setdefault("chain", {}).setdefault("entries", [])
+        label = (payload.label or target["label"] or target["host"]).strip()[:40]
+        entry = {
+            "id": chain.new_id(),
+            "label": label,
+            "host": target["host"],
+            "port": target["port"],
+            "uuid": target["uuid"],
+            "pbk": target["pbk"],
+            "sid": target["sid"],
+            "sni": target["sni"],
+            "flow": target["flow"],
+            "local_port": local_port,
+            "enabled": True,
+            "default_out": bool(payload.default_out),
+            "created_at": int(time.time()),
+            "last_probe": {
+                "ts": int(time.time()),
+                "ok": bool(probe.get("ok")),
+                "probe_ok": bool(probe.get("probe_ok", True)),
+                "ms": probe.get("ms"),
+                "exit_ip": probe.get("exit_ip") or "",
+                "detail": probe.get("detail") or "",
+            },
+        }
+        if entry["default_out"]:
+            for other in entries:
+                other["default_out"] = False
+        entries.append(entry)
+        config.audit(
+            state, "chain_add", f"{label} → {entry['host']}:{entry['port']}", actor=_client_ip(request)
+        )
+        steps = _reapply(state, request)
+        steps.append(
+            {
+                "name": "链路测试 (真实出口往返)",
+                "ok": bool(probe.get("ok")),
+                "detail": probe.get("detail") or "",
+                "ms": int(probe.get("ms") or 0),
+            }
+        )
+        steps.append(
+            {
+                "name": "放行中转入站端口",
+                "ok": True,
+                "detail": services.open_firewall_port(local_port, "tcp"),
+                "ms": 0,
+            }
+        )
+        body = _dashboard_body(state, request)
+        body["steps"] = steps
+        return body
+
+
+class ChainEntryPatch(BaseModel):
+    enabled: bool | None = None
+    default_out: bool | None = None
+    label: str | None = None
+
+
+def _find_chain_entry(state: dict, entry_id: str) -> dict | None:
+    for entry in (state.get("chain") or {}).get("entries") or []:
+        if entry.get("id") == entry_id:
+            return entry
+    return None
+
+
+@router.post("/api/chain/entries/{entry_id}")
+def chain_entry_update(entry_id: str, payload: ChainEntryPatch, request: Request):
+    """启用/停用某条链式连接、设为默认出口、改名。"""
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        entry = _find_chain_entry(state, entry_id)
+        if entry is None:
+            return _err("链式条目不存在", 404)
+
+        changed: list[str] = []
+        label = entry.get("label") or entry.get("host")
+        if payload.enabled is not None and bool(payload.enabled) != bool(entry.get("enabled", True)):
+            entry["enabled"] = bool(payload.enabled)
+            if not entry["enabled"]:
+                entry["default_out"] = False
+            changed.append(f"{label} {'启用' if entry['enabled'] else '停用'}")
+        if payload.default_out is not None and bool(payload.default_out) != bool(entry.get("default_out")):
+            if payload.default_out and not entry.get("enabled", True):
+                return _err("该链式节点已停用, 先启用再设为默认出口")
+            entry["default_out"] = bool(payload.default_out)
+            for other in (state.get("chain") or {}).get("entries") or []:
+                if other is not entry:
+                    other["default_out"] = False
+            changed.append(
+                f"{label} 设为默认出口 (本机所有节点改走它)" if entry["default_out"]
+                else f"{label} 取消默认出口"
+            )
+        if payload.label is not None:
+            new_label = payload.label.strip()[:40]
+            if new_label and new_label != (entry.get("label") or ""):
+                entry["label"] = new_label
+                changed.append(f"名称改为「{new_label}」")
+        if not changed:
+            return _err("没有需要修改的内容")
+
+        config.audit(state, "chain_update", "; ".join(changed), actor=_client_ip(request))
+        steps = _reapply(state, request)
+        body = _dashboard_body(state, request)
+        body["steps"] = steps
+        return body
+
+
+@router.post("/api/chain/entries/{entry_id}/probe")
+def chain_entry_probe(entry_id: str, request: Request):
+    """单条链式连接的测速: 真的穿过落地端出网一次, 读回落地出口 IP。"""
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        entry = _find_chain_entry(state, entry_id)
+        if entry is None:
+            return _err("链式条目不存在", 404)
+        label = entry.get("label") or entry.get("host")
+        target = chain.as_target(entry)
+
+    probe = chain.probe_target(target)
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        entry = _find_chain_entry(state, entry_id)
+        if entry is None:
+            return _err("链式条目不存在", 404)
+        entry["last_probe"] = {
+            "ts": int(time.time()),
+            "ok": bool(probe.get("ok")),
+            "probe_ok": bool(probe.get("probe_ok", True)),
+            "ms": probe.get("ms"),
+            "exit_ip": probe.get("exit_ip") or "",
+            "detail": probe.get("detail") or "",
+        }
+        config.audit(state, "chain_probe", f"{label}: {'ok' if probe.get('ok') else 'failed'}", actor=_client_ip(request))
+        save_state(state)
+        body = _dashboard_body(state, request)
+        body["steps"] = [
+            {
+                "name": f"链路测速 · {label}",
+                "ok": bool(probe.get("ok")),
+                "detail": probe.get("detail") or "",
+                "ms": int(probe.get("ms") or 0),
+            }
+        ]
+        return body
+
+
+@router.delete("/api/chain/entries/{entry_id}")
+def chain_entry_delete(entry_id: str, request: Request):
+    """断开并删除一条链式连接 (落地端的凭据不受影响)。"""
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        entry = _find_chain_entry(state, entry_id)
+        if entry is None:
+            return _err("链式条目不存在", 404)
+        label = entry.get("label") or entry.get("host")
+        state["chain"]["entries"] = [
+            e for e in state["chain"]["entries"] if e.get("id") != entry_id
+        ]
+        config.audit(state, "chain_delete", label, actor=_client_ip(request))
+        steps = _reapply(state, request)
+        body = _dashboard_body(state, request)
+        body["steps"] = steps
+        return body
+
+
 @router.post("/api/apply")
 def apply_endpoint(request: Request):
     with config.locked():
@@ -808,6 +1197,14 @@ def _diagnose(state: dict) -> list[dict]:
             for nid in XRAY_NODE_IDS
             if state["nodes"].get(nid) and (nid != "trojan" or xray_config.cert_usable(state))
         }
+        # 链式代理两边都有自己的入站, 漏掉一个就会出现"面板绿了但链路不通"
+        chain_cfg = state.get("chain") or {}
+        exit_cfg = chain_cfg.get("exit") or {}
+        if exit_cfg.get("enabled") and exit_cfg.get("uuid"):
+            want.add("chain-exit")
+        want.update(
+            f"chain-{e['id']}" for e in chain_cfg.get("entries") or [] if e.get("enabled", True)
+        )
         missing = want - tags
         add(
             "入站与节点开关一致",
@@ -861,6 +1258,25 @@ def _diagnose(state: dict) -> list[dict]:
     # 6. 伪装目标可达性 (Reality / Trojan fallback 依赖它)
     ok, detail = _check_tcp(state["reality"]["dest"], f"Reality dest {state['reality']['dest']}")
     add("伪装目标可达性", ok, detail)
+
+    # 7. 链式代理: 落地端是否还在 (中转链路断了的话, 客户端那头的节点就是死的)
+    entries = (state.get("chain") or {}).get("entries") or []
+    if entries:
+        down = []
+        for entry in entries:
+            if not entry.get("enabled", True):
+                continue
+            reachable, _, _ = services.tcp_connect_ms(entry["host"], int(entry["port"]), 3.0)
+            if not reachable:
+                down.append(f"{entry.get('label') or entry.get('host')} ({entry['host']}:{entry['port']})")
+        add(
+            "链式落地端可达性",
+            not down,
+            f"{len(entries)} 条链式连接全部可达 (已停用的不计)"
+            if not down
+            else f"连不上: {', '.join(down)} — 客户端连这些节点会失败",
+            fixable=False,
+        )
 
     return checks
 
@@ -1189,7 +1605,7 @@ def _qr_png(data: str, size: int = 8) -> Response:
 
 @router.get("/api/nodes/{node_id}/qr")
 def qr(node_id: str, request: Request, size: int = 8, img: str = "png"):
-    if node_id not in NODE_IDS:
+    if node_id not in NODE_IDS and not node_id.startswith("chain-"):
         return _err("未知节点", 404)
     state = load_state()
     if not _require_auth(state, request):
@@ -1210,3 +1626,15 @@ def subscription_qr(request: Request, size: int = 8, format: str = "base64", img
     if (format or "base64").lower() != "base64":
         url = f"{url}?format={format}"
     return _qr_response(url, size, img)
+
+
+@router.get("/api/chain/exit/qr")
+def chain_exit_qr(request: Request, size: int = 6, img: str = "png"):
+    """落地端配对码的二维码 (另一台机器的摄像头直接扫, 省掉手抄 300 字符)。"""
+    state = load_state()
+    if not _require_auth(state, request):
+        return _err("未登录", 401)
+    code = chain.exit_code(state)
+    if not code:
+        return _err("本机还没有作为落地端的凭据, 请先生成配对码", 409)
+    return _qr_response(code, size, img)

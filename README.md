@@ -53,6 +53,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **一键更新** | 面板「程序更新」按钮, 或服务器上 `upgrade.sh` 一条命令: 自动备份代码与 `state.json` → 替换 → 按现有 `state.json` 重新落地配置 → 失败自动回滚; 面板内更新由 systemd 瞬时单元托管, 面板自身重启不会打断升级 |
 | **配置落地可验证** | 每次应用配置都用真实二进制校验 (`xray -test` / `nginx -t`) 并**复查端口是否真的在监听**; 任一步失败会在面板顶部标红, 不再出现「服务全绿但节点全不通」 |
 | **5 个节点** | VLESS Reality (TCP+Vision)、VLESS XHTTP Reality、VLESS WebSocket、Trojan TLS、Hysteria 2 (QUIC+端口跳跃) |
+| **链式代理 (中转 → 落地)** | 两台机器各装一份本面板, 在面板里用一行**配对码**把它们接成一条链: 近的机器做入口 (延迟低), 远的机器做落地 (出口 IP 换成它)。对客户端只是「订阅里多了一个普通节点」——不用手写 Clash relay / sing-box detour, 手机也能用; 落地凭据是**独立 UUID + 独立端口**, 可单独轮换 / 吊销, 不影响自己的订阅 |
 | **3 种订阅格式** | 同一订阅地址 `?format=` 切换: Base64 通用 / Clash(mihomo) YAML / sing-box JSON |
 | **3 档分流模板** | 智能分流 (国内直连+广告拦截) / 全局代理 / 全部直连; 面板一键切换或 `?rules=` 单客户端覆盖, 切换不重启服务 |
 | **引导令牌保护** | 初始化必须带 `?token=`, 公网暴露时别人抢不走你的面板; 初始化成功即作废 |
@@ -65,7 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 94 项 (90 passed + 4 skipped; 带 `ZP_XRAY_BIN` 时 94 全通过) + `scripts/verify.py` (74 项) + `scripts/browser_check.cjs` (66 项) + `scripts/upgrade_sim.sh` (21 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 113 项 (108 passed + 5 skipped; 带 `ZP_XRAY_BIN` 时 113 全通过) + `scripts/verify.py` (74 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (81 项) + `scripts/upgrade_sim.sh` (21 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 
 竞品与技术调研见 `docs/RESEARCH.md`。
@@ -84,11 +85,14 @@ zeroproxy/
 │   ├── requirements.txt           # fastapi / uvicorn / qrcode / cryptography / pyyaml
 │   ├── requirements-dev.txt       # + pytest / httpx
 │   ├── tests/                     # pytest 回归测试 (dry-run 全流程 + 安全边界 + 状态迁移)
+│   ├── static/
+│   │   └── index.html             # Apple 风格单文件 UI (零构建, 深浅色, 无 CDN)
 │   └── zeroproxy/
 │       ├── main.py                # FastAPI 入口 + 安全响应头中间件
-│       ├── config.py              # 状态模型 (state.json v3) / 文件锁 / 引导令牌 / 审计日志 / 备份还原
+│       ├── config.py              # 状态模型 (state.json v4) / 文件锁 / 引导令牌 / 审计日志 / 备份还原
 │       ├── crypto.py              # VLESS UUID 派生 / Reality X25519 密钥对 / PBKDF2
 │       ├── xray_config.py         # Xray 配置生成 (Reality / XHTTP / WS / Trojan + Stats API)
+│       ├── chain.py               # 链式代理 (配对码打包 / 解析 / 落地端口分配 / 真实出口 IP 探测)
 │       ├── geodata.py             # GeoIP/GeoSite 下载与校验 + 分流规则 (硬前置: 数据缺失不下发) + 启动前自愈 CLI
 │       ├── nginx_config.py        # Nginx 生成 (ACME + 443 WS 反代 + 伪装主页 + 8899 面板 TLS)
 │       ├── hysteria_config.py     # Hysteria 2 配置生成 (端口跳跃 + masquerade 伪装)
@@ -96,15 +100,13 @@ zeroproxy/
 │       ├── update.py              # 面板自更新 (远端版本检查 + 触发 upgrade.sh + 回读升级进度)
 │       ├── services.py            # systemctl / certbot / 自签证书 / 流量统计 / 节点握手探测 / 诊断
 │       ├── share_links.py         # 单节点链接 + Base64 / Clash / sing-box 订阅 + 三档分流模板
-│       └── routes.py              # API: setup / login / dashboard / settings / diagnose / probe / backup / sub / qr / update
+│       └── routes.py              # API: setup / login / dashboard / settings / diagnose / probe / backup / sub / qr / update / chain
 ├── docs/
 │   └── RESEARCH.md                # 竞品与技术调研 (含上游源码一手证据)
 ├── scripts/
 │   ├── verify.py                  # 端到端验证: 真实二进制跑通配置生成 / 订阅解析 / 探测 / 备份 / GeoIP
 │   ├── browser_check.cjs          # 真实浏览器 (Playwright) UI 验证与截图
 │   └── upgrade_sim.sh             # 一键升级演练: 真跑 upgrade.sh (桩掉 root/systemd), 覆盖成功与回滚两条路径
-├── static/
-│   └── index.html                 # Apple 风格单文件 UI (零构建, 深浅色, 无 CDN)
 └── systemd/
     ├── zeroproxy.service          # 面板 (仅监听 127.0.0.1:9900, nginx 在 8899 终结 TLS)
     ├── xray.service
@@ -277,7 +279,7 @@ GET /sub/{token}?format=singbox-next  → 同上, 但用 1.14+ 的 http_clients 
 用户操作 (开关节点 / 改端口 / 改伪装 / 续期证书)
         │  POST /api/...   (config.locked() 事务)
         ▼
-state.json (唯一事实来源, schema v3, 旧版本自动升级)
+state.json (唯一事实来源, schema v4, 旧版本自动升级)
         │
         ├──► 重新生成 xray/config.json + hysteria/config.yaml + nginx conf
         │            │
@@ -291,7 +293,9 @@ state.json (唯一事实来源, schema v3, 旧版本自动升级)
 
 - 节点关闭 = 订阅中移除该行 + 入站从 Xray 配置移除 + Hysteria 监听收敛回 `127.0.0.1`。
 - 证书续期只换文件 + `reload nginx`; 重复 `/api/apply` 使用 `--keep-until-expiring --expand`, 不会重复签发。
-- state.json 结构升级: 新增字段在读取时由 `_merge` 自动补齐 (v1 → v2 → v3 已覆盖测试)。
+- state.json 结构升级: 新增字段在读取时由 `_merge` 自动补齐 (v1 → v2 → v3 → v4 已覆盖测试)。
+- 链式代理的落地链路同样走「改 state → 重新生成配置 → 热重载 → 复查端口监听」这条闭环:
+  中转端多一个入站 (客户端连它) + 一个出站 (连落地端) + 一条路由规则, 订阅里随即多一个节点。
 - GeoIP 数据每 7 天自动更新: 面板后台线程每 6 小时检查一次, 只在数据真的变化时重启 Xray;
   下载先落到临时目录并通过真实 `xray -test` 校验后才原子替换, 所以不会出现"半个数据集"。
 
@@ -299,13 +303,15 @@ state.json (唯一事实来源, schema v3, 旧版本自动升级)
 
 ## 8. 前端 UI
 
-单文件 `static/index.html` (原生 JS + CSS, 零构建零 CDN, 离线可用):
+单文件 `backend/static/index.html` (原生 JS + CSS, 零构建零 CDN, 离线可用):
 
 - **Apple 风格**: SF 字体栈、18px 圆角卡片、柔和阴影、深浅色自动 + 手动切换。
 - **三步交互**: 初始化 (三输入框 + 部署进度逐步打钩) → 登录 → 仪表盘, 每 20s 静默轮询。
 - **仪表盘卡片**: 订阅三种格式 (各自复制 / 二维码)、5 张节点卡 (协议徽标 / 传输 / 加密 / 状态灯 /
   开关 / 单节点流量 / **握手延迟徽标** / 复制链接 / 二维码)、流量总览与节点占比、
   高级设置 (Reality SNI / Hysteria 伪装站点 / 各节点端口 / **GeoIP 分流开关与数据更新**)、
+  **链式代理 (落地端生成配对码 / 入口端粘贴配对码 → 真实握手测试 → 一键落地; 链式节点带
+  "链式" 徽标与落地出口 IP, 支持设为默认出口 / 单条测速 / 断开, 见 16)**、
   诊断与一键修复、证书与系统状态 (**含证书申请 / 续期, 备份下载与恢复**)、
   **程序更新 (完整升级闭环, 见 8.2)**、操作审计。
 - **失败不装成功**: 「一键生成」「保存并应用」「一键修复」的每一步失败都会顶到仪表盘顶部标红
@@ -379,6 +385,12 @@ state.json (唯一事实来源, schema v3, 旧版本自动升级)
 | GET | `/api/logs/{service}` | 会话 | 服务日志尾部 (journalctl) |
 | GET | `/sub/{token}?format=&rules=` | 订阅令牌 | Base64 / Clash / sing-box / sing-box-next 订阅内容, `rules=smart\|global\|direct` 单客户端覆盖分流模板 |
 | GET | `/api/nodes/{id}/qr` / `/api/subscription/qr` | 会话 | 节点 / 订阅二维码 PNG |
+| POST | `/api/chain/exit` | 会话 | 本机作为**落地端**: `action=generate\|rotate\|disable`, 可带 `port` / `label`; 生成的是独立 UUID + 独立端口的专用凭据 |
+| GET | `/api/chain/exit/qr` | 会话 | 配对码二维码 (另一台机器扫码即得, 不用手抄) |
+| POST | `/api/chain/entries` | 会话 | 本机作为**入口端**: `{code, label, local_port, default_out, force}` → 解析配对码 → **真实握手探测** → 落地成入站/出站/路由; 探测不通时返回 400 + `{probe, needs_force}`, 由前端二次确认后带 `force=1` 重试 |
+| POST | `/api/chain/entries/{id}` | 会话 | 启用 / 停用某条链式连接、设为默认出口 (同时只允许一条)、改名 |
+| POST | `/api/chain/entries/{id}/probe` | 会话 | 单条链式连接的测速: 真的穿过落地端出一次网并读回落地出口 IP |
+| DELETE | `/api/chain/entries/{id}` | 会话 | 断开并删除 (落地端的凭据不受影响) |
 
 ---
 
@@ -435,7 +447,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 
 在 macOS (Apple Silicon, Python 3.14) 上实测通过:
 
-- `python -m pytest tests -q` → **90 passed, 4 skipped** (带 `ZP_XRAY_BIN` 时 **94 passed**, 约 20 秒);
+- `python -m pytest tests -q` → **108 passed, 5 skipped** (带 `ZP_XRAY_BIN` 时 **113 passed**, 约 29 秒);
   含 `/api/update` 鉴权与版本比较、`apply` 的"写不进 /etc/nginx 即失败"语义、CLI 退出码、以及
   `install.sh` 重跑不覆盖已初始化配置 / `upgrade.sh` 随包发布 / 自签证书可补签 Let's Encrypt /
   `systemctl` 参数顺序的回归断言 / Reality 密钥必须是成对的 X25519 (Ed25519 必须判无效) /
@@ -443,6 +455,11 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   深度体检客户端在自签场景下不发已被 Xray 26 移除的 `allowInsecure` (改用 `pinnedPeerCertSha256`) /
   深度体检必须把 SOCKS5 回复读满 (只读 4 字节会让 TLS 报 `WRONG_VERSION_NUMBER`) /
   服务版本探测要跳过 Hysteria 2 的块字符 banner (否则面板挂一串花屏方块)。
+  链式代理另有 20 项 (`tests/test_chain.py`): 配对码往返与 8 类坏码的中文报错 /
+  落地端生成-轮换-关闭与端口冲突 / **探测不通必须拦一下 (400 + needs_force), 只有 `force=1` 才硬加** /
+  环境不支持探测 (无 xray 二进制) 时不该拦住用户 / 拒绝"配对码指向本机自己"与重复添加 /
+  入站与出站/路由规则落在生成配置里、订阅三种格式都带上它、默认出口会把 4 个主力入站整体改道、
+  停用即从订阅与配置里消失、删除后 `share_links` 里也没有 / 链路诊断与流量标签。
   **升级脚本必须从临时副本启动** (脚本会在运行中覆盖自己, 就地执行会被 bash 读出语法错)。
 - `scripts/verify.py` (Xray 26.3.27 + Hysteria 2.12.3 + mihomo 1.19.31 + sing-box 1.14.2) → **74/74 项通过**:
   setup 8 步全绿 / 三种订阅格式可被真实客户端解析 / 三档分流模板分别被 `mihomo -t` 与
@@ -453,7 +470,12 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   **启动期自愈闭环**: 配置带 geo 规则 + 数据文件消失 → 原样启动被 Xray 拒绝 (复现) → `geodata guard`
   重新生成 (已移除 geo 规则) → 再自检通过 / 备份-恢复往返一致且篡改被拒 /
   5 个节点握手探测全部成功 (Reality TLS 136ms, 出口 RTT 54ms)。
-- `scripts/browser_check.cjs` → **66/66 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
+  **[10] 链式代理: 两台「机器」真跑一条链** —— 用两份独立 state + 三个真实 Xray 进程扮演
+  「客户端 → 中转端 → 落地端」: 落地端生成专用凭据后, 中转端配置只含 `chain-<id>` 入站 + Stats API,
+  出站指向落地端 `127.0.0.1:8666`; 客户端拿中转端凭据连进去, **真的从落地端出网并读回出口 IP**;
+  反向用例: 把落地端的专用 UUID 换掉 (等价于配对码被轮换) 后同一条链立刻读不到 IP —— 证明确实是
+  链路上的每一跳在起作用, 而不是"随便走哪条路都能出网"。
+- `scripts/browser_check.cjs` → **81/81 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
   诊断 8/8、节点测速结果落到卡片、GeoIP 开关与状态、**分流模板选择器 (切换 → 订阅内容
   真的变化 → 切回)**、备份下载、**程序更新卡片 (版本行 / 检查更新 / 非生产环境隐藏一键更新)**、
   **二维码弹窗 (走 SVG 缩放不糊 / 图案完整落在卡片内 / 长链接省略号截断而不顶破卡片 /
@@ -464,6 +486,9 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   **升级交互闭环 (确认弹窗逐条列出会做什么与不动什么 / 取消不开始 / 升级中 ✓○⟳ 清单与正在执行的
   那一步 / 进度条按已完成步数推进 / 「已完成 n/N 步 · 已用 X 秒」/ 完成态版本跨度与用时并折叠步骤 /
   本页 JS 落后时给出「重新加载面板」/ 失败态标出断在第几步 + 进度条转红 + 日志尾巴)**;
+  **链式代理 (落地端生成配对码 + 说明端口/凭据隔离/泄露风险 / 配对码二维码出图 /
+  粘贴配对码后"探测不通先拦一下"的二次确认 / 落地成链式卡片 + 节点网格变 6 张 + 订阅里看得见 /
+  设为默认出口的确认与标记 / 测速失败如实标红 / 断开后卡片与订阅节点一起消失)**;
   无 console 错误、无失败请求。
 - `scripts/upgrade_sim.sh` → **21/21 项通过**: 在模拟的"已部署机器"上真跑 `upgrade.sh` ——
   备份 → 换代码 → 按 `state.json` 重新落地配置 (把占位配置修回真实配置) → 写 `update.json` /
@@ -678,3 +703,68 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
   直接后台执行 (面板重启可能打断升级), 这种情况下建议改用命令行 `upgrade.sh`。
 - 升级脚本按 `ZP_HOME`(默认 `/opt/zeroproxy`) 布局工作, 只覆盖 `zeroproxy/` `static/`
   `requirements.txt` `systemd/*.service` 与 `upgrade.sh`, 不碰 `data/`、`certs/`、`geo/`。
+
+---
+
+## 16. 链式代理 (两台机器接成一条链)
+
+**要解决的问题**: 你有一台香港机器和一台美国机器 —— 香港离你近 (延迟低)、美国出口才是你要的 IP。
+想让客户端连香港、出口走美国。
+
+Clash 的 `relay` / sing-box 的 `detour` 都能做这件事, 但都要**在客户端手写配置** (手机上尤其难受),
+而且每加一台机器就要改一次客户端。本面板把链式做在**服务端**: 对你手机 / 电脑上的客户端来说,
+它只是订阅里多出来的一个普通节点。
+
+### 16.1 三步接完
+
+1. **落地端** (美国机器): 面板「链式代理 → 落地端」→ 填端口 (默认 8447) 与名称 → 「生成配对码」。
+   本机随即多一个**专用入站** (`chain-exit`), 与订阅里那份凭据完全分开。
+2. **入口端** (香港机器): 面板「链式代理 → 入口端」→ 粘贴配对码 (可扫码) → 需要的话勾「设为默认出口」
+   → 「连接并测试」。面板会起一个**临时 Xray 客户端真的穿过落地端出一次网**, 读回落地出口 IP:
+   - 通 → 一键落地: 新增入站 (`chain-<短id>`, 客户端连它) + 出站 (`chain-out-<短id>`, 连落地端) +
+     一条路由规则, **订阅里立刻多出这个节点**;
+   - 不通 → 弹确认框说明原因 (安全组没放行? 配对码轮换过?) —— 你可以选择仍然添加, 稍后修好再测速。
+3. 客户端重新拉一次订阅 (或等它自动刷新), 直接选这个节点即可。**不用改任何客户端配置**。
+
+### 16.2 落地凭据是专用的
+
+配对码里装的是落地端**专门生成**的一份凭据: 独立 UUID + 独立端口 (默认 8447, 走 VLESS + TCP +
+Reality + Vision, 复用本机 Reality 密钥与伪装目标, 免证书)。
+
+| 操作 | 效果 |
+|---|---|
+| 「重新生成」 | 旧配对码**立即作废**, 已经连上的入口端会断链 (拿新码重连即可); 你自己的订阅、节点、客户端**完全不受影响** |
+| 「关闭落地端」 | 入站下线 + 配对码作废; 随时可再生成 |
+| 「断开」(入口端) | 删掉本机的入站 / 出站 / 路由规则, 订阅里该节点消失; 落地端那边毫发无损 |
+
+> 配对码等同凭据: 谁拿到都能把你的机器当出口用。别公开发布; 万一泄露点「重新生成」即可
+> (配对码末尾的 6 位校验和只用来挡"复制粘贴被截断", 不是签名)。
+
+### 16.3 「设为默认出口」: 真正的链式加速
+
+某条链可以设为**默认出口**: 本机 4 个主力节点 (Reality / XHTTP / WS / Trojan) 的流量整体改道到那条链 ——
+客户端**不用换节点**, 但出口 IP 变成落地服务器。同时只允许一条默认出口; 停用某条链会自动摘掉它的默认标记。
+GeoIP 分流 (广告拦截 / 私有地址防护) 的优先级高于默认出口, 该拦的照拦。
+
+### 16.4 端口与安全组 (最容易卡住的地方)
+
+链式要用到两个**主力节点之外**的新端口, `install.sh` 里那几条放行规则覆盖不到:
+
+| 端口 | 在哪台机器 | 干什么 |
+|---|---|---|
+| 配对码里的端口 (默认 `8447/tcp`) | 落地端 | 给别的中转服务器接入 |
+| 自动分配的入站端口 (从 `8446/tcp` 往后找) | 入口端 | 客户端连它 (也可以在面板里手动指定) |
+
+面板在启用时会尽力 `ufw allow` 并把这个动作作为一步写进结果清单; **云厂商的安全组要你自己去控制台放行**
+(面板管不到)。对方连不上, 九成是这里没放行。
+
+### 16.5 实现要点 (排障时有用)
+
+- 配对码是 `ZPC1~<base64url(JSON)>~<sha256 前 6 位>` 一行, 可复制可扫码; 解析阶段就把
+  "地址 / 端口 / UUID / SNI / shortId / Reality 公钥长度 / flow" 逐项校验, 坏码当场给出中文原因,
+  不会等落地后才握手失败 (`backend/zeroproxy/chain.py: parse_code`)。
+- 探测用的是**真实数据面**: 起一个最小 Xray 客户端 + 本地 SOCKS5, 经隧道发一次 HTTP GET 读回出口 IP
+  (回显服务按"国内也能直连"的顺序试: `ip.3322.net` → `ifconfig.me/ip` → `api.ipify.org`)。
+  因此"探测通过"= 整条链真的能出网, 而不是"端口开着"。
+- 环境不允许探测时 (比如没有 xray 二进制) 面板会明确说明并**不拦**用户 —— 把差异留给「测速」按钮去补。
+- 进 `state.json` 的 `chain` 段 (schema v4), 随备份 / 恢复一起走; 流量统计按节点展开到链式入站。

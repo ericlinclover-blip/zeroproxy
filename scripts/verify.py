@@ -556,6 +556,146 @@ def main() -> int:
             except subprocess.TimeoutExpired:
                 proc.kill()
 
+    print("\n[10] 链式代理 (两台「机器」真跑: 客户端 → 中转 → 落地 → 外网)")
+    # 只有一台机器, 就用两份独立的 state + 两个真实 Xray 进程扮演两台服务器:
+    #   A = 落地端 (面板生成 `chain-exit` 入站, 专用 UUID + 独立端口)
+    #   B = 中转端 (另一套 Reality 密钥, 只有 `chain-<id>` 入站 + 指向 A 的出站)
+    # 客户端拿 B 的入站凭据连进去, 只有三跳全通才能读到出口 IP —— 任何一跳坏了
+    # (Reality 密钥 / shortId / 专用 UUID / 路由规则) 都会变成"读不到 IP"。
+    if not xray_bin:
+        print("  - 跳过 (未提供 ZP_XRAY_BIN)")
+    else:
+        import uuid as uuid_mod
+
+        from zeroproxy import chain, crypto, services, xray_config
+
+        exit_port = 8666
+        entry_port = 8667
+        client.post("/api/chain/exit", json={"action": "generate", "port": exit_port, "label": "落地A"})
+        code = chain.parse_code(client.get("/api/dashboard").json()["chain"]["exit"]["code"])
+        record("落地端生成专用凭据 + 配对码", code["port"] == exit_port and bool(code["uuid"]),
+               f"端口 {code['port']}")
+
+        asset = str(geo_dir) if geo_dir.is_dir() else ""
+        env_a = {**os.environ, **({"XRAY_LOCATION_ASSET": asset} if asset else {})}
+        chain_procs: list[subprocess.Popen] = []
+        try:
+            # ---- A: 落地端 (直接用面板生成的配置, 含 chain-exit 入站)
+            chain_procs.append(subprocess.Popen(
+                [xray_bin, "run", "-c", str(home / "xray" / "config.json")],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env_a,
+            ))
+            deadline = time.time() + 20
+            while time.time() < deadline and not port_open(exit_port):
+                time.sleep(0.5)
+            record(f"落地端 xray 监听 {exit_port}/tcp (chain-exit 入站)", port_open(exit_port))
+
+            # ---- B: 中转端 (另一台机器: 独立 UUID + 独立 Reality 密钥, 只开链式入站)
+            state_a = config.load_state()
+            state_b = json.loads(json.dumps(state_a))
+            state_b["uuid"] = str(uuid_mod.uuid4())
+            state_b["reality"]["private_key"], state_b["reality"]["public_key"], state_b["reality"]["short_id"] = (
+                crypto.new_reality_keys()
+            )
+            state_b["nodes"] = {nid: False for nid in config.NODE_IDS}
+            state_b["geodata"] = {**state_b.get("geodata", {}), "enabled": False}
+            state_b["ports"] = {**state_b["ports"], "api": free_port()}
+            state_b["chain"]["exit"] = {"enabled": False, "port": 8668, "uuid": "", "label": "", "created_at": 0}
+            entry = {
+                "id": "e2e00001",
+                "label": "落地A",
+                "host": "127.0.0.1",
+                "port": code["port"],
+                "uuid": code["uuid"],
+                "pbk": code["pbk"],
+                "sid": code["sid"],
+                "sni": code["sni"],
+                "flow": code["flow"],
+                "local_port": entry_port,
+                "enabled": True,
+                "default_out": False,
+                "created_at": int(time.time()),
+                "last_probe": {},
+            }
+            state_b["chain"]["entries"] = [entry]
+            cfg_b = xray_config.build_xray_config(state_b)
+            cfg_b_path = home / "chain-b.json"
+            cfg_b_path.write_text(json.dumps(cfg_b), encoding="utf-8")
+            tags_b = [i["tag"] for i in cfg_b["inbounds"]]
+            record("中转端配置只含链式入站 + Stats API", tags_b == [f"chain-{entry['id']}", "api"], str(tags_b))
+            out_b = next(o for o in cfg_b["outbounds"] if o["tag"] == f"chain-out-{entry['id']}")
+            record("中转端出站指向落地端",
+                   out_b["settings"]["vnext"][0]["address"] == "127.0.0.1"
+                   and out_b["settings"]["vnext"][0]["port"] == exit_port,
+                   f"127.0.0.1:{exit_port} → 客户端端口 {entry['local_port']}")
+
+            chain_procs.append(subprocess.Popen(
+                [xray_bin, "run", "-c", str(cfg_b_path)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env_a,
+            ))
+            deadline = time.time() + 20
+            while time.time() < deadline and not port_open(entry_port):
+                time.sleep(0.5)
+            record(f"中转端 xray 监听 {entry_port}/tcp (客户端连它)", port_open(entry_port))
+
+            # ---- 客户端: 用中转端的入站凭据起一个真 SOCKS, 穿过整条链读出口 IP
+            def through_chain(state: dict, node_id: str, label: str, timeout: float = 20) -> str:
+                socks_port = free_port()
+                cfg_path = home / f"client-{label}.json"
+                cfg_path.write_text(
+                    json.dumps(services.client_config(state, node_id, socks_port)), encoding="utf-8"
+                )
+                proc = subprocess.Popen(
+                    [xray_bin, "run", "-c", str(cfg_path)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env_a,
+                )
+                chain_procs.append(proc)
+                try:
+                    deadline = time.time() + 15
+                    while time.time() < deadline and not port_open(socks_port):
+                        time.sleep(0.3)
+                    ip, _ = chain.read_exit_ip(socks_port, timeout)
+                    return ip
+                finally:
+                    proc.terminate()
+
+            node_id = f"chain-{entry['id']}"
+            ip = through_chain(state_b, node_id, "chain")
+            record("客户端 → 中转 → 落地 → 外网 真实出网", bool(ip), f"出口 IP {ip}" if ip else "读不到出口 IP")
+
+            # 面板「连接并测试」走的就是这个: 入口端起临时客户端, 直连落地端的
+            # chain-exit 入站出一次网, 读回出口 IP 之后才允许落地。
+            probe = chain.probe_target(chain.as_target(entry))
+            record("入口端「连接并测试」真实探测落地端", bool(probe["ok"]),
+                   f"{probe['detail']} · {probe['ms']}ms" if probe["ok"] else str(probe["detail"]))
+
+            # 反向用例: 把落地端的专用 UUID 换掉 (等价于配对码被轮换过),
+            # 链路必须立刻断 —— 证明上一步的成功不是"随便走哪条路都能出网"。
+            broken = json.loads(json.dumps(state_b))
+            broken["chain"]["entries"][0]["uuid"] = str(uuid_mod.uuid4())
+            broken["chain"]["entries"][0]["local_port"] = 8668
+            broken["ports"] = {**broken["ports"], "api": free_port()}   # 两个 Xray 进程不能抢同一个端口
+            bad_cfg = xray_config.build_xray_config(broken)
+            bad_cfg_path = home / "chain-b-broken.json"
+            bad_cfg_path.write_text(json.dumps(bad_cfg), encoding="utf-8")
+            chain_procs.append(subprocess.Popen(
+                [xray_bin, "run", "-c", str(bad_cfg_path)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env_a,
+            ))
+            deadline = time.time() + 20
+            while time.time() < deadline and not port_open(8668):
+                time.sleep(0.5)
+            bad_ip = through_chain(broken, node_id, "chain-broken", timeout=10)
+            record("落地端凭据被换掉后链路立即失效 (反向用例)", not bad_ip, f"出口 IP {bad_ip or '读不到'}")
+        finally:
+            for proc in chain_procs:
+                proc.terminate()
+            for proc in chain_procs:
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
     failed = [name for name, ok, _ in results if not ok]
     print(f"\n结论: {len(results) - len(failed)}/{len(results)} 项通过")
     if failed:

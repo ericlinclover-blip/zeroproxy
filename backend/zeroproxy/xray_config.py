@@ -185,6 +185,135 @@ def geo_rules(state: dict) -> list[dict]:
     return rules
 
 
+# ---------------------------------------------------------------- 链式代理
+
+def chain_exit_enabled(state: dict) -> bool:
+    """本机是否作为落地端对外开放 (已生成专用凭据)。"""
+    exit_cfg = (state.get("chain") or {}).get("exit") or {}
+    return bool(exit_cfg.get("enabled")) and bool(exit_cfg.get("uuid"))
+
+
+def chain_entries(state: dict) -> list[dict]:
+    """本机作为中转端时, 已启用的落地端条目。"""
+    return [e for e in (state.get("chain") or {}).get("entries") or [] if e.get("enabled", True)]
+
+
+def chain_node_id(entry: dict) -> str:
+    """链式节点 id —— 同时用作 Xray 入站 tag, 面板/订阅里到处都是这个值。"""
+    return f"chain-{entry['id']}"
+
+
+def _reality_stream(state: dict) -> dict:
+    """本机 Reality 入站的 streamSettings (与主力节点共用同一套密钥与伪装目标)。"""
+    r = state["reality"]
+    return {
+        "network": "tcp",
+        "security": "reality",
+        "tcpSettings": {"header": {"type": "none"}},
+        "realitySettings": {
+            "show": False,
+            "xver": 0,
+            "dest": r["dest"],
+            "serverNames": [r["server_name"]],
+            "privateKey": r["private_key"],
+            "shortIds": [r["short_id"]],
+        },
+    }
+
+
+def _chain_exit_inbound(state: dict) -> dict:
+    """落地端入站: 给"别人的中转服务器"用的专用凭据 (独立 UUID / 独立端口)。
+
+    与主力 Reality 节点同样的协议组合 —— 免证书, 且中转服务器的出站正好是
+    VLESS Reality 客户端, 两端参数一一对应。
+    """
+    exit_cfg = state["chain"]["exit"]
+    return {
+        "tag": "chain-exit",
+        "listen": "0.0.0.0",
+        "port": int(exit_cfg["port"]),
+        "protocol": "vless",
+        "settings": {
+            "clients": [{"id": exit_cfg["uuid"], "flow": "xtls-rprx-vision"}],
+            "decryption": "none",
+        },
+        "streamSettings": _reality_stream(state),
+    }
+
+
+def _chain_entry_inbound(state: dict, entry: dict) -> dict:
+    """中转端入站: 客户端连这里 (地址就是本机), 流量随后交给落地端出网。"""
+    return {
+        "tag": chain_node_id(entry),
+        "listen": "0.0.0.0",
+        "port": int(entry["local_port"]),
+        "protocol": "vless",
+        "settings": {
+            "clients": [{"id": state["uuid"], "flow": "xtls-rprx-vision"}],
+            "decryption": "none",
+        },
+        "streamSettings": _reality_stream(state),
+    }
+
+
+def chain_entry_outbound(entry: dict) -> dict:
+    """中转端出站: 以 VLESS Reality 客户端身份连落地端。"""
+    return {
+        "tag": f"chain-out-{entry['id']}",
+        "protocol": "vless",
+        "settings": {
+            "vnext": [
+                {
+                    "address": entry["host"],
+                    "port": int(entry["port"]),
+                    "users": [
+                        {
+                            "id": entry["uuid"],
+                            "encryption": "none",
+                            "flow": entry.get("flow") or "xtls-rprx-vision",
+                        }
+                    ],
+                }
+            ]
+        },
+        "streamSettings": {
+            "network": "tcp",
+            "security": "reality",
+            "tcpSettings": {"header": {"type": "none"}},
+            "realitySettings": {
+                "serverName": entry["sni"],
+                "publicKey": entry["pbk"],
+                "shortId": entry.get("sid") or "",
+                "fingerprint": "chrome",
+                "spiderX": "/",
+            },
+        },
+    }
+
+
+def local_inbound_tags(state: dict) -> list[str]:
+    """本机主力节点当前启用的入站 tag (链式"设为默认出口"要把它们整体改道)。"""
+    nodes = state.get("nodes", {})
+    tags: list[str] = []
+    if nodes.get("vless-reality") and state["reality"]["private_key"]:
+        tags.append("vless-reality")
+    if nodes.get("vless-xhttp") and state["reality"]["private_key"]:
+        tags.append("vless-xhttp")
+    if nodes.get("vless-ws"):
+        tags.append("vless-ws")
+    if nodes.get("trojan") and cert_usable(state):
+        tags.append("trojan")
+    return tags
+
+
+def default_chain_entry(state: dict) -> dict | None:
+    """被设为"默认出口"的链式条目 (同时只允许一个)。"""
+    for entry in chain_entries(state):
+        if entry.get("default_out"):
+            return entry
+    return None
+
+
 def build_xray_config(state: dict) -> dict:
     cfg = {
         "log": {"loglevel": "warning"},
@@ -223,9 +352,42 @@ def build_xray_config(state: dict) -> dict:
         cfg["inbounds"].append(_ws_inbound(state))
     if nodes.get("trojan") and cert_usable(state):
         cfg["inbounds"].append(_trojan_inbound(state))
+
+    # 链式代理: 中转端每条落地连接 = 一个入站 + 一个出站 + 一条路由规则
+    entries = chain_entries(state)
+    if chain_exit_enabled(state):
+        cfg["inbounds"].append(_chain_exit_inbound(state))
+    for entry in entries:
+        cfg["inbounds"].append(_chain_entry_inbound(state, entry))
+        cfg["outbounds"].append(chain_entry_outbound(entry))
+
     # API 入站始终存在: 面板靠它读流量, 但如果没有启用的 xray 节点则没必要开
     if cfg["inbounds"]:
         cfg["inbounds"].append(_api_inbound(state))
+
+    # 路由顺序即优先级: API 处理 → geo 拦截 → 链式默认出口 → 各链式入口。
+    # "设为默认出口"会把本机 4 个主力节点的流量整体改道到落地端 —— 这正是
+    # "拿香港机器给美国落地加速"的用法; 放在 geo 拦截之后, 保证广告/私有地址
+    # 的拦截规则依然优先。
+    default_entry = default_chain_entry(state)
+    if default_entry is not None:
+        tags = local_inbound_tags(state)
+        if tags:
+            cfg["routing"]["rules"].append(
+                {
+                    "type": "field",
+                    "inboundTag": tags,
+                    "outboundTag": f"chain-out-{default_entry['id']}",
+                }
+            )
+    for entry in entries:
+        cfg["routing"]["rules"].append(
+            {
+                "type": "field",
+                "inboundTag": [chain_node_id(entry)],
+                "outboundTag": f"chain-out-{entry['id']}",
+            }
+        )
     return cfg
 
 

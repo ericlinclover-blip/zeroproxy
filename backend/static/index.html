@@ -77,6 +77,13 @@ input {
   transition: border 0.15s, box-shadow 0.15s;
 }
 input:focus { border-color: var(--accent-2); box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.2); }
+textarea {
+  width: 100%; padding: 11px 14px; border-radius: 12px; resize: vertical;
+  border: 1px solid var(--border); background: transparent;
+  color: var(--text); font-size: 12.5px; line-height: 1.5; outline: none; word-break: break-all;
+  transition: border 0.15s, box-shadow 0.15s;
+}
+textarea:focus { border-color: var(--accent-2); box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.2); }
 label { display: block; font-size: 13px; color: var(--sub); margin: 0 0 6px 4px; }
 .field { margin-bottom: 18px; }
 .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
@@ -380,6 +387,22 @@ code.inline { background: var(--border); padding: 2px 7px; border-radius: 6px; f
         <span class="muted" style="font-size:12px">数据源 Loyalsoldier/v2ray-rules-dat, 每 7 天自动更新</span>
       </div>
     </div>
+
+    <div class="section-title">链式代理</div>
+    <div class="card" id="chain-intro">
+      <div class="row" style="justify-content:space-between">
+        <span style="font-weight:600;font-size:13.5px">两台机器接成一条链: 近的做入口加速, 远的做落地出口</span>
+        <span class="muted" style="font-size:12.5px">客户端只连本机, 出口 IP 是落地服务器</span>
+      </div>
+      <div class="muted" style="font-size:12.5px;margin-top:8px;line-height:1.6">
+        典型用法: 香港机器离你近 (延迟低) 做 <b>入口</b>, 美国机器做 <b>落地</b> (出口 IP 显示为美国)。
+        两台都装本程序 → 落地端点「生成配对码」→ 入口端粘贴那行码点「连接并测试」即可。
+        链式节点对你手机 / 电脑上的客户端就是一个普通节点 (订阅里多一条), 不用手写 Clash relay /
+        sing-box detour 配置; 也不需要在客户端装任何东西。
+      </div>
+    </div>
+    <div class="grid" id="chain-grid" style="margin-top:16px"></div>
+    <div id="chain-entries"></div>
 
     <div class="section-title">诊断</div>
     <div class="card" id="diag-card">
@@ -730,6 +753,7 @@ function renderDash(quiet) {
 
   renderTraffic(dash.traffic);
   renderAdvanced(dash);
+  renderChain(dash);
   renderSystem(dash);
   renderAudit(dash.audit);
   renderDashboardBanner();
@@ -804,14 +828,26 @@ function renderNodes() {
       const traffic = n.traffic
         ? `<div class="muted" style="font-size:12.5px;margin-top:6px">↑ ${fmtBytes(n.traffic.uplink)} · ↓ ${fmtBytes(n.traffic.downlink)}</div>`
         : "";
-      return `<div class="card node-card">
+      // 链式节点: 客户端连的是本机, 出口在落地服务器 —— 卡片上把这两件事说清楚
+     return `<div class="card node-card">
         <div class="top">
-          <span class="name"><span class="badge ${PROTO_BADGE[n.protocol] || "vless"}">${esc(n.protocol)}</span> ${esc(n.name)}</span>
+          <span class="name">${
+            n.chain
+              ? '<span class="badge hysteria" title="链式中转: 客户端连本机, 出口 IP 是落地服务器">链式</span>'
+              : `<span class="badge ${PROTO_BADGE[n.protocol] || "vless"}">${esc(n.protocol)}</span>`
+          }${esc(n.name)}${n.default_out ? '<span class="badge trojan">默认出口</span>' : ""}</span>
           <label class="switch"><input type="checkbox" data-node="${escAttr(n.id)}" ${n.enabled ? "checked" : ""}><span class="slider"></span></label>
         </div>
         <div class="meta">${esc(n.transport)} · ${esc(n.security)}</div>
         <div class="addr mono">${esc(n.host)}:${n.port} <span class="dot ${stateClass(n.service_state)}" title="${escAttr(n.service)}"></span> <span class="muted">${STATE_TXT[n.service_state] || esc(n.service_state)}</span>${pingHtml(n.id)}</div>
         <div class="muted" style="font-size:12.5px">${esc(n.desc || "")}</div>
+        ${
+          n.chain && n.last_probe && n.last_probe.exit_ip
+            ? `<div class="muted" style="font-size:12.5px;margin-top:4px">落地出口 IP ${esc(n.last_probe.exit_ip)}${
+                n.last_probe.ms ? " · " + n.last_probe.ms + "ms" : ""
+              } · ${esc(fmtTime(n.last_probe.ts))}</div>`
+            : ""
+        }
         ${traffic}
         ${n.note ? `<div class="note">${esc(n.note)}</div>` : ""}
         <div class="actions" style="margin-top:12px">
@@ -1150,6 +1186,303 @@ function renderAudit(entries) {
     .slice(0, 4)
     .map((e) => `${fmtTime(e.ts)} ${e.action}${e.detail ? " (" + e.detail + ")" : ""}`)
     .join("  |  ");
+}
+
+/* ---------------- 链式代理 ----------------
+ * 两台机器各装一份本程序, 接成一条链 (入口 → 落地):
+ *   落地端: 生成专用凭据 (独立 UUID + 独立端口, 与订阅凭据分开, 可单独作废) → 配对码
+ *   入口端: 粘贴配对码 → 真实握手探测 → 新增入站 + 出站 + 路由规则, 订阅里随即多一个节点
+ * 对客户端只是"多了一个普通节点", 链式链路完全透明 (不用手写 Clash relay / sing-box detour)。
+ * 可选「设为默认出口」: 本机 4 个主力节点的流量整体改道到落地端 —— 这才是"链式加速"。 */
+function renderChain(d) {
+  const grid = $("#chain-grid");
+  if (!grid) return;
+  const c = d.chain || {};
+  const ex = c.exit || {};
+  const entries = c.entries || [];
+  grid.innerHTML = chainExitCard(d, ex) + chainPeerCard(d, entries);
+  $("#chain-entries").innerHTML = entries.length
+    ? `<div class="section-title" style="margin-bottom:0">已连接的落地端 (${entries.length})</div>` +
+      entries.map((e) => chainEntryCard(d, e)).join("")
+    : "";
+  bindChainExit(ex);
+  bindChainPeer();
+  bindChainEntries(entries);
+}
+
+function chainExitCard(d, ex) {
+  const head = `<div class="top" style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+      <span class="name" style="font-weight:600;font-size:15.5px;display:flex;align-items:center;gap:8px">
+        <span class="badge trojan">落地端</span>本机对外当出口</span>
+      ${ex.enabled ? '<span class="badge vless">已开启</span>' : '<span class="badge hysteria">未开启</span>'}
+    </div>`;
+  if (!ex.enabled) {
+    return `<div class="card" id="chain-exit-card">${head}
+      <div class="muted" style="font-size:12.5px;margin:10px 0 14px;line-height:1.6">
+        开启后本机会多一个<b>专用入站</b> (独立凭据, 与订阅里那份互不影响), 供另一台机器把本机当出口用。
+        客户端最终看到的出口 IP 就是这台服务器。</div>
+      <div class="adv-grid">
+        <div class="field"><label>落地端口 (TCP)</label>
+          <input class="mono" id="chain-exit-port" value="${ex.port || 8447}" inputmode="numeric"></div>
+        <div class="field"><label>名称 (给对方看, 可留空)</label>
+          <input id="chain-exit-label" placeholder="${escAttr(d.domain)}" spellcheck="false"></div>
+      </div>
+      <div class="row" style="margin-top:4px">
+        <button class="btn small" id="btn-chain-exit-gen">生成配对码</button>
+        <span class="muted" style="font-size:12px">生成后把配对码贴到入口端服务器</span>
+      </div>
+    </div>`;
+  }
+  const code = ex.code || "";
+  return `<div class="card" id="chain-exit-card">${head}
+    <div class="muted" style="font-size:12.5px;margin:10px 0 10px;line-height:1.6">
+      把这行配对码贴到入口端服务器的「连接到落地服务器」里, 它就会把本机的出口当自己的出口。</div>
+    <div class="qr-link mono" id="chain-exit-code" title="${escAttr(code)}">${esc(code)}</div>
+    <div class="row" style="margin-top:12px">
+      <button class="btn ghost small" id="btn-chain-exit-copy">复制配对码</button>
+      <button class="btn ghost small" id="btn-chain-exit-qr">二维码</button>
+      <button class="btn ghost small" id="btn-chain-exit-rotate">重新生成</button>
+      <button class="btn ghost small danger" id="btn-chain-exit-off">关闭落地端</button>
+    </div>
+    <div class="divider"></div>
+    <div class="kv"><span class="k">落地端口</span><span class="mono">${ex.port} / tcp</span></div>
+    <div class="kv"><span class="k">专用凭据</span><span class="mono">${esc(ex.credential || "")}… <span class="muted">与订阅凭据分开, 可单独作废</span></span></div>
+    ${ex.label ? `<div class="kv"><span class="k">名称</span><span>${esc(ex.label)}</span></div>` : ""}
+    <div class="kv"><span class="k">开启时间</span><span>${esc(fmtTime(ex.created_at))}</span></div>
+    <div class="note">配对码等同凭据: 谁拿到都能把本机当出口用, 别公开发布; 万一泄露点「重新生成」即可
+      (旧码立即作废, 你自己的订阅完全不受影响)。对方连不上, 多半是云安全组没放行
+      <span class="mono">${ex.port}/tcp</span>。</div>
+  </div>`;
+}
+
+function chainPeerCard(d, entries) {
+  return `<div class="card" id="chain-peer-card">
+    <div class="top" style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+      <span class="name" style="font-weight:600;font-size:15.5px;display:flex;align-items:center;gap:8px">
+        <span class="badge vless">入口端</span>连接到落地服务器</span>
+      <span class="muted" style="font-size:12.5px">已连接 ${entries.length} 条</span>
+    </div>
+    <div class="field" style="margin-top:12px">
+      <label>配对码 (在落地服务器面板「链式代理 → 落地端」里生成)</label>
+      <textarea class="mono" id="chain-code" rows="3" spellcheck="false"
+        placeholder="ZPC1~… 整段粘贴, 别只复制一部分"></textarea>
+    </div>
+    <div class="adv-grid">
+      <div class="field"><label>名称 (可留空, 默认用落地地址)</label>
+        <input id="chain-label" placeholder="例如 美国落地" spellcheck="false"></div>
+      <div class="field"><label>本机对外端口 (留空自动分配)</label>
+        <input class="mono" id="chain-local-port" placeholder="自动" inputmode="numeric"></div>
+    </div>
+    <label class="chk" style="margin-top:4px"><input type="checkbox" id="chain-default-out">
+      设为默认出口: 本机所有节点整体改走这条链 (客户端不用换节点)</label>
+    <div class="row" style="margin-top:14px">
+      <button class="btn small" id="btn-chain-connect">连接并测试</button>
+      <span class="muted" style="font-size:12px">会真的穿过去出一次网并读回落地出口 IP (约 3-10 秒)</span>
+    </div>
+  </div>`;
+}
+
+function chainEntryCard(d, e) {
+  const p = e.last_probe || {};
+  let probe;
+  if (!p.ts && !p.detail) {
+    probe = `<span class="muted" style="font-size:12.5px">还没测过这条链 —— 点「测速」跑一次真实出口往返。</span>`;
+  } else {
+    const cls = p.ok ? "ok" : "bad";
+    const head = p.ok
+      ? `出口 IP ${esc(p.exit_ip || "?")}${p.ms ? " · " + p.ms + "ms" : ""}`
+      : "不通";
+    probe = `<span class="ping ${cls}">${esc(head)}</span>
+      <span class="muted" style="font-size:12px">${esc(p.detail || "")}${p.ts ? " · " + esc(fmtTime(p.ts)) : ""}</span>`;
+  }
+  return `<div class="card node-card" style="margin-top:12px">
+    <div class="top">
+      <span class="name"><span class="badge hysteria">链式</span>${esc(e.label || e.host)}${
+        e.default_out ? '<span class="badge trojan">默认出口</span>' : ""
+      }</span>
+      <label class="switch"><input type="checkbox" data-chain-toggle="${escAttr(e.id)}" ${
+        e.enabled ? "checked" : ""
+      }><span class="slider"></span></label>
+    </div>
+    <div class="meta">经落地 ${esc(e.host)}:${e.port} · SNI ${esc(e.sni || "")}</div>
+    <div class="addr mono">${esc(d.domain)}:${e.local_port} <span class="dot ${
+      e.enabled ? "running" : "other"
+    }"></span> <span class="muted">${e.enabled ? "运行中" : "已停用"}</span>${
+      e.enabled ? ` <span class="badge hysteria" style="font-size:11px">订阅里有它</span>` : ""
+    }</div>
+    <div style="margin-top:6px">${probe}</div>
+    <div class="actions" style="margin-top:12px">
+      <button class="btn ghost small" data-chain-probe="${escAttr(e.id)}">测速</button>
+      <button class="btn ghost small" data-chain-default="${escAttr(e.id)}" data-on="${
+        e.default_out ? "1" : "0"
+      }">${e.default_out ? "取消默认出口" : "设为默认出口"}</button>
+      <button class="btn ghost small danger" data-chain-del="${escAttr(e.id)}">断开</button>
+    </div>
+  </div>`;
+}
+
+/* 链式接口统一入口: 回来后用服务器返回的完整仪表盘数据整体重渲染 */
+async function chainApply(method, path, payload, btn, busyText) {
+  const original = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; if (busyText) btn.textContent = busyText; }
+  try {
+    const opts = { method };
+    if (payload !== undefined) {
+      opts.headers = { "Content-Type": "application/json" };
+      opts.body = JSON.stringify(payload);
+    }
+    dash = await api(path, opts);
+    renderDash(true);
+    const failed = (dash.steps || []).filter((s) => !s.ok);
+    toast(failed.length ? `已应用, 但有 ${failed.length} 步告警: ${failed[0].name}` : "已应用, 订阅内容已刷新");
+  } catch (e) {
+    toast("操作失败: " + e.message);
+  }
+  // 控件可能已经被整体重渲染掉, 只有还留在页面上时才恢复
+  if (btn && document.body.contains(btn)) {
+    btn.disabled = false;
+    if (busyText) btn.textContent = original;
+  }
+}
+
+function bindChainExit(ex) {
+  if (!ex.enabled) {
+    const btn = $("#btn-chain-exit-gen");
+    if (btn) btn.onclick = () => chainApply("POST", "/api/chain/exit", {
+      action: "generate",
+      port: parseInt($("#chain-exit-port").value, 10) || undefined,
+      label: $("#chain-exit-label").value.trim(),
+    }, btn, "生成中…");
+    return;
+  }
+  const code = ex.code || "";
+  $("#btn-chain-exit-copy").onclick = () => copyText(code);
+  $("#btn-chain-exit-qr").onclick = () =>
+    openQr({
+      title: "落地端配对码",
+      sub: `在入口端服务器面板粘贴, 端口 ${ex.port}/tcp`,
+      link: code,
+      svg: "/api/chain/exit/qr?img=svg",
+      png: "/api/chain/exit/qr?size=8",
+      file: "zeroproxy-chain-exit.png",
+    });
+  $("#btn-chain-exit-rotate").onclick = () =>
+    openConfirm({
+      title: "重新生成配对码?",
+      okLabel: "重新生成 (旧的作废)",
+      html: `<div class="qr-sub" style="text-align:left">已经连上本机的入口服务器会<b>立刻断链</b>,
+        需要拿新配对码重新连接一次。<br>本机自己的订阅凭据 / 节点 / 客户端配置完全不受影响。</div>`,
+      onOk: () => chainApply("POST", "/api/chain/exit", { action: "rotate" }, $("#btn-chain-exit-rotate"), "生成中…"),
+    });
+  $("#btn-chain-exit-off").onclick = () =>
+    openConfirm({
+      title: "关闭落地端?",
+      okLabel: "关闭 (配对码作废)",
+      html: `<div class="qr-sub" style="text-align:left">本机的落地入站会下线, 配对码同时作废;
+        已连接的入口服务器那条链会不通。<br>随时可以再点「生成配对码」重新开启 (端口与凭据会重新生成)。</div>`,
+      onOk: () => chainApply("POST", "/api/chain/exit", { action: "disable" }, $("#btn-chain-exit-off"), "关闭中…"),
+    });
+}
+
+/* 连接: 400 + needs_force 表示"链路测试没通过", 让用户看清楚原因再决定要不要硬加 */
+async function connectChain(force) {
+  const btn = $("#btn-chain-connect");
+  const code = $("#chain-code").value.trim();
+  if (!code) { toast("先把落地端的配对码粘进来"); return; }
+  const localPort = parseInt($("#chain-local-port").value, 10);
+  const payload = {
+    code,
+    label: $("#chain-label").value.trim(),
+    local_port: Number.isNaN(localPort) ? null : localPort,
+    default_out: $("#chain-default-out").checked,
+    force: !!force,
+  };
+  btn.disabled = true;
+  btn.textContent = force ? "强制连接中…" : "连接并测试中…";
+  try {
+    const res = await fetch("/api/chain/entries", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const detail = body.error || `HTTP ${res.status}`;
+      if (body.needs_force) {
+        btn.disabled = false;
+        btn.textContent = "连接并测试";
+        openConfirm({
+          title: "链路测试没通过, 仍然添加?",
+          okLabel: "仍然添加",
+          html: `<div class="qr-sub" style="text-align:left">真实握手 / 出口往返失败:<br>
+            <span class="mono">${esc(detail)}</span><br><br>
+            常见原因: 落地端安全组或防火墙没放行配对码里的端口; 落地端已关闭 / 配对码被轮换过;
+            配对码复制不完整。<br>
+            仍然添加的话, 这条链在客户端那边多半连不通 (但可以稍后修好落地端再点「测速」复验)。</div>`,
+          onOk: () => connectChain(true),
+        });
+        return;
+      }
+      throw new Error(detail);
+    }
+    dash = body;
+    $("#chain-code").value = "";
+    $("#chain-label").value = "";
+    $("#chain-local-port").value = "";
+    $("#chain-default-out").checked = false;
+    renderDash(true);
+    const probe = (body.steps || []).find((s) => s.name.indexOf("链路测试") === 0) || {};
+    toast(probe.ok === false ? "已添加, 但链路测试没通过: " + String(probe.detail || "").slice(0, 60) : "链路已接通, 订阅里已多出这个节点");
+  } catch (e) {
+    toast("连接失败: " + e.message);
+    if (document.body.contains(btn)) { btn.disabled = false; btn.textContent = "连接并测试"; }
+  }
+}
+
+function bindChainPeer() {
+  const btn = $("#btn-chain-connect");
+  if (btn) btn.onclick = () => connectChain(false);
+}
+
+function bindChainEntries(entries) {
+  document.querySelectorAll("[data-chain-toggle]").forEach((el) =>
+    (el.onchange = () =>
+      chainApply("POST", `/api/chain/entries/${el.dataset.chainToggle}`, { enabled: el.checked }, null))
+  );
+  document.querySelectorAll("[data-chain-probe]").forEach((el) =>
+    (el.onclick = () =>
+      chainApply("POST", `/api/chain/entries/${el.dataset.chainProbe}/probe`, {}, el, "测速中…"))
+  );
+  document.querySelectorAll("[data-chain-default]").forEach((el) =>
+    (el.onclick = () => {
+      const on = el.dataset.on !== "1";
+      const entry = entries.find((e) => e.id === el.dataset.chainDefault) || {};
+      const doIt = () =>
+        chainApply("POST", `/api/chain/entries/${el.dataset.chainDefault}`, { default_out: on }, el);
+      if (!on) return doIt();
+      openConfirm({
+        title: `把「${entry.label || entry.host}」设为默认出口?`,
+        okLabel: "设为默认出口",
+        html: `<div class="qr-sub" style="text-align:left">本机 4 个主力节点 (Reality / XHTTP / WS / Trojan) 的流量会整体改道,
+          从这台落地服务器出网 —— 客户端不用换节点。<br>
+          分流模板里的广告 / 私有地址拦截规则优先级更高, 不受影响。</div>`,
+        onOk: doIt,
+      });
+    })
+  );
+  document.querySelectorAll("[data-chain-del]").forEach((el) =>
+    (el.onclick = () => {
+      const entry = entries.find((e) => e.id === el.dataset.chainDel) || {};
+      openConfirm({
+        title: `断开「${entry.label || entry.host}」?`,
+        okLabel: "断开并删除",
+        html: `<div class="qr-sub" style="text-align:left">本机的链式入站 / 出站 / 路由规则都会删掉,
+          订阅里这个节点同时消失。<br>落地端服务器上的凭据不受影响 (需要时重新贴一次配对码即可)。</div>`,
+        onOk: () => chainApply("DELETE", `/api/chain/entries/${el.dataset.chainDel}`, undefined, el, "断开中…"),
+      });
+    })
+  );
 }
 
 /* ---------------- 诊断 / 修复 ---------------- */

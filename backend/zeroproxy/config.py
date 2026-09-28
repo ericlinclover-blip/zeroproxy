@@ -24,7 +24,7 @@ except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
 #: state.json 结构版本 — 新增字段时 +1, `_merge` 会自动补齐缺失键
-STATE_VERSION = 3
+STATE_VERSION = 4
 
 DEFAULT_HOME = "/opt/zeroproxy"
 #: 面板对外端口 (nginx 监听, 默认 8899) — 用于生成订阅/面板链接
@@ -169,6 +169,13 @@ DEFAULTS: dict = {
         "files": {},            # 文件名 -> {"size": int, "sha256": str}
     },
     "nodes": {nid: True for nid in NODE_IDS},
+    # 链式代理 (中转 → 落地)。两台机器各装一份本程序: 落地端生成配对码, 中转端粘贴即连。
+    #   exit    — 本机作为落地端时的专用凭据 (独立 UUID + 独立端口, 可与订阅凭据分开吊销)
+    #   entries — 本机作为中转端时已连接的落地端清单 (每条 = 一个入站 + 一个出站 + 一条路由)
+    "chain": {
+        "exit": {"enabled": False, "port": 8447, "uuid": "", "label": "", "created_at": 0},
+        "entries": [],
+    },
     "cert": {
         "type": "none",  # none | letsencrypt | selfsigned
         "issuer": "",

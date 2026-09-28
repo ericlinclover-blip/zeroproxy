@@ -35,6 +35,24 @@ function check(name, ok, detail = "") {
   console.log(`  ${ok ? "✓" : "✗"} ${name}${detail ? " — " + detail : ""}`);
 }
 
+/**
+ * 把本机生成的配对码改成"另一台服务器"的 (校验和按新内容重算)。
+ * 验证链路要两台机器, 这里只有一台, 所以借本机的密钥造一个指向测试网段
+ * (203.0.113.0/24, 永远连不上) 的配对码 —— 正好用来验证"探测不通要拦一下"这条路径。
+ */
+function retargetCode(code, host) {
+  const crypto = require("crypto");
+  const [prefix, payload] = code.split("~");
+  const raw = JSON.parse(Buffer.from(payload.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8"));
+  raw.h = host;
+  raw.p = 8447;
+  raw.l = "美国落地";
+  const raw2 = Buffer.from(JSON.stringify(raw), "utf8");
+  const b64 = raw2.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const sum = crypto.createHash("sha256").update(raw2).digest("hex").slice(0, 6);
+  return `${prefix}~${b64}~${sum}`;
+}
+
 async function waitFor(url, timeoutMs = 20000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -424,6 +442,128 @@ async function main() {
     check("用 IP 访问时提示切到域名面板", ipBanner.cls.includes("info") && ipBanner.hasBtn, ipBanner.url);
     check("证书不是真证书时改成告警语气",
       ipBanner.selfSigned.includes("bad") && ipBanner.restored, ipBanner.selfSigned);
+
+    console.log("\n[3f] 链式代理 (入口 → 落地)");
+    check("链式代理区有说明 + 两张卡 (落地端 / 入口端)",
+      (await page.locator("#chain-intro").count()) === 1
+      && (await page.locator("#chain-exit-card").count()) === 1
+      && (await page.locator("#chain-peer-card").count()) === 1,
+      (await page.locator("#chain-intro").innerText()).split("\n")[0].trim().slice(0, 40));
+    check("未开启时落地端卡片给出「生成配对码」入口",
+      (await page.locator("#btn-chain-exit-gen").count()) === 1
+      && /未开启/.test(await page.locator("#chain-exit-card").innerText()));
+
+    // 落地端: 生成配对码 (专用凭据 = 独立 UUID + 独立端口)
+    await page.fill("#chain-exit-port", "8666");
+    await page.fill("#chain-exit-label", "香港落地");
+    await page.click("#btn-chain-exit-gen");
+    await page.waitForSelector("#chain-exit-code", { timeout: 30000 });
+    const exitCard = await page.evaluate(() => ({
+      code: document.querySelector("#chain-exit-code").textContent.trim(),
+      text: document.querySelector("#chain-exit-card").innerText,
+      hasQr: !!document.querySelector("#btn-chain-exit-qr"),
+    }));
+    check("落地端生成配对码 (ZPC1~ 一行, 可复制可扫码)",
+      exitCard.code.startsWith("ZPC1~") && exitCard.hasQr, `${exitCard.code.length} 字符`);
+    check("落地端卡片写清端口 / 凭据隔离 / 泄露风险",
+      /8666/.test(exitCard.text) && /专用凭据/.test(exitCard.text)
+      && /配对码等同凭据/.test(exitCard.text) && /重新生成/.test(exitCard.text), "");
+    await page.locator("#chain-exit-card").screenshot({ path: path.join(SHOT_DIR, "chain-exit.png") });
+
+    await page.click("#btn-chain-exit-qr");
+    await page.waitForSelector("#qr-mask:not(.hidden)");
+    await page.waitForFunction(() => {
+      const img = document.querySelector("#qr-img");
+      return img && img.complete && img.naturalWidth > 0;
+    }, { timeout: 15000 });
+    check("配对码二维码出图 (SVG)",
+      await page.evaluate(() => document.querySelector("#qr-img").getAttribute("src").includes("/api/chain/exit/qr")));
+    await page.keyboard.press("Escape");
+
+    // 入口端: 粘贴"另一台服务器"的配对码 → 真实链路探测失败 → 二次确认 → 强行添加
+    const peerHost = "203.0.113.9";
+    const peerCode = retargetCode(exitCard.code, peerHost);
+    await page.fill("#chain-code", peerCode);
+    await page.fill("#chain-label", "美国落地");
+    const errMark = consoleErrors.length;
+    await page.click("#btn-chain-connect");
+    await page.waitForSelector("#confirm-mask:not(.hidden)", { timeout: 60000 });
+    // 这个 400 是"探测失败先拦一下"的约定信号 (后端带 needs_force), 不是缺陷 ——
+    // 浏览器会照例往控制台打一条红字, 这里把它从噪声里摘掉, 免得掩盖真正的报错。
+    for (let i = consoleErrors.length - 1; i >= errMark; i -= 1) {
+      if (/400 \(Bad Request\)/.test(consoleErrors[i])) consoleErrors.splice(i, 1);
+    }
+    const probeConfirm = await page.evaluate(() => ({
+      title: document.querySelector("#confirm-title").innerText,
+      body: document.querySelector("#confirm-body").innerText.replace(/\s+/g, " "),
+      ok: document.querySelector("#confirm-ok").innerText,
+    }));
+    check("探测不通时先拦一下并说清原因 (而不是静默落地)",
+      /链路测试没通过/.test(probeConfirm.title) && /安全组|超时|连不上/.test(probeConfirm.body),
+      probeConfirm.title);
+    check("确认框给出「仍然添加」的出口", probeConfirm.ok === "仍然添加", probeConfirm.ok);
+    await page.locator("#confirm-mask .modal").screenshot({ path: path.join(SHOT_DIR, "chain-confirm.png") });
+    await page.click("#confirm-ok");
+    await page.waitForSelector("#chain-entries .node-card", { timeout: 40000 });
+    const entryCard = await page.evaluate(() => {
+      const card = document.querySelector("#chain-entries .node-card");
+      const text = card.innerText;
+      return {
+        text,
+        id: (card.querySelector("[data-chain-probe]") || {}).dataset?.chainProbe || "",
+        hasToggle: !!card.querySelector(".switch .slider"),
+        hasDefault: !!card.querySelector("[data-chain-default]"),
+        hasDelete: !!card.querySelector("[data-chain-del]"),
+        toggled: !!card.querySelector("input:checked"),
+      };
+    });
+    check("入口端落地成一张链式卡片 (经落地地址 + 本机端口)",
+      /203\.0\.113\.9:8447/.test(entryCard.text) && /运行中/.test(entryCard.text)
+      && entryCard.hasToggle && entryCard.hasDefault && entryCard.hasDelete && entryCard.toggled,
+      entryCard.text.split("\n").slice(0, 3).join(" · "));
+    check("链式节点同时出现在「节点」网格里 (客户端就是一个普通节点)",
+      (await page.locator("#node-grid .node-card").count()) === 6
+      && /链式/.test(await page.locator("#node-grid .node-card").last().innerText()),
+      `${await page.locator("#node-grid .node-card").count()} 张节点卡`);
+    const chainSubPath = new URL(await page.evaluate(() => dash.subscription_formats.clash)).pathname;
+    const clashText = await (await page.request.get(`${base}${chainSubPath}?format=clash`)).text();
+    check("订阅立即多出这个节点 (Clash 里看得见)",
+      /ZeroProxy 链式 · 美国落地/.test(clashText)
+      && /port: 8446|port: 8447|port: 8448/.test(clashText),
+      `${clashText.length} 字节`);
+    await page.locator("#chain-entries").screenshot({ path: path.join(SHOT_DIR, "chain-entry.png") });
+
+    // 设为默认出口: 本机 4 个主力节点整体改道 (客户端不用换节点)
+    await page.click(`[data-chain-default='${entryCard.id}']`);
+    await page.waitForSelector("#confirm-mask:not(.hidden)");
+    const defaultConfirm = await page.evaluate(() => document.querySelector("#confirm-body").innerText.replace(/\s+/g, " "));
+    check("设为默认出口前说清会改道什么",
+      /主力节点/.test(defaultConfirm) && /改道/.test(defaultConfirm), defaultConfirm.slice(0, 50));
+    await page.click("#confirm-ok");
+    await page.waitForFunction(
+      () => /默认出口/.test(document.querySelector("#chain-entries").innerText), { timeout: 30000 });
+    check("默认出口标记上卡片", /默认出口/.test(await page.locator("#chain-entries").innerText()), "");
+
+    // 测速 (落地端是测试网段, 必然不通 → 卡片上要显示"不通"而不是假装成功)
+    const [probeResp] = await Promise.all([
+      page.waitForResponse(
+        (r) => r.url().includes(`/api/chain/entries/${entryCard.id}/probe`), { timeout: 60000 }),
+      page.click(`[data-chain-probe='${entryCard.id}']`),
+    ]);
+    check("链式测速失败会如实标红 (不假装成功)",
+      probeResp.status() === 200 && /不通/.test(await page.locator("#chain-entries").innerText()),
+      `HTTP ${probeResp.status()}`);
+
+    // 断开 → 卡片与订阅里的节点一起消失
+    await page.click(`[data-chain-del='${entryCard.id}']`);
+    await page.waitForSelector("#confirm-mask:not(.hidden)");
+    await page.click("#confirm-ok");
+    await page.waitForFunction(() => !document.querySelector("#chain-entries .node-card"), { timeout: 30000 });
+    check("断开后链式卡片消失、节点网格回到 5 张",
+      (await page.locator("#chain-entries .node-card").count()) === 0
+      && (await page.locator("#node-grid .node-card").count()) === 5, "");
+    const clashAfter = await (await page.request.get(`${base}${chainSubPath}?format=clash`)).text();
+    check("断开后订阅里不再有这个节点", !/ZeroProxy 链式/.test(clashAfter), "");
 
     await page.click("#btn-logout");
     await page.waitForSelector("#view-login:not(.hidden)", { timeout: 15000 });
