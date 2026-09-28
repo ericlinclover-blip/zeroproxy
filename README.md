@@ -64,7 +64,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 91 项 (87 passed + 4 skipped; 带 `ZP_XRAY_BIN` 时 91 全通过) + `scripts/verify.py` (74 项) + `scripts/browser_check.cjs` (41 项) + `scripts/upgrade_sim.sh` (13 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 93 项 (89 passed + 4 skipped; 带 `ZP_XRAY_BIN` 时 93 全通过) + `scripts/verify.py` (74 项) + `scripts/browser_check.cjs` (48 项) + `scripts/upgrade_sim.sh` (13 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 
 竞品与技术调研见 `docs/RESEARCH.md`。
 
@@ -309,6 +309,24 @@ state.json (唯一事实来源, schema v3, 旧版本自动升级)
 - **失败不装成功**: 「一键生成」「保存并应用」「一键修复」的每一步失败都会顶到仪表盘顶部标红
   (含具体原因), 而不是只弹一句「完成」。
 
+### 8.1 初始化 → 域名面板 的交接
+
+初始化是在 **IP 页面**上做的 (`https://<IP>:8899/?token=...`, 自签证书, 浏览器会提示不安全),
+而正式入口是 `https://<域名>:8899`。这一步过去只把域名当文字显示在副标题里, 用户初始化完就
+一直留在那个"不安全"的 IP 页面上 —— 所以现在把它做成交接:
+
+- 后端在 `/api/setup` 的响应里带上 `redirect`: 只有**证书是 Let's Encrypt 签发的**,
+  并且**从服务器本机按浏览器的方式访问 `https://<域名>:8899/api/info` 真的能通**
+  (证书链按系统 CA 校验) 时, `ready` 才是 `true`。真实服务器上这一步实测通过。
+- `ready` 为真 → 前端显示「部署完成 · 正在跳转到 `https://<域名>:8899/?user=<用户名>` · 3 秒」,
+  3 秒后自动跳转, 也可以点「立即前往」; 域名面板的登录页会**预填用户名、聚焦密码框**并提示
+  「已切换到域名面板」。会话 Cookie 是按 host 存的, 所以跨到域名必须重新登录一次 ——
+  密码不会进 URL, 用户名用完即从地址栏去掉 (`history.replaceState`)。
+- `ready` 为假 → **不跳**, 留在 IP 页面并说清原因 (「证书不是 Let's Encrypt (域名可能还没解析到
+  本机, 或 80 端口被挡)」), 引导用户去「高级设置 → 重新应用」重试; 避免把人送到一个打不开的地址。
+- 事后用 IP 打开面板也一样: 仪表盘顶部会有一条蓝色提示「你正在用 IP 地址访问面板 (证书不受
+  浏览器信任)」, 并附「切到域名面板」按钮。
+
 ---
 
 ## 9. API
@@ -391,7 +409,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 
 在 macOS (Apple Silicon, Python 3.14) 上实测通过:
 
-- `python -m pytest tests -q` → **87 passed, 4 skipped** (带 `ZP_XRAY_BIN` 时 **91 passed**, 约 20 秒);
+- `python -m pytest tests -q` → **89 passed, 4 skipped** (带 `ZP_XRAY_BIN` 时 **93 passed**, 约 20 秒);
   含 `/api/update` 鉴权与版本比较、`apply` 的"写不进 /etc/nginx 即失败"语义、CLI 退出码、以及
   `install.sh` 重跑不覆盖已初始化配置 / `upgrade.sh` 随包发布 / 自签证书可补签 Let's Encrypt /
   `systemctl` 参数顺序的回归断言 / Reality 密钥必须是成对的 X25519 (Ed25519 必须判无效) /
@@ -408,11 +426,13 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   **启动期自愈闭环**: 配置带 geo 规则 + 数据文件消失 → 原样启动被 Xray 拒绝 (复现) → `geodata guard`
   重新生成 (已移除 geo 规则) → 再自检通过 / 备份-恢复往返一致且篡改被拒 /
   5 个节点握手探测全部成功 (Reality TLS 136ms, 出口 RTT 54ms)。
-- `scripts/browser_check.cjs` → **41/41 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
+- `scripts/browser_check.cjs` → **48/48 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
   诊断 8/8、节点测速结果落到卡片、GeoIP 开关与状态、**分流模板选择器 (切换 → 订阅内容
   真的变化 → 切回)**、备份下载、**程序更新卡片 (版本行 / 检查更新 / 非生产环境隐藏一键更新)**、
   **二维码弹窗 (走 SVG 缩放不糊 / 图案完整落在卡片内 / 长链接省略号截断而不顶破卡片 /
-  复制·保存·关闭三个按钮 / 节点卡片副标题是人话不是长链接 / Esc 可关闭)**;
+  复制·保存·关闭三个按钮 / 节点卡片副标题是人话不是长链接 / Esc 可关闭)**、
+  **初始化→域名面板交接 (跳转卡片 / 立即前往 / 留在本页回到仪表盘 / 登录页预填用户名并聚焦密码框 /
+  用户名不留在地址栏 / 用刚设置的凭据可登录)**;
   无 console 错误、无失败请求。
 - `scripts/upgrade_sim.sh` → **13/13 项通过**: 在模拟的"已部署机器"上真跑 `upgrade.sh` ——
   备份 → 换代码 → 按 `state.json` 重新落地配置 (把占位配置修回真实配置) → 写 `update.json` /
@@ -543,7 +563,8 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 ## 14. FAQ
 
 - **打不开面板 / 提示不安全?** 引导阶段用自签证书, 点「继续访问」即可; 完成 setup 且 certbot
-  签发成功后, 用 `https://<域名>:8899` 访问即为可信证书。
+  签发成功后, 面板会自动跳到 `https://<域名>:8899` (登录页已预填用户名); 也可以手动用它访问,
+  那时就是可信证书。用 IP 访问时仪表盘顶部也会给一条「切到域名面板」的提示。
 - **提示「引导令牌无效」?** 必须用安装完成时终端打印的、带 `?token=` 的链接打开面板。令牌文件在
   `/opt/zeroproxy/data/bootstrap_token`, 初始化成功后自动删除。
 - **certbot 申请失败?** 面板自动回退自签证书, WS / Trojan 节点带 `allowInsecure=1` 仍可用;

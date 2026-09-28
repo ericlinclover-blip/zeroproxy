@@ -341,6 +341,9 @@ def setup(payload: SetupIn, request: Request):
         body["warning"] = (
             f"{failed[0]['name']}: {failed[0]['detail']}" if failed else ""
         )
+        # 初始化是在 IP 页面 (自签证书) 上做的: 真证书到手且域名可达时, 前端会把
+        # 用户直接送到域名面板, 而不是让他继续对着"不安全"的地址用
+        body["redirect"] = _post_setup_redirect(state, request)
         response = JSONResponse(body)
         _issue_session(state, request, response)
         save_state(state)
@@ -461,6 +464,25 @@ def _cert_view(state: dict) -> dict:
     cert = state["cert"]
     days_left = max(0, int((cert["not_after"] - time.time()) // 86400)) if cert["not_after"] else 0
     return {**cert, "days_left": days_left}
+
+
+def _post_setup_redirect(state: dict, request: Request) -> dict:
+    """初始化完成后, 要不要把用户直接送到"真证书 + 域名"的面板。
+
+    必须两个条件都成立才敢跳: 证书是 Let's Encrypt 签的, 并且从本机按浏览器的方式
+    访问 `https://<域名>:<面板端口>/api/info` 真的能通 (DNS 已解析 + nginx 已挂真证书)。
+    否则跳过去只会把用户扔到一个打不开或证书报错的页面 —— 那还不如留在 IP 页面并说清
+    原因。用户是在 IP 页面上初始化的, 所以这一步是"从自签兜底切到正式入口"的唯一机会。
+    """
+    domain = (state.get("domain") or "").strip()
+    url = share_links.panel_base_url(request, state)
+    if not services.is_domain(domain):
+        return {"ready": False, "url": url, "reason": "填写的是 IP, 没有域名面板可切"}
+    if state.get("cert", {}).get("type") != "letsencrypt":
+        return {"ready": False, "url": url,
+                "reason": "证书不是 Let's Encrypt (域名可能还没解析到本机, 或 80 端口被挡)"}
+    ok, detail = services.probe_public_panel(domain, config.PANEL_PORT)
+    return {"ready": ok, "url": url, "reason": detail}
 
 
 def _system_view(state: dict) -> dict:

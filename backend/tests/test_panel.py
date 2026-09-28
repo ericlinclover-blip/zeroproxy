@@ -46,6 +46,57 @@ def test_setup_validation(client, token):
     assert client.post("/api/setup", json={**base, "domain": DOMAIN, "username": "a"}).status_code == 400
 
 
+def test_setup_tells_frontend_when_domain_panel_is_not_ready(client, token, home, monkeypatch):
+    """初始化是在 IP 页面 (自签证书) 上做的。
+
+    dry-run 拿不到真证书时, 后端必须明确说"域名面板还不可用 + 为什么", 前端才不会
+    把用户跳到一个打不开、或者证书报错的地址上。
+    """
+    from zeroproxy import config, services
+
+    monkeypatch.setattr(
+        services, "probe_public_panel",
+        lambda domain, port, timeout=10.0: (True, f"https://{domain}:{port} 可达且证书受信任"),
+    )
+    payload = {"domain": DOMAIN, "username": USERNAME, "password": PASSWORD, "token": token}
+    body = client.post("/api/setup", json=payload).json()
+    redirect = body["redirect"]
+    assert redirect["ready"] is False
+    assert "Let's Encrypt" in redirect["reason"]
+    assert DOMAIN in redirect["url"] and str(config.PANEL_PORT) in redirect["url"]
+
+
+def test_setup_offers_handoff_when_cert_and_domain_are_ready(client, token, home, monkeypatch):
+    """真证书 + 域名真的能按浏览器方式访问到 → 告诉前端可以跳了 (带真实 URL)。"""
+    import time as _time
+
+    from zeroproxy import services
+
+    calls = []
+
+    def fake_install_cert(host: str):
+        return True, "Let's Encrypt 证书已签发 (测试桩)", {
+            "type": "letsencrypt",
+            "issuer": "Let's Encrypt",
+            "cert_file": str(home / "data" / "fullchain.pem"),
+            "key_file": str(home / "data" / "privkey.pem"),
+            "not_after": int(_time.time()) + 90 * 86400,
+        }
+
+    def fake_probe(domain: str, port: int, timeout: float = 10.0):
+        calls.append((domain, port))
+        return True, f"https://{domain}:{port} 可达且证书受信任"
+
+    monkeypatch.setattr(services, "install_cert", fake_install_cert)
+    monkeypatch.setattr(services, "probe_public_panel", fake_probe)
+    payload = {"domain": DOMAIN, "username": USERNAME, "password": PASSWORD, "token": token}
+    body = client.post("/api/setup", json=payload).json()
+
+    assert body["redirect"]["ready"] is True, body["redirect"]
+    assert DOMAIN in body["redirect"]["url"]
+    assert calls and calls[0][0] == DOMAIN          # 真的按域名探过一次, 不是无脑跳
+
+
 # ---------------------------------------------------------------- 鉴权
 
 def test_dashboard_requires_auth(client, configured):

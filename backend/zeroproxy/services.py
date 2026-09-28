@@ -16,6 +16,8 @@ import ssl
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -52,6 +54,27 @@ def bin_path(name: str) -> str | None:
 def is_prod() -> bool:
     """是否在具备 systemd 的 Linux 生产环境。"""
     return sys.platform.startswith("linux") and shutil.which("systemctl") is not None
+
+
+def probe_public_panel(domain: str, port: int, timeout: float = 10.0) -> tuple[bool, str]:
+    """按"浏览器的方式"访问一次 https://<域名>:<端口>/api/info。
+
+    用于判断"初始化完成后能不能把用户直接送到域名面板": DNS 是否解析、nginx 是否
+    已经在用真实证书、端口是否通 —— 一次请求全验证。证书链按系统 CA 校验, 所以
+    自签证书会直接判失败 (那正是我们要避免让用户看到的东西)。
+    """
+    url = f"https://{domain}:{port}/api/info"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310 — 固定 https
+            if not resp.read(64):
+                return False, f"{url} 无响应内容"
+        return True, f"{url} 可达且证书受信任"
+    except urllib.error.HTTPError as exc:  # 有证书但接口报错: 面板是活的
+        return True, f"{url} 可达 (HTTP {exc.code})"
+    except urllib.error.URLError as exc:
+        return False, f"{url} 不可达: {getattr(exc, 'reason', exc)}"
+    except (OSError, ValueError) as exc:
+        return False, f"{url} 不可达: {exc}"
 
 
 def run(cmd: list[str], timeout: int = 120, env: dict | None = None) -> tuple[bool, str]:

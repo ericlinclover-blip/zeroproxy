@@ -257,6 +257,7 @@ code.inline { background: var(--border); padding: 2px 7px; border-radius: 6px; f
       <div class="hint-box hidden" id="setup-hint"></div>
       <div class="err-box hidden" id="setup-err"></div>
       <div class="progress hidden" id="setup-progress"></div>
+      <div class="hidden" id="setup-done"></div>
     </div>
   </section>
 
@@ -264,6 +265,7 @@ code.inline { background: var(--border); padding: 2px 7px; border-radius: 6px; f
   <section id="view-login" class="hidden">
     <div class="hero"><h1>登录面板</h1><p>ZeroProxy 已初始化</p></div>
     <div class="card setup-card">
+      <div class="hint-box hidden" id="login-hint"></div>
       <div class="field"><label>用户名</label><input id="login-user" spellcheck="false"></div>
       <div class="field"><label>密码</label><input id="login-pass" type="password"></div>
       <button class="btn" id="btn-login" style="width:100%">登录</button>
@@ -488,7 +490,10 @@ async function boot() {
   // 引导令牌来自 install.sh 打印的链接 (?token=...), 初始化时必须带上
   const params = new URLSearchParams(location.search);
   bootstrapToken = params.get("token") || "";
-  if (bootstrapToken) history.replaceState(null, "", location.pathname);
+  // 初始化完成后会把用户送到域名面板, 顺手带上刚设的用户名 (?user=...), 省一次输入
+  // (会话 Cookie 是按 host 存的, 跨到域名必须重新登录 —— 密码绝不会出现在 URL 里)
+  const presetUser = params.get("user") || "";
+  if (bootstrapToken || presetUser) history.replaceState(null, "", location.pathname);
   try {
     const st = await api("/api/status");
     if (!st.configured) {
@@ -501,7 +506,14 @@ async function boot() {
       return;
     }
     if (st.authenticated) return loadDash();
+    if (presetUser) {
+      $("#login-user").value = presetUser;
+      const hint = $("#login-hint");
+      hint.textContent = "已切换到域名面板 (真实证书)。用刚设置的账号密码登录即可, 用户名已填好。";
+      hint.classList.remove("hidden");
+    }
     show("view-login");
+    if (presetUser) $("#login-pass").focus();
   } catch (e) {
     show("view-setup");
   }
@@ -532,6 +544,14 @@ $("#btn-setup").onclick = async () => {
     renderSteps(res.steps || [], prog);
     prog.classList.remove("hidden");
     const failed = (res.steps || []).filter((s) => !s.ok);
+    const dest = res.redirect || {};
+    if (!failed.length && dest.ready) {
+      // 部署顺利 + 域名已带真证书可达 → 直接把用户送到正式入口
+      // (留在这个 IP 页面上只会一直看到"不安全"的证书警告)
+      btn.textContent = "完成 ✓";
+      showSetupHandoff(dest, payload.username);
+      return;
+    }
     if (res.ok === false || failed.length) {
       // 不再假装成功: 失败步骤留在页面上, 让用户先看到再进面板
       btn.textContent = "完成 (有步骤失败)";
@@ -542,6 +562,14 @@ $("#btn-setup").onclick = async () => {
       toast(`部署完成但有 ${failed.length} 步失败`);
     } else {
       btn.textContent = "完成 ✓";
+      if (dest.url && !dest.ready) {
+        // 证书/域名这一步没成: 说清原因, 别让用户以为该用域名却打不开
+        const hint = $("#setup-hint");
+        hint.textContent =
+          `本页面走的是 IP + 自签证书 (浏览器会提示"不安全")。域名面板暂时还不可用: ` +
+          `${dest.reason}。修好 DNS / 证书后到「高级设置 → 重新应用」重试, 或直接点下面的「重新应用配置」。`;
+        hint.classList.remove("hidden");
+      }
     }
     setTimeout(() => { loadDash(); }, 1400);
   } catch (e) {
@@ -551,6 +579,44 @@ $("#btn-setup").onclick = async () => {
     btn.textContent = "一键生成";
   }
 };
+
+/* 部署完成 → 交接到域名面板。默认 3 秒后自动跳, 也给"留在本页"的出口。 */
+function showSetupHandoff(dest, user, seconds) {
+  const url = `${String(dest.url || "").replace(/\/+$/, "")}/?user=${encodeURIComponent(user || "")}`;
+  const total = Number(seconds) > 0 ? Number(seconds) : 3;
+  const box = $("#setup-done");
+  box.classList.remove("hidden");
+  box.innerHTML = `
+    <div class="progress" style="margin-top:0">
+      <div class="pstep"><span class="ico ok">✓</span><span>部署完成</span>
+        <div class="detail">${esc(dest.reason || "域名面板已就绪")}</div></div>
+    </div>
+    <div class="hint-box">
+      <div id="handoff-count">正在跳转到 <b>${esc(url)}</b> · ${total} 秒</div>
+      <div class="row" style="justify-content:center;margin-top:10px">
+        <button class="btn small" id="handoff-go">立即前往</button>
+        <button class="btn ghost small" id="handoff-stay">留在本页</button>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:8px">
+        该地址用的是真实证书, 不会再报"不安全"; 用户名已预填, 输入密码即可登录。
+      </div>
+    </div>`;
+  let left = total;
+  const go = () => { location.href = url; };
+  const timer = setInterval(() => {
+    left -= 1;
+    const el = $("#handoff-count");
+    if (el) el.innerHTML = `正在跳转到 <b>${esc(url)}</b> · ${left} 秒`;
+    if (left <= 0) { clearInterval(timer); go(); }
+  }, 1000);
+  $("#handoff-go").onclick = go;
+  $("#handoff-stay").onclick = () => {
+    clearInterval(timer);
+    box.classList.add("hidden");
+    box.innerHTML = "";
+    loadDash();
+  };
+}
 function renderSteps(steps, container) {
   (container || $("#setup-progress")).innerHTML = steps
     .map(
@@ -644,12 +710,16 @@ function renderDash(quiet) {
 /* ---------------- 失败告警横幅 ----------------
  * 初始化 / 重新应用留下的步骤结果会落盘, 这里把失败项直接顶到仪表盘顶部,
  * 避免出现"服务全是运行中, 但节点其实不通"的假绿。 */
-function renderBanner(el, kind, title, detail) {
+function renderBanner(el, kind, title, detail, action) {
   if (!el) return;
   if (!title) { el.classList.add("hidden"); el.innerHTML = ""; return; }
   el.innerHTML = `<div class="banner ${kind}">
       <span class="ico">${kind === "bad" ? "✗" : kind === "good" ? "✓" : "i"}</span>
-      <span><b>${esc(title)}</b>${detail ? `<br><span class="muted">${esc(detail)}</span>` : ""}</span>
+      <span><b>${esc(title)}</b>${detail ? `<br><span class="muted">${esc(detail)}</span>` : ""}${
+        action
+          ? `<br><a class="btn ghost small" style="margin-top:9px;display:inline-block" href="${escAttr(action.href)}">${esc(action.label)}</a>`
+          : ""
+      }</span>
     </div>`;
   el.classList.remove("hidden");
 }
@@ -657,14 +727,27 @@ function renderBanner(el, kind, title, detail) {
 function renderDashboardBanner() {
   const steps = (dash && dash.steps) || [];
   const failed = steps.filter((s) => !s.ok);
-  if (!failed.length) return renderBanner($("#dash-banner"), "bad", "");
-  const first = failed[0];
-  renderBanner(
-    $("#dash-banner"),
-    "bad",
-    `上次配置落地有 ${failed.length} 步失败, 节点可能不可用`,
-    `${first.name}: ${first.detail} —— 点右上角「一键诊断」查看, 或点「一键修复」重试`
-  );
+  if (failed.length) {
+    const first = failed[0];
+    return renderBanner(
+      $("#dash-banner"),
+      "bad",
+      `上次配置落地有 ${failed.length} 步失败, 节点可能不可用`,
+      `${first.name}: ${first.detail} —— 点右上角「一键诊断」查看, 或点「一键修复」重试`
+    );
+  }
+  // 用 IP 打开面板时会一直看到"证书不受信任", 这里给一条能点过去的出口
+  const onIp = dash.system && dash.system.prod && location.hostname !== dash.domain;
+  if (onIp) {
+    return renderBanner(
+      $("#dash-banner"),
+      "info",
+      "你正在用 IP 地址访问面板 (证书不受浏览器信任)",
+      `正式入口是 ${dash.panel_url}, 证书由 Let's Encrypt 签发。切换过去后需要重新登录一次。`,
+      { label: "切到域名面板", href: dash.panel_url }
+    );
+  }
+  renderBanner($("#dash-banner"), "bad", "");
 }
 
 /* ---------------- 节点卡片 + 测速 ---------------- */

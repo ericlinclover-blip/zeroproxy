@@ -241,6 +241,57 @@ async function main() {
       (await page.locator("#btn-renew").innerText()).trim() === "申请证书"
       && !(await page.locator("#btn-renew").isDisabled()));
 
+    console.log("\n[3e] 初始化 → 域名面板 交接到位");
+    // 真机上部署成功后后端会返回 redirect.ready, 前端弹这张"3 秒后跳转"的卡。
+    // 本地拿不到真证书, 所以直接调用页面里的交接函数来验证渲染与出口。
+    // 切回初始化视图再渲染这张卡 (真机上它本来就是初始化完成后出现的);
+    // 倒计时给长一点, 免得验证过程中真的跳走 (真机上默认 3 秒)
+    await page.evaluate(() => {
+      show("view-setup");
+      showSetupHandoff(
+        { ready: true, url: "https://panel.example.com:8899", reason: "https://panel.example.com:8899 可达且证书受信任" },
+        "admin",
+        60,
+      );
+    });
+    const handoff = await page.evaluate(() => {
+      const box = document.querySelector("#setup-done");
+      const go = document.querySelector("#handoff-go");
+      return {
+        visible: !box.classList.contains("hidden"),
+        countText: (document.querySelector("#handoff-count") || {}).innerText || "",
+        hasGo: !!go,
+        hasStay: !!document.querySelector("#handoff-stay"),
+      };
+    });
+    check("部署成功给出跳转卡片", handoff.visible && /正在跳转到/.test(handoff.countText), handoff.countText.replace(/\n/g, " "));
+    check("跳转卡片带「立即前往 / 留在本页」", handoff.hasGo && handoff.hasStay, "");
+    await page.screenshot({ path: path.join(SHOT_DIR, "setup-handoff.png"), fullPage: true });
+    await page.click("#handoff-stay");
+    await page.waitForSelector("#view-dash:not(.hidden)", { timeout: 20000 });
+    check("「留在本页」取消跳转并回到仪表盘",
+      (await page.locator("#setup-done.hidden").count()) === 1
+      && (await page.locator("#view-dash:not(.hidden)").count()) === 1, "");
+
+    await page.click("#btn-logout");
+    await page.waitForSelector("#view-login:not(.hidden)", { timeout: 15000 });
+    await page.goto(`${base}/?user=admin`, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#view-login:not(.hidden)", { timeout: 15000 });
+    const loginPrefill = await page.evaluate(() => ({
+      user: document.querySelector("#login-user").value,
+      hint: (document.querySelector("#login-hint") || {}).innerText || "",
+      cleanUrl: !location.search.includes("user="),   // 用户名不该留在地址栏
+      focused: document.activeElement === document.querySelector("#login-pass"),
+    }));
+    check("域名面板登录页预填用户名并聚焦密码框", loginPrefill.user === "admin" && loginPrefill.focused, loginPrefill.user);
+    check("登录页给出「已切换到域名面板」提示", /已切换到域名面板/.test(loginPrefill.hint), loginPrefill.hint.slice(0, 40));
+    check("用户名不留在地址栏", loginPrefill.cleanUrl, new URL(page.url()).search || "(无查询串)");
+    // 继续用同一套凭据登录, 后面的检查 (深浅色 / 控制台) 仍要有仪表盘
+    await page.fill("#login-pass", "s3cretpass");
+    await page.click("#btn-login");
+    await page.waitForSelector("#view-dash:not(.hidden)", { timeout: 20000 });
+    check("用刚设置的凭据可登录", (await page.locator("#node-grid .node-card").count()) === 5, "");
+
     await page.screenshot({ path: path.join(SHOT_DIR, "dashboard-light.png"), fullPage: true });
     await page.click("#themeBtn");
     await page.waitForTimeout(400);
