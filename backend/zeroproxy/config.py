@@ -39,9 +39,19 @@ LOCK = threading.RLock()
 SESSION_TTL = 72 * 3600
 MAX_SESSIONS = 8
 
-#: Reality 默认伪装的 SNI 目标 (技术文档 §7.6.3: 知名度高、TLS1.3、x25519 key_share)
-DEFAULT_REALITY_DEST = "www.microsoft.com:443"
-DEFAULT_REALITY_SNI = "www.microsoft.com"
+#: Reality 默认伪装的 SNI 目标 (技术文档 §7.6.3: 知名度高、TLS1.3、x25519 key_share)。
+#: 硬约束 (Xray 26.3 实测 + `xtls/reality` 源码 `size = 8192`): 目标站点发回的
+#: Certificate 握手报文必须 ≤ 8192 字节, 超了 REALITY 服务端会直接放弃握手 ——
+#: 客户端只看到连接被重置。www.microsoft.com 的证书链是 8273 字节, 必定失败;
+#: cloudflare 的 ECDSA 链只有 4KB 出头, 实测握手通过且有 X25519MLKEM768 支持。
+#: 注意: 这里只填域名 —— 面板会写成 `<域名>:443`, 且 SNI 与 dest 必须一致。
+DEFAULT_REALITY_DEST = "www.cloudflare.com:443"
+DEFAULT_REALITY_SNI = "www.cloudflare.com"
+
+#: 历史默认伪装目标 (v2.3.3 及更早)。证书链超过 REALITY 的 8KB 缓冲, 握手必然
+#: 失败 → 落地时若发现用户没改过这个默认值, 自动迁移到新默认 (见 apply)。
+LEGACY_REALITY_DEST = "www.microsoft.com:443"
+LEGACY_REALITY_SNI = "www.microsoft.com"
 
 #: WebSocket 传输路径 (nginx 反代 + 客户端 path 参数共用)
 WS_PATH = "/ws/zeroproxy"

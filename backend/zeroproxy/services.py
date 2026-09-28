@@ -470,6 +470,181 @@ def _probe_target(state: dict, node_id: str) -> tuple[str, str, int, str]:
     return "127.0.0.1", "tls", int(ports.get(key, 0)), sni
 
 
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def _socks5_tls_probe(proxy_port: int, host: str, port: int, timeout: float = 8.0) -> tuple[bool, float, str]:
+    """经本地 SOCKS5 隧道对目标做一次真实 TLS 握手 —— 节点深度体检的判据。
+
+    只做 SOCKS5 CONNECT 是不够的: Xray 的 SOCKS 入站会**先回成功**再尝试dial,
+    节点不通时失败发生在之后 (连接被关掉)。因此必须真的跑一次往返 —— 这里让
+    TLS 握手穿过隧道直达伪装目标: 通了就说明"客户端→节点→服务器出站→目标"
+    整条链路都在工作。
+    """
+    start = time.perf_counter()
+    sock = None
+    try:
+        sock = socket.create_connection(("127.0.0.1", proxy_port), timeout=timeout)
+        sock.settimeout(timeout)
+        sock.sendall(b"\x05\x01\x00")
+        if sock.recv(2) != b"\x05\x00":
+            return False, -1.0, "SOCKS5 协商失败"
+        addr = host.encode()
+        sock.sendall(b"\x05\x01\x00\x03" + bytes([len(addr)]) + addr + int(port).to_bytes(2, "big"))
+        resp = sock.recv(4)
+        if len(resp) < 2 or resp[1] != 0:
+            return False, -1.0, f"SOCKS5 连接被拒 (code={resp[1] if len(resp) > 1 else '?'})"
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with ctx.wrap_socket(sock, server_hostname=host) as tls:
+            tls.version()
+        sock = None
+        return True, (time.perf_counter() - start) * 1000, f"隧道 + 到 {host} 的 TLS 往返成功"
+    except (OSError, ssl.SSLError) as exc:
+        return False, -1.0, f"{type(exc).__name__}: {exc}"
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:  # pragma: no cover
+                pass
+
+
+def client_config(state: dict, node_id: str, socks_port: int) -> dict | None:
+    """把一个节点渲染成最小可用的 Xray 客户端配置 (含本地 SOCKS 入站)。
+
+    这是面板"深度体检"用的: 客户端 → 节点 → 出站 走完整链路, Reality 的
+    密钥 / SNI / 伪装目标 / 传输层任何一处不对都会连不通。Hysteria 2 需要
+    hysteria 客户端, 这里不支持 (返回 None)。
+    """
+    reality = state["reality"]
+    ports = state.get("ports", {})
+    domain = state.get("domain", "")
+    uuid = state.get("uuid", "")
+    common = {"serverName": reality["server_name"], "fingerprint": "chrome"}
+    outbound: dict | None = None
+
+    if node_id == "vless-reality":
+        outbound = {
+            "protocol": "vless",
+            "settings": {"vnext": [{"address": "127.0.0.1", "port": int(ports["reality"]),
+                                    "users": [{"id": uuid, "encryption": "none", "flow": "xtls-rprx-vision"}]}]},
+            "streamSettings": {"network": "tcp", "security": "reality", "realitySettings": {
+                **common, "publicKey": reality["public_key"], "shortId": reality["short_id"], "spiderX": "/"}},
+        }
+    elif node_id == "vless-xhttp":
+        xhttp = state.get("xhttp", {})
+        outbound = {
+            "protocol": "vless",
+            "settings": {"vnext": [{"address": "127.0.0.1", "port": int(ports["xhttp"]),
+                                    "users": [{"id": uuid, "encryption": "none", "flow": ""}]}]},
+            "streamSettings": {"network": "xhttp", "security": "reality",
+                               "xhttpSettings": {"host": xhttp.get("host") or reality["server_name"],
+                                                 "path": xhttp.get("path") or "/",
+                                                 "mode": xhttp.get("mode") or "auto"},
+                               "realitySettings": {
+                                   **common, "publicKey": reality["public_key"],
+                                   "shortId": reality["short_id"], "spiderX": "/"}},
+        }
+    elif node_id == "vless-ws":
+        from .config import WS_PATH
+
+        outbound = {
+            "protocol": "vless",
+            "settings": {"vnext": [{"address": domain, "port": 443,
+                                    "users": [{"id": uuid, "encryption": "none", "flow": ""}]}]},
+            "streamSettings": {"network": "ws", "security": "tls",
+                               "wsSettings": {"path": WS_PATH, "headers": {"Host": domain}},
+                               "tlsSettings": {"serverName": domain, "allowInsecure": True}},
+        }
+    elif node_id == "trojan":
+        outbound = {
+            "protocol": "trojan",
+            "settings": {"servers": [{"address": domain, "port": int(ports["trojan"]),
+                                      "password": state.get("trojan_password", "")}]},
+            "streamSettings": {"network": "tcp", "security": "tls",
+                               "tlsSettings": {"serverName": domain, "allowInsecure": True}},
+        }
+
+    if outbound is None:
+        return None
+    outbound["tag"] = "node"
+    return {
+        "log": {"loglevel": "error"},
+        "inbounds": [{"listen": "127.0.0.1", "port": socks_port, "protocol": "socks",
+                      "settings": {"udp": False}}],
+        "outbounds": [outbound],
+    }
+
+
+def deep_probe_node(state: dict, node_id: str, timeout: float = 9.0) -> dict:
+    """节点深度体检: 起一个临时客户端, 真的从节点穿到外网。
+
+    为什么需要它: 只做 TLS 握手的浅探测无法发现 Reality 认证失败 —— 认证失败时
+    服务端会**回落到真实伪装站点**, 裸 TLS 握手照样成功 (这正是"面板全绿但节点
+    不通"的来源)。这里用真实 Xray 客户端 + 真实数据面, 任何一处不匹配都过不去。
+    """
+    import tempfile
+
+    from .config import NODE_BY_ID
+
+    if not state.get("nodes", {}).get(node_id, True):
+        return {"node": node_id, "ok": None, "kind": "deep", "ms": None, "detail": "节点已关闭"}
+
+    if node_id == "trojan" and not os.path.exists(state["cert"].get("cert_file") or ""):
+        return {"node": node_id, "ok": False, "kind": "deep", "ms": None,
+                "detail": "证书未就绪, 入站未生效"}
+
+    binary = bin_path("xray")
+    if not binary:
+        return {"node": node_id, "ok": None, "kind": "deep", "ms": None,
+                "detail": "xray 二进制不可用, 无法深度体检"}
+    socks_port = _free_port()
+    config = client_config(state, node_id, socks_port)
+    if config is None:
+        return {"node": node_id, "ok": None, "kind": "deep", "ms": None,
+                "detail": "该节点不支持深度体检"}
+
+    host, port = state["reality"]["dest"].rsplit(":", 1)
+    workdir = tempfile.mkdtemp(prefix="zp-probe-")
+    cfg_path = os.path.join(workdir, "client.json")
+    with open(cfg_path, "w", encoding="utf-8") as fh:
+        json.dump(config, fh)
+    proc = subprocess.Popen(
+        [binary, "run", "-c", cfg_path],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env={**os.environ, **xray_env()},
+    )
+    try:
+        deadline = time.time() + 4
+        while time.time() < deadline and not _tcp_reachable("127.0.0.1", socks_port, 0.3):
+            if proc.poll() is not None:
+                return {"node": node_id, "ok": False, "kind": "deep", "ms": None,
+                        "detail": "临时客户端启动失败 (xray 退出, 详见 journalctl -u xray)"}
+            time.sleep(0.15)
+        if not _tcp_reachable("127.0.0.1", socks_port, 0.3):
+            return {"node": node_id, "ok": False, "kind": "deep", "ms": None,
+                    "detail": "临时客户端 SOCKS 端口未就绪"}
+        ok, ms, detail = _socks5_tls_probe(socks_port, host, int(port or 443), timeout=timeout)
+        port_label = NODE_BY_ID[node_id]["port_key"]
+        shown = 443 if node_id in ("vless-ws",) else state["ports"].get(port_label, "")
+        if ok:
+            return {"node": node_id, "ok": True, "kind": "deep", "ms": round(ms, 1),
+                    "detail": f"{shown} · 深度握手 + 真实出口往返 ({state['reality']['dest']}) 通过"}
+        return {"node": node_id, "ok": False, "kind": "deep", "ms": None,
+                "detail": f"{shown} · {detail} (Reality 密钥/SNI/伪装目标 或传输层不匹配)"}
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:  # pragma: no cover - 兜底
+            proc.kill()
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def probe_node(state: dict, node_id: str, timeout: float = 4.0) -> dict:
     """单节点体检: 握手耗时 + 结论。"""
     if not state.get("nodes", {}).get(node_id, True):
@@ -518,36 +693,55 @@ def probe_node(state: dict, node_id: str, timeout: float = 4.0) -> dict:
     }
 
 
-def probe_all(state: dict, timeout: float = 4.0) -> dict:
-    """全部节点 + 服务器出网 RTT。每个节点独立线程, 最慢一项决定总耗时。"""
+def deep_probe_all(state: dict, timeout: float = 9.0) -> list[dict]:
+    """对 4 个 TCP 节点逐个做深度体检 (串行: 单核小内存 VPS 上别同时起 4 个内核)。"""
+    results = []
+    for nid in ("vless-reality", "vless-xhttp", "vless-ws", "trojan"):
+        try:
+            results.append(deep_probe_node(state, nid, timeout))
+        except Exception as exc:  # noqa: BLE001 — 体检异常不能让接口 500
+            results.append({"node": nid, "ok": False, "kind": "deep", "ms": None,
+                            "detail": f"深度体检异常: {exc}"})
+    return results
+
+
+def probe_all(state: dict, timeout: float = 4.0, deep: bool = False) -> dict:
+    """全部节点 + 服务器出网 RTT。每个节点独立线程, 最慢一项决定总耗时。
+
+    deep=True 时对 4 个 TCP 节点改用"真实客户端穿一次"的深度体检 (见
+    deep_probe_node); 本地开发 / 无 xray 二进制时自动退回浅探测。
+    """
     from concurrent.futures import ThreadPoolExecutor
 
     from .config import NODE_IDS
 
     nodes = list(NODE_IDS)
-    with ThreadPoolExecutor(max_workers=min(6, len(nodes) + 1)) as pool:
-        futures = {nid: pool.submit(probe_node, state, nid, timeout) for nid in nodes}
-        dest = pool.submit(
-            tcp_connect_ms,
-            state["reality"]["dest"].rsplit(":", 1)[0],
-            int(state["reality"]["dest"].rsplit(":", 1)[-1] or 443),
-            max(timeout, 5.0),
-        )
-        results = []
-        for nid in nodes:
-            try:
-                results.append(futures[nid].result())
-            except Exception as exc:  # noqa: BLE001
-                results.append(
-                    {"node": nid, "ok": False, "kind": "?", "ms": None, "detail": f"探测异常: {exc}"}
-                )
-        dest_ok, dest_ms, dest_detail = dest.result()
+    dest_host, dest_port = state["reality"]["dest"].rsplit(":", 1)
+    if deep and is_prod() and bin_path("xray") is not None:
+        results = deep_probe_all(state, max(timeout, 9.0))
+        results.append(probe_node(state, "hysteria2", timeout))
+        dest_ok, dest_ms, dest_detail = tcp_connect_ms(dest_host, int(dest_port or 443), max(timeout, 5.0))
+    else:
+        with ThreadPoolExecutor(max_workers=min(6, len(nodes) + 1)) as pool:
+            futures = {nid: pool.submit(probe_node, state, nid, timeout) for nid in nodes}
+            dest = pool.submit(tcp_connect_ms, dest_host, int(dest_port or 443), max(timeout, 5.0))
+            results = []
+            for nid in nodes:
+                try:
+                    results.append(futures[nid].result())
+                except Exception as exc:  # noqa: BLE001
+                    results.append(
+                        {"node": nid, "ok": False, "kind": "?", "ms": None, "detail": f"探测异常: {exc}"}
+                    )
+            dest_ok, dest_ms, dest_detail = dest.result()
 
     ok_count = sum(1 for r in results if r["ok"])
+    label = "深度握手" if deep and is_prod() and bin_path("xray") is not None else "握手"
     return {
         "checked_at": int(time.time()),
         "nodes": results,
-        "summary": f"{ok_count}/{len(results)} 个节点握手成功",
+        "deep": bool(deep),
+        "summary": f"{ok_count}/{len(results)} 个节点{label}成功",
         "dest": {
             "address": state["reality"]["dest"],
             "ok": dest_ok,

@@ -64,7 +64,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 77 项 (74 passed + 3 skipped) + `scripts/verify.py` (74 项) + `scripts/browser_check.cjs` (33 项) + `scripts/upgrade_sim.sh` (13 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 83 项 (79 passed + 4 skipped; 带 `ZP_XRAY_BIN` 时 83 全通过) + `scripts/verify.py` (74 项) + `scripts/browser_check.cjs` (33 项) + `scripts/upgrade_sim.sh` (13 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 
 竞品与技术调研见 `docs/RESEARCH.md`。
 
@@ -143,8 +143,14 @@ zeroproxy/
 
 - **凭据统一**: 用户只输入一次密码 — Trojan / Hysteria 2 直接使用该口令, VLESS UUID 由
   `SHA256(用户名+密码)` 确定性派生, 重新生成配置时 UUID 恒定, 客户端无需重新导入。
-- **Reality 免证书**: 部署时生成 X25519 密钥对, SNI 默认伪装 `www.microsoft.com`,
-  `pbk`/`sid` 随订阅分发; 面板可随时改伪装目标 (自动改成 `sni:443` 并做可达性检查)。
+- **Reality 免证书**: 部署时生成 X25519 密钥对 (REALITY 只认 X25519, 用 Ed25519 生成的
+  密钥对会让每一次握手都失败 —— 服务端 active、面板全绿、节点却不通), `pbk`/`sid` 随订阅
+  分发; 面板可随时改伪装目标 (自动改成 `sni:443`)。
+- **伪装目标的硬约束 (实测 + `xtls/reality` 源码)**: 目标站点发回的 Certificate 握手报文
+  必须 ≤ **8192 字节** (REALITY 服务端缓冲上限), 超了服务端直接放弃握手、客户端只看到连接
+  被重置。默认值因此从 `www.microsoft.com` (证书链 **8273** 字节, 必定失败) 换成
+  `www.cloudflare.com` (ECDSA 链 4KB 出头, 实测通过); 换目标后请点「节点测速」验证 ——
+  它现在用真实客户端穿一次外网, 而不是只看端口是否监听。
 - **XHTTP**: Vision flow 只能用于 TCP, 因此 XHTTP 入站 `flow` 为空; 与 Reality 叠加后同样免证书。
 - **端口跳跃默认开启**: Hysteria 2 同时监听 3 个 UDP 端口, 封锁单端口不影响服务; 订阅链接把端口
   写在 host 位置 (`host:30001,31001,32001`), 官方客户端据此启用 udphop。
@@ -316,7 +322,7 @@ state.json (唯一事实来源, schema v3, 旧版本自动升级)
 | POST | `/api/nodes/{id}/toggle` | 会话 | 节点启停 → 热重载 |
 | POST | `/api/hysteria/hopping` | 会话 | 端口跳跃开关 → 热重载 |
 | POST | `/api/settings` | 会话 | 改 Reality SNI / Hysteria 伪装站点 / 节点端口 / 分流模板 (含端口占用校验; 只改模板时不重载服务) |
-| GET | `/api/probe` | 会话 | 节点真实握手探测 + 服务器出口 RTT (3 秒内复用缓存) |
+| GET | `/api/probe` | 会话 | 节点探测 + 服务器出口 RTT (`?deep=1` 用临时 Xray 客户端真的从每个节点穿一次外网, 生产环境面板默认走它; 3s / 20s 缓存) |
 | POST | `/api/geodata/update` | 会话 | 下载/刷新 GeoIP + GeoSite 数据并热重载 (互斥, 并发时 409) |
 | GET | `/api/backup` | 会话 | 导出备份 JSON (含密钥与令牌, 带 SHA-256 校验和, 不含会话) |
 | POST | `/api/restore` | 会话 | 从备份恢复并热重载 (校验和/必填字段/版本三重校验) |
@@ -385,10 +391,11 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 
 在 macOS (Apple Silicon, Python 3.14) 上实测通过:
 
-- `python -m pytest tests -q` → **74 passed, 3 skipped** (带 `ZP_XRAY_BIN` 时 **77 passed**, 约 17 秒);
+- `python -m pytest tests -q` → **79 passed, 4 skipped** (带 `ZP_XRAY_BIN` 时 **83 passed**, 约 20 秒);
   含 `/api/update` 鉴权与版本比较、`apply` 的"写不进 /etc/nginx 即失败"语义、CLI 退出码、以及
   `install.sh` 重跑不覆盖已初始化配置 / `upgrade.sh` 随包发布 / 自签证书可补签 Let's Encrypt /
-  `systemctl` 参数顺序的回归断言。
+  `systemctl` 参数顺序的回归断言 / Reality 密钥必须是成对的 X25519 (Ed25519 必须判无效) /
+  旧默认伪装目标 (证书链超 8KB) 自动迁移 / 深度体检客户端配置真的带齐各节点参数。
 - `scripts/verify.py` (Xray 26.3.27 + Hysteria 2.12.3 + mihomo 1.19.31 + sing-box 1.14.2) → **74/74 项通过**:
   setup 8 步全绿 / 三种订阅格式可被真实客户端解析 / 三档分流模板分别被 `mihomo -t` 与
   `sing-box check` 通过 / **用真实 sing-box 实跑** 5 份订阅 (通用 + 1.14+ 写法 × 智能/全局/直连) 全部启动成功,

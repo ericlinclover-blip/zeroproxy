@@ -61,26 +61,44 @@ def gen_xray(state: dict, timeout: int = 0) -> tuple[bool, str]:
     return True, f"已生成 ({count} 个入站)"
 
 
-def ensure_reality_keys(state: dict, timeout: int = 0) -> tuple[bool, str]:
-    """落地前保证 state 里是一对有效的 X25519 Reality 密钥对。
+def ensure_reality_settings(state: dict, timeout: int = 0) -> tuple[bool, str]:
+    """落地前校验两件会让 REALITY 必然失败的东西: 密钥对 与 伪装目标。
 
-    v2.3.2 及更早的 `new_reality_keys()` 误用 Ed25519 生成密钥, 而 REALITY 只认
-    X25519 → 服务端私钥与订阅下发的 `pbk` 对不上, 四个 TCP 节点全部握手失败
-    (服务却一直是 active, 面板显示"运行中")。升级到 v2.3.3 后跑一次落地即可自愈,
-    不必重装、也不必手动改 state.json。
+    1. 密钥对: v2.3.2 及更早的 `new_reality_keys()` 误用 Ed25519, 而 REALITY 只认
+       X25519 → 服务端私钥与订阅下发的 `pbk` 对不上, 四个 TCP 节点全部握手失败
+       (服务却一直是 active, 面板显示"运行中")。
+    2. 伪装目标: 目标站点的 Certificate 握手报文必须 ≤ 8192 字节 (REALITY 服务端
+       缓冲区), 旧默认值 www.microsoft.com 的证书链是 8273 字节 → 握手被放弃,
+       客户端只看到连接重置。用户自己改过目标时不动。
 
-    密钥被替换时订阅 URL 不变 (UUID / 令牌都没动), 客户端重新拉一次订阅即可。
+    两处修复都只改 state, 订阅 URL 不变 (UUID / 令牌都没动), 客户端重新拉一次
+    订阅即可。
     """
     reality = state["reality"]
-    if crypto.reality_key_valid(reality.get("private_key", ""), reality.get("public_key", "")):
-        return True, "Reality 密钥对有效 (X25519)"
-    private_key, public_key, short_id = crypto.new_reality_keys()
-    reality["private_key"] = private_key
-    reality["public_key"] = public_key
-    reality["short_id"] = reality.get("short_id") or short_id
+    notes: list[str] = []
+
+    if not crypto.reality_key_valid(reality.get("private_key", ""), reality.get("public_key", "")):
+        private_key, public_key, short_id = crypto.new_reality_keys()
+        reality["private_key"] = private_key
+        reality["public_key"] = public_key
+        reality["short_id"] = reality.get("short_id") or short_id
+        notes.append("密钥对无效 (旧版 Ed25519, REALITY 需要 X25519) → 已重新生成")
+
+    if (
+        reality.get("dest") == config.LEGACY_REALITY_DEST
+        and reality.get("server_name") == config.LEGACY_REALITY_SNI
+    ):
+        reality["dest"] = config.DEFAULT_REALITY_DEST
+        reality["server_name"] = config.DEFAULT_REALITY_SNI
+        notes.append(
+            f"伪装目标仍是旧默认值 (证书链超过 REALITY 的 8KB 缓冲, 握手必然失败) → "
+            f"已换成 {config.DEFAULT_REALITY_SNI}"
+        )
+
+    if notes:
+        return True, "; ".join(notes) + " (客户端需重新拉取订阅)"
     return True, (
-        "检测到无效的 Reality 密钥对 (旧版 Ed25519, REALITY 需要 X25519) → "
-        "已重新生成, 客户端需重新拉取订阅"
+        f"密钥对有效 (X25519); 伪装目标 {reality.get('dest') or '(未设置)'} 非已知问题值"
     )
 
 
@@ -195,7 +213,7 @@ def verify_listeners(state: dict, timeout: int = 0) -> tuple[bool, str]:
 def reapply(state: dict, timeout: int = 0) -> list[dict]:
     """完整闭环: 重新生成三份配置 → 校验 → 重载服务 → 验证端口。"""
     steps = steps_recorder()
-    add_step(steps, "校验 Reality 密钥", ensure_reality_keys, state)
+    add_step(steps, "校验 Reality 密钥与伪装目标", ensure_reality_settings, state)
     add_step(steps, "重新生成 Xray 配置", gen_xray, state)
     add_step(steps, "重新生成 Nginx 配置", gen_nginx, state)
     add_step(steps, "重新生成 Hysteria 2 配置", gen_hysteria, state)

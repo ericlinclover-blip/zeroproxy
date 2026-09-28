@@ -921,34 +921,37 @@ def logs(service: str, request: Request, lines: int = 40):
 
 # ---------------------------------------------------------------- 连通性探测
 
-#: 探测缓存 (探测要握 6 次手, 3 秒内重复点击直接复用结果)
-_PROBE_CACHE: dict = {"at": 0, "body": None}
+#: 探测缓存 (浅探测 3s / 深度探测 20s 内重复点击直接复用结果)
+_PROBE_CACHE: dict = {}
 _PROBE_LOCK = threading.Lock()
 
 
 @router.get("/api/probe")
-def probe(request: Request, force: int = 0):
+def probe(request: Request, force: int = 0, deep: int = 0):
     """节点体检: 对每个本地入站做一次真实握手, 并测量服务器到伪装目标的 RTT。
 
-    这是服务端能给出的最有意义的"延迟" —— 客户端到服务器的 RTT 只能由客户端
-    测量, 服务端无法自测; 但"入站握手是否成功 + 握手耗时"能直接反映节点是否
-    真的可用 (Reality 密钥/SNI/dest 不匹配时握手必然失败)。
+    `?deep=1` 换成深度体检: 起一个临时 Xray 客户端, 真的从每个节点穿一次外网。
+    浅探测只能证明端口在监听 —— Reality 认证失败时服务端会回落到真实伪装站点,
+    裸 TLS 握手照样成功 (这就是"面板全绿但节点不通"的来源), 因此排查问题应当
+    用 deep=1。
     """
     with config.locked():
         state = load_state()
         if not _require_auth(state, request):
             return _err("未登录", 401)
 
+    want_deep = bool(deep)
     now = time.time()
+    ttl = 20 if want_deep else 3
+    key = "deep" if want_deep else "fast"
     with _PROBE_LOCK:
-        cached = _PROBE_CACHE["body"]
-        if cached and not force and now - _PROBE_CACHE["at"] < 3:
-            return cached
+        entry = _PROBE_CACHE.get(key)
+        if entry and not force and now - entry["at"] < ttl:
+            return entry["body"]
 
-    body = services.probe_all(state)
+    body = services.probe_all(state, deep=want_deep)
     with _PROBE_LOCK:
-        _PROBE_CACHE["at"] = time.time()
-        _PROBE_CACHE["body"] = body
+        _PROBE_CACHE[key] = {"at": time.time(), "body": body}
     return body
 
 

@@ -309,7 +309,8 @@ code.inline { background: var(--border); padding: 2px 7px; border-radius: 6px; f
       <div class="adv-grid">
         <div class="field">
           <label>Reality 伪装 SNI</label>
-          <input id="adv-sni" placeholder="www.microsoft.com" spellcheck="false"></div>
+          <input id="adv-sni" placeholder="www.cloudflare.com" spellcheck="false">
+          <div class="muted" style="font-size:12px;margin-top:4px">目标站点证书链必须 ≤ 8KB (Reality 服务端缓冲上限), 超了握手必然失败; 改完点「节点测速」验证。</div></div>
         <div class="field">
           <label>Hysteria 2 伪装站点 (留空关闭)</label>
           <input id="adv-masq" placeholder="https://www.microsoft.com/" spellcheck="false"></div>
@@ -704,7 +705,7 @@ function renderProbe() {
   const el = $("#probe-summary");
   if (!el) return;
   if (!probeData) {
-    el.innerHTML = `<span class="muted" style="font-size:12.5px">点「节点测速」对每个节点做一次真实握手 (Reality/Trojan 走完整 TLS), 并测量服务器到伪装目标的出口延迟。</span>`;
+    el.innerHTML = `<span class="muted" style="font-size:12.5px">点「节点测速」用真实客户端从每个节点穿一次外网 (深度握手, 能查出 Reality 密钥 / SNI / 伪装目标不匹配), 并测量服务器到伪装目标的出口延迟。本地开发环境下自动降级为裸握手。</span>`;
     return;
   }
   const when = fmtTime(probeData.checked_at);
@@ -721,7 +722,7 @@ async function runProbe(force) {
   const original = btn.textContent;
   btn.textContent = "测速中…";
   try {
-    probeData = await api("/api/probe" + (force ? "?force=1" : ""));
+    probeData = await api("/api/probe?deep=1" + (force ? "&force=1" : ""));
     renderNodes();
   } catch (e) {
     toast("测速失败: " + e.message);

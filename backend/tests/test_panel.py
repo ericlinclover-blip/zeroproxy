@@ -347,7 +347,8 @@ def test_diagnose_reports_checks(client, configured):
 
 def test_repair_regenerates_configs(client, configured):
     body = client.post("/api/repair").json()
-    assert [s["name"] for s in body["steps"]][:2] == ["校验 Reality 密钥", "重新生成 Xray 配置"]
+    assert [s["name"] for s in body["steps"]][:2] == [
+        "校验 Reality 密钥与伪装目标", "重新生成 Xray 配置"]
     assert all(s["ok"] for s in body["steps"]), body["steps"]
 
 
@@ -389,7 +390,7 @@ def test_state_migrates_v1_layout(home):
     assert state["ports"]["xhttp"] == 8445
     assert state["nodes"]["vless-xhttp"] is True          # 新节点自动补默认值
     assert state["hysteria_masquerade"]["enabled"] is True
-    assert state["reality"]["server_name"] == "www.microsoft.com"
+    assert state["reality"]["server_name"] == "www.cloudflare.com"
     # v2 → v3 新增的 GeoIP 分流字段同样自动补齐
     assert state["geodata"]["enabled"] is False
     assert state["geodata"]["block_private"] is True
@@ -487,7 +488,7 @@ def test_apply_migrates_legacy_reality_keys(client, home, configured):
 
     steps = apply.reapply(state)
 
-    assert steps[0]["name"] == "校验 Reality 密钥" and steps[0]["ok"] is True
+    assert steps[0]["name"] == "校验 Reality 密钥与伪装目标" and steps[0]["ok"] is True
     assert "X25519" in steps[0]["detail"] and "重新生成" in steps[0]["detail"]
     assert crypto.reality_key_valid(state["reality"]["private_key"], state["reality"]["public_key"])
     assert state["reality"]["short_id"] == "a1b2c3d4"        # sid 本身合法, 保留原值
@@ -495,6 +496,42 @@ def test_apply_migrates_legacy_reality_keys(client, home, configured):
     # 幂等: 已经是合法密钥时不动它 (否则每次落地都换 pbk, 客户端订阅白拉)
     again = apply.reapply(state)
     assert again[0]["ok"] is True and "有效" in again[0]["detail"]
+
+
+def test_apply_migrates_legacy_masquerade_target(client, home, configured):
+    """旧默认伪装目标 www.microsoft.com 的证书链 8273 字节 > REALITY 的 8KB 缓冲,
+    握手必然失败 (真机实测 `REALITY: processed invalid connection ... handshake did
+    not complete successfully`) → 落地时自动换成新默认值; 用户自己改过的不动。"""
+    from zeroproxy import apply
+
+    state = config.load_state()
+    state["reality"]["dest"] = config.LEGACY_REALITY_DEST
+    state["reality"]["server_name"] = config.LEGACY_REALITY_SNI
+    config.save_state(state)
+
+    steps = apply.reapply(state)
+
+    assert steps[0]["ok"] is True and "8KB" in steps[0]["detail"]
+    assert state["reality"]["dest"] == config.DEFAULT_REALITY_DEST
+    assert state["reality"]["server_name"] == config.DEFAULT_REALITY_SNI
+    assert config.DEFAULT_REALITY_DEST == "www.cloudflare.com:443"   # 实测握手通过
+
+    # 用户自选目标不得被改写 (哪怕它同样有问题, 用户要能看到自己选的)
+    state["reality"]["dest"] = state["reality"]["server_name"] = "www.samsung.com"
+    state["reality"]["dest"] = "www.samsung.com:443"
+    config.save_state(state)
+    apply.reapply(state)
+    assert state["reality"]["server_name"] == "www.samsung.com"
+
+
+def test_apply_reapply_leaves_valid_targets_alone(client, home, configured):
+    from zeroproxy import apply
+
+    state = config.load_state()
+    before = (state["reality"]["dest"], state["reality"]["server_name"])
+    detail = apply.reapply(state)[0]["detail"]
+    assert (state["reality"]["dest"], state["reality"]["server_name"]) == before
+    assert "非已知问题值" in detail
 
 
 @pytest.mark.skipif(not os.environ.get("ZP_XRAY_BIN"), reason="需要真实 xray 二进制 (ZP_XRAY_BIN)")
@@ -532,7 +569,7 @@ def test_probe_endpoint_reports_every_node(client, configured):
     for item in body["nodes"]:
         assert item["ok"] is not None
         assert item["detail"]
-    assert body["dest"]["address"] == "www.microsoft.com:443"
+    assert body["dest"]["address"] == "www.cloudflare.com:443"
 
 
 def test_probe_requires_auth(client, configured):
@@ -545,6 +582,73 @@ def test_probe_skips_disabled_nodes(client, configured):
     body = client.get("/api/probe?force=1").json()
     hysteria = next(n for n in body["nodes"] if n["node"] == "hysteria2")
     assert hysteria["ok"] is None and "关闭" in hysteria["detail"]
+
+
+def test_deep_probe_client_config_covers_every_tcp_node(home):
+    """深度体检用的客户端配置必须真的带上各节点的关键参数 (否则体检没意义)。"""
+    from zeroproxy import config as cfg, services
+
+    state = cfg.load_state()
+    state["reality"]["dest"] = "www.cloudflare.com:443"
+    state["reality"]["server_name"] = "www.cloudflare.com"
+
+    for node_id, network in (("vless-reality", "tcp"), ("vless-xhttp", "xhttp"),
+                             ("vless-ws", "ws"), ("trojan", "tcp")):
+        cfg_json = services.client_config(state, node_id, 12345)
+        assert cfg_json is not None, node_id
+        assert cfg_json["inbounds"][0]["port"] == 12345
+        outbound = cfg_json["outbounds"][0]
+        assert outbound["streamSettings"]["network"] == network
+        if node_id != "trojan":
+            user = outbound["settings"]["vnext"][0]["users"][0]
+            assert user["id"] == state["uuid"]
+            assert user["flow"] == ("xtls-rprx-vision" if node_id == "vless-reality" else "")
+        if node_id in ("vless-reality", "vless-xhttp"):
+            rs = outbound["streamSettings"]["realitySettings"]
+            assert rs["publicKey"] == state["reality"]["public_key"]
+            assert rs["shortId"] == state["reality"]["short_id"]
+            assert rs["serverName"] == "www.cloudflare.com"
+
+    # Hysteria 2 需要 hysteria 客户端, 深度体检不支持 → 明确返回 None 而不是瞎编
+    assert services.client_config(state, "hysteria2", 12345) is None
+
+
+def test_deep_probe_is_unavailable_without_xray_binary(client, configured, home, monkeypatch):
+    """没有 xray 二进制时给出"无法体检"而不是谎报成功/失败。"""
+    from zeroproxy import services
+
+    monkeypatch.setattr(services, "bin_path", lambda name: None)
+    result = services.deep_probe_node(config.load_state(), "vless-reality")
+    assert result["ok"] is None and "无法深度体检" in result["detail"]
+
+
+def test_deep_probe_reports_failure_when_node_is_dead(client, configured, home, monkeypatch):
+    """节点端口没人监听时, 深度体检必须判失败 (而不是像裸 TLS 探测那样误报)。"""
+    import socket
+
+    from zeroproxy import services
+
+    fake = os.environ.get("ZP_XRAY_BIN") or services.bin_path("xray")
+    if not fake or not os.path.exists(fake):
+        pytest.skip("需要真实 xray 二进制 (ZP_XRAY_BIN)")
+    monkeypatch.setenv("ZP_XRAY_BIN", fake)
+
+    with socket.socket() as s:                      # 占一个端口后立刻释放 → 必定无监听
+        s.bind(("127.0.0.1", 0))
+        dead_port = s.getsockname()[1]
+    state = config.load_state()
+    state["ports"]["reality"] = dead_port
+    result = services.deep_probe_node(state, "vless-reality", timeout=4)
+    assert result["ok"] is False
+    assert "Reality 密钥/SNI/伪装目标" in result["detail"]
+
+
+def test_probe_deep_flag_falls_back_to_shallow_in_dev(client, configured):
+    """本地开发 (无 systemd / 非 Linux) 下 deep=1 也必须能返回, 而不是 500。"""
+    body = client.get("/api/probe?deep=1&force=1").json()
+    assert len(body["nodes"]) == 5
+    assert body["deep"] is True
+    assert all(n["kind"] in ("tcp", "tls", "udp", "off", "deep", "?") for n in body["nodes"])
 
 
 def test_tcp_connect_probe_helper(home):
@@ -614,13 +718,13 @@ def test_backup_and_restore_roundtrip(client, configured):
 
     token = payload["state"]["subscription_token"]
     client.post("/api/nodes/vless-ws/toggle")
-    client.post("/api/settings", json={"reality_sni": "www.cloudflare.com"})
+    client.post("/api/settings", json={"reality_sni": "www.bing.com"})
 
     restored = client.post("/api/restore", content=exported.content)
     assert restored.status_code == 200, restored.text
     state = config.load_state()
     assert state["nodes"]["vless-ws"] is True           # 节点开关回到备份点
-    assert state["reality"]["server_name"] == "www.microsoft.com"
+    assert state["reality"]["server_name"] == "www.cloudflare.com"
     assert state["subscription_token"] == token
     assert state["geodata"]["enabled"] is False
     assert any(a["action"] == "restore" for a in state["audit"])
@@ -925,7 +1029,7 @@ def test_apply_reapply_persists_steps(client, configured, home):
     state = config.load_state()
     steps = apply.reapply(state)
     assert [s["name"] for s in steps] == [
-        "校验 Reality 密钥",
+        "校验 Reality 密钥与伪装目标",
         "重新生成 Xray 配置",
         "重新生成 Nginx 配置",
         "重新生成 Hysteria 2 配置",
