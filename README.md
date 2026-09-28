@@ -66,7 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 116 项 (111 passed + 5 skipped; 带 `ZP_XRAY_BIN` 时 116 全通过) + `scripts/verify.py` (74 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (81 项) + `scripts/upgrade_sim.sh` (21 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 117 项 (112 passed + 5 skipped; 带 `ZP_XRAY_BIN` 时 117 全通过) + `scripts/verify.py` (74 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (81 项) + `scripts/upgrade_sim.sh` (21 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 | **看得懂的界面 (v2.6.0)** | 控制台布局: 左侧锚点导航 (带计数角标 + 滚动高亮) + 顶部指标条 (健康节点 / 落地出口 IP / 平均延迟 + 迷你折线 / 运行时长) + 节点密集表格 (名称 / 地址状态 / **握手延迟条** / **上下行双轨** / 开关与复制) + **流量卡 (双弧圆环 + 实时速率曲线 + 逐节点双色流量条)** + 链式链路拓扑 (你的设备 → 本机入口 → 落地端) + 程序更新闭环; 动效全部走 `transform`/自绘 rAF 并受 `prefers-reduced-motion` 约束 |
 
@@ -376,6 +376,24 @@ state.json (唯一事实来源, schema v4, 旧版本自动升级)
 `current`, 每完成一步追加到 `steps` —— 面板只负责把这些字段渲染出来, 不猜步骤、不造进度
 (踩过的坑: 前端自己 `setTimeout` 假装进度, 一旦脚本卡住就变成骗人)。
 
+**v2.6.3 / v2.6.4: 面板内升级其实一直是"报错但成功"** —— 这一条只有真机才会暴露
+(本地 `pytest` 里 `systemd` 不存在, 走的永远是另一条分支):
+
+1. `POST /api/update` 的回执里带了 `update.status()`, 那会顺手做一次远端版本检查。
+   国内直连 GitHub 要等 4 个镜像依次超时 (最坏 ~32s), 而升级任务大约 34s 后就重启面板 ——
+   于是响应要么被掐断、要么赶在重启前一刻回来。**修法**: 回执只走本地
+   (`{"ok": true, "detail": ...}`), 真正的进度交给前端 2.5s 一次的 `GET /api/update` 轮询
+   (那条路径有 600s 缓存, 不会反复出网)。
+2. 真正的大坑是 `systemd-run`: 不加 `--no-block` 时它会把这个 `Type=oneshot` 单元
+   **跑完**才返回, 而 `subprocess.run` 的超时是 30 秒 —— 结果面板每点一次「一键更新」
+   都会在 ~30-60 秒后回一句 409「无法启动升级任务: ... timed out after 30 seconds」,
+   而 `update.json` 里明明是一条 8/8 步的成功记录 (真机上量到: 点按钮 63.5 秒后弹错,
+   升级早已完成)。**修法**: `systemd-run --no-block` 入队即返回; 没有
+   `systemd-run` 的老系统改用 `Popen` 脱离进程组起跑 —— 原来的兜底也同样会
+   30 秒超时, 而且超时会**杀掉跑到一半的升级**。
+   两条都补了回归断言 (`test_update_start_reply_is_local_only` /
+   `test_update_launch_does_not_wait_for_the_unit`), 一旦有人把远端检查或同步等待塞回去, 测试立刻炸。
+
 ---
 
 ## 9. API
@@ -464,7 +482,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 
 在 macOS (Apple Silicon, Python 3.14) 上实测通过:
 
-- `python -m pytest tests -q` → **111 passed, 5 skipped** (带 `ZP_XRAY_BIN` 时 **116 passed**, 约 37 秒);
+- `python -m pytest tests -q` → **112 passed, 5 skipped** (带 `ZP_XRAY_BIN` 时 **117 passed**, 约 30 秒);
   含 `/api/update` 鉴权与版本比较、`apply` 的"写不进 /etc/nginx 即失败"语义、CLI 退出码、以及
   `install.sh` 重跑不覆盖已初始化配置 / `upgrade.sh` 随包发布 / 自签证书可补签 Let's Encrypt /
   `systemctl` 参数顺序的回归断言 / Reality 密钥必须是成对的 X25519 (Ed25519 必须判无效) /

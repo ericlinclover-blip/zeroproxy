@@ -1259,6 +1259,37 @@ def test_update_start_reply_is_local_only(client, configured, home, monkeypatch)
     assert body["ok"] is True
 
 
+def test_update_launch_does_not_wait_for_the_unit(client, configured, home, monkeypatch):
+    """回归: `systemd-run` 必须带 `--no-block`。
+
+    默认情况下 systemd-run 会把这个 oneshot 单元**跑完**才返回 —— 而升级要 30-40 秒,
+    于是 `subprocess.run(timeout=30)` 先超时, 面板回执变成 409「无法启动升级任务」,
+    界面上却能看到升级真的在进行 (v2.6.3 在真机上量到: 点按钮 63 秒后才弹这句错,
+    同时 update.json 里是一条 8/8 步的成功记录)。
+    """
+    from zeroproxy import services, update
+
+    monkeypatch.setattr(services, "is_prod", lambda: True)
+    (home / "upgrade.sh").write_text("#!/usr/bin/env bash\nexit 0\n")
+    captured = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return _Proc()
+
+    monkeypatch.setattr(update.shutil, "which", lambda name: "/usr/bin/systemd-run")
+    monkeypatch.setattr(update.subprocess, "run", fake_run)
+    ok, detail = update.start(trigger="panel")
+    assert ok is True, detail
+    assert captured["cmd"][0] == "/usr/bin/systemd-run"
+    assert "--no-block" in captured["cmd"]
+
+
 def test_update_runs_a_staged_copy(client, configured, home, monkeypatch):
     """回归: 面板必须跑 upgrade.sh 的**临时副本**, 不能就地执行 ZP_HOME 里那一份。
 
@@ -1275,17 +1306,13 @@ def test_update_runs_a_staged_copy(client, configured, home, monkeypatch):
 
     captured = {}
 
-    class _Proc:
-        returncode = 0
-        stdout = ""
-        stderr = ""
-
-    def fake_run(cmd, **kwargs):
+    def fake_popen(cmd, **kwargs):
         captured["cmd"] = cmd
         captured["env"] = kwargs.get("env") or {}
-        return _Proc()
+        return None
 
-    monkeypatch.setattr(update.subprocess, "run", fake_run)
+    # 兜底路径是 Popen: 不能同步等 upgrade.sh 跑完 (30 秒超时会杀掉跑到一半的升级)
+    monkeypatch.setattr(update.subprocess, "Popen", fake_popen)
     ok, detail = update.start(trigger="panel")
     assert ok is True, detail
 

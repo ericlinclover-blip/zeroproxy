@@ -4,7 +4,10 @@
   * 升级动作本身由仓库里的 `upgrade.sh` 完成 —— 面板只是「按一下按钮」,
     所以面板内升级与 README 里那条 curl 命令走的是**同一条代码路径**;
   * 升级脚本会重启面板进程, 因此不能在请求线程里同步执行: 用 systemd 的
-    瞬时单元 (systemd-run) 把它放到独立 cgroup 里跑, 面板重启不会杀掉它;
+    瞬时单元 (`systemd-run --no-block`) 把它放到独立 cgroup 里跑, 面板重启不会杀掉它。
+    `--no-block` 是必须的 —— 不加的话 systemd-run 会把这个 oneshot 单元**等完**
+    (升级要 30-40 秒), 请求线程撞上 30 秒超时, 回执变成"无法启动升级任务",
+    而升级其实已经跑起来了 (`--no-block` 让 systemd-run 入队即返回);
   * 脚本永远**从临时副本**启动而不是就地执行 —— 见 `stage_script()`;
   * 进度落在 `$ZP_HOME/data/update.json` + `data/update.log`, 面板重启后照常
     能读到「上次升级做了什么、结果是成功还是失败」。
@@ -251,6 +254,10 @@ def start(trigger: str = "panel", timeout: int = 30) -> tuple[bool, str]:
         cmd = [
             runner,
             f"--unit={unit}",
+            # 必须 --no-block: 默认 systemd-run 会等这个 oneshot 单元**跑完**才返回,
+            # 而升级要 30-40 秒 —— 于是 subprocess 的 30 秒超时先到, 面板回执变成
+            # "无法启动升级任务" (409), 界面上却看到升级真的在跑 (v2.6.3 真机复现)。
+            "--no-block",
             "--collect",
             "--property=Type=oneshot",
             "--property=StandardOutput=null",
@@ -266,6 +273,32 @@ def start(trigger: str = "panel", timeout: int = 30) -> tuple[bool, str]:
     else:  # pragma: no cover - 极老系统兜底 (面板重启可能打断升级)
         cmd = ["/bin/bash", staged]
 
+    if not runner:
+        # 没有 systemd-run 时不能同步等 (要等 30-40 秒, 而且 30 秒超时会**杀掉**
+        # 跑到一半的升级) —— 只能脱离进程组先跑起来, 剩下的交给脚本自己。
+        try:
+            subprocess.Popen(   # noqa: S603 - 参数固定, 走私有临时副本
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=runner_env,
+                start_new_session=True,
+            )
+        except OSError as exc:
+            _write_status(
+                {
+                    "state": "failed",
+                    "from": current_version(),
+                    "trigger": trigger,
+                    "started_at": int(time.time()),
+                    "finished_at": int(time.time()),
+                    "message": f"无法启动升级任务: {exc}",
+                    "steps": [],
+                }
+            )
+            return False, f"无法启动升级任务: {exc}"
+        return True, "升级已开始, 面板会自动重启, 完成后本页会自动刷新"
+
     try:
         proc = subprocess.run(
             cmd,
@@ -273,7 +306,7 @@ def start(trigger: str = "panel", timeout: int = 30) -> tuple[bool, str]:
             text=True,
             timeout=timeout,
             env=runner_env,
-            start_new_session=not runner,
+            start_new_session=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         _write_status(
