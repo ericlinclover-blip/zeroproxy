@@ -190,6 +190,9 @@ code.inline { background: var(--border-soft); padding: 3px 8px; border-radius: 7
   display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 999px;
   font-size: 11px; font-weight: 650; background: var(--border-soft); color: var(--sub);
   font-variant-numeric: tabular-nums; transition: background 0.2s, color 0.2s;
+  /* 药丸内容不许折行: 列窄时一折行就会变成一坨三行的绿块, 还会盖住旁边的东西
+     (真机上「出口 IP 192.220.64.127 · 1129.4ms」在 116px 的列里就是这个下场) */
+  white-space: nowrap;
 }
 .ping.ok { background: color-mix(in srgb, var(--ok) 15%, transparent); color: var(--ok); }
 .ping.bad { background: color-mix(in srgb, var(--err) 15%, transparent); color: var(--err); }
@@ -380,6 +383,26 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
 }
 @keyframes zp-wire { to { background-position: 13px 0; } }
 .wire.off i { background: repeating-linear-gradient(90deg, var(--sub) 0 7px, transparent 7px 13px); background-size: 13px 2px; animation: none; opacity: 0.45; }
+
+/* 已连接的落地端: 一条链一张小卡。
+ * 这里不能复用 .node-card —— 那是节点表的 5 列固定列宽 (名称/说明/地址/延迟/按钮),
+ * 落地端这条链的"说明 + 地址"比那两列宽, 探测药丸 + 那句结果也比延迟列宽, 三个按钮
+ * 更塞不进 176px: 真实后果是药丸折成三行、按钮压到结果文字上 (v2.6.13 修)。
+ * 自己竖排, 最后一行的探测结果与按钮用 flex 分流, 窄屏自动换行。 */
+.chain-entry {
+  display: flex; flex-direction: column; gap: 5px; margin-top: 12px;
+  padding: 13px 15px; background: var(--card-2); border-color: var(--border-soft); box-shadow: none;
+}
+.chain-entry .top { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.chain-entry .top .switch { margin-left: auto; }
+.chain-entry .name { display: flex; align-items: center; gap: 8px; min-width: 0; font-weight: 650; font-size: 13.5px; }
+.chain-entry .name .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chain-entry .meta { font-size: 11.5px; color: var(--sub); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chain-entry .addr { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chain-entry .ce-foot { display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap; margin-top: 7px; }
+.chain-entry .ce-probe { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.chain-entry .actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-left: auto; }
+.chain-entry .actions .btn { flex-shrink: 0; }
 
 /* ---------- 诊断 / 进度 ---------- */
 .check { display: flex; gap: 9px; align-items: flex-start; padding: 8px 0; font-size: 13px; border-top: 1px solid var(--border-soft); }
@@ -2350,11 +2373,11 @@ function chainEntryCard(d, e) {
     probe = `<span class="ping ${cls}">${esc(head)}</span>
       <span class="muted" style="font-size:12px">${esc(p.detail || "")}${p.ts ? " · " + esc(fmtTime(p.ts)) : ""}</span>`;
   }
-  return `<div class="card node-card" style="margin-top:12px">
+  return `<div class="card chain-entry">
     <div class="top">
-      <span class="name"><span class="badge hysteria">链式</span>${esc(e.label || e.host)}${
-        e.default_out ? '<span class="badge trojan">默认出口</span>' : ""
-      }</span>
+      <span class="name"><span class="badge hysteria">链式</span><span class="nm">${esc(
+        e.label || e.host
+      )}</span>${e.default_out ? '<span class="badge trojan">默认出口</span>' : ""}</span>
       <label class="switch"><input type="checkbox" data-chain-toggle="${escAttr(e.id)}" ${
         e.enabled ? "checked" : ""
       }><span class="slider"></span></label>
@@ -2365,13 +2388,15 @@ function chainEntryCard(d, e) {
     }"></span> <span class="muted">${e.enabled ? "运行中" : "已停用"}</span>${
       e.enabled ? ` <span class="badge hysteria" style="font-size:11px">订阅里有它</span>` : ""
     }</div>
-    <div style="margin-top:6px">${probe}</div>
-    <div class="actions" style="margin-top:12px">
-      <button class="btn ghost small" data-chain-probe="${escAttr(e.id)}">测速</button>
-      <button class="btn ghost small" data-chain-default="${escAttr(e.id)}" data-on="${
-        e.default_out ? "1" : "0"
-      }">${e.default_out ? "取消默认出口" : "设为默认出口"}</button>
-      <button class="btn ghost small danger" data-chain-del="${escAttr(e.id)}">断开</button>
+    <div class="ce-foot">
+      <div class="ce-probe">${probe}</div>
+      <div class="actions">
+        <button class="btn ghost small" data-chain-probe="${escAttr(e.id)}">测速</button>
+        <button class="btn ghost small" data-chain-default="${escAttr(e.id)}" data-on="${
+          e.default_out ? "1" : "0"
+        }">${e.default_out ? "取消默认出口" : "设为默认出口"}</button>
+        <button class="btn ghost small danger" data-chain-del="${escAttr(e.id)}">断开</button>
+      </div>
     </div>
   </div>`;
 }

@@ -558,9 +558,9 @@ async function main() {
     check("确认框给出「仍然添加」的出口", probeConfirm.ok === "仍然添加", probeConfirm.ok);
     await page.locator("#confirm-mask .modal").screenshot({ path: path.join(SHOT_DIR, "chain-confirm.png") });
     await page.click("#confirm-ok");
-    await page.waitForSelector("#chain-entries .node-card", { timeout: 40000 });
+    await page.waitForSelector("#chain-entries .chain-entry", { timeout: 40000 });
     const entryCard = await page.evaluate(() => {
-      const card = document.querySelector("#chain-entries .node-card");
+      const card = document.querySelector("#chain-entries .chain-entry");
       const text = card.innerText;
       return {
         text,
@@ -575,6 +575,36 @@ async function main() {
       /203\.0\.113\.9:8447/.test(entryCard.text) && /运行中/.test(entryCard.text)
       && entryCard.hasToggle && entryCard.hasDefault && entryCard.hasDelete && entryCard.toggled,
       entryCard.text.split("\n").slice(0, 3).join(" · "));
+
+    // v2.6.13: 这张卡原来复用节点表的 .node-card (5 列固定列宽), 结果"出口 IP …· …ms"
+    // 那个药丸在 116px 的列里折成三行, 三个按钮塞不进 176px 的列往左压到结果文字上。
+    const entryLayout = await page.evaluate(() => {
+      const card = document.querySelector("#chain-entries .chain-entry");
+      const r = (el) => el.getBoundingClientRect();
+      const box = r(card);
+      const pill = card.querySelector(".ping");
+      const probe = card.querySelector(".ce-probe");
+      const actions = card.querySelector(".actions");
+      const hit = (a, b) =>
+        Math.min(a.right, b.right) - Math.max(a.left, b.left) > 2 &&
+        Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 2;
+      const parts = [".ping", ".btn", ".meta", ".addr", ".ce-probe", ".actions"]
+        .map((s) => card.querySelector(s)).filter(Boolean);
+      return {
+        display: getComputedStyle(card).display,
+        pillLines: Math.round(r(pill).height / 16),
+        probeVsActions: hit(r(probe), r(actions)),
+        insideCard: parts.every((el) => {
+          const b = r(el);
+          return b.left >= box.left - 1 && b.right <= box.right + 1;
+        }),
+      };
+    });
+    check("链式卡片自己竖排 (不再套节点表的 5 列网格)",
+      entryLayout.display === "flex", `display=${entryLayout.display}`);
+    check("出口 IP 药丸不折行 (单行) ", entryLayout.pillLines === 1, `${entryLayout.pillLines} 行`);
+    check("按钮不压到探测结果上 (各自成块)",
+      !entryLayout.probeVsActions && entryLayout.insideCard, "");
     check("链式节点同时出现在「节点」网格里 (客户端就是一个普通节点)",
       (await page.locator("#node-grid .node-card").count()) === 6
       && /链式/.test(await page.locator("#node-grid .node-card").last().innerText()),
@@ -612,9 +642,9 @@ async function main() {
     await page.click(`[data-chain-del='${entryCard.id}']`);
     await page.waitForSelector("#confirm-mask:not(.hidden)");
     await page.click("#confirm-ok");
-    await page.waitForFunction(() => !document.querySelector("#chain-entries .node-card"), { timeout: 30000 });
+    await page.waitForFunction(() => !document.querySelector("#chain-entries .chain-entry"), { timeout: 30000 });
     check("断开后链式卡片消失、节点网格回到 5 张",
-      (await page.locator("#chain-entries .node-card").count()) === 0
+      (await page.locator("#chain-entries .chain-entry").count()) === 0
       && (await page.locator("#node-grid .node-card").count()) === 5, "");
     const clashAfter = await (await page.request.get(`${base}${chainSubPath}?format=clash`)).text();
     check("断开后订阅里不再有这个节点", !/ZeroProxy 链式/.test(clashAfter), "");
