@@ -194,11 +194,34 @@ def main() -> int:
     print("\n[1] setup 流水线")
     config.write_bootstrap_token(TOKEN)
     client = TestClient(create_app())
-    assert client.post(
+
+    def apply_post(path: str, **kwargs):
+        """改动类请求 + 等后台落地任务跑完 (v2.6.9)。
+
+        面板从 v2.6.9 起把"重新生成配置 → 重启内核 → 验端口"放到后台任务里, 接口
+        立刻回执 (响应里带 `job`), 前端靠轮询 `/api/apply/job` 看进度。这个脚本是
+        直接读磁盘上的配置来断言的, 所以每个改动类请求都要等任务结束 —— 面板的
+        前端也是这么做的, 两边行为一致。
+        """
+        res = client.request("POST", path, **kwargs)
+        try:
+            job = (res.json() or {}).get("job")
+        except Exception:  # noqa: BLE001 — 非 JSON 响应 (如 4xx 文本) 就没有任务
+            job = None
+        if job:
+            deadline = time.time() + 120
+            while time.time() < deadline:
+                snap = client.get(f"/api/apply/job?id={job['id']}").json()
+                if snap.get("state") != "running":
+                    break
+                time.sleep(0.2)
+        return res
+
+    assert apply_post(
         "/api/setup",
         json={"domain": DOMAIN, "username": USERNAME, "password": PASSWORD, "token": "wrong"},
     ).status_code == 403
-    response = client.post(
+    response = apply_post(
         "/api/setup",
         json={"domain": DOMAIN, "username": USERNAME, "password": PASSWORD, "token": TOKEN},
     )
@@ -309,7 +332,7 @@ def main() -> int:
             # 「关掉节点」必须真的把端口关掉。这里手动重启内核, 等价于生产里
             # systemd 那一步 —— 旧版本在"节点全关/只剩镜像"时压根不重启服务,
             # 于是面板显示已停用, 端口却还开着。
-            client.post("/api/nodes/vless-reality/toggle")
+            apply_post("/api/nodes/vless-reality/toggle")
             check = subprocess.run(
                 [xray_bin, "-test", "-c", str(home / "xray" / "config.json")],
                 capture_output=True,
@@ -333,7 +356,7 @@ def main() -> int:
             record("停用的 Reality 端口 8443 真的关闭", not port_open(8443))
             record("仍在启用的 XHTTP 端口 8445 照常监听", port_open(8445))
 
-            client.post("/api/nodes/vless-reality/toggle")   # 还原成全部启用
+            apply_post("/api/nodes/vless-reality/toggle")   # 还原成全部启用
         finally:
             proc.terminate()
             proc.wait(timeout=10)
@@ -343,7 +366,7 @@ def main() -> int:
     print("\n[5] Hysteria 2")
     if hy_bin:
         # macOS 不支持多端口监听, 先关掉端口跳跃以验证配置本体
-        client.post("/api/hysteria/hopping")
+        apply_post("/api/hysteria/hopping")
         proc = subprocess.Popen(
             [hy_bin, "server", "-c", str(home / "hysteria" / "config.yaml")],
             stdout=subprocess.PIPE,
@@ -364,7 +387,7 @@ def main() -> int:
             proc.terminate()
             proc.wait(timeout=10)
         # 恢复端口跳跃, 确认多端口配置也能生成 (Linux 上才是有效监听)
-        client.post("/api/hysteria/hopping")
+        apply_post("/api/hysteria/hopping")
         conf = (home / "hysteria" / "config.yaml").read_text()
         record("端口跳跃多端口配置", '"0.0.0.0:30001,31001,32001"' in conf)
     else:
@@ -373,7 +396,7 @@ def main() -> int:
     print("\n[6] 诊断与自愈")
     diag = client.get("/api/diagnose").json()
     record("自检", bool(diag["checks"]), diag["summary"])
-    repair = client.post("/api/repair").json()
+    repair = apply_post("/api/repair").json()
     record("一键修复", all(s["ok"] for s in repair["steps"]), f"{len(repair['steps'])} 步")
 
     print("\n[7] GeoIP 数据与分流防护")
@@ -388,7 +411,7 @@ def main() -> int:
         have_geo = True
         record("准备 GeoIP 数据", True, f"来自 {geo_src}")
     else:
-        res = client.post("/api/geodata/update").json()
+        res = apply_post("/api/geodata/update").json()
         have_geo = bool(res.get("ok"))
         record("下载 GeoIP 数据", have_geo, str(res.get("detail"))[:110])
 
@@ -408,7 +431,7 @@ def main() -> int:
                 shutil.move(str(stash / name), str(geo_dir / name))
 
         # 数据就绪后开启分流 (设置接口会触发重新生成 + 热重载)
-        client.post("/api/settings", json={"geodata_enabled": True})
+        apply_post("/api/settings", json={"geodata_enabled": True})
         state = config.load_state()
         cfg_path = home / "xray" / "config.json"
         cfg = json.loads(cfg_path.read_text())
@@ -449,7 +472,7 @@ def main() -> int:
 
         # 反向用例: 数据缺失时 geo 规则必须被丢弃 (否则 Xray 整体起不来)
         geo_out()
-        client.post("/api/apply")
+        apply_post("/api/apply")
         cfg2 = json.loads(cfg_path.read_text())
         record(
             "数据缺失时不再下发 geo 规则 (硬前置)",
@@ -464,7 +487,7 @@ def main() -> int:
             )
             record("无数据时 xray -test 仍通过", proc.returncode == 0)
         geo_back()
-        client.post("/api/apply")
+        apply_post("/api/apply")
 
         # 启动期漏洞: 配置已落盘、数据随后消失 (磁盘清理 / 手动删 / 恢复到新机),
         # 此时 `systemctl restart xray` 会让整个 Xray 起不来。guard 是 ExecStartPre 兜底。
@@ -513,7 +536,7 @@ def main() -> int:
             )
             record("guard 后 Xray 可通过自检 (启动不再被卡死)", fixed.returncode == 0)
         geo_back()
-        client.post("/api/apply")
+        apply_post("/api/apply")
 
     print("\n[8] 备份 / 恢复")
     exported = client.get("/api/backup")
@@ -527,9 +550,9 @@ def main() -> int:
     token_before = payload["state"]["subscription_token"]
 
     # 改点东西, 再用备份覆盖回去
-    client.post("/api/nodes/vless-ws/toggle")
+    apply_post("/api/nodes/vless-ws/toggle")
     assert config.load_state()["nodes"]["vless-ws"] is False
-    restore = client.post("/api/restore", content=exported.content)
+    restore = apply_post("/api/restore", content=exported.content)
     record("恢复备份", restore.status_code == 200, f"HTTP {restore.status_code}")
     after = config.load_state()
     record("恢复后节点开关回到备份点", after["nodes"]["vless-ws"] is True)
@@ -537,7 +560,7 @@ def main() -> int:
 
     tampered = dict(payload)
     tampered["state"] = {**payload["state"], "domain": "evil.example.com"}
-    bad = client.post("/api/restore", json=tampered)
+    bad = apply_post("/api/restore", json=tampered)
     record("校验和不匹配时拒绝恢复", bad.status_code == 400, bad.json().get("error", "")[:60])
 
     print("\n[9] 连通性探测 (真实握手)")
@@ -555,7 +578,7 @@ def main() -> int:
                 )
             )
         if hy_bin and config.load_state().get("hysteria_hopping"):
-            client.post("/api/hysteria/hopping")  # macOS 不支持多端口监听
+            apply_post("/api/hysteria/hopping")  # macOS 不支持多端口监听
         if hy_bin:
             procs.append(
                 subprocess.Popen(
@@ -600,7 +623,7 @@ def main() -> int:
 
         exit_port = 8666
         entry_port = 8667
-        client.post("/api/chain/exit", json={"action": "generate", "port": exit_port, "label": "落地A"})
+        apply_post("/api/chain/exit", json={"action": "generate", "port": exit_port, "label": "落地A"})
         code = chain.parse_code(client.get("/api/dashboard").json()["chain"]["exit"]["code"])
         record("落地端生成专用凭据 + 配对码", code["port"] == exit_port and bool(code["uuid"]),
                f"端口 {code['port']}")

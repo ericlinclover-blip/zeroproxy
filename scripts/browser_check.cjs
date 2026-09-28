@@ -644,6 +644,32 @@ async function main() {
     await page.screenshot({ path: path.join(SHOT_DIR, "dashboard-dark.png"), fullPage: true });
     check("深浅色切换 + 截图留存", true, SHOT_DIR);
 
+    console.log("\n[3h] 后台落地任务的实时进度 (v2.6.9)");
+    // 改配置 = 重新生成三份配置 → 重启内核 → 验端口, 真机上 2~4 秒, 而重启 Xray 会
+    // 掐断"走本机链路上网"的浏览器。现在接口立刻回执 + 后台任务 + 进度条轮询。
+    await page.click("#btn-apply");
+    await page.waitForSelector("#apply-strip .bar", { timeout: 20000 });
+    const stripText = (await page.locator("#apply-strip").innerText()).replace(/\s*\n\s*/g, " · ");
+    check(
+      "点改配置立刻出现实时进度 (接口不再阻塞)",
+      /正在应用配置|配置已应用/.test(stripText) && /\/6 步/.test(stripText),
+      stripText
+    );
+    await page.waitForFunction(
+      () => {
+        const s = document.querySelector("#apply-strip .banner");
+        return !!s && /配置已应用/.test(s.innerText);
+      },
+      { timeout: 30000 }
+    );
+    check("任务跑完给出结论", /配置已应用/.test(await page.locator("#apply-strip").innerText()), "");
+    await page.waitForTimeout(4600);
+    check(
+      "结论留几秒后自动收起",
+      await page.evaluate(() => document.querySelector("#apply-strip").classList.contains("hidden")),
+      ""
+    );
+
     console.log("\n[4] 控制台与请求");
     check("无 console 错误", consoleErrors.length === 0, consoleErrors.slice(0, 3).join(" | "));
     check("无失败请求", failedRequests.length === 0, failedRequests.slice(0, 3).join(" | "));

@@ -576,6 +576,7 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
     </div>
 
     <div id="dash-banner" class="hidden"></div>
+    <div id="apply-strip" class="hidden"></div>
 
     <div class="kpi reveal">
       <div class="k">
@@ -916,6 +917,104 @@ function toast(msg) {
  * 用户以为没反应就会再点一次, 于是同一条链被落地两次。 */
 let opBusy = 0;
 
+/* ---------------- 后台配置任务 (v2.6.9) ----------------
+ * 改配置 = 重新生成三份配置 → 重启内核 → 验端口, 真机上要 2~4 秒; 而重启 Xray
+ * 会掐断"走本机链路上网"的浏览器 —— 很多用户就是用自己的节点访问面板的
+ * (v2.6.7 真机实测: 面板把请求当成了"登录失效"直接跳登录页)。
+ * 现在这条闭环由面板后台任务跑, 接口立刻回执 (body.job), 这里轮询
+ * /api/apply/job 把进度画成一条实时进度条: 页面全程可用, "在动"和"卡住"一眼可分。
+ */
+let applyJobId = null;   // 正在落地的任务 id
+let applyJobWait = null; // 该任务结束的 Promise (并发点击排到它后面, 而不是被丢掉)
+let lastApplyJob = null; // 最后一次任务快照 (失败原因要能说给用户听)
+
+/** 上一次改动还在落地就等它跑完 —— 直接拒绝会让用户觉得"点了没反应"。 */
+async function waitPendingApply() {
+  if (!applyJobWait) return;
+  try {
+    await applyJobWait;
+  } catch (e) { /* 上一次的失败自己已经报过错了 */ }
+}
+
+function renderApplyStrip(st) {
+  const box = $("#apply-strip");
+  if (!box) return;
+  if (!st) {
+    box.classList.add("hidden");
+    box.innerHTML = "";
+    return;
+  }
+  const running = st.state === "running";
+  const stepFails = ((st.steps || []).filter((s) => !s.ok)).length;
+  const bad = !running && (st.state === "failed" || !!st.error || stepFails > 0);
+  const total = st.total || 6;
+  const index = Math.max(1, Math.min(st.index || 1, total));
+  const pct = Math.round((index / total) * 100);
+  const secs = ((st.elapsed_ms || 0) / 1000).toFixed(1);
+  const title = bad
+    ? st.error ? "配置落地失败" : `配置已应用, 但有 ${stepFails} 步告警`
+    : running ? "正在应用配置" : "配置已应用";
+  box.classList.remove("hidden");
+  box.innerHTML = `<div class="banner ${bad ? "bad" : running ? "info" : "good"}">
+    <span class="ico">${bad ? "✗" : running ? "⟳" : "✓"}</span>
+    <span style="flex:1">
+      <b>${title}</b>
+      <span class="muted"> · 第 ${index}/${total} 步 · ${esc(st.current || "")} · 已用 ${secs}s</span>
+      <div class="bar${running ? " live" : ""}"><i class="${bad ? "bad" : ""}" style="width:${bad ? 100 : pct}%"></i></div>
+      ${bad ? `<div class="muted" style="font-size:12px;margin-top:6px">${esc(st.error || "")}</div>` : ""}
+    </span></div>`;
+}
+
+/** 轮询后台任务直到跑完; 返回最终 steps (拿不到就返回 [])。 */
+async function watchApply(job) {
+  let last = job;
+  renderApplyStrip(job);
+  for (let i = 0; i < 300; i++) {          // 上限 ~2 分钟, 正常 2~4 秒
+    await sleep(400);
+    try {
+      last = await api(`/api/apply/job?id=${encodeURIComponent(job.id)}`);
+    } catch (e) {
+      if (e.status === 404 || e.status === 401) break;   // 任务表被清 / 会话过期
+      continue;                            // 重启内核掐断了隧道: 连接回来接着轮询
+    }
+    if (last.state !== "running") break;
+    renderApplyStrip(last);
+  }
+  renderApplyStrip(last);
+  lastApplyJob = last;
+  setTimeout(() => renderApplyStrip(null), 4000);        // 留几秒让用户看见结论
+  return last.steps || [];
+}
+
+/** 只等后台任务 (响应不是完整仪表盘时用, 如 /api/renew)。 */
+async function awaitJob(body) {
+  lastApplyJob = null;
+  if (!body || !body.job) return (body && body.steps) || [];
+  applyJobId = body.job.id;
+  applyJobWait = watchApply(body.job);
+  try {
+    return await applyJobWait;
+  } finally {
+    applyJobId = null;
+    applyJobWait = null;
+  }
+}
+
+/** 改配置接口的统一收尾: 渲染返回的仪表盘 → 等后台任务 → 再用最新数据对齐一次。 */
+async function settleApply(body) {
+  dash = body;
+  renderDash(true);
+  const steps = await awaitJob(body);
+  if (body && body.job) {
+    // 任务期间面板可能重启过 / 界面被 20s 自动刷新顶掉, 对齐一次真实状态
+    try {
+      dash = await api("/api/dashboard");
+      renderDash(true);
+    } catch (e) { /* 断线: 保持现有界面, 下次刷新会补上 */ }
+  }
+  return steps;
+}
+
 /* ---------------- 重渲染时的"草稿保护" ----------------
  * 仪表盘每 20s 自动刷新一次, 而刷新是整块重画 DOM 的 (节点表 / 高级设置 /
  * 链式代理全是 innerHTML)。没有这层保护时, 用户正在填的 SNI、端口、配对码
@@ -1219,7 +1318,10 @@ async function loadDash(quiet) {
   clearInterval(refreshTimer);
   // 链式连接 / 热更新这类操作可能跑十几秒: 期间别整块重绘, 否则按钮的"进行中"
   // 状态会被冲掉, 用户还能再点一次 (连接落地端会重复落地)
-  refreshTimer = setInterval(() => { if (dash && !opBusy) loadDash(true); }, 20000);
+  // 后台落地任务同理: 任务跑着的时候重绘会跟进度条抢屏, 而且这次刷新还得排队等锁
+  refreshTimer = setInterval(() => {
+    if (dash && !opBusy && !applyJobId) loadDash(true);
+  }, 20000);
   // 首次进入仪表盘自动测一次速 (之后由用户点「节点测速」触发)
   if (!probeRan) { probeRan = true; runProbe(false); }
 }
@@ -1479,9 +1581,12 @@ function renderNodes() {
     (el.onchange = async () => {
       el.disabled = true;
       try {
-        dash = await api(`/api/nodes/${el.dataset.node}/toggle`, { method: "POST" });
-        renderDash(true);
-        toast("已热更新, 订阅内容已刷新");
+        const steps = await settleApply(
+          await api(`/api/nodes/${el.dataset.node}/toggle`, { method: "POST" })
+        );
+        const failed = steps.filter((s) => !s.ok);
+        toast(failed.length ? `已应用, 但 ${failed.length} 步告警: ${failed[0].name}`
+                            : "已热更新, 订阅内容已刷新");
       } catch (e) {
         el.disabled = false;
         toast("操作失败: " + e.message);
@@ -1851,12 +1956,13 @@ function renderRouting(d) {
   const previous = sel.value;
   sel.onchange = async () => {
     try {
-      dash = await api("/api/settings", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ template: sel.value }),
-      });
-      renderDash(true);
+      await settleApply(
+        await api("/api/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ template: sel.value }),
+        })
+      );
       toast("分流模板已切换, 订阅即刻生效");
     } catch (e) {
       sel.value = previous;
@@ -1880,12 +1986,13 @@ function renderGeo(d) {
 
   const save = async (payload, revert) => {
     try {
-      dash = await api("/api/settings", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      renderDash(true);
+      await settleApply(
+        await api("/api/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        })
+      );
       toast("分流设置已应用");
     } catch (e) {
       toast("设置失败: " + e.message);
@@ -1938,15 +2045,18 @@ async function saveAdvanced() {
   btn.disabled = true;
   btn.textContent = "应用中…";
   try {
-    dash = await api("/api/settings", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
+    const steps = await settleApply(
+      await api("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      })
+    );
     // 提交成功 → 解除草稿保护, 让服务器值 (含后端规范化, 如 SNI 转小写) 正常回灌
     clearDraft("#adv-sni, #adv-masq, [data-port-node]");
-    renderDash(true);
-    toast("设置已应用, 订阅内容已刷新");
+    const failed = steps.filter((s) => !s.ok);
+    toast(failed.length ? `已应用, 但 ${failed.length} 步告警: ${failed[0].name}`
+                        : "设置已应用, 订阅内容已刷新");
   } catch (e) {
     toast("保存失败: " + e.message);
   }
@@ -2002,7 +2112,7 @@ function renderSystem(d) {
     renewBtn.disabled = true; renewBtn.textContent = "处理中…";
     try {
       const r = await api("/api/renew", { method: "POST" });
-      const failed = (r.steps || []).filter((s) => !s.ok);
+      const failed = (await awaitJob(r)).filter((s) => !s.ok);
       toast(
         r.ok
           ? failed.length ? `证书已更新, 但 ${failed.length} 步配置落地失败` : r.detail || "证书已更新"
@@ -2243,6 +2353,7 @@ function chainEntryCard(d, e) {
 /* 改动类接口的统一入口 (端口跳跃 / 链式代理): 回来后用服务器返回的完整仪表盘
  * 数据整体重渲染, 并把落地的步骤结果转成提示 */
 async function applyAction(method, path, payload, btn, busyText) {
+  await waitPendingApply();   // 上一次还在落地: 排队等它, 别把这次点了没反应
   const original = btn ? btn.textContent : "";
   const before = dash ? JSON.stringify(dash) : "";   // 用于"断线后其实已经生效"的比对
   if (btn) { btn.disabled = true; if (busyText) btn.textContent = busyText; }
@@ -2253,10 +2364,13 @@ async function applyAction(method, path, payload, btn, busyText) {
       opts.headers = { "Content-Type": "application/json" };
       opts.body = JSON.stringify(payload);
     }
-    dash = await api(path, opts);
-    renderDash(true);
-    const failed = (dash.steps || []).filter((s) => !s.ok);
-    toast(failed.length ? `已应用, 但有 ${failed.length} 步告警: ${failed[0].name}` : "已应用, 订阅内容已刷新");
+    const steps = await settleApply(await api(path, opts));
+    const failed = steps.filter((s) => !s.ok);
+    if (lastApplyJob && lastApplyJob.state === "failed") {
+      toast("应用失败: " + (lastApplyJob.error || "后台任务异常"));   // 步骤清单没有, 至少别报"已应用"
+    } else {
+      toast(failed.length ? `已应用, 但有 ${failed.length} 步告警: ${failed[0].name}` : "已应用, 订阅内容已刷新");
+    }
   } catch (e) {
     if (e.dropped) {
       // 面板其实已经把活干完了, 断的只是"浏览器 → 本机链路 → 面板"这条路
@@ -2321,6 +2435,7 @@ function bindChainExit(ex) {
 /* 连接: 400 + needs_force 表示"链路测试没通过", 让用户看清楚原因再决定要不要硬加 */
 async function connectChain(force) {
   const btn = $("#btn-chain-connect");
+  await waitPendingApply();
   const code = $("#chain-code").value.trim();
   if (!code) { toast("先把落地端的配对码粘进来"); return; }
   const localPort = parseInt($("#chain-local-port").value, 10);
@@ -2373,13 +2488,13 @@ async function connectChain(force) {
       }
       throw new Error(detail);
     }
-    dash = body;
+    // 先把表单清空再重绘: 草稿保护会把"正在编辑的输入"原样放回来, 不清就成了"粘进去的码还在"
     $("#chain-code").value = "";
     $("#chain-label").value = "";
     $("#chain-local-port").value = "";
     $("#chain-default-out").checked = false;
-    renderDash(true);
-    const probe = (body.steps || []).find((s) => s.name.indexOf("链路测试") === 0) || {};
+    const steps = await settleApply(body);
+    const probe = steps.find((s) => s.name.indexOf("链路测试") === 0) || {};
     if (probe.skipped) {
       toast("已添加; 本机缺少 xray 二进制, 没能做链路测试 —— 可稍后点「测速」复验");
     } else if (probe.ok === false) {
@@ -2500,11 +2615,11 @@ $("#btn-repair").onclick = async () => {
 /* ---------------- 重新应用 ---------------- */
 $("#btn-apply").onclick = async () => {
   const btn = $("#btn-apply");
+  await waitPendingApply();
   btn.disabled = true; btn.textContent = "应用中…";
   try {
-    dash = await api("/api/apply", { method: "POST" });
-    renderDash(true);
-    const failed = (dash.steps || []).filter((s) => !s.ok);
+    const steps = await settleApply(await api("/api/apply", { method: "POST" }));
+    const failed = steps.filter((s) => !s.ok);
     toast(failed.length ? `已重载, 但 ${failed.length} 步失败: ${failed[0].name}` : "配置已重新生成并热重载");
   } catch (e) { toast("应用失败: " + e.message); }
   btn.disabled = false; btn.textContent = "重新应用配置";

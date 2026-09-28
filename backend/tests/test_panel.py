@@ -1553,6 +1553,138 @@ def test_apply_reapply_persists_steps(client, configured, home):
     assert (home / "xray" / "config.json").is_file()
 
 
+def test_apply_skips_services_whose_config_did_not_change(client, configured, home, monkeypatch):
+    """配置一个字节都没变的服务不该被重启 (v2.6.9)。
+
+    链式代理的操作只动 Xray 的入站, nginx / hysteria 的配置一个字符都没变, 却要
+    陪着重载一次; 反过来, 服务真的挂了 (不在跑) 时又要照样自愈 —— 两条都要守住。
+    """
+    from zeroproxy import apply, services
+
+    calls: list[str] = []
+    running = {"nginx": True}
+
+    monkeypatch.setattr(services, "is_prod", lambda: True)
+    monkeypatch.setattr(
+        services, "service_state",
+        lambda name: "active" if running.get(name, True) else "inactive",
+    )
+    monkeypatch.setattr(
+        services, "restart_service",
+        lambda name, timeout=90: (calls.append(name), (True, "已重启"))[1],
+    )
+    monkeypatch.setattr(
+        services, "reload_service",
+        lambda name, timeout=60: (calls.append(name), (True, "已重载"))[1],
+    )
+    monkeypatch.setattr(apply, "_tcp_open", lambda port, timeout=0.3: True)
+    monkeypatch.setattr(services, "udp_port_listening", lambda port: True)
+    monkeypatch.setattr(apply, "_hop_redirect_note", lambda state: "")
+
+    state = config.load_state()
+    wanted = {int(port) for port, _, _ in apply._wanted_ports(state)}  # noqa: SLF001
+    monkeypatch.setattr(apply, "_tcp_open", lambda port, timeout=0.3: int(port) in wanted)
+
+    # 1) 三份配置都变了 → 三个服务都动 (并发执行, 所以只比集合)
+    ok, detail = apply.restart_services(state, changed={"xray", "nginx", "hysteria"})
+    assert ok is True, detail
+    assert sorted(calls) == ["hysteria2", "nginx", "xray"], calls
+
+    # 2) 只有 Xray 变 → 只重启 Xray (链式代理操作的典型场景)
+    calls.clear()
+    apply.restart_services(state, changed={"xray"})
+    assert calls == ["xray"], calls
+
+    # 3) 一份都没变 → 一个服务都不动
+    calls.clear()
+    ok, detail = apply.restart_services(state, changed=set())
+    assert ok is True and "无需重启" in detail, detail
+    assert calls == [], calls
+
+    # 4) 配置没变但服务没在跑 → 照样重启 (自愈不能被"跳过"吃掉)
+    calls.clear()
+    running["nginx"] = False
+    apply.restart_services(state, changed=set())
+    assert calls == ["nginx"], calls
+    running["nginx"] = True
+
+    # 5) 端到端: 第一次配置确实变了才重启, 第二次一模一样 → 一个都不重启
+    (home / "xray" / "config.json").write_text("{}\n", encoding="utf-8")
+    calls.clear()
+    assert apply.reapply(config.load_state())[4]["ok"] is True
+    assert calls == ["xray"], calls
+    calls.clear()
+    again = apply.reapply(config.load_state())
+    assert again[4]["ok"] is True and "无需重启" in again[4]["detail"], again
+    assert calls == [], calls
+
+
+def test_apply_verify_listeners_polls_quickly_instead_of_waiting_a_full_round(
+    client, configured, monkeypatch
+):
+    """重启 Xray 后端口要 ~0.7s 才起来, 校验必须快速轮询 (v2.6.9)。
+
+    旧实现固定 `sleep(0.6)`: 端口 0.3 秒后才通也要白等一整轮 —— 这是"关闭落地端"
+    那 1 秒的来源之一。这里让端口第 2 轮才通, 断言总耗时 < 0.5s (旧实现 ~1.2s)。
+    """
+    import time
+
+    from zeroproxy import apply, services
+
+    monkeypatch.setattr(services, "is_prod", lambda: True)
+    monkeypatch.setattr(services, "udp_port_listening", lambda port: True)
+    monkeypatch.setattr(apply, "_hop_redirect_note", lambda state: "")
+    state = config.load_state()
+    ports = apply._wanted_ports(state)  # noqa: SLF001
+    assert ports, "这个用例需要一个有端口的配置"
+    first_port = int(ports[0][0])
+    rounds = {"n": 0}
+
+    def round_aware(port, timeout=0.3):
+        if int(port) == first_port:
+            rounds["n"] += 1
+        return rounds["n"] >= 2
+
+    monkeypatch.setattr(apply, "_tcp_open", round_aware)
+
+    started = time.perf_counter()
+    ok, detail = apply.verify_listeners(state, timeout=8)
+    elapsed = time.perf_counter() - started
+    assert ok is True, detail
+    assert elapsed < 0.5, f"端口校验白等了 {elapsed:.2f}s"
+
+
+def test_apply_async_job_reports_progress_and_finishes(client, configured, monkeypatch):
+    """链式按钮不再让请求阻塞 4 秒: 立刻回执 + 后台任务 + 进度轮询 (v2.6.9)。"""
+    import time
+
+    from zeroproxy import apply
+
+    monkeypatch.setenv("ZP_APPLY_ASYNC", "1")
+    body = client.post("/api/chain/exit", json={"action": "generate", "port": 8666}).json()
+    job = body.get("job") or {}
+    assert job.get("total") == len(apply.STEP_NAMES), body
+    assert body["steps"] == []                     # 立刻回执, 步骤稍后从任务里取
+    assert body["chain"]["exit"]["enabled"] is True
+
+    deadline = time.time() + 30
+    snap: dict = {}
+    while time.time() < deadline:
+        snap = client.get(f"/api/apply/job?id={job['id']}").json()
+        if snap.get("state") != "running":
+            break
+        time.sleep(0.05)
+    assert snap.get("state") == "done", snap
+    # 六步闭环 + 这次操作自己的收尾步 (放行落地端端口), 顺序与面板显示一致
+    assert [s["name"] for s in snap["steps"]] == list(apply.STEP_NAMES) + ["放行落地端端口"], snap
+    assert all(s["ok"] for s in snap["steps"]), snap
+    assert snap["elapsed_ms"] >= 0
+
+    # 进度接口只认发起任务的那个会话 (换一个会话就看不到)
+    client.cookies.clear()
+    assert client.get(f"/api/apply/job?id={job['id']}").status_code == 401
+
+
 def test_apply_restart_services_uses_correct_systemctl_args(client, configured, monkeypatch):
     """回归: 曾经把 timeout 当服务名传下去 (fn(t) 而不是 fn(name, t)), 生产环境必炸 ——
     本地 dry-run 看不到, 因为非生产环境直接"跳过"。"""

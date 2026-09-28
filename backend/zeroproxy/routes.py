@@ -16,6 +16,7 @@ import hashlib
 import hmac
 import io
 import ipaddress
+import itertools
 import json
 import os
 import re
@@ -264,6 +265,155 @@ def _reload_nginx(state: dict, timeout: int = 0) -> tuple[bool, str]:
 def _reapply(state: dict, request: Request | None = None) -> list[dict]:
     """修改配置后的热更新闭环 (实现见 zeroproxy.apply, 与 upgrade.sh 共用)。"""
     return apply.reapply(state)
+
+
+# ---------------------------------------------------------------- 后台落地任务
+#
+# 为什么要有这一层: 「重新生成配置 → 重启内核 → 验端口」在真机上要 2~4 秒
+# (xray -test 0.7s + 重启 xray 0.9s + 端口恢复 0.7s), 而重启 Xray 会掐断
+# "走本机链路上网"的浏览器 —— 很多用户就是用自己的节点访问面板的, 于是同步
+# 等着干的结果是: 按钮转 4 秒、请求被中断、还可能看不到结果。
+#
+# 改成: 接口只做"改 state + 落盘 + 立刻回执", 闭环交给后台线程; 前端用
+# `GET /api/apply/job?id=` 轮询进度 (400ms 一次), 页面全程可用, 进度条让
+# "在动"和"卡住"一眼可分。后台任务自己拿 `config.locked()`, 所以并发点击会
+# 自动串行化, 且每次都按最新 state 落地。
+#
+# `ZP_APPLY_ASYNC=0` 可退回同步返回 (测试 / 本地排查用)。
+_APPLY_JOBS: dict[str, dict] = {}
+_APPLY_JOBS_LOCK = threading.Lock()
+_APPLY_SEQ = itertools.count(1)
+#: 最多留几份任务记录 (前端轮询按 id 取; 留够"刚点完那几秒"就够用了)
+_APPLY_JOB_KEEP = 8
+
+
+def _apply_async_enabled() -> bool:
+    return os.environ.get("ZP_APPLY_ASYNC", "1").strip() != "0"
+
+
+def _job_snapshot(job: dict) -> dict:
+    """给前端看的任务快照 (不含 state, 也就不需要拿配置锁)。"""
+    started = float(job.get("started_at") or 0)
+    end = job.get("finished_at")
+    return {
+        "id": job["id"],
+        "state": job["state"],
+        "index": int(job.get("index") or 0),
+        "total": int(job.get("total") or len(apply.STEP_NAMES)),
+        "current": job.get("current", ""),
+        "steps": job.get("steps", []),
+        "error": job.get("error", ""),
+        "elapsed_ms": int(max(0.0, float(end or time.time()) - started) * 1000) if started else 0,
+    }
+
+
+def _job_update(job_id: str, **fields) -> None:
+    with _APPLY_JOBS_LOCK:
+        job = _APPLY_JOBS.get(job_id)
+        if job is not None:
+            job.update(fields)
+
+
+def _run_apply_job(job_id: str, after=None) -> None:
+    """后台线程: 跑完整闭环 (含"放行端口"这类收尾步骤), 结果写回任务表。"""
+    steps: list[dict] = []
+    error = ""
+    try:
+        with config.locked():
+            state = load_state()
+            steps = apply.reapply(
+                state,
+                progress=lambda index, total, name: _job_update(
+                    job_id, index=index + 1, total=total, current=name
+                ),
+            )
+            if after is not None:
+                steps.extend(after())
+    except Exception as exc:  # noqa: BLE001 — 后台任务不能把异常吞成"静默失败"
+        error = f"{type(exc).__name__}: {exc}"
+    with _APPLY_JOBS_LOCK:
+        job = _APPLY_JOBS.get(job_id)
+        if job is not None:
+            job.update(
+                state="failed" if error else "done",
+                steps=steps,
+                error=error,
+                finished_at=time.time(),
+                index=job.get("index") or job.get("total") or len(apply.STEP_NAMES),
+            )
+        stale = sorted(_APPLY_JOBS, key=lambda k: _APPLY_JOBS[k]["started_at"])[:-_APPLY_JOB_KEEP]
+        for key in stale:
+            _APPLY_JOBS.pop(key, None)
+
+
+def _reapply_job(
+    state: dict, request: Request | None = None, after=None
+) -> tuple[list[dict], dict | None]:
+    """落地闭环: 生产环境返回 ([], 任务描述) 让前端轮询; 同步模式返回 (steps, None)。
+
+    `after` 是收尾步骤 (如"放行落地端端口"): 它跟配置落地同属一次操作, 放进
+    后台一起跑 —— 既省掉一次 `ufw status`, 也不用让用户为它多等。
+    """
+    if not _apply_async_enabled():
+        steps = _reapply(state, request)
+        if after is not None:
+            steps.extend(after())
+        return steps, None
+    with _APPLY_JOBS_LOCK:
+        job_id = str(next(_APPLY_SEQ))
+        job = {
+            "id": job_id,
+            "state": "running",
+            "index": 0,
+            "total": len(apply.STEP_NAMES),
+            "current": apply.STEP_NAMES[0],
+            "steps": [],
+            "error": "",
+            "started_at": time.time(),
+            "finished_at": None,
+            # 只有发起这个任务的会话能查它的进度 (会话令牌本身就是面板的凭据)
+            "token": (request.cookies.get(SESSION_COOKIE) if request is not None else "") or "",
+        }
+        _APPLY_JOBS[job_id] = job
+    # 先把这次改动落盘再放任务: 后台线程是从磁盘读最新 state 的 (load_state),
+    # 不先存的话这次改的节点开关 / 链式条目就白改了。
+    save_state(state)
+    threading.Thread(
+        target=_run_apply_job, args=(job_id, after), name=f"zp-apply-{job_id}", daemon=True
+    ).start()
+    return [], _job_snapshot(job)
+
+
+@router.get("/api/apply/job")
+def apply_job(id: str, request: Request):
+    """后台落地任务的进度 (前端 400ms 轮询一次)。
+
+    刻意**不读 state**: 任务正把整个闭环跑在 `config.locked()` 里, 这里再去
+    `load_state()` 就会排队等它跑完, 进度条也就白做了。鉴权改为"必须是发起
+    这个任务的那个会话" —— 令牌本身就是登录时发的那个。
+    """
+    with _APPLY_JOBS_LOCK:
+        job = _APPLY_JOBS.get(str(id))
+        if job is None:
+            return _err("任务不存在或已过期", 404)
+        token = request.cookies.get(SESSION_COOKIE) or ""
+        if job.get("token") and job["token"] != token:
+            return _err("未登录", 401)
+        return _job_snapshot(job)
+
+
+def _landing_body(state: dict, request: Request, after=None) -> dict:
+    """改配置后的统一回执: 仪表盘数据 + 同步步骤 / 后台任务描述。
+
+    同步模式 (ZP_APPLY_ASYNC=0) 里 `steps` 是完整的六步结果; 异步模式里
+    `steps` 为空数组、`job` 有值, 前端据此轮询进度 —— 两种形状前端都认。
+    """
+    steps, job = _reapply_job(state, request, after=after)
+    body = _dashboard_body(state, request)
+    body["steps"] = steps
+    if job is not None:
+        body["job"] = job
+    return body
 
 
 @router.post("/api/setup")
@@ -678,10 +828,7 @@ def toggle_node(node_id: str, request: Request):
             state["nodes"][node_id] = not state["nodes"].get(node_id, True)
             label = f"{node_id}={'on' if state['nodes'][node_id] else 'off'}"
         config.audit(state, "toggle_node", label, actor=_client_ip(request))
-        steps = _reapply(state, request)
-        body = _dashboard_body(state, request)
-        body["steps"] = steps
-        return body
+        return _landing_body(state, request)
 
 
 @router.post("/api/hysteria/hopping")
@@ -702,19 +849,20 @@ def toggle_hopping(request: Request):
             + (f" ports={state['hysteria_ports']}" if state["hysteria_hopping"] else ""),
             actor=_client_ip(request),
         )
-        steps = _reapply(state, request)
-        if state["hysteria_hopping"]:
-            steps.append(
+
+        def open_hopping_ports() -> list[dict]:
+            if not state["hysteria_hopping"]:
+                return []
+            return [
                 {
                     "name": "放行端口跳跃区间",
                     "ok": True,
                     "detail": services.open_firewall_ports(state["hysteria_ports"], "udp"),
                     "ms": 0,
                 }
-            )
-        body = _dashboard_body(state, request)
-        body["steps"] = steps
-        return body
+            ]
+
+        return _landing_body(state, request, after=open_hopping_ports)
 
 
 class SettingsIn(BaseModel):
@@ -833,22 +981,27 @@ def update_settings(payload: SettingsIn, request: Request):
             body = _dashboard_body(state, request)
             body["steps"] = steps
             return body
-        steps = _reapply(state, request)
-        # 改过端口就得让防火墙跟上: install.sh 只按默认端口写了那几条放行规则,
-        # 换了端口而 ufw 还挡着的话, 端口在本机是听的、面板全绿, 外面却连不上。
-        for key, port in moved_ports:
-            if key == "hysteria" and state.get("hysteria_hopping"):
-                name, detail = (
-                    "放行 Hysteria 2 端口 + 跳跃区间",
-                    services.open_firewall_ports(state["hysteria_ports"], "udp"),
-                )
-            else:
-                proto = "udp" if key == "hysteria" else "tcp"
-                name, detail = f"放行新端口 {port}/{proto}", services.open_firewall_port(port, proto)
-            steps.append({"name": name, "ok": True, "detail": detail, "ms": 0})
-        body = _dashboard_body(state, request)
-        body["steps"] = steps
-        return body
+
+        def open_moved_ports() -> list[dict]:
+            # 改过端口就得让防火墙跟上: install.sh 只按默认端口写了那几条放行规则,
+            # 换了端口而 ufw 还挡着的话, 端口在本机是听的、面板全绿, 外面却连不上。
+            out: list[dict] = []
+            for key, port in moved_ports:
+                if key == "hysteria" and state.get("hysteria_hopping"):
+                    name, detail = (
+                        "放行 Hysteria 2 端口 + 跳跃区间",
+                        services.open_firewall_ports(state["hysteria_ports"], "udp"),
+                    )
+                else:
+                    proto = "udp" if key == "hysteria" else "tcp"
+                    name, detail = (
+                        f"放行新端口 {port}/{proto}",
+                        services.open_firewall_port(port, proto),
+                    )
+                out.append({"name": name, "ok": True, "detail": detail, "ms": 0})
+            return out
+
+        return _landing_body(state, request, after=open_moved_ports)
 
 
 # ---------------------------------------------------------------- 链式代理
@@ -921,19 +1074,20 @@ def chain_exit(payload: ChainExitIn, request: Request):
                 changed.append("落地端已是最新状态")
 
         config.audit(state, "chain_exit", "; ".join(changed), actor=_client_ip(request))
-        steps = _reapply(state, request)
-        if exit_cfg.get("enabled"):
-            steps.append(
+
+        def open_exit_port() -> list[dict]:
+            if not exit_cfg.get("enabled"):
+                return []
+            return [
                 {
                     "name": "放行落地端端口",
                     "ok": True,
                     "detail": services.open_firewall_port(exit_cfg["port"], "tcp"),
                     "ms": 0,
                 }
-            )
-        body = _dashboard_body(state, request)
-        body["steps"] = steps
-        return body
+            ]
+
+        return _landing_body(state, request, after=open_exit_port)
 
 
 class ChainEntryIn(BaseModel):
@@ -1025,28 +1179,26 @@ def chain_entry_add(payload: ChainEntryIn, request: Request):
         config.audit(
             state, "chain_add", f"{label} → {entry['host']}:{entry['port']}", actor=_client_ip(request)
         )
-        steps = _reapply(state, request)
-        steps.append(
-            {
-                "name": "链路测试 (真实出口往返)",
-                # 环境不支持探测不算失败 (与 apply 里"跳过"步骤的约定一致)
-                "ok": bool(probe.get("ok")) or not probe_ran,
-                "detail": probe.get("detail") or "",
-                "ms": int(probe.get("ms") or 0),
-                "skipped": not probe_ran,
-            }
-        )
-        steps.append(
-            {
-                "name": "放行中转入站端口",
-                "ok": True,
-                "detail": services.open_firewall_port(local_port, "tcp"),
-                "ms": 0,
-            }
-        )
-        body = _dashboard_body(state, request)
-        body["steps"] = steps
-        return body
+
+        def after_landing() -> list[dict]:
+            return [
+                {
+                    "name": "链路测试 (真实出口往返)",
+                    # 环境不支持探测不算失败 (与 apply 里"跳过"步骤的约定一致)
+                    "ok": bool(probe.get("ok")) or not probe_ran,
+                    "detail": probe.get("detail") or "",
+                    "ms": int(probe.get("ms") or 0),
+                    "skipped": not probe_ran,
+                },
+                {
+                    "name": "放行中转入站端口",
+                    "ok": True,
+                    "detail": services.open_firewall_port(local_port, "tcp"),
+                    "ms": 0,
+                },
+            ]
+
+        return _landing_body(state, request, after=after_landing)
 
 
 class ChainEntryPatch(BaseModel):
@@ -1105,10 +1257,7 @@ def chain_entry_update(entry_id: str, payload: ChainEntryPatch, request: Request
             return _err("没有需要修改的内容")
 
         config.audit(state, "chain_update", "; ".join(changed), actor=_client_ip(request))
-        steps = _reapply(state, request)
-        body = _dashboard_body(state, request)
-        body["steps"] = steps
-        return body
+        return _landing_body(state, request)
 
 
 @router.post("/api/chain/entries/{entry_id}/probe")
@@ -1172,10 +1321,7 @@ def chain_entry_delete(entry_id: str, request: Request):
             e for e in state["chain"]["entries"] if e.get("id") != entry_id
         ]
         config.audit(state, "chain_delete", label, actor=_client_ip(request))
-        steps = _reapply(state, request)
-        body = _dashboard_body(state, request)
-        body["steps"] = steps
-        return body
+        return _landing_body(state, request)
 
 
 @router.post("/api/apply")
@@ -1185,10 +1331,7 @@ def apply_endpoint(request: Request):
         if not _require_auth(state, request):
             return _err("未登录", 401)
         config.audit(state, "apply", actor=_client_ip(request))
-        steps = _reapply(state, request)
-        body = _dashboard_body(state, request)
-        body["steps"] = steps
-        return body
+        return _landing_body(state, request)
 
 
 @router.post("/api/renew")
@@ -1201,13 +1344,17 @@ def renew(request: Request):
         ok, detail = services.renew_cert(state)
         config.audit(state, "renew_cert", detail, actor=_client_ip(request))
         steps: list[dict] = []
+        job: dict | None = None
         if ok and (state.get("cert") or {}).get("cert_file", "") != before:
             # 首次拿到 Let's Encrypt 证书: nginx / xray 里写的还是自签证书路径,
             # 必须重新生成配置并热重载, 否则浏览器 / 客户端仍看到自签证书。
-            steps = _reapply(state, request)
+            steps, job = _reapply_job(state, request)
         else:
             save_state(state)
-    return {"ok": ok, "detail": detail, "steps": steps}
+    body = {"ok": ok, "detail": detail, "steps": steps}
+    if job is not None:
+        body["job"] = job
+    return body
 
 
 # ---------------------------------------------------------------- 诊断 / 自愈

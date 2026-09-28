@@ -18,13 +18,33 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
+import threading
 import time
 
 from . import config, crypto, hysteria_config, nginx_config, services, xray_config
 from .config import XRAY_NODE_IDS, load_state, paths, save_state
+
+#: 落地闭环的六个步骤 —— 顺序即面板进度条的顺序。改这里 = 改面板显示的步骤。
+STEP_NAMES = (
+    "校验 Reality 密钥与伪装目标",
+    "重新生成 Xray 配置",
+    "重新生成 Nginx 配置",
+    "重新生成 Hysteria 2 配置",
+    "重载服务 (nginx/xray/hysteria2)",
+    "验证端口监听",
+)
+
+#: 端口校验的轮询间隔。重启 Xray 之后端口还要 ~0.7s 才真的 listen 上
+#: (`systemctl restart` 在进程 fork 出来就返回了), 之前固定 sleep 0.6s 会让
+#: 成功路径也白等一整轮 —— 这是"关闭落地端要转 1 秒"的来源之一。
+_VERIFY_POLL = 0.15
+#: 单个端口的探测超时。回环上正常情况 <1ms (端口没开就是 RST), 只有真的没起来
+#: 才会用满超时, 所以这里给短一点, 让"没起来"也能快速判出来。
+_VERIFY_PROBE_TIMEOUT = 0.3
 
 
 def steps_recorder() -> list[dict]:
@@ -136,16 +156,25 @@ def gen_hysteria(state: dict, timeout: int = 0) -> tuple[bool, str]:
     return True, "已生成"
 
 
-def restart_services(state: dict, timeout: int = 0) -> tuple[bool, str]:
-    results: list[str] = []
+def restart_services(
+    state: dict, timeout: int = 0, changed: set[str] | None = None
+) -> tuple[bool, str]:
+    """按新配置收敛服务; 三个服务并发重启。
 
-    def run(name: str, fn, t: int) -> None:
-        # 注意参数顺序: restart_service(name, timeout) / reload_service(name, timeout)。
-        # 曾经的写法是 fn(t) —— 把 timeout 当服务名传下去, 生产环境下 systemctl 直接抛
-        # "expected str, bytes or os.PathLike object, not int", 而面板当时把失败吞掉了。
-        ok, detail = fn(name, t)
-        mark = "✓" if ok else ("↷" if "跳过" in detail else "✗")
-        results.append(f"{name} {mark} {detail}")
+    `changed` 是本次真正被改写的配置文件集合 (`xray` / `nginx` / `hysteria`):
+
+      * `None` (命令行 `python -m zeroproxy.apply`、旧调用方) → 一律重启, 与
+        以前的行为完全一致;
+      * 传集合 → **配置没变且服务正在跑的服务直接跳过**。链式代理的操作只动
+        Xray 的入站, nginx 配置与 Hysteria 配置一个字节都没变, 却要陪着重载/
+        重启一次 (实测 ~180ms + 一次没必要的 nginx 配置校验), 这是"点一下按钮
+        转半天"里完全可以省掉的部分。服务本身没在跑时照样重启 (顺手自愈)。
+
+    并发重启: 三个 systemctl 之间没有依赖, 串行要 ~1.1s, 并发只要最慢那个
+    (xray ~0.9s)。结果按 xray / hysteria2 / nginx 的固定顺序拼回去, 面板上的
+    文案与以前一致。
+    """
+    nodes = state.get("nodes", {})
 
     def installed(name: str) -> bool:
         """该服务是否"在本机存在" (装了二进制, 或 systemd 里已经跑着)。
@@ -157,21 +186,50 @@ def restart_services(state: dict, timeout: int = 0) -> tuple[bool, str]:
             return True
         return services.service_state(name) in ("active", "running")
 
-    nodes = state.get("nodes", {})
+    def needed(name: str, config_key: str, wanted: bool) -> bool:
+        if not wanted:
+            return False
+        if changed is None or config_key in changed:
+            return True
+        # 配置没变: 只有当这个服务其实没在跑时才需要动它 (崩溃 / 被手工停掉)
+        return services.service_state(name) != "active"
+
     # 关键: 判据不能是"还有没有节点开着"。全部停用时也要重启一次, 否则变更只落在
     # 磁盘上 (config.json 里入站没了), 运行中的进程照旧在旧端口上服务 ——
     # 面板显示"已停用", 端口其实还开着。重启到"零入站配置"是安全的 (xray -test
     # 与真实启动都验证过), Hysteria 2 同理 (停用时 listen 收敛到 127.0.0.1)。
-    if any(nodes.get(n) for n in XRAY_NODE_IDS) or installed("xray"):
-        run("xray", services.restart_service, timeout or 90)
-    if nodes.get("hysteria2") or installed("hysteria2"):
-        run("hysteria2", services.restart_service, timeout or 90)
-    run("nginx", services.reload_service, timeout or 60)
-    if not results:
-        return True, "无需操作"
-    all_skipped = all("↷" in r for r in results)
-    failed = any("✗" in r for r in results)
-    return (all_skipped or not failed), "; ".join(results)
+    jobs: list[tuple[str, object, int]] = []
+    if needed("xray", "xray", any(nodes.get(n) for n in XRAY_NODE_IDS) or installed("xray")):
+        jobs.append(("xray", services.restart_service, timeout or 90))
+    if needed("hysteria2", "hysteria", nodes.get("hysteria2") or installed("hysteria2")):
+        jobs.append(("hysteria2", services.restart_service, timeout or 90))
+    if needed("nginx", "nginx", True):
+        jobs.append(("nginx", services.reload_service, timeout or 60))
+    if not jobs:
+        return True, "三份配置都没有变化, 无需重启 (服务都在正常运行)"
+
+    results: dict[str, str] = {}
+
+    def run_one(name: str, fn, t: int) -> None:
+        # 注意参数顺序: restart_service(name, timeout) / reload_service(name, timeout)。
+        # 曾经的写法是 fn(t) —— 把 timeout 当服务名传下去, 生产环境下 systemctl 直接抛
+        # "expected str, bytes or os.PathLike object, not int", 而面板当时把失败吞掉了。
+        ok, detail = fn(name, t)
+        mark = "✓" if ok else ("↷" if "跳过" in detail else "✗")
+        results[name] = f"{name} {mark} {detail}"
+
+    threads = [
+        threading.Thread(target=run_one, args=job, name=f"zp-restart-{job[0]}", daemon=True)
+        for job in jobs
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    ordered = [results.get(name, f"{name} ✗ 没有结果") for name, _, _ in jobs]
+    failed = any("✗" in row for row in ordered)
+    return (not failed), "; ".join(ordered)
 
 
 def _tcp_open(port: int, timeout: float = 0.6) -> bool:
@@ -304,15 +362,21 @@ def verify_listeners(state: dict, timeout: int = 0) -> tuple[bool, str]:
         missing = []
         for port, proto, label in want:
             if proto == "tcp":
-                alive = _tcp_open(port)
+                alive = _tcp_open(port, timeout=_VERIFY_PROBE_TIMEOUT)
             else:
                 alive = services.udp_port_listening(port) is True
             if not alive:
                 missing.append(f"{label} {port}/{proto}")
-        still_open = [f"{label} {port}/tcp" for port, _, label in closed if _tcp_open(port)]
+        still_open = [
+            f"{label} {port}/tcp"
+            for port, _, label in closed
+            if _tcp_open(port, timeout=_VERIFY_PROBE_TIMEOUT)
+        ]
         if (not missing and not still_open) or time.time() >= deadline:
             break
-        time.sleep(0.6)
+        # 重启 Xray 之后端口还要 ~0.7s 才 listen 上, 这段时间要来回探几次 ——
+        # 间隔 0.15s 既能第一时间发现"起来了", 又不会把 CPU 打满。
+        time.sleep(min(_VERIFY_POLL, max(0.0, deadline - time.time())))
     problems: list[str] = []
     if missing:
         problems.append("以下端口未监听: " + ", ".join(missing))
@@ -336,15 +400,57 @@ def verify_listeners(state: dict, timeout: int = 0) -> tuple[bool, str]:
 
 # ---------------------------------------------------------------- 对外入口
 
-def reapply(state: dict, timeout: int = 0) -> list[dict]:
-    """完整闭环: 重新生成三份配置 → 校验 → 重载服务 → 验证端口。"""
+def _digest(path: str) -> str | None:
+    """文件内容的 sha256; 读不到 (不存在 / 没权限) 返回 None。"""
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _config_digests() -> dict[str, str | None]:
+    """三份生成出来的配置各自的落盘指纹 (用于判断"这次到底改没改")。
+
+    每次都重新解析路径: nginx 配置在 `install.sh` 部署后位于 `/etc/nginx/conf.d/`,
+    非 root 的本地开发则落在 `$ZP_HOME/nginx/` —— 第一次落地时以"实际写出来的
+    那一份"为准, 所以 before/after 各自现算一次。
+    """
+    p = paths()
+    nginx = p["nginx_etc"] if os.path.exists(p["nginx_etc"]) else p["nginx_home"]
+    return {
+        "xray": _digest(p["xray_config"]),
+        "nginx": _digest(nginx),
+        "hysteria": _digest(p["hysteria_config"]),
+    }
+
+
+def reapply(state: dict, timeout: int = 0, progress=None) -> list[dict]:
+    """完整闭环: 重新生成三份配置 → 校验 → 重载服务 → 验证端口。
+
+    `progress` 可选, 形如 `fn(index, total, name)`: 每进入一步回调一次 ——
+    面板把整条闭环放到后台跑, 就靠它给用户画实时进度。
+    """
     steps = steps_recorder()
-    add_step(steps, "校验 Reality 密钥与伪装目标", ensure_reality_settings, state)
-    add_step(steps, "重新生成 Xray 配置", gen_xray, state)
-    add_step(steps, "重新生成 Nginx 配置", gen_nginx, state)
-    add_step(steps, "重新生成 Hysteria 2 配置", gen_hysteria, state)
-    add_step(steps, "重载服务 (nginx/xray/hysteria2)", restart_services, state, timeout=180)
-    add_step(steps, "验证端口监听", verify_listeners, state, timeout=12)
+    before = _config_digests()
+
+    def restart_step(current: dict, t: int = 0) -> tuple[bool, str]:
+        after = _config_digests()
+        changed = {key for key, digest in after.items() if before.get(key) != digest}
+        return restart_services(current, t, changed=changed)
+
+    plan = (
+        (STEP_NAMES[0], ensure_reality_settings, 0),
+        (STEP_NAMES[1], gen_xray, 0),
+        (STEP_NAMES[2], gen_nginx, 0),
+        (STEP_NAMES[3], gen_hysteria, 0),
+        (STEP_NAMES[4], restart_step, 180),
+        (STEP_NAMES[5], verify_listeners, 12),
+    )
+    for index, (name, fn, t) in enumerate(plan):
+        if progress is not None:
+            progress(index, len(plan), name)
+        add_step(steps, name, fn, state, timeout=t)
     state["steps"] = steps
     save_state(state)
     return steps
