@@ -994,11 +994,16 @@ function renderApplyStrip(st) {
     </span></div>`;
 }
 
-/** 轮询后台任务直到跑完; 返回最终 steps (拿不到就返回 [])。 */
+/** 轮询后台任务直到跑完; 返回最终 steps (拿不到就返回 [])。
+ *
+ * 预算按任务类型给: 改配置 2~4 秒 (给 2 分钟), GeoIP 要下 ~28 MB 且后端自己的
+ * 上限是 180s (给 8 分钟) —— 以前统一按 2 分钟掐表, 超时后既不报错也不报进度,
+ * 还会把"其实还在下载"当成成功, 用户回头看到卡片还是旧的, 只能说"出错了"。 */
 async function watchApply(job) {
   let last = job;
   renderApplyStrip(job);
-  for (let i = 0; i < 300; i++) {          // 上限 ~2 分钟, 正常 2~4 秒
+  const budgetMs = job.kind === "geodata" ? 480000 : 120000;
+  for (let waited = 0; waited < budgetMs; waited += 400) {
     await sleep(400);
     try {
       last = await api(`/api/apply/job?id=${encodeURIComponent(job.id)}`);
@@ -1011,7 +1016,8 @@ async function watchApply(job) {
   }
   renderApplyStrip(last);
   lastApplyJob = last;
-  setTimeout(() => renderApplyStrip(null), 4000);        // 留几秒让用户看见结论
+  // 还在跑就别收起进度条 (收起等于"没了", 用户会以为卡住/失败)
+  if (last.state !== "running") setTimeout(() => renderApplyStrip(null), 4000);
   return last.steps || [];
 }
 
@@ -2046,6 +2052,8 @@ function renderGeo(d) {
     const btn = $("#btn-geo-update");
     btn.disabled = true;
     btn.textContent = "下载中… (约 28 MB)";
+    const before = dash ? JSON.stringify(dash) : "";       // 断线后比对"到底更新了没"
+    const stamp = ((dash || {}).geodata || {}).updated_at || 0;
     try {
       const res = await api("/api/geodata/update", { method: "POST" });
       dash = res;
@@ -2054,8 +2062,10 @@ function renderGeo(d) {
       // 期间顶部的进度条会显示"第几步 / 在做什么 / 已用多久"
       await awaitJob(res);
       const job = lastApplyJob;
-      const bad = !res.ok || (job && (job.state === "failed" || job.error));
-      if (bad) {
+      if (job && job.state === "running") {
+        // 还没跑完 (慢线路), 不能报成功也不能报失败 —— 说清它还在后台跑
+        toast("还在后台下载 GeoIP 数据, 顶部进度条会继续走; 完成后卡片会自己刷新");
+      } else if (!res.ok || (job && (job.state === "failed" || job.error))) {
         const stepFail = job && (job.steps || []).find((s) => !s.ok);
         const why = (job && (job.error || (stepFail && stepFail.detail))) || res.detail || "";
         toast("更新失败: " + String(why).slice(0, 120));
@@ -2064,7 +2074,19 @@ function renderGeo(d) {
       }
       await loadDash(true);   // 重新拉一次: 卡片要把数据状态 / 失败原因显示出来
     } catch (e) {
-      toast("更新失败: " + e.message);
+      if (e.dropped) {
+        // 重启内核 (下载完要热重载) 会掐断"走本机链路访问面板"的浏览器 ——
+        // 请求断了不等于更新失败, 数据很可能已经落好了。等连接回来再看真相。
+        markDisconnected("重启内核中, 正在确认更新结果…");
+        await syncAfterDrop(before);
+        const now = ((dash || {}).geodata || {}).updated_at || 0;
+        toast(now > stamp ? "GeoIP 数据已更新并生效" : "连接已恢复, 更新结果请以卡片状态为准");
+      } else if (e.status === 409) {
+        // 后台自动更新正在跑 (或上一次还没结束): 这不是"失败", 等一下再点就行
+        toast("先等一下: " + e.message);
+      } else {
+        toast("更新失败: " + e.message);
+      }
     }
     btn.disabled = false;
     btn.textContent = "下载 / 更新 GeoIP 数据";

@@ -66,7 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 149 项 (144 passed + 5 skipped; 带 `ZP_XRAY_BIN` 时 149 全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (98 项) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 150 项 (145 passed + 5 skipped; 带 `ZP_XRAY_BIN` 时 150 全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (100 项) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 | **看得懂的界面 (v2.6.0)** | 控制台布局: 左侧锚点导航 (带计数角标 + 滚动高亮) + 顶部指标条 (健康节点 / 落地出口 IP / 平均延迟 + 迷你折线 / 运行时长) + 节点密集表格 (名称 / 地址状态 / **握手延迟条** / **上下行双轨** / 开关与复制) + **流量卡 (双弧圆环 + 实时速率曲线 + 逐节点双色流量条)** + 链式链路拓扑 (你的设备 → 本机入口 → 落地端) + 程序更新闭环; 动效全部走 `transform`/自绘 rAF 并受 `prefers-reduced-motion` 约束 |
 
@@ -676,6 +676,39 @@ v2.6.8 修掉了"跳登录", 但用户紧接着反馈: **生成配对码 / 重�
 回归: `scripts/browser_check.cjs` 95 → **98/98 项通过**; 990px 与 420px 两个宽度下实测截图,
 药丸都是单行、按钮与结果各占一块, 420px 时按钮换行到下一排 (不再压字); `pytest` 149 项不变。
 
+### 8.11 v2.6.14: GeoIP 按钮"还是有出错"的两个真凶 (前端 2 分钟就放弃 / 撞上自动更新被报成失败)
+
+v2.6.12 把下载改成后台任务之后, 用户反馈"点击下载/更新 GeoIP 数据按钮, 还是有出错"。在真机上把这条闭环
+重新量了一遍: **下载本身没问题** —— 镜像全通, 直跑 `geodata.update()` 1.76s 走完, 校验走的是真实
+`xray -test` (结论"数据可被 xray 加载"); 面板级 `POST /api/geodata/update` 也是 200 + `{"ok":true}`,
+9 步全绿。问题全在**前端怎么读这个结果**:
+
+1. **轮询 2 分钟就放弃, 而且不区分"还在跑"**: `watchApply()` 的上限是 `300 × 400ms` ≈ 2 分钟 (当初是按
+   改配置的 2~4 秒定的)。GeoIP 在慢线路上"下载 → 校验 → 落地"完全可能超过 2 分钟, 超时那一轮拿到的
+   任务状态是 `running` —— 既不是成功也不是失败, 但旧代码照样报成功、按钮复位。用户回头看卡片还是旧数据,
+   只能说"出错了"。现在按任务类型给预算 (**GeoIP 8 分钟 / 改配置 2 分钟**), 并且**还在跑就不收起进度条**
+   (以前 4 秒后无条件收起, 等于告诉用户"没了")。
+2. **撞上后台自动更新被当成"下载失败"**: 手动按钮与后台自动更新线程共用 `geodata.UPDATE_LOCK`
+   (面板起来 90s 后首次检查, 之后每 6 小时一次)。后台正在下的时候点按钮, 后端按约定回 409 —— 这是
+   "稍等一下", 不是故障, 但前端无条件 `toast("更新失败: " + e.message)`。现在 409 单独走一条文案
+   (**"先等一下: GeoIP 数据正在更新中, 请稍等再点"**), 后端那句提示也一起改写得更像人话。
+3. **"重启内核掐断隧道"没在这条路径上兜住**: 下载完要热重载 Xray, 走本机链路访问面板的浏览器会被掐断
+   (`e.dropped`)。改配置那条路径从 v2.6.7 起就有 `syncAfterDrop()` 兜底, GeoIP 这条一直没有 —— 断线直接
+   报"更新失败"。现在与改配置对齐: 断线后等连接回来, 用 `updated_at` 比对判断"到底更新了没", 再给结论。
+
+顺带修掉一个**与用户问题无关、但会造成线上事故**的缺陷 (就是这轮排查里真踩到的): `nginx_config.write_nginx_conf()`
+以前只判断"有没有权限写 `/etc/nginx/conf.d/`"。面板在服务器上是 root 跑的, 权限永远有 —— 于是一个换
+`ZP_HOME` 起在别的端口上的**临时实例** (做验证/排查用) 也会顺手把**线上**的
+`/etc/nginx/conf.d/zeroproxy.conf` 覆盖成它自己那份 (指向临时目录的证书和端口), 下次 reload 就让 nginx
+起不来。现在先过一道 `services.is_prod()`: 非生产环境一律只写 `$ZP_HOME/nginx/`。
+
+另外把下载源从 3 个扩到 5 个: 同一个 jsdelivr 挂在不同 CDN 边缘后面 (Fastly / Gcore / Cloudflare),
+走的是完全不同的网络路径, 某一条被限速时另外几条往往还通 (真机实测 `gcore` / `testingcf` 均返回 206)。
+
+回归: `scripts/browser_check.cjs` 98 → **100/100 项通过** (新增 [3b] 两条: 撞上后台自动更新时提示
+「等一下」而不是「更新失败」/ 这之后按钮自己恢复可用); `pytest` 149 → **150 项通过** (145 passed + 5 skipped,
+新增一条: 非生产环境绝不写 `/etc/nginx/conf.d/` 的 nginx 配置)。
+
 ---
 
 ## 9. API
@@ -767,7 +800,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 
 在 macOS (Apple Silicon, Python 3.14) 上实测通过:
 
-- `python -m pytest tests -q` → **144 passed, 5 skipped** (带 `ZP_XRAY_BIN` 时 **149 passed**, 约 30 秒);
+- `python -m pytest tests -q` → **145 passed, 5 skipped** (带 `ZP_XRAY_BIN` 时 **150 passed**, 约 31 秒);
   含 `/api/update` 鉴权与版本比较、`apply` 的"写不进 /etc/nginx 即失败"语义、CLI 退出码、以及
   `install.sh` 重跑不覆盖已初始化配置 / `upgrade.sh` 随包发布 / 自签证书可补签 Let's Encrypt /
   `systemctl` 参数顺序的回归断言 / Reality 密钥必须是成对的 X25519 (Ed25519 必须判无效) /
@@ -799,6 +832,8 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   跑着"改配置"任务时点下载会起自己的任务而不是接管别人。
   v2.6.13 补 3 项浏览器断言 (见 8.10): 「已连接的落地端」那张卡是自己竖排而不是套节点表的 5 列网格 /
   出口 IP 药丸单行不折成三行 / 测速等按钮不压到探测结果上且不越出卡片。
+  v2.6.14 再补 2 项 (见 8.11): 下载撞上后台自动更新时给的是「先等一下 … 请稍等再点」而不是「更新失败」 /
+  这之后按钮自己恢复可用 (不再卡在"下载中…")。
 - `scripts/verify.py` (Xray 26.3.27 + Hysteria 2.12.3 + mihomo 1.19.31 + sing-box 1.14.2) → **77/77 项通过**:
   setup 8 步全绿 / 三种订阅格式可被真实客户端解析 / 三档分流模板分别被 `mihomo -t` 与
   `sing-box check` 通过 / **用真实 sing-box 实跑** 5 份订阅 (通用 + 1.14+ 写法 × 智能/全局/直连) 全部启动成功,

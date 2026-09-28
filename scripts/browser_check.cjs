@@ -223,6 +223,29 @@ async function main() {
     const geoStatus = (await page.locator("#geo-status").innerText()).trim();
     check("GeoIP 数据状态可见", geoStatus.length > 0, geoStatus);
 
+    // v2.6.14: 后台自动更新正占着下载锁时, 手动点按钮以前会弹一句"更新失败: 已有更新任务在进行中",
+    // 用户以为按钮坏了。现在要明确说"等一下", 并且按钮自己恢复 (不能卡在"下载中…")。
+    await page.evaluate(() => document.querySelector("#toast").classList.remove("show"));
+    const lockErrMark = consoleErrors.length;
+    await page.route("**/api/geodata/update", (route) => route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({ error: "GeoIP 数据正在更新中 (后台自动更新或上一次任务还没结束), 请稍等再点" }),
+    }));
+    await page.click("#btn-geo-update");
+    await page.waitForSelector("#toast.show", { timeout: 10000 });
+    // 这个 409 是脚本自己伪造的约定信号, 浏览器照例会往控制台打条红字 —— 摘掉, 别掩盖真报错
+    for (let i = consoleErrors.length - 1; i >= lockErrMark; i -= 1) {
+      if (/409 \(Conflict\)/.test(consoleErrors[i])) consoleErrors.splice(i, 1);
+    }
+    const busyToast = (await page.locator("#toast").innerText()).trim();
+    check("下载撞上后台自动更新时提示「等一下」而不是「更新失败」",
+      /先等一下/.test(busyToast) && /稍等/.test(busyToast), busyToast);
+    check("下载失败后按钮自己恢复可用",
+      !(await page.locator("#btn-geo-update").isDisabled())
+      && /下载 \/ 更新/.test(await page.locator("#btn-geo-update").innerText()), "");
+    await page.unroute("**/api/geodata/update");
+
     console.log("\n[3c] 分流模板");
     const tplCount = await page.locator("#adv-template option").count();
     check("分流模板选择器有三个选项", tplCount === 3, `实际 ${tplCount}`);

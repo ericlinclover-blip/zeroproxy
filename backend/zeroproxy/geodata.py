@@ -37,15 +37,21 @@ UPDATE_LOCK = threading.Lock()
 
 #: 每个数据文件的候选下载源 (按顺序回退)。
 #: jsdelivr 的 @release 指向仓库的 release 分支, 内容与 Release 资产一致。
+#: 同一个 jsdelivr 挂在不同 CDN 后面 (Fastly / Gcore / Cloudflare), 走的是完全不同的
+#: 网络路径 —— 某一条被墙 / 被限速时另外几条往往还通, 所以按 CDN 边缘逐个回退。
 SOURCES: dict[str, list[str]] = {
     "geoip.dat": [
         "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geoip.dat",
         "https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geoip.dat",
+        "https://gcore.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geoip.dat",
+        "https://testingcf.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geoip.dat",
         "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat",
     ],
     "geosite.dat": [
         "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geosite.dat",
         "https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geosite.dat",
+        "https://gcore.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geosite.dat",
+        "https://testingcf.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geosite.dat",
         "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat",
     ],
 }

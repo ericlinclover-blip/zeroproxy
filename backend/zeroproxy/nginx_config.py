@@ -176,9 +176,18 @@ def build_fake_index(state: dict) -> str:
 def write_nginx_conf(state: dict) -> tuple[bool, str]:
     """写入 nginx 配置。
 
-    优先写入 /etc/nginx/conf.d/; 无权限时 (本地开发) 落到 $ZP_HOME/nginx/。
+    生产环境 (systemd 在位的 Linux) 才写 /etc/nginx/conf.d/; 其它情况一律落到
+    $ZP_HOME/nginx/, 无权限时同样退回那里。
     返回 (是否写入 /etc, 实际路径或说明)。
+
+    为什么按"是不是生产"判断, 而不只看有没有权限: 面板在服务器上是以 root 跑的,
+    权限永远是有的 —— 于是一个临时实例 (换 ZP_HOME 起在别的端口上做验证 / 排查)
+    也会顺手把**线上**的 /etc/nginx/conf.d/zeroproxy.conf 覆盖成它自己那份
+    (指向临时目录的证书 / 端口), 下次 nginx reload 就起不来。v2.6.13 的排查里
+    真踩到了这个坑。
     """
+    from . import services  # 延迟导入, 避免模块级循环依赖
+
     p = paths()
     conf = build_nginx_conf(state)
     os.makedirs(p["nginx_dir"], exist_ok=True)
@@ -188,6 +197,8 @@ def write_nginx_conf(state: dict) -> tuple[bool, str]:
     os.makedirs(p["www"], exist_ok=True)
     with open(os.path.join(p["www"], "index.html"), "w", encoding="utf-8") as fh:
         fh.write(build_fake_index(state))
+    if not services.is_prod():
+        return False, p["nginx_home"]
     try:
         os.makedirs(os.path.dirname(p["nginx_etc"]), exist_ok=True)
         with open(p["nginx_etc"], "w", encoding="utf-8") as fh:

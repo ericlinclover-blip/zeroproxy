@@ -1922,7 +1922,11 @@ def geodata_update(request: Request):
                 return body
 
     if not _GEO_UPDATE_LOCK.acquire(blocking=False):
-        return _err("已有更新任务在进行中", 409)
+        # 两条路径会撞上这把锁: 后台自动更新线程 (面板启动 90s 后按 6 小时检查一次,
+        # 数据过期时下载), 以及上一次还没跑完的手动任务。但"上一次手动任务"前面已经
+        # 被 _running_job 接管了, 所以走到这里基本是自动更新 —— 这不是失败, 等它跑完
+        # 再点就行, 提示要写成"等一下", 别让用户以为按钮坏了。
+        return _err("GeoIP 数据正在更新中 (后台自动更新或上一次任务还没结束), 请稍等再点", 409)
     if not _apply_async_enabled():
         try:
             return _geodata_update_sync(state, request)

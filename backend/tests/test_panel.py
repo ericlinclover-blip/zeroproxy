@@ -1462,7 +1462,9 @@ def test_geodata_update_conflicts_with_auto_update(client, configured, home, mon
     try:
         response = client.post("/api/geodata/update")
         assert response.status_code == 409
-        assert "已有更新任务" in response.json()["error"]
+        # 提示要写成"等一下", 而不是让用户以为按钮坏了 (v2.6.14 改过措辞)
+        assert "正在更新中" in response.json()["error"]
+        assert "稍等" in response.json()["error"]
     finally:
         geodata.UPDATE_LOCK.release()
 
@@ -1471,6 +1473,31 @@ def test_settings_reject_enabling_geodata_without_data(client, configured):
     response = client.post("/api/settings", json={"geodata_enabled": True})
     assert response.status_code == 400
     assert "GeoIP" in response.json()["error"]
+
+
+def test_nginx_conf_never_leaves_home_outside_prod(configured, home, monkeypatch, tmp_path):
+    """非生产环境 (没有 systemd) 一律只写 $ZP_HOME/nginx/, 绝不碰 /etc/nginx/conf.d/。
+
+    这是 v2.6.13 真机排查踩到的坑: 面板在服务器上以 root 跑, "有没有权限" 永远是
+    有 —— 于是一个换 ZP_HOME 起的临时实例也会把线上 nginx 配置覆盖掉 (指向临时
+    目录的证书/端口), 下次 reload nginx 就起不来。
+    """
+    from zeroproxy import nginx_config, services
+
+    monkeypatch.setattr(services, "is_prod", lambda: False)
+    # 把 /etc 那份换成一个临时路径: 万一防呆失效, 断言能直接抓到它被写了
+    fake_etc = tmp_path / "etc-nginx" / "zeroproxy.conf"
+    real_paths = nginx_config.paths
+    monkeypatch.setattr(
+        nginx_config, "paths",
+        lambda: {**real_paths(), "nginx_etc": str(fake_etc)},
+    )
+
+    wrote_etc, where = nginx_config.write_nginx_conf(config.load_state())
+    assert wrote_etc is False
+    assert where == str(home / "nginx" / "zeroproxy.conf")
+    assert (home / "nginx" / "zeroproxy.conf").exists()
+    assert not fake_etc.exists()
 
 
 def test_geodata_autoupdate_respects_explicit_opt_out(home, monkeypatch, tmp_path):
