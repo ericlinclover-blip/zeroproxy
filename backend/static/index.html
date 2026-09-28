@@ -1599,8 +1599,9 @@ function renderRate() {
     lineEl.setAttribute("d", "");
     if (areaEl) areaEl.setAttribute("d", "");
     const cur = $("#rate-cursor"), head = $("#rate-head");
-    if (cur) cur.setAttribute("opacity", "0");
-    if (head) head.setAttribute("opacity", "0");
+    // 用 inline style 而不是 opacity 属性: CSS 规则 (.spark .cursor{opacity:.6}) 会盖掉属性
+    if (cur) cur.style.opacity = "0";
+    if (head) head.style.opacity = "0";
     return;
   }
   const peak = Math.max(...rates, 1);
@@ -1618,12 +1619,12 @@ function renderRate() {
   const lastPt = pts[pts.length - 1];
   const cur = $("#rate-cursor"), head = $("#rate-head");
   if (cur) {
-    cur.setAttribute("opacity", "0.6");
+    cur.style.opacity = "0.6";
     cur.setAttribute("x1", lastPt[0].toFixed(1)); cur.setAttribute("x2", lastPt[0].toFixed(1));
     cur.setAttribute("y1", "0"); cur.setAttribute("y2", String(H));
   }
   if (head) {
-    head.setAttribute("opacity", "1");
+    head.style.opacity = "1";
     head.setAttribute("cx", lastPt[0].toFixed(1)); head.setAttribute("cy", lastPt[1].toFixed(1));
   }
   nowEl.textContent = `↑${fmtBytes(ups[ups.length - 1])}/s · ↓${fmtBytes(dns[dns.length - 1])}/s`;
@@ -2305,7 +2306,9 @@ function renderUpdate() {
         ? `<span class="badge trojan">有新版本 v${esc(latest)}</span>`
         : `<span class="badge vless">已是最新</span>`;
   $("#update-status-line").innerHTML =
-    `${badge} <span class="muted">当前 v${esc(cur)}${latest ? " · 最新 v" + esc(latest) : ""}` +
+    // 远端版本只由徽标表达: raw.githubusercontent 有 ~5 分钟 CDN 缓存, 刚发布完会拿到旧号,
+    // 那时「当前 v2.6.1 · 最新 v2.6.0」这种自相矛盾的写法比不写更糟
+    `${badge} <span class="muted">当前 v${esc(cur)}` +
     `${u.checked_at ? " · " + esc(fmtTime(u.checked_at)) + " 检查" : ""}</span>`;
 
   const lines = [];

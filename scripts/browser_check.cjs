@@ -248,6 +248,12 @@ async function main() {
 
     console.log("\n[3d] 程序更新");
     check("程序更新卡片存在", (await page.locator("#update-card").count()) === 1);
+    // 首次 /api/update 要出网查远端版本 (开发机上多半要等镜像超时, 最坏 ~30s),
+    // 卡片上的版本行与提示语是它回来之后才填的 —— 这里等它填好再断言, 别测出假阴性。
+    await page.waitForFunction(
+      () => /当前 v\d/.test(document.querySelector("#update-status-line").innerText),
+      { timeout: 60000 }
+    );
     const updLine = (await page.locator("#update-status-line").innerText()).trim();
     check("版本行显示当前版本", /当前 v\d/.test(updLine), updLine.replace(/\n/g, " ").slice(0, 60));
     const updHint = (await page.locator("#update-hint").innerText()).trim();
