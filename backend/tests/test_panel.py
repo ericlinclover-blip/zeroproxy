@@ -751,6 +751,47 @@ def test_socks5_tls_probe_reports_tunnel_failure(home):
         server.close()
 
 
+# ---------------------------------------------------------------- 服务版本探测
+
+#: 真机 `hysteria version` 的原始输出 (2.12.3): 先一段块字符 banner, 再才是 Version 行
+HYSTERIA_VERSION_OUTPUT = (
+    "\n"
+    "░█░█░█░█░█▀▀░▀█▀░█▀▀░█▀▄░▀█▀░█▀█░░░▀▀▄\n"
+    "░█▄█░█░█░▀▀█░░█░░█▀▀░█▀▄░░█░░█▀█░░░▄▀░\n"
+    "░▀░▀░▀░▀░▀▀▀░░▀░░▀▀▀░▀░▀░░▀░░▀░▀░░░▀▀▀\n"
+    "\n"
+    "a powerful, lightning fast and censorship resistant proxy\n"
+    "Aperture Internet Laboratory <https://github.com/apernet>\n"
+    "\n"
+    "Version:\tv2.12.3\n"
+    "BuildDate:\t2026-09-16T03:45:59Z\n"
+    "BuildType:\trelease\n"
+    "Toolchain:\tgo1.26.8 linux/amd64\n"
+)
+
+
+def test_version_from_output_skips_hysteria_banner(home):
+    """Hysteria 2 会把块字符 banner 打在第一行, 面板上曾经就挂成"运行中 · ░█░█…"。"""
+    from zeroproxy import services
+
+    assert services.version_from_output(HYSTERIA_VERSION_OUTPUT) == "v2.12.3"
+    # 带 ANSI 颜色 / 只有 banner 时, 宁可空也不能把花屏当版本号
+    assert services.version_from_output("\x1b[1;34mVersion: v2.12.3\x1b[0m\n") == "v2.12.3"
+    assert services.version_from_output("░█░█░█░█░█▀▀░▀█▀\n░▀░▀░▀░▀░▀▀▀░░▀░\n") == ""
+    assert services.version_from_output("") == ""
+
+
+def test_version_from_output_keeps_single_line_versions(home):
+    """Xray / nginx 这种第一行就是版本的要原样保留 (顺便验证不误伤)。"""
+    from zeroproxy import services
+
+    xray_line = "Xray 26.3.27 (Xray, Penetrates Everything.) d2758a0 (go1.26.1 linux/amd64)"
+    assert services.version_from_output(xray_line + "\n") == xray_line
+    assert services.version_from_output("nginx version: nginx/1.24.0 (Ubuntu)\n") == "nginx version: nginx/1.24.0 (Ubuntu)"
+    # Hysteria 1 那种 "Version: v1.3.5" 也要认
+    assert services.version_from_output("Hysteria 1.3.5\nVersion: v1.3.5\n") == "v1.3.5"
+
+
 def test_deep_probe_is_unavailable_without_xray_binary(client, configured, home, monkeypatch):
     """没有 xray 二进制时给出"无法体检"而不是谎报成功/失败。"""
     from zeroproxy import services

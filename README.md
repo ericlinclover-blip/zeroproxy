@@ -64,7 +64,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 88 项 (84 passed + 4 skipped; 带 `ZP_XRAY_BIN` 时 88 全通过) + `scripts/verify.py` (74 项) + `scripts/browser_check.cjs` (33 项) + `scripts/upgrade_sim.sh` (13 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 90 项 (86 passed + 4 skipped; 带 `ZP_XRAY_BIN` 时 90 全通过) + `scripts/verify.py` (74 项) + `scripts/browser_check.cjs` (33 项) + `scripts/upgrade_sim.sh` (13 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 
 竞品与技术调研见 `docs/RESEARCH.md`。
 
@@ -391,13 +391,14 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 
 在 macOS (Apple Silicon, Python 3.14) 上实测通过:
 
-- `python -m pytest tests -q` → **84 passed, 4 skipped** (带 `ZP_XRAY_BIN` 时 **88 passed**, 约 20 秒);
+- `python -m pytest tests -q` → **86 passed, 4 skipped** (带 `ZP_XRAY_BIN` 时 **90 passed**, 约 20 秒);
   含 `/api/update` 鉴权与版本比较、`apply` 的"写不进 /etc/nginx 即失败"语义、CLI 退出码、以及
   `install.sh` 重跑不覆盖已初始化配置 / `upgrade.sh` 随包发布 / 自签证书可补签 Let's Encrypt /
   `systemctl` 参数顺序的回归断言 / Reality 密钥必须是成对的 X25519 (Ed25519 必须判无效) /
   旧默认伪装目标 (证书链超 8KB) 自动迁移 / 深度体检客户端配置真的带齐各节点参数 /
   深度体检客户端在自签场景下不发已被 Xray 26 移除的 `allowInsecure` (改用 `pinnedPeerCertSha256`) /
-  深度体检必须把 SOCKS5 回复读满 (只读 4 字节会让 TLS 报 `WRONG_VERSION_NUMBER`)。
+  深度体检必须把 SOCKS5 回复读满 (只读 4 字节会让 TLS 报 `WRONG_VERSION_NUMBER`) /
+  服务版本探测要跳过 Hysteria 2 的块字符 banner (否则面板挂一串花屏方块)。
 - `scripts/verify.py` (Xray 26.3.27 + Hysteria 2.12.3 + mihomo 1.19.31 + sing-box 1.14.2) → **74/74 项通过**:
   setup 8 步全绿 / 三种订阅格式可被真实客户端解析 / 三档分流模板分别被 `mihomo -t` 与
   `sing-box check` 通过 / **用真实 sing-box 实跑** 5 份订阅 (通用 + 1.14+ 写法 × 智能/全局/直连) 全部启动成功,
@@ -429,7 +430,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
    (有效期至 2026-12-27, `certbot.timer` enabled, 证书出现后 `/api/renew` 会自动重新生成
    nginx/xray 配置并热重载) → nginx 监听 80/443/8899、xray 监听 8443/8445/8444 +
    127.0.0.1:6000、hysteria2 监听 30001/31001/32001 (UDP 端口跳跃)。
-2. **一键升级真机实测**: `upgrade.sh` 连升 v2.3.2 → v2.3.3 → v2.3.4 → v2.3.5 → v2.3.6, 每次 6 步全绿
+2. **一键升级真机实测**: `upgrade.sh` 连升 v2.3.2 → … → v2.3.7, 每次 6 步全绿
    (备份 → 换代码 → 按 `state.json` 重新落地三份配置 → 重载服务 → 复查端口监听),
    `data/update.json` 记 success, 旧代码 + `state.json` 备份保留最近 5 份;
    面板「程序更新 → 一键更新」走 systemd 瞬时单元, 面板自身重启不打断升级。
@@ -463,6 +464,10 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
    Xray 客户端经 SOCKS5 隧道对伪装目标做一次真实 TLS 往返 (生产环境面板默认走它), 并把
    `allowInsecure` 换成 Xray 26 要求的 `pinnedPeerCertSha256` (Xray 25 起 `allowInsecure` 已移除,
    26.3 上直接拒绝加载配置 —— 这一点也是真机联调时才踩到的)。
+8. **杂项 (真机才看得到)**: 面板「系统」卡片读的是各服务的 `xxx version`, 而 Hysteria 2 会在
+   第一行先打一段块字符 banner (`░█░█░█░█░█▀▀░▀█▀…`) → 面板上显示成"Hysteria 2 运行中 · ░█░█…"
+   一串花屏方块。修复: 剥掉 ANSI / 块字符后优先认 `Version: v2.12.3` 这类带标签的行, banner-only
+   的输出宁可显示为空也不当版本号。
 
 macOS 上仍无法覆盖的只有: ufw/云安全组规则、systemd 单元里的 `XRAY_LOCATION_ASSET` 生效细节
 (单元文件已写入该变量, 真机 `xray -test` 与启动均通过) 与不同客户端 App 的导入行为。

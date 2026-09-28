@@ -9,6 +9,7 @@ import ipaddress
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import ssl
@@ -97,16 +98,49 @@ def reload_service(name: str, timeout: int = 60) -> tuple[bool, str]:
     return (ok, "已重载") if ok else (False, f"重载失败: {out[:200]}")
 
 
+#: 终端颜色等控制序列
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+#: 块字符 / 制表字符 (U+2500-U+259F): Hysteria 2 的 `version` 会先打一段这种 banner
+_ART_RE = re.compile(r"[\u2500-\u259f]")
+#: `Version:\tv2.12.3` 这种明确带标签的行最可信, 优先取它
+_VERSION_LABEL_RE = re.compile(r"^version\s*[:=]\s*(\S+)", re.IGNORECASE)
+#: 退而求其次: 行里能找到一个 x.y[.z] 形式的版本号
+_VERSION_TOKEN_RE = re.compile(r"v?\d+(?:\.\d+)+[\w.+-]*")
+
+
+def version_from_output(out: str) -> str:
+    """从 `xxx version` 的输出里挑出版本行。
+
+    坑 (真机踩到过): Hysteria 2 的 `hysteria version` 先打一段块字符 banner
+    (`░█░█░█░█░█▀▀░▀█▀░█▀▀…`), 旧实现直接取第一行 → 面板的「Hysteria 2 运行中 ·」
+    后面挂了一串花屏方块。这里先剥掉控制序列和 banner, 再优先认 `Version: x.y.z`。
+    """
+    lines = []
+    for raw in _ANSI_RE.sub("", out).splitlines():
+        line = " ".join(raw.replace("\t", " ").split())
+        if line:
+            lines.append(line)
+    for line in lines:
+        match = _VERSION_LABEL_RE.match(line)
+        if match:
+            return match.group(1)[:80]
+    for line in lines:
+        if _ART_RE.search(line):
+            continue
+        if _VERSION_TOKEN_RE.search(line):
+            return line[:80]
+    # 没有可信的版本行就不要硬凑: 宁可让面板只显示"运行中", 也不把 banner 当版本号
+    return lines[0][:80] if lines and not _ART_RE.search(lines[0]) else ""
+
+
 def service_version(name: str) -> str:
-    binary = SERVICES.get(name, name)
     path = bin_path(name)
     if path is None:
         return ""
     ok, out = run([path, "version"], timeout=15)
     if not ok:
         return ""
-    first = out.strip().splitlines()[0] if out.strip() else ""
-    return first[:80]
+    return version_from_output(out)
 
 
 def server_info() -> dict:
