@@ -1595,16 +1595,19 @@ function renderRate() {
   if (!rates.length) {
     nowEl.textContent = "—";
     if (hintEl) hintEl.textContent = "本页打开后开始采样, 每 20s 一点";
-    lineEl.setAttribute("d", `M0 ${base} L${W} ${base}`);
-    if (areaEl) areaEl.setAttribute("d", `M0 ${base} L${W} ${base} L${W} ${H} L0 ${H} Z`);
+    // 一个采样点也画不出趋势 —— 宁可空着, 也不画一条假的平线
+    lineEl.setAttribute("d", "");
+    if (areaEl) areaEl.setAttribute("d", "");
     const cur = $("#rate-cursor"), head = $("#rate-head");
     if (cur) cur.setAttribute("opacity", "0");
     if (head) head.setAttribute("opacity", "0");
     return;
   }
   const peak = Math.max(...rates, 1);
-  const pts = rates.map((v, i) => {
-    const x = rates.length === 1 ? W : (i / (rates.length - 1)) * W;
+  // 只用过一个采样点时画成一条平线 (表示"当前就是这个速率"), 而不是一个看不见的点
+  const series = rates.length === 1 ? [rates[0], rates[0]] : rates;
+  const pts = series.map((v, i) => {
+    const x = (i / (series.length - 1)) * W;
     return [x, base - (v / peak) * (base - padTop)];
   });
   const d = pts.map(([x, y], i) => `${i ? "L" : "M"}${x.toFixed(1)} ${y.toFixed(1)}`).join(" ");
