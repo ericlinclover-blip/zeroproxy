@@ -72,6 +72,7 @@
 | Hysteria | v2.12.3 | QUIC 节点 + 端口跳跃 |
 | mihomo | v1.19.31 | 校验 Clash 订阅可被真实客户端解析 |
 | sing-box | 1.14.2 | 校验 sing-box 订阅可被真实客户端解析 |
+| sing-box | 1.13.21 | 同一份订阅在"上一个稳定大版本"上复测 (1.14 才加入的字段会在这里暴露兼容性代价) |
 
 ---
 
@@ -94,6 +95,12 @@
 | 10 | `geoip:private` 也依赖 `geoip.dat`, **不是**内置常量 | 同上 (隔离目录 + 仅 private 规则 → 同样启动失败) | 连"私有地址防护"这种基础规则都有前置条件 |
 | 11 | Xray 找 geo 文件的顺序: 可执行文件所在目录 → `XRAY_LOCATION_ASSET` | 把二进制复制到空目录后立即失败, 加环境变量后恢复 | 生产必须在 systemd 单元里设置该变量, 面板调用 `xray` 时也要带上 |
 | 12 | mihomo 加载含 `GEOIP` 规则的订阅时会下载 `geoip.metadb`, 默认源是 GitHub | 实测: `GEOIP,CN,DIRECT` → `can't download MMDB ... operation timed out` → 整个订阅 `test failed` | 订阅应内置 `geox-url` 指向可用镜像, 否则受限网络下用户首次导入直接失败 |
+| 13 | sing-box 1.12 起**内置** `geoip` / `geosite` 规则字段被彻底移除, 分流只能改用远程 `rule_set` | 1.14.2 实测报错原文: `geosite database is deprecated in sing-box 1.8.0 and removed in 1.12.0` | 面向 sing-box 的分流模板必须用远程 rule-set, 不能再写 `route.geosite` |
+| 14 | 远程 rule-set 若**不指定下载出口**, sing-box 会拿**默认出站 (即节点组)** 去下载; 节点不可达时直接 `FATAL` 起不来 (引导期死锁) | 1.14.2 + 1.13.21 双版本实测: 节点写不可解析域名时 `FATAL ... Get "http://…/ads.srs": lookup proxy.example.com: empty result`; 日志显示下载确实走了 `outbound/vless[node-A]` | 分流模板必须把下载指向直连, 否则"节点没通 → 客户端整个起不来" |
+| 15 | `route.rule_set[].download_detour` (1.8~1.15 可用, 1.14 起标记废弃, **1.16 移除**) 与 1.14 新增的 `http_clients` + `route.default_http_client` 是**两代互斥写法** | 上游 `option/route.go` v1.14.2 源码 + docs「Changes in sing-box 1.14.0」; 实测 1.13.21 遇到 `http_clients` 直接 `decode config: http_clients: json: unknown field` (Options 解码用 `DisallowUnknownFields`) | v1.14.0 发布于 2026-08-31 (不到一个月), 绝大多数在用的客户端仍是 1.13 —— 默认订阅只能用 `download_detour`, 新版写法做成可选格式 |
+| 16 | 写 `detour: "direct"` 的 HTTP 客户端会被拒绝: `detour to an empty direct outbound makes no sense`; **留空 detour 才是直连** | 1.14.2 实测 (http_clients 写法) | 生成 `http_clients` 时不能画蛇添足地写 `detour` |
+| 17 | 证书文件"生成后消失"同样会让 Xray 拒绝启动 (`failed to parse certificate > open …: no such file or directory`) | 隔离二进制 + 指向不存在证书的 Trojan 入站 → `xray -test` exit 23 | 与 geo 数据同一个漏洞面, 启动前自检应一并兜底 |
+| 18 | 远程 rule-set 的下载结果会被 `experimental.cache_file` 缓存, 第二次启动零下载 | 1.13.21 实测: 4 次启动只发出 3 次 GET (首轮各 3 次, 第二轮 0 次), 断网也能用上次数据启动 | 订阅应默认开启缓存, 启动速度和离线可用性都受益 |
 
 ### 3.1 一个反直觉的口令陷阱
 
@@ -101,6 +108,20 @@ Xray 的 VLESS/Trojan 用 `user:pass@` 是 **HTTP Basic 风格的 URI 语法糖*
 `hy2://` URI 里, 客户端会把 `user:pass` **整串**当作 auth 发给服务端, 而服务端做的是整串比较
 (见证据 #4/#5)。因此生成 Hysteria2 链接时**只能写密码, 不能写 `user:pass`**, 否则认证必然失败。
 这一点在 `backend/zeroproxy/share_links.py` 中已固化, 并由真实客户端解析测试守护。
+
+### 3.2 sing-box 分流模板: 三种写法的实测定档
+
+证据 #14~#16 凑在一起, 就变成一道必须做选择的兼容题。三种候选写法在**两个真实版本**上的表现:
+
+| 写法 | sing-box 1.13.21 | sing-box 1.14.2 | 结论 |
+|---|---|---|---|
+| 不指定下载出口 (改版前) | 下载走节点; 节点不可达 → `FATAL` | 同上, 且多一条废弃警告 | ✗ 引导期死锁 |
+| `rule_set[].download_detour: "direct"` | **启动成功**, 下载走 `outbound/direct` | **启动成功**, 走直连, 有废弃警告 (1.16 移除) | ✓ 默认采用 |
+| `http_clients` + `route.default_http_client` | ✗ `unknown field "http_clients"` | **启动成功**, 零警告 | ✓ 作为可选格式 |
+
+因此本项目默认订阅 (面向**当前在用的 1.13 / 1.14**) 统一写 `download_detour: "direct"`, 并额外提供
+`?format=singbox-next` 给 1.14+ 客户端生成 `http_clients` 写法。两者都由 `scripts/verify.py`
+每天用"本地 rule-set 镜像 + 不可解析节点"实跑验证: 只有下载确实走了直连, 进程才能活下来。
 
 ---
 
@@ -142,8 +163,8 @@ Xray 的 VLESS/Trojan 用 `user:pass@` 是 **HTTP Basic 风格的 URI 语法糖*
 本项目**当前不如**竞品的地方:
 
 1. **无多用户/配额** — 3x-ui / Marzban / Remnawave 的主战场, 本项目不覆盖 (定位差异, 非缺陷)。
-2. **分流规则模板仍简陋** — 只有"私有地址 + 广告"两条; Clash 订阅未带 rule-set / 自定义
-   proxy-group。Sub-Store 在这一层更强。
+2. **分流规则可定制性** — 已有三档模板 (智能/全局/直连), 但不支持用户自定义规则集
+   (Sub-Store 在这一层更强)。
 3. **无 Docker 交付** — 目前是 Shell 一行部署, 未提供镜像。
 4. **无多域名/多证书** — 单域名单证书。
 5. **IPv6 未专门处理** — 双栈环境需手动确认。
@@ -156,6 +177,8 @@ Xray 的 VLESS/Trojan 用 `user:pass@` 是 **HTTP Basic 风格的 URI 语法糖*
 | 无节点健康/延迟探测 | `GET /api/probe`: Reality/Trojan 走**完整 TLS 握手**, WS 走 TCP, Hysteria 走 UDP 监听检测, 另测出口 RTT |
 | 无分流数据自动更新 | GeoIP/GeoSite 多镜像下载 + `xray -test` 真机校验 + 原子替换, 面板后台每 6 小时检查、7 天 TTL |
 | 无备份/恢复 | `GET /api/backup` / `POST /api/restore`, 带 SHA-256 校验和与三重校验 |
+| 订阅只有一条硬编码规则 | 三档**客户端分流模板** (智能分流 / 全局代理 / 全部直连), 面板切换或 `?rules=` 覆盖; Clash 侧带 5 个策略组, sing-box 侧带 selector/urltest 出站组 |
+| 启动期可能被 geo 数据卡死 | `systemd ExecStartPre` 调用 `python -m zeroproxy.geodata guard`: 数据缺失或配置自检不过就按当前状态重新生成, 保证核心先起来 (证书丢失同路径兜底) |
 
 ---
 
@@ -168,6 +191,8 @@ Xray 的 VLESS/Trojan 用 `user:pass@` 是 **HTTP Basic 风格的 URI 语法糖*
   `app/cmd/server.go` (`serverConfigMasquerade*`), `extras/auth/password.go` (v2.12.3)。
 - GeoIP/GeoSite 数据: [Loyalsoldier/v2ray-rules-dat](https://github.com/Loyalsoldier/v2ray-rules-dat)
   release 分支 (每日构建); 客户端侧数据源 [MetaCubeX/meta-rules-dat](https://github.com/MetaCubeX/meta-rules-dat)。
-- 端到端复现: 见仓库 `scripts/verify.py` (真实内核 53/53) 与 `backend/tests/` (42 项)。
+- sing-box 源码: `option/route.go` / `option/options.go` / `option/http.go` (v1.14.2),
+  `docs/configuration/route/*` 与 `docs/configuration/shared/http-client*` (字段版本号与语义)。
+- 端到端复现: 见仓库 `scripts/verify.py` (真实内核 **74/74**) 与 `backend/tests/` (**52 项**)。
 
 原始取数结果保存在开发机的 `/tmp/zp-bin/competitors.json` (临时文件, 不入库)。

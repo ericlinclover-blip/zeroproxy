@@ -23,6 +23,7 @@ curl -fsSL https://<raw-host>/install.sh | bash
 | **一条命令部署** | `install.sh` 自动完成 BBR、依赖、Xray/Hysteria 2 二进制、venv、nginx 引导配置、systemd、防火墙 |
 | **5 个节点** | VLESS Reality (TCP+Vision)、VLESS XHTTP Reality、VLESS WebSocket、Trojan TLS、Hysteria 2 (QUIC+端口跳跃) |
 | **3 种订阅格式** | 同一订阅地址 `?format=` 切换: Base64 通用 / Clash(mihomo) YAML / sing-box JSON |
+| **3 档分流模板** | 智能分流 (国内直连+广告拦截) / 全局代理 / 全部直连; 面板一键切换或 `?rules=` 单客户端覆盖, 切换不重启服务 |
 | **引导令牌保护** | 初始化必须带 `?token=`, 公网暴露时别人抢不走你的面板; 初始化成功即作废 |
 | **一键自检自愈** | `/api/diagnose` 检查 8 项 (服务、配置、入站一致性、GeoIP 一致性、证书、端口、伪装目标可达性) + `/api/repair` 重新生成并重启 |
 | **节点测速** | `/api/probe` 对每个节点做**真实握手** (Reality / Trojan 走完整 TLS, 失败即说明配置不对), 并测服务器到伪装目标的出口延迟 |
@@ -32,7 +33,8 @@ curl -fsSL https://<raw-host>/install.sh | bash
 | **订阅恒定, 内容动态** | 订阅 URL 永不变; 节点启停 / 端口变更 / 伪装设置都会自动同步到客户端 |
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
-| **可回归验证** | `pytest` 41 项 + `scripts/verify.py` (53 项) + `scripts/browser_check.cjs` (23 项), 全部用真实二进制 / 真实浏览器 |
+| **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
+| **可回归验证** | `pytest` 52 项 + `scripts/verify.py` (74 项) + `scripts/browser_check.cjs` (27 项), 全部用真实二进制 / 真实浏览器 |
 
 竞品与技术调研见 `docs/RESEARCH.md`。
 
@@ -54,11 +56,11 @@ zeroproxy/
 │       ├── config.py              # 状态模型 (state.json v3) / 文件锁 / 引导令牌 / 审计日志 / 备份还原
 │       ├── crypto.py              # VLESS UUID 派生 / Reality ed25519 / PBKDF2
 │       ├── xray_config.py         # Xray 配置生成 (Reality / XHTTP / WS / Trojan + Stats API)
-│       ├── geodata.py             # GeoIP/GeoSite 下载与校验 + 分流规则 (硬前置: 数据缺失不下发)
+│       ├── geodata.py             # GeoIP/GeoSite 下载与校验 + 分流规则 (硬前置: 数据缺失不下发) + 启动前自愈 CLI
 │       ├── nginx_config.py        # Nginx 生成 (ACME + 443 WS 反代 + 伪装主页 + 8899 面板 TLS)
 │       ├── hysteria_config.py     # Hysteria 2 配置生成 (端口跳跃 + masquerade 伪装)
 │       ├── services.py            # systemctl / certbot / 自签证书 / 流量统计 / 节点握手探测 / 诊断
-│       ├── share_links.py         # 单节点链接 + Base64 / Clash / sing-box 三种订阅
+│       ├── share_links.py         # 单节点链接 + Base64 / Clash / sing-box 订阅 + 三档分流模板
 │       └── routes.py              # API: setup / login / dashboard / settings / diagnose / probe / backup / sub / qr
 ├── docs/
 │   └── RESEARCH.md                # 竞品与技术调研 (含上游源码一手证据)
@@ -125,17 +127,35 @@ zeroproxy/
 
 ---
 
-## 4. 订阅: 一个地址, 三种格式
+## 4. 订阅: 一个地址, 三种格式, 三档分流
 
 ```
 GET /sub/{token}                   → Base64 (通用: Shadowrocket / v2box / NekoBox / Streisand ...)
 GET /sub/{token}?format=clash      → mihomo / Clash.Meta 完整 YAML (含 proxy-groups 与 rules)
-GET /sub/{token}?format=singbox    → sing-box 1.14 完整 JSON (mixed 入站 + 嗅探 + 自动选择出口)
+GET /sub/{token}?format=singbox    → sing-box 完整 JSON (mixed 入站 + 嗅探 + 自动选择出口)
+GET /sub/{token}?format=singbox-next  → 同上, 但用 1.14+ 的 http_clients 写法 (无废弃警告)
+任意格式可叠加 ?rules=smart|global|direct  → 只为这一个客户端覆盖分流模板
 ```
+
+**分流模板** (面板「高级设置 → 分流模板」切换, 或在 URL 上加 `?rules=`):
+
+| 模板 | 规则 | 适用 |
+|---|---|---|
+| `smart` (默认) | 广告拦截 + 国内域名/IP 直连 + 私有地址直连, 其余走节点 | 日常: 国内网站直连, 国外走代理 |
+| `global` | 只拦广告, 其余全部走节点 | 需要全部流量走代理 |
+| `direct` | 全部直连 (策略组手动选节点) | 排障 / 不需要分流, **零 geo 下载** |
+
+两端的策略组是一套语义: `♻️ 自动选择` / `🚀 节点选择` / `🎯 全球直连` / `🛑 广告拦截` / `🐟 漏网之鱼`。
+切换模板只影响订阅输出, **不重载任何服务** (前端即时生效)。
 
 - 三种格式**内容一致、地址恒定**; 客户端按 `profile-update-interval: 12` 自动刷新, 节点启停 /
   端口变更 / 伪装设置变化自动同步, 用户侧零操作。
 - 响应带 `subscription-userinfo` 头 (有统计数据时), 客户端可直接显示已用流量。
+- **sing-box 分流的关键细节** (双版本实测, 见 `docs/RESEARCH.md` §3.2):
+  sing-box 不指定下载出口时会**拿节点去下载 rule-set**, 节点没通就 `FATAL` 起不来 —— 因此订阅
+  统一写 `download_detour: "direct"` 让 geo 数据走直连, 并默认开启 `experimental.cache_file`
+  (第二次启动零下载, 断网也能用上次数据)。1.14 起该字段标记废弃, 所以另给
+  `?format=singbox-next` 走新的 `http_clients` 写法 (1.13 及更早**不支持**, 会报 unknown field)。
 - **凭据格式经过源码级核对**: Hysteria 2 官方客户端把 `hysteria2://user:pass@host` 整串 `user:pass`
   当作 auth 发送, 而服务端 `extras/auth/password.go` 是整串比较口令 —— 因此本面板只写
   `hysteria2://<password>@host`; 端口跳跃同样按官方实现写在 host 的端口位置 (并附带 `mport`
@@ -176,7 +196,23 @@ GET /sub/{token}?format=singbox    → sing-box 1.14 完整 JSON (mixed 入站 +
 
 `POST /api/repair` 一键自愈: 重新生成 Xray + Nginx + Hysteria 配置 → 重载服务 → 复检并回传结果。
 
-### 6.1 节点测速 (真实握手, 不是 ICMP ping)
+### 6.1 启动期自愈 (systemd `ExecStartPre`)
+
+「面板生成配置时检查过数据」并不等于「磁盘上的配置永远可启动」: 数据文件或证书可能在之后
+消失 (磁盘清理、手动删除、恢复到新机器)。此时 `systemctl restart xray` / 重启机器会让
+**整个 Xray 起不来** —— geo 数据和证书都在配置构建阶段就要读。
+
+所以 `systemd/xray.service` 在 `ExecStart` 之前跑一次:
+
+```bash
+/opt/zeroproxy/venv/bin/python -m zeroproxy.geodata guard    # ExecStartPre, 前缀 '-' 不阻塞启动
+```
+
+逻辑: ① 配置里有 geo 规则但数据文件不在 → 按当前状态重新生成 (自动不下发 geo 规则);
+② 否则用真实 `xray -test` 自检, 不过同样重新生成 (证书丢失走的就是这条路)。修完还会**再自检一次**
+并把结论写进日志 (只是"先保证能用", 面板会继续提示数据/证书需要修复)。
+
+### 6.2 节点测速 (真实握手, 不是 ICMP ping)
 
 `GET /api/probe` (仪表盘「节点测速」, 进入仪表盘时自动跑一次):
 
@@ -242,7 +278,7 @@ state.json (唯一事实来源, schema v3, 旧版本自动升级)
 | GET | `/api/dashboard` | 会话 | 节点 / 证书 / 系统 / 订阅 / 流量 / 审计 全量视图 |
 | POST | `/api/nodes/{id}/toggle` | 会话 | 节点启停 → 热重载 |
 | POST | `/api/hysteria/hopping` | 会话 | 端口跳跃开关 → 热重载 |
-| POST | `/api/settings` | 会话 | 改 Reality SNI / Hysteria 伪装站点 / 节点端口 (含端口占用校验) |
+| POST | `/api/settings` | 会话 | 改 Reality SNI / Hysteria 伪装站点 / 节点端口 / 分流模板 (含端口占用校验; 只改模板时不重载服务) |
 | GET | `/api/probe` | 会话 | 节点真实握手探测 + 服务器出口 RTT (3 秒内复用缓存) |
 | POST | `/api/geodata/update` | 会话 | 下载/刷新 GeoIP + GeoSite 数据并热重载 (互斥, 并发时 409) |
 | GET | `/api/backup` | 会话 | 导出备份 JSON (含密钥与令牌, 带 SHA-256 校验和, 不含会话) |
@@ -252,7 +288,7 @@ state.json (唯一事实来源, schema v3, 旧版本自动升级)
 | GET | `/api/diagnose` / POST `/api/repair` | 会话 | 自检 / 一键自愈 |
 | GET | `/api/traffic` | 会话 | 流量统计 (Stats API) |
 | GET | `/api/logs/{service}` | 会话 | 服务日志尾部 (journalctl) |
-| GET | `/sub/{token}?format=` | 订阅令牌 | Base64 / Clash / sing-box 订阅内容 |
+| GET | `/sub/{token}?format=&rules=` | 订阅令牌 | Base64 / Clash / sing-box / sing-box-next 订阅内容, `rules=smart\|global\|direct` 单客户端覆盖分流模板 |
 | GET | `/api/nodes/{id}/qr` / `/api/subscription/qr` | 会话 | 节点 / 订阅二维码 PNG |
 
 ---
@@ -269,7 +305,9 @@ state.json (唯一事实来源, schema v3, 旧版本自动升级)
 | Hysteria 2 | **v2.12.3** | 生成的配置 (含 `masquerade.proxy.url` / `rewriteHost`) 能被真实二进制启动; 多端口 `listen` 仅 Linux 支持 (macOS 会明确报错) |
 | mihomo | **v1.19.31** | Clash 订阅 (含 `network: xhttp` + `xhttp-opts`、hysteria2 `ports` / `hop-interval`) 通过 `mihomo -t` |
 | mihomo geox | — | 订阅里的 `GEOIP` 规则会让 mihomo 首次加载时下载 `geoip.metadb`; 默认指向 GitHub, 受限网络下会超时**导致订阅加载失败**。订阅已内置 `geox-url` 指向可用镜像 |
-| sing-box | **1.14.2** | 订阅 JSON 通过 `sing-box check`; 1.13 起 legacy inbound 字段 (`sniff: true`) 被移除, 已改用 `route.rules[].action: sniff` |
+| sing-box | **1.14.2 / 1.13.21** | 订阅 JSON 双版本通过 `check` 且能被真实 `run` 起来; 1.13 起 legacy inbound 字段 (`sniff: true`) 被移除, 已改用 `route.rules[].action: sniff` |
+| sing-box 分流 | — | 1.12 起内置 `geoip`/`geosite` 字段被移除, 只能用远程 rule-set; 不指定下载出口时会**借节点下载** (节点不通即 FATAL), 因此订阅写 `download_detour: "direct"`。1.14 起该字段废弃 (1.16 移除), 另提供 `?format=singbox-next` 用 `http_clients` 写法 —— 它只适用于 1.14+, 1.13 会报 unknown field |
+| sing-box 缓存 | — | 订阅默认带 `experimental.cache_file`, 实测第二次启动零下载 |
 | certbot | 系统包 | webroot 签发, `--keep-until-expiring --expand` 保证重复应用不重复签发; 失败自动回退自签 (10 年) |
 
 ---
@@ -304,14 +342,19 @@ ZP_NODE_PATH=/path/to/node_modules node scripts/browser_check.cjs
 
 在 macOS (Apple Silicon, Python 3.14) 上实测通过:
 
-- `python -m pytest tests -q` → **41 passed, 1 skipped** (带 `ZP_XRAY_BIN` 时 42 passed, 约 8 秒)。
-- `scripts/verify.py` (Xray 26.3.27 + Hysteria 2.12.3 + mihomo 1.19.31 + sing-box 1.14.2) → **53/53 项通过**:
-  setup 8 步全绿 / 三种订阅格式可被真实客户端解析 / Xray 真实监听 8443, 8445, 8444, 10085 /
+- `python -m pytest tests -q` → **50 passed, 2 skipped** (带 `ZP_XRAY_BIN` 时 **52 passed**, 约 10 秒)。
+- `scripts/verify.py` (Xray 26.3.27 + Hysteria 2.12.3 + mihomo 1.19.31 + sing-box 1.14.2) → **74/74 项通过**:
+  setup 8 步全绿 / 三种订阅格式可被真实客户端解析 / 三档分流模板分别被 `mihomo -t` 与
+  `sing-box check` 通过 / **用真实 sing-box 实跑** 5 份订阅 (通用 + 1.14+ 写法 × 智能/全局/直连) 全部启动成功,
+  并留下反例: 去掉 `download_detour` 即 `FATAL` / Xray 真实监听 8443, 8445, 8444, 10085 /
   面板成功读取 Stats API / Hysteria 真实启动并监听 UDP 30001 / 8 项自检全过 / 一键修复 4 步完成 /
   GeoIP 分流规则被真实 Xray 接受 / 反向证明缺数据或缺 `XRAY_LOCATION_ASSET` 时 Xray 拒绝启动 /
-  备份-恢复往返一致且篡改被拒 / 5 个节点握手探测全部成功 (Reality TLS 134ms, 出口 RTT 62ms)。
-- `scripts/browser_check.cjs` → **23/23 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
-  二维码出图、诊断 8/8、节点测速结果落到卡片、GeoIP 开关与状态、备份下载; 无 console 错误、无失败请求。
+  **启动期自愈闭环**: 配置带 geo 规则 + 数据文件消失 → 原样启动被 Xray 拒绝 (复现) → `geodata guard`
+  重新生成 (已移除 geo 规则) → 再自检通过 / 备份-恢复往返一致且篡改被拒 /
+  5 个节点握手探测全部成功 (Reality TLS 136ms, 出口 RTT 54ms)。
+- `scripts/browser_check.cjs` → **27/27 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
+  二维码出图、诊断 8/8、节点测速结果落到卡片、GeoIP 开关与状态、**分流模板选择器 (切换 → 订阅内容
+  真的变化 → 切回)**、备份下载; 无 console 错误、无失败请求。
 - API 边界: 无令牌 setup 403、重复 setup 409、非法域名 / 弱密码 / 非法用户名 400、
   无 Cookie dashboard 401、错密码 401 且第 4 次起 429、错误订阅令牌 404、未知节点 404、
   备份/探测/GeoIP 接口未登录一律 401、备份校验和不匹配 400。
@@ -364,6 +407,12 @@ bash /opt/zeroproxy/uninstall.sh
 - **想改端口 / 伪装站点?** 仪表盘「高级设置」直接改, 保存后自动重新生成配置并热重载。
 - **「广告域名拦截」打开了但没效果?** 先确认 GeoIP 数据已下载 (高级设置里显示「数据未下载」时,
   分流规则不会下发); 点「下载 / 更新 GeoIP 数据」即可。
+- **想换分流策略 (国内直连 / 全局 / 直连)?** 高级设置「分流模板」一键切换, 订阅立刻生效且不重启服务;
+  只想给某一个客户端用别的策略, 就在它的订阅地址后加 `?rules=global` (或 `smart` / `direct`)。
+- **sing-box 报 `unknown field "http_clients"`?** 说明用了 `?format=singbox-next`, 而客户端低于 1.14;
+  换回默认 `?format=singbox` 即可 (它同时兼容 1.13 与 1.14)。
+- **sing-box 启动报 `lookup ... : empty result` / 卡在下载?** 那是 rule-set 下载走了节点而节点不通;
+  本项目生成的订阅已固定走直连下载, 若是自己改过配置, 请保留 `download_detour: "direct"`。
 - **节点测速显示「握手失败」?** 说明该入站真的不可用 (Reality 密钥/SNI/dest 不匹配, 或内核没在跑);
   点「一键诊断」看具体哪一项不过, 再点「一键修复」。
 - **换服务器怎么迁移?** 新机跑 `install.sh` → 打开面板 → 「系统 → 从备份恢复」→ 选旧机的备份
@@ -381,4 +430,7 @@ bash /opt/zeroproxy/uninstall.sh
 - 节点测速给的是「入站握手是否成功 + 出口 RTT」; 客户端到服务器的 RTT 服务端无法自测。
 - Hysteria 2 无法用 TCP 探测, 只能检测 UDP 端口是否被监听 (Windows 上可能显示「无法主动探测」)。
 - GeoIP 数据自动更新依赖 jsdelivr / GitHub 至少一个可达; 全部不可达时保留旧数据并记录审计。
-- 尚未内置: 核心二进制自动更新、DNS/ACL 分流订阅模板、多域名与多证书、多用户与配额。
+- 分流模板是三档预设 (智能/全局/直连), 暂不支持用户自定义规则集; `?rules=` 只能选这三档。
+- 面向 sing-box ≥1.14 的 `?format=singbox-next` 是**手选格式**: 面板无法识别客户端版本,
+  默认格式 (`download_detour`) 才能同时兼容 1.13 与 1.14。等 1.16 发布 (该字段移除) 后默认值会切到新版写法。
+- 尚未内置: 核心二进制自动更新、用户自定义分流规则、多域名与多证书、多用户与配额。

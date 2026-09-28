@@ -4,6 +4,12 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# 启动前自愈: geo 数据缺失 / 证书丢失等原因让磁盘配置过不了 `xray -test` 时,
+# 先按当前状态重新生成配置 (缺数据时自动不下发 geo 规则), 保证核心能起来。
+# 前缀 '-' 表示失败也不阻塞 Xray 启动。
+Environment=ZP_HOME=/opt/zeroproxy
+Environment=PYTHONPATH=/opt/zeroproxy
+ExecStartPre=-/opt/zeroproxy/venv/bin/python -m zeroproxy.geodata guard
 ExecStart=/usr/local/bin/xray run -c /opt/zeroproxy/xray/config.json
 WorkingDirectory=/opt/zeroproxy/xray
 # Xray 只从"可执行文件所在目录"或本变量指定的目录加载 geoip.dat / geosite.dat。

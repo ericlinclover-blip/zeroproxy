@@ -68,6 +68,108 @@ def udp_port_open(port: int) -> bool:
     return False
 
 
+def free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _run_singbox(binary: str, profile: dict, home: Path, port: int, label: str) -> tuple[bool, str]:
+    """跑一次 sing-box, 返回 (是否存活, 说明)。远程 rule-set 指向本地镜像。"""
+    for rule_set in profile["route"].get("rule_set", []):
+        rule_set["url"] = f"http://127.0.0.1:{port}/{rule_set['tag']}.srs"
+    profile["inbounds"][0]["listen_port"] = free_port()
+    profile["experimental"] = {"cache_file": {"enabled": True, "path": str(home / f"cache-{label}.db")}}
+    path = home / f"singbox-{label}.json"
+    path.write_text(json.dumps(profile, ensure_ascii=False), encoding="utf-8")
+    proc = subprocess.Popen(
+        [binary, "run", "-c", str(path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        time.sleep(4)
+        if proc.poll() is None:
+            return True, "启动成功 (rule-set 直连下载)"
+        return False, last_line(proc.stdout.read() if proc.stdout else "")
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def _live_singbox(binary: str, client, sub_path: str, home: Path) -> None:
+    """用真实 sing-box 实跑三个模板 —— 全程不发外网请求。
+
+    节点的 server 是不可解析的 proxy.example.com: 任何"借默认出站 (节点) 下载
+    rule-set"的写法都会让 sing-box 直接 FATAL, 所以进程能活下来就等价于证明
+    rule-set 走的是直连下载。rule-set 内容用真实二进制编译, 由本地 HTTP 服务提供。
+    """
+    import functools
+    import http.server
+    import threading
+
+    version_line = subprocess.run(
+        [binary, "version"], capture_output=True, text=True, timeout=30
+    ).stdout.strip().splitlines()[0]
+
+    fixtures = home / "rule-set"
+    fixtures.mkdir(exist_ok=True)
+    sources = {
+        "ads": {"version": 1, "rules": [{"domain_suffix": ["ads.example"]}]},
+        "cn": {"version": 1, "rules": [{"domain_suffix": ["example.cn"]}]},
+        "cn-ip": {"version": 1, "rules": [{"ip_cidr": ["10.0.0.0/8"]}]},
+    }
+    for tag, body in sources.items():
+        src = fixtures / f"{tag}.json"
+        src.write_text(json.dumps(body), encoding="utf-8")
+        proc = subprocess.run(
+            [binary, "rule-set", "compile", str(src), "-o", str(fixtures / f"{tag}.srs")],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if proc.returncode != 0:
+            record("编译测试用 rule-set", False, last_line(proc.stdout + proc.stderr))
+            return
+
+    port = free_port()
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(fixtures))
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
+    httpd.RequestHandlerClass.log_message = lambda *args, **kwargs: None
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    record("sing-box 版本", True, version_line)
+
+    def supports_next() -> bool:
+        try:  # "sing-box version 1.14.2"
+            parts = version_line.split()[-1].split("-")[0].split(".")
+            return (int(parts[0]), int(parts[1])) >= (1, 14)
+        except (IndexError, ValueError):
+            return False
+
+    try:
+        formats = [("singbox", "通用写法")]
+        if supports_next():
+            formats.append(("singbox-next", "1.14+ 写法"))
+        for fmt, label in formats:
+            for tpl in ("smart", "global", "direct"):
+                body = client.get(f"{sub_path}?format={fmt}&rules={tpl}").text
+                ok, detail = _run_singbox(binary, json.loads(body), home, port, f"{fmt}-{tpl}")
+                record(f"实跑 {label} / {tpl}", ok, detail)
+
+        # 反例: 去掉 download_detour → 下载改走节点 → 节点不可达 → 起不来
+        raw = json.loads(client.get(f"{sub_path}?format=singbox&rules=global").text)
+        for rule_set in raw["route"]["rule_set"]:
+            rule_set.pop("download_detour", None)
+        ok, detail = _run_singbox(binary, raw, home, port, "negative")
+        record("反例: 不指定下载出口则起不来 (证明修复必要)", not ok, detail)
+    finally:
+        httpd.shutdown()
+
+
 def main() -> int:
     home = Path(tempfile.mkdtemp(prefix="zp-verify-home-"))
     os.environ["ZP_HOME"] = str(home)
@@ -121,17 +223,19 @@ def main() -> int:
     if mihomo_bin or singbox_bin:
         print("\n[2b] 客户端解析校验")
     if mihomo_bin:
-        path = home / "clash.yaml"
-        path.write_text(client.get(f"{sub_path}?format=clash").text, encoding="utf-8")
-        proc = subprocess.run(
-            [mihomo_bin, "-t", "-f", str(path), "-d", str(home)],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        output = (proc.stdout or "") + (proc.stderr or "")
-        ok = proc.returncode == 0 or "test is successful" in output
-        record("mihomo 解析 Clash 订阅", ok, last_line(output))
+        for tpl in ("smart", "global", "direct"):
+            path = home / f"clash-{tpl}.yaml"
+            path.write_text(client.get(f"{sub_path}?format=clash&rules={tpl}").text, encoding="utf-8")
+            proc = subprocess.run(
+                # -d 复用同一个工作目录: geo 数据只下载一次
+                [mihomo_bin, "-t", "-f", str(path), "-d", str(home / "mihomo-data")],
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            output = (proc.stdout or "") + (proc.stderr or "")
+            ok = proc.returncode == 0 or "test is successful" in output
+            record(f"mihomo 解析 Clash 订阅 ({tpl})", ok, last_line(output))
     if singbox_bin:
         path = home / "singbox.json"
         path.write_text(client.get(f"{sub_path}?format=singbox").text, encoding="utf-8")
@@ -140,6 +244,32 @@ def main() -> int:
         )
         output = (proc.stdout or "") + (proc.stderr or "")
         record("sing-box 解析订阅", proc.returncode == 0, "check PASS" if proc.returncode == 0 else last_line(output))
+
+    print("\n[2c] 分流模板 (smart / global / direct)")
+    templates = {
+        "smart": ("GEOSITE,cn", "GEOSITE,category-ads-all"),
+        "global": (None, "GEOSITE,category-ads-all"),
+        "direct": (None, None),
+    }
+    for tpl, (must, ads) in templates.items():
+        clash = client.get(f"{sub_path}?format=clash&rules={tpl}").text
+        ok = (must in clash if must else "GEOSITE,cn" not in clash) and (
+            ads in clash if ads else "GEOSITE" not in clash and "GEOIP," not in clash
+        )
+        record(f"clash 模板 {tpl}", ok, f"{len(clash)} 字节")
+        profile = json.loads(client.get(f"{sub_path}?format=singbox&rules={tpl}").text)
+        rule_sets = profile["route"].get("rule_set", [])
+        if tpl == "direct":
+            ok = not rule_sets and "experimental" not in profile
+        else:
+            ok = bool(rule_sets) and all(
+                rs.get("download_detour") == "direct" for rs in rule_sets
+            )
+        record(f"singbox 模板 {tpl} (rule-set 直连下载)", ok, f"{len(rule_sets)} 条 rule-set")
+
+    if singbox_bin:
+        print("\n[2d] 用真实 sing-box 实跑订阅 (节点不可达也必须起得来)")
+        _live_singbox(singbox_bin, client, sub_path, home)
 
     print("\n[3] 生成产物")
     artifacts = {
@@ -234,7 +364,19 @@ def main() -> int:
         record("下载 GeoIP 数据", have_geo, str(res.get("detail"))[:110])
 
     if have_geo:
-        from zeroproxy import geodata
+        from zeroproxy import geodata, xray_config
+
+        # 数据文件级"搬走 / 搬回" (目录级 move 会撞上被自动重建的空目录)
+        stash = home / "geo-stash"
+        stash.mkdir(exist_ok=True)
+
+        def geo_out() -> None:
+            for name in geodata.MIN_BYTES:
+                shutil.move(str(geo_dir / name), str(stash / name))
+
+        def geo_back() -> None:
+            for name in geodata.MIN_BYTES:
+                shutil.move(str(stash / name), str(geo_dir / name))
 
         # 数据就绪后开启分流 (设置接口会触发重新生成 + 热重载)
         client.post("/api/settings", json={"geodata_enabled": True})
@@ -277,8 +419,7 @@ def main() -> int:
             )
 
         # 反向用例: 数据缺失时 geo 规则必须被丢弃 (否则 Xray 整体起不来)
-        backup_dir = home / "geo-bak"
-        shutil.move(str(geo_dir), str(backup_dir))
+        geo_out()
         client.post("/api/apply")
         cfg2 = json.loads(cfg_path.read_text())
         record(
@@ -293,7 +434,56 @@ def main() -> int:
                 timeout=60,
             )
             record("无数据时 xray -test 仍通过", proc.returncode == 0)
-        shutil.move(str(backup_dir), str(geo_dir))
+        geo_back()
+        client.post("/api/apply")
+
+        # 启动期漏洞: 配置已落盘、数据随后消失 (磁盘清理 / 手动删 / 恢复到新机),
+        # 此时 `systemctl restart xray` 会让整个 Xray 起不来。guard 是 ExecStartPre 兜底。
+        print("\n[7b] 启动前自愈 (systemd ExecStartPre: python -m zeroproxy.geodata guard)")
+        cfg_path = home / "xray" / "config.json"
+        iso_bin = home / "xray-isolated" / "xray"
+        # 前置: 让磁盘上的配置确实带着 geo 规则 (等价于面板正常运行过)
+        fresh = config.load_state()
+        fresh["geodata"]["enabled"] = True
+        xray_config.write_xray_config(fresh)
+        record("前置: 配置里已下发 geo 规则", "geoip:private" in cfg_path.read_text())
+        geo_out()
+        if xray_bin:
+            broken = subprocess.run(
+                [str(iso_bin), "-test", "-c", str(cfg_path)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            record(
+                "无 guard 时 Xray 拒绝启动 (漏洞复现)",
+                broken.returncode != 0,
+                last_line(broken.stdout + broken.stderr),
+            )
+        guard = subprocess.run(
+            [sys.executable, "-m", "zeroproxy.geodata", "guard"],
+            cwd=str(BACKEND),
+            env={**os.environ},
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        record("guard 执行", guard.returncode == 0, last_line(guard.stdout + guard.stderr))
+        text = cfg_path.read_text()
+        record(
+            "guard 后配置不再引用 geo 规则",
+            "geoip:" not in text and "geosite:" not in text,
+            "auto-degraded",
+        )
+        if xray_bin:
+            fixed = subprocess.run(
+                [str(iso_bin), "-test", "-c", str(cfg_path)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            record("guard 后 Xray 可通过自检 (启动不再被卡死)", fixed.returncode == 0)
+        geo_back()
         client.post("/api/apply")
 
     print("\n[8] 备份 / 恢复")

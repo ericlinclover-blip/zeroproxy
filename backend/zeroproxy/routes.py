@@ -515,6 +515,14 @@ def _dashboard_body(state: dict, request: Request, traffic: dict | None = None) 
         },
         "cert": _cert_view(state),
         "nodes": _node_view(state, traffic),
+        "routing": {
+            "template": share_links.template_of(state),
+            "templates": [
+                {"id": "smart", "name": "智能分流", "desc": "国内直连 + 广告拦截, 其余走代理"},
+                {"id": "global", "name": "全局代理", "desc": "除局域网外全部走代理"},
+                {"id": "direct", "name": "全部直连", "desc": "不下载 geo 数据, 全部直连 (手动切组)"},
+            ],
+        },
         "hysteria_hopping": state.get("hysteria_hopping", False),
         "hysteria_ports": state.get("hysteria_ports", []),
         "hysteria_masquerade": state.get("hysteria_masquerade", {}),
@@ -601,6 +609,8 @@ class SettingsIn(BaseModel):
     reality_sni: str | None = None
     masquerade_url: str | None = None
     ports: dict[str, int] | None = None
+    # 客户端分流模板 (只影响订阅生成, 不动服务端配置)
+    template: str | None = None
     # GeoIP 分流开关 (数据文件缺失时规则不会下发, 见 xray_config.geo_rules)
     geodata_enabled: bool | None = None
     block_private: bool | None = None
@@ -623,6 +633,12 @@ def update_settings(payload: SettingsIn, request: Request):
             url = payload.masquerade_url.strip()
             if url and not _URL_RE.match(url):
                 return _err("伪装站点需为 http(s) URL (示例: https://www.microsoft.com/)")
+
+        new_template = ""
+        if payload.template is not None:
+            new_template = payload.template.strip().lower()
+            if new_template not in share_links.TEMPLATES:
+                return _err(f"分流模板只能是: {', '.join(share_links.TEMPLATES)}")
 
         new_ports: dict[str, int] = {}
         if payload.ports:
@@ -654,6 +670,10 @@ def update_settings(payload: SettingsIn, request: Request):
             state["hysteria_masquerade"]["url"] = url
             changed.append(f"masquerade={url or 'off'}")
 
+        if new_template and new_template != state.get("routing", {}).get("template"):
+            state.setdefault("routing", {})["template"] = new_template
+            changed.append(f"template={new_template}")
+
         for key, port in new_ports.items():
             if port != state["ports"].get(key):
                 state["ports"][key] = port
@@ -684,6 +704,22 @@ def update_settings(payload: SettingsIn, request: Request):
             return _err("没有需要修改的内容")
 
         config.audit(state, "settings", ", ".join(changed), actor=_client_ip(request))
+        # 分流模板只影响订阅输出, 服务端配置一字不变 → 直接保存, 不做无谓的重载
+        if all(item.startswith("template=") for item in changed):
+            steps = _steps_recorder()
+            steps.append(
+                {
+                    "name": "切换分流模板",
+                    "ok": True,
+                    "detail": f"{changed[0]} (订阅即刻生效, 未重载服务)",
+                    "ms": 0,
+                }
+            )
+            state["steps"] = steps
+            save_state(state)
+            body = _dashboard_body(state, request)
+            body["steps"] = steps
+            return body
         steps = _reapply(state, request)
         body = _dashboard_body(state, request)
         body["steps"] = steps
@@ -1058,13 +1094,14 @@ def geodata_update(request: Request):
 # ---------------------------------------------------------------- 订阅 / 二维码
 
 @router.get("/sub/{token}")
-def subscribe(token: str, request: Request, format: str = "base64"):
+def subscribe(token: str, request: Request, format: str = "base64", rules: str = ""):
     state = load_state()
     if not state["configured"] or not hmac.compare_digest(
         token, state.get("subscription_token", "")
     ):
         return _err("无效订阅", 404)
-    body, media_type = share_links.subscription_body(state, format)
+    # rules 参数可对单个客户端覆盖分流模板 (?rules=smart|global|direct)
+    body, media_type = share_links.subscription_body(state, format, rules)
     headers = {
         # 客户端按此周期自动刷新订阅 (小时), 节点启停/端口变更自动同步
         "profile-update-interval": "12",

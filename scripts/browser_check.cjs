@@ -160,6 +160,29 @@ async function main() {
     const geoStatus = (await page.locator("#geo-status").innerText()).trim();
     check("GeoIP 数据状态可见", geoStatus.length > 0, geoStatus);
 
+    console.log("\n[3c] 分流模板");
+    const tplCount = await page.locator("#adv-template option").count();
+    check("分流模板选择器有三个选项", tplCount === 3, `实际 ${tplCount}`);
+    await page.selectOption("#adv-template", "direct");
+    await page.waitForFunction(
+      () => (document.querySelector("#adv-template") || {}).value === "direct",
+      { timeout: 20000 }
+    );
+    const dash = await (await page.request.get(`${base}/api/dashboard`)).json();
+    check("切换模板写入面板状态", dash.routing.template === "direct", dash.routing.template);
+    const subPath = new URL(dash.subscription_url).pathname;
+    const subText = await (await page.request.get(`${base}${subPath}?format=clash`)).text();
+    check("订阅按新模板生成 (direct 不引用 geo 规则)",
+      !subText.includes("GEOSITE,cn") && subText.includes("MATCH,"),
+      `${subText.length} 字节`);
+    await page.selectOption("#adv-template", "smart");
+    await page.waitForFunction(
+      () => (document.querySelector("#adv-template") || {}).value === "smart",
+      { timeout: 20000 }
+    );
+    const subSmart = await (await page.request.get(`${base}${subPath}?format=clash`)).text();
+    check("切回 smart 后恢复国内直连规则", subSmart.includes("GEOSITE,cn"), "");
+
     const backup = await page.request.get(`${base}/api/backup`);
     const backupBody = await backup.json();
     check("备份可下载", backup.ok() && !!backupBody.checksum,

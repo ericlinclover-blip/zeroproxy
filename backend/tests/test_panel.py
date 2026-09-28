@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 
 import pytest
 
@@ -151,6 +152,120 @@ def test_invalid_token_404(client, configured):
     assert client.get("/sub/definitely-wrong-token").status_code == 404
 
 
+# ---------------------------------------------------------------- 分流模板
+
+def _sub(client, configured, fmt="clash", extra=""):
+    path = configured["subscription_url"].split("testserver")[-1]
+    response = client.get(f"{path}?format={fmt}{extra}")
+    assert response.status_code == 200, response.text
+    return response
+
+
+def test_routing_template_defaults_to_smart(client, configured):
+    """默认即「智能分流」, 面板把三个模板都暴露给前端。"""
+    from zeroproxy import share_links
+
+    dash = client.get("/api/dashboard").json()
+    assert dash["routing"]["template"] == "smart"
+    assert [t["id"] for t in dash["routing"]["templates"]] == list(share_links.TEMPLATES)
+    state = config.load_state()
+    assert state["routing"]["template"] == "smart"
+
+
+def test_clash_templates(client, configured):
+    yaml = pytest.importorskip("yaml")
+
+    smart = yaml.safe_load(_sub(client, configured).text)
+    rules = "\n".join(smart["rules"])
+    assert "GEOSITE,category-ads-all" in rules and "GEOSITE,cn," in rules
+    assert "GEOIP,LAN," in rules and "GEOIP,CN," in rules
+    assert smart["rules"][-1] == "MATCH,🐟 漏网之鱼"
+    assert [g["name"] for g in smart["proxy-groups"]] == [
+        "♻️ 自动选择",
+        "🚀 节点选择",
+        "🎯 全球直连",
+        "🛑 广告拦截",
+        "🐟 漏网之鱼",
+    ]
+    assert smart["geox-url"]["geoip"].startswith("https://")
+
+    # global: 只拦广告, 其余全走节点
+    glob = yaml.safe_load(_sub(client, configured, extra="&rules=global").text)
+    grules = "\n".join(glob["rules"])
+    assert "GEOSITE,category-ads-all" in grules
+    assert "GEOSITE,cn," not in grules and "GEOIP,CN," not in grules
+    assert glob["rules"][-1] == "MATCH,🚀 节点选择"
+
+    # direct: 不引用任何 geo 规则 (客户端零下载)
+    direct = yaml.safe_load(_sub(client, configured, extra="&rules=direct").text)
+    assert direct["rules"] == ["MATCH,🐟 漏网之鱼"]
+    assert direct["proxy-groups"][-1]["proxies"][0] == "DIRECT"
+
+
+def test_singbox_templates_download_rule_set_directly(client, configured):
+    """远程 rule-set 必须直连下载 —— 否则节点不可达时 sing-box 直接起不来。
+
+    实测 (见 docs/RESEARCH.md): 不指定 download_detour 时 sing-box 会拿默认出站
+    (也就是节点) 去下载 rule-set, 节点不通就 FATAL。
+    """
+    profile = json.loads(_sub(client, configured, fmt="singbox").text)
+    route = profile["route"]
+    assert {rs["tag"] for rs in route["rule_set"]} == {"ads", "cn", "cn-ip"}
+    assert all(rs["download_detour"] == "direct" for rs in route["rule_set"])
+    assert all(rs["url"].startswith("https://") for rs in route["rule_set"])
+    assert profile["experimental"]["cache_file"]["enabled"] is True
+    # 默认格式面向 1.8~1.15 的通用写法, 不能出现 1.14 才有的字段
+    assert "http_clients" not in profile and "default_http_client" not in route
+    assert route["final"] == "🚀 节点选择"
+    assert {o["tag"] for o in profile["outbounds"]} >= {"direct", "♻️ 自动选择", "🚀 节点选择"}
+
+    glob = json.loads(_sub(client, configured, fmt="singbox", extra="&rules=global").text)
+    assert [rs["tag"] for rs in glob["route"]["rule_set"]] == ["ads"]
+    assert glob["route"]["final"] == "🚀 节点选择"
+
+    direct = json.loads(_sub(client, configured, fmt="singbox", extra="&rules=direct").text)
+    assert "rule_set" not in direct["route"]
+    assert "experimental" not in direct                # 无下载也就无需缓存
+    assert direct["route"]["final"] == "🐟 漏网之鱼"
+    assert direct["route"]["rules"][-1]["outbound"] == "🎯 全球直连"
+
+
+def test_singbox_next_format_uses_http_client(client, configured):
+    """`?format=singbox-next` 面向 sing-box ≥1.14 (download_detour 已废弃)。"""
+    from zeroproxy import share_links
+
+    profile = json.loads(_sub(client, configured, fmt="singbox-next").text)
+    assert profile["http_clients"] == [{"tag": share_links.DEFAULT_HTTP_CLIENT}]
+    assert profile["route"]["default_http_client"] == share_links.DEFAULT_HTTP_CLIENT
+    assert "download_detour" not in json.dumps(profile)
+    assert profile["experimental"]["cache_file"]["enabled"] is True
+
+
+def test_routing_template_setting_persists_without_service_restart(client, configured):
+    response = client.post("/api/settings", json={"template": "global"})
+    assert response.status_code == 200, response.text
+    steps = {s["name"]: s for s in response.json()["steps"]}
+    assert steps["切换分流模板"]["ok"] is True
+    assert "未重载服务" in steps["切换分流模板"]["detail"]
+    assert "重载服务 (nginx/xray/hysteria2)" not in steps
+
+    assert config.load_state()["routing"]["template"] == "global"
+    assert client.get("/api/dashboard").json()["routing"]["template"] == "global"
+    yaml = pytest.importorskip("yaml")
+    assert yaml.safe_load(_sub(client, configured).text)["rules"][-1] == "MATCH,🚀 节点选择"
+
+
+def test_routing_template_validation_and_override(client, configured):
+    # 非法模板: 设置接口拒绝, URL 参数则忽略 (回落到已保存的模板)
+    assert client.post("/api/settings", json={"template": "turbo"}).status_code == 400
+    yaml = pytest.importorskip("yaml")
+    fallback = yaml.safe_load(_sub(client, configured, extra="&rules=turbo").text)
+    assert "GEOSITE,cn," in "\n".join(fallback["rules"])   # 仍是 smart
+    # URL 参数覆盖不改变面板设置
+    _sub(client, configured, extra="&rules=direct")
+    assert config.load_state()["routing"]["template"] == "smart"
+
+
 # ---------------------------------------------------------------- 节点操作
 
 def test_toggle_node_updates_subscription(client, configured):
@@ -278,6 +393,8 @@ def test_state_migrates_v1_layout(home):
     # v2 → v3 新增的 GeoIP 分流字段同样自动补齐
     assert state["geodata"]["enabled"] is False
     assert state["geodata"]["block_private"] is True
+    # 分流模板是纯增量字段 (补默认值即 smart), 老状态不需要版本迁移
+    assert state["routing"]["template"] == "smart"
 
 
 def test_generated_xray_config_matches_enabled_nodes(client, configured, home):
@@ -524,3 +641,91 @@ def test_geodata_autoupdate_respects_explicit_opt_out(home, monkeypatch, tmp_pat
     assert geodata.wants_update(state) is False         # 显式关闭 → 不再更新
     state["geodata"]["enabled"] = True
     assert geodata.wants_update(state) is True          # 重新打开 → 恢复更新
+
+
+needs_xray = pytest.mark.skipif(
+    not os.environ.get("ZP_XRAY_BIN"), reason="需要真实 xray 二进制 (ZP_XRAY_BIN)"
+)
+
+
+def _seed_geo_data(monkeypatch, tmp_path):
+    """用 file:// 假数据源把 geo 数据备齐 (不依赖网络)。"""
+    from zeroproxy import geodata
+
+    source = tmp_path / "geo-src"
+    source.mkdir()
+    for name in geodata.MIN_BYTES:
+        (source / name).write_bytes(b"ZP" * 600_000)
+    monkeypatch.setattr(
+        geodata, "SOURCES", {name: [(source / name).as_uri()] for name in geodata.MIN_BYTES}
+    )
+    ok, detail, _ = geodata.update(config.load_state(), validate=False)
+    assert ok, detail
+
+
+def test_geodata_guard_repairs_config_when_data_vanishes(client, configured, home, monkeypatch, tmp_path):
+    """启动期漏洞: 配置已落盘、geo 数据随后丢失 → `systemctl restart xray` 会起不来。
+
+    面板路径本来安全 (每次生成都查 usable()), 但磁盘上的旧配置可能失去数据文件
+    (磁盘清理 / 手动删 / 恢复到新机器)。guard() 是 systemd ExecStartPre 的兜底。
+    """
+    from zeroproxy import geodata, xray_config
+
+    _seed_geo_data(monkeypatch, tmp_path)
+    state = config.load_state()
+    state["geodata"]["enabled"] = True
+    xray_config.write_xray_config(state)                 # 模拟"配置已落盘"
+    cfg_path = home / "xray" / "config.json"
+    assert "geoip:private" in cfg_path.read_text()
+
+    for name in geodata.MIN_BYTES:                       # 数据文件消失
+        (home / "geo" / name).unlink()
+    assert geodata.present() is False
+
+    fixed, detail = geodata.guard()
+    assert fixed is True, detail
+    assert "geo 数据文件缺失" in detail and "已移除 geo 规则" in detail
+    text = cfg_path.read_text()
+    assert "geoip:" not in text and "geosite:" not in text
+
+
+def test_geodata_guard_is_noop_when_config_is_fine(client, configured, home):
+    """正常部署下 guard 不该改动任何文件 (每次启动都跑, 必须是幂等的)。"""
+    from zeroproxy import geodata
+
+    cfg_path = home / "xray" / "config.json"
+    before = cfg_path.read_text()
+    fixed, detail = geodata.guard()
+    assert fixed is False, detail
+    assert cfg_path.read_text() == before
+
+
+def test_geodata_guard_skips_before_setup(home):
+    """还没初始化时磁盘上只是占位配置, guard 不该擅自生成半成品配置。"""
+    from zeroproxy import geodata
+
+    cfg_path = home / "xray" / "config.json"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text('{"routing": {"rules": [{"domain": ["geoip:private"]}]}}')
+    fixed, detail = geodata.guard()
+    assert fixed is False and "尚未初始化" in detail
+
+
+@needs_xray
+def test_geodata_guard_self_heals_missing_cert(client, configured, home):
+    """同类漏洞: 证书文件"生成后消失"同样会让 Xray 拒绝启动 —— 自检兜底。"""
+    from zeroproxy import geodata, services, xray_config
+
+    state = config.load_state()
+    cfg_path = home / "xray" / "config.json"
+    assert xray_config.cert_usable(state) is True
+    assert "trojan" in cfg_path.read_text()
+
+    os.unlink(state["cert"]["cert_file"])                # 证书丢了
+    xray = services.bin_path("xray")
+    assert services.run([xray, "-test", "-c", str(cfg_path)])[0] is False
+
+    fixed, detail = geodata.guard()
+    assert fixed is True and "自检未通过" in detail
+    assert "trojan" not in cfg_path.read_text()          # 入站被摘掉, 核心先起来
+    assert services.run([xray, "-test", "-c", str(cfg_path)])[0] is True

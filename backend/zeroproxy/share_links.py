@@ -10,6 +10,11 @@
   - clash         : mihomo / Clash.Meta 可直接加载的完整 YAML 配置
   - singbox       : sing-box 可直接加载的 JSON 配置
 
+分流模板 (同一 URL, `?rules=smart|global|direct` 或面板「高级设置」切换):
+   - smart  : 国内直连 + 广告拦截, 其余走代理 (默认)
+   - global : 除局域网外全部走代理, 仅保留广告拦截
+   - direct : 全部直连, 不下载任何 geo 数据 (完全离线可用)
+
 字段级依据 (均为上游一手来源):
   - hysteria2 URI: `app/cmd/client.go` 的 parseURI() — `user:pass@` 会把整串
     "user:pass" 当作 auth 发给服务端, 而 `extras/auth/password.go` 是整串比较,
@@ -31,6 +36,56 @@ from .config import WS_PATH, XHTTP_PATH
 #: 客户端分流数据库镜像 (mihomo geox-url)。GitHub Release 在受限网络下不可达,
 #: 客户端首次导入订阅若拉不到 geoip.metadb 会直接报配置失败, 因此换成可用镜像。
 GEOX_BASE = "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/"
+
+#: sing-box 1.12 起内置 geoip/geosite 字段被彻底移除 (实测报错
+#: "geosite database is deprecated in sing-box 1.8.0 and removed in 1.12.0"),
+#: 分流只能用远程 rule-set, 同样换成可用镜像。
+SRS_BASE = "https://fastly.jsdelivr.net/gh/SagerNet/"
+
+#: sing-box 远程 rule-set 的"下载出口"字段分两代 (均为上游源码 + 真实二进制实测):
+#:   - 1.8 ~ 1.13: 只能写 `route.rule_set[].download_detour`
+#:   - 1.14 起: 新增顶层 `http_clients` + `route.default_http_client`,
+#:     `download_detour` 标记废弃并在 1.16 移除
+#: 关键风险 (实测): 不指定下载出口时, rule-set 会**走默认出站 (节点组)** 下载。
+#: 节点不可达时 sing-box 直接 FATAL 起不来 —— 这就是引导期死锁。
+#: 因此默认格式统一写成 `download_detour: "direct"` (1.13.21 / 1.14.2 实测均可用,
+#: 且在 1.13 上无需任何额外字段), 另有 `?format=singbox-next` 给 1.14+ 客户端
+#: 生成零废弃警告的 http_clients 写法。
+SMART_RULE_SETS = (
+    ("ads", "sing-geosite@rule-set/geosite-category-ads-all.srs"),
+    ("cn", "sing-geosite@rule-set/geosite-cn.srs"),
+    ("cn-ip", "sing-geoip@rule-set/geoip-cn.srs"),
+)
+ADS_RULE_SET = ("ads", "sing-geosite@rule-set/geosite-category-ads-all.srs")
+
+#: 新版写法里默认 HTTP 客户端的标签。留空 detour = 直连下载。
+#: (不能写 detour: "direct": 实测报 "detour to an empty direct outbound makes no sense")
+DEFAULT_HTTP_CLIENT = "bootstrap-direct"
+
+#: 分流模板。smart = 国内直连 + 广告拦截; global = 全部走代理; direct = 全部直连
+TEMPLATES = ("smart", "global", "direct")
+DEFAULT_TEMPLATE = "smart"
+
+#: 策略组名 (Clash 与 sing-box 共用, 保证两种格式语义一致)
+G_SELECT = "🚀 节点选择"
+G_AUTO = "♻️ 自动选择"
+G_FINAL = "🐟 漏网之鱼"
+G_ADS = "🛑 广告拦截"
+G_DIRECT = "🎯 全球直连"
+
+
+def template_of(state: dict, override: str | None = None) -> str:
+    """生效的分流模板: URL 参数 > 面板设置 > 默认值。"""
+    candidate = (override or "").strip().lower()
+    if candidate in TEMPLATES:
+        return candidate
+    saved = str((state.get("routing") or {}).get("template", "")).strip().lower()
+    return saved if saved in TEMPLATES else DEFAULT_TEMPLATE
+
+
+def _dedup(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    return [x for x in items if not (x in seen or seen.add(x))]
 
 #: 各客户端对 XHTTP 传输的支持情况 — 已用真实二进制验证:
 #: mihomo v1.19.31 接受 network: xhttp + xhttp-opts, sing-box 1.14.2 接受
@@ -252,7 +307,7 @@ def _clash_proxy(state: dict, node_id: str) -> dict | None:
     return None
 
 
-def clash_profile(state: dict) -> str:
+def clash_profile(state: dict, template: str | None = None) -> str:
     proxies: list[dict] = []
     skipped: list[str] = []
     for node_id, _ in enabled_links(state):
@@ -262,7 +317,51 @@ def clash_profile(state: dict) -> str:
         else:
             skipped.append(_node_name(node_id))
 
+    tpl = template_of(state, template)
     names = [p["name"] for p in proxies]
+    # 节点全关时也要产出可用的配置: 策略组退化为只含 DIRECT
+    groups: list[dict] = []
+    if names:
+        groups.append(
+            {
+                "name": G_AUTO,
+                "type": "url-test",
+                "url": "http://www.gstatic.com/generate_204",
+                "interval": 300,
+                "proxies": names,
+            }
+        )
+    groups += [
+        {"name": G_SELECT, "type": "select", "proxies": _dedup([G_AUTO, *names, "DIRECT"])},
+        {"name": G_DIRECT, "type": "select", "proxies": ["DIRECT", G_SELECT]},
+        {"name": G_ADS, "type": "select", "proxies": ["REJECT", "DIRECT"]},
+        {
+            "name": G_FINAL,
+            "type": "select",
+            # direct 模板下"漏网之鱼"默认直连, 其余模板默认交给节点选择
+            "proxies": [G_SELECT, "DIRECT"] if tpl != "direct" else ["DIRECT", G_SELECT],
+        },
+    ]
+
+    if tpl == "smart":
+        # 国内 / 私有地址直连, 广告拦截, 其余走"漏网之鱼"
+        rules = [
+            f"GEOSITE,category-ads-all,{G_ADS}",
+            f"GEOSITE,private,{G_DIRECT}",
+            f"GEOSITE,cn,{G_DIRECT}",
+            f"GEOIP,LAN,{G_DIRECT},no-resolve",
+            f"GEOIP,CN,{G_DIRECT}",
+            f"MATCH,{G_FINAL}",
+        ]
+    elif tpl == "global":
+        rules = [
+            f"GEOSITE,category-ads-all,{G_ADS}",
+            f"GEOIP,LAN,{G_DIRECT},no-resolve",
+            f"MATCH,{G_SELECT}",
+        ]
+    else:  # direct: 不依赖任何 geo 数据 (无需下载), 只做广告拦截与手动切换
+        rules = [f"MATCH,{G_FINAL}"]
+
     profile = {
         "mixed-port": 7890,
         "allow-lan": False,
@@ -278,22 +377,19 @@ def clash_profile(state: dict) -> str:
             "asn": GEOX_BASE + "GeoLite2-ASN.mmdb",
         },
         "proxies": proxies,
-        "proxy-groups": [
-            {"name": "🚀 节点选择", "type": "select", "proxies": ["♻️ 自动选择", *names, "DIRECT"]},
-            {
-                "name": "♻️ 自动选择",
-                "type": "url-test",
-                "url": "http://www.gstatic.com/generate_204",
-                "interval": 300,
-                "proxies": names,
-            },
-        ],
-        "rules": ["GEOIP,LAN,DIRECT,no-resolve", "GEOIP,CN,DIRECT", "MATCH,🚀 节点选择"],
+        "proxy-groups": groups,
+        "rules": rules,
     }
     head = [
         "# ZeroProxy 订阅 — Clash / mihomo",
         "# 直接导入 App 或保存为 config.yaml 使用; 订阅内容会随面板配置自动更新",
+        f"# 分流模板: {tpl}"
+        + (" (国内直连 + 广告拦截)" if tpl == "smart" else
+           " (全部走代理)" if tpl == "global" else " (全部直连, 不下载 geo 数据)"),
+        "# 切换模板: 面板「高级设置 → 分流模板」, 或在订阅 URL 后加 ?rules=smart|global|direct",
     ]
+    if tpl != "direct":
+        head.append("# 分流依赖客户端 geo 数据; 已内置 geox-url 镜像, 首次导入会自动下载")
     if skipped:
         head.append(f"# 本客户端不支持的节点已跳过: {', '.join(skipped)} (请用 sing-box / 单节点链接)")
     body = yaml.safe_dump(profile, allow_unicode=True, sort_keys=False, default_flow_style=False)
@@ -403,7 +499,25 @@ def _singbox_outbound(state: dict, node_id: str) -> dict | None:
     return None
 
 
-def singbox_profile(state: dict) -> str:
+def _singbox_rule_set(tag: str, name: str, next_gen: bool = False) -> dict:
+    """一条远程 rule-set 规则。
+
+    next_gen=True 走 1.14+ 的 http_clients 写法 (不写 download_detour);
+    否则写 download_detour=direct, 保证下载不经过节点、也不依赖节点是否可用。
+    """
+    ruleset: dict = {
+        "type": "remote",
+        "tag": tag,
+        "format": "binary",
+        "url": f"{SRS_BASE}{name}",
+    }
+    if not next_gen:
+        ruleset["download_detour"] = "direct"
+    return ruleset
+
+
+def singbox_profile(state: dict, template: str | None = None, next_gen: bool = False) -> str:
+    """sing-box 单文件配置。next_gen=True 面向 sing-box ≥1.14 (零废弃警告)。"""
     outbounds: list[dict] = []
     for node_id, _ in enabled_links(state):
         out = _singbox_outbound(state, node_id)
@@ -411,34 +525,101 @@ def singbox_profile(state: dict) -> str:
             outbounds.append(out)
 
     tags = [o["tag"] for o in outbounds]
+    tpl = template_of(state, template)
     outbounds.append({"type": "direct", "tag": "direct"})
 
-    profile = {
-        "log": {"level": "info", "timestamp": True},
-        "inbounds": [
+    if tags:
+        outbounds.append(
             {
-                "type": "mixed",
-                "tag": "mixed-in",
-                "listen": "127.0.0.1",
-                "listen_port": 2080,
+                "type": "urltest",
+                "tag": G_AUTO,
+                "outbounds": tags,
+                "url": "http://www.gstatic.com/generate_204",
+                "interval": "5m",
             }
-        ],
-        "outbounds": outbounds,
+        )
+    outbounds.append(
+        {
+            "type": "selector",
+            "tag": G_SELECT,
+            "outbounds": _dedup([G_AUTO, *tags, "direct"]),
+            "default": tags[0] if tags else "direct",
+        }
+    )
+    outbounds.append(
+        {
+            "type": "selector",
+            "tag": G_DIRECT,
+            "outbounds": ["direct", G_SELECT],
+            "default": "direct",
+        }
+    )
+    outbounds.append(
+        {
+            "type": "selector",
+            "tag": G_FINAL,
+            "outbounds": [G_SELECT, "direct"] if tpl != "direct" else ["direct", G_SELECT],
+            "default": G_SELECT if tpl != "direct" else "direct",
+        }
+    )
+
+    rule_set: list[dict] = []
+    rules: list[dict] = [
         # sing-box 1.11 起 sniff 等 legacy inbound 字段被移除, 改用路由动作
-        "route": {"rules": [{"action": "sniff"}], "final": tags[0] if tags else "direct"},
-    }
+        {"action": "sniff"},
+        {"ip_is_private": True, "action": "route", "outbound": G_DIRECT},
+    ]
+    if tpl == "smart":
+        rule_set = [_singbox_rule_set(tag, name, next_gen) for tag, name in SMART_RULE_SETS]
+        rules.append({"rule_set": ["ads"], "action": "reject"})
+        rules.append({"rule_set": ["cn", "cn-ip"], "action": "route", "outbound": G_DIRECT})
+        final = G_SELECT
+    elif tpl == "global":
+        rule_set = [_singbox_rule_set(*ADS_RULE_SET, next_gen)]
+        rules.append({"rule_set": ["ads"], "action": "reject"})
+        final = G_SELECT
+    else:  # direct: 不引用任何远程 rule-set, 客户端零下载
+        final = G_FINAL
+
+    route: dict = {"rules": rules, "final": final}
+    if rule_set:
+        route = {"rule_set": rule_set, **route}
+
+    profile: dict = {"log": {"level": "info", "timestamp": True}}
+    if rule_set:
+        # 远程 rule-set 落地缓存: 实测第二次启动零下载 (断网也能直接用上次数据)
+        profile["experimental"] = {"cache_file": {"enabled": True}}
+    if rule_set and next_gen:
+        # 1.14+ 的写法: 显式声明下载用的 HTTP 客户端, 消除废弃警告
+        profile["http_clients"] = [{"tag": DEFAULT_HTTP_CLIENT}]
+        route["default_http_client"] = DEFAULT_HTTP_CLIENT
+    profile["inbounds"] = [
+        {
+            "type": "mixed",
+            "tag": "mixed-in",
+            "listen": "127.0.0.1",
+            "listen_port": 2080,
+        }
+    ]
+    profile["outbounds"] = outbounds
+    profile["route"] = route
     return json.dumps(profile, ensure_ascii=False, indent=2)
 
 
 # ---------------------------------------------------------------- 订阅出口
 
-def subscription_body(state: dict, fmt: str = "base64") -> tuple[str, str]:
+def subscription_body(
+    state: dict, fmt: str = "base64", template: str | None = None
+) -> tuple[str, str]:
     """返回 (响应体, media_type)。"""
     fmt = (fmt or "base64").lower()
     if fmt in ("clash", "mihomo", "yaml", "yml"):
-        return clash_profile(state), "text/yaml; charset=utf-8"
+        return clash_profile(state, template), "text/yaml; charset=utf-8"
+    if fmt in ("singbox-next", "singbox14", "singbox-1.14", "singbox-new"):
+        # 面向 sing-box ≥1.14: 用 http_clients 指定下载出口 (无废弃警告)
+        return singbox_profile(state, template, next_gen=True), "application/json; charset=utf-8"
     if fmt in ("singbox", "sing-box", "singbox-json", "json"):
-        return singbox_profile(state), "application/json; charset=utf-8"
+        return singbox_profile(state, template), "application/json; charset=utf-8"
     return subscription_b64(state), "text/plain; charset=utf-8"
 
 

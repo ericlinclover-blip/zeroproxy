@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import tempfile
 import time
 import urllib.error
@@ -264,3 +265,102 @@ def auto_tick(state: dict, *, validate: bool = False) -> tuple[bool, str]:
     if after == before:
         return False, "数据无变化"
     return True, "数据已更新"
+
+
+# ---------------------------------------------------------------- 启动前自愈
+
+def _xray_test(cfg_path: str) -> tuple[bool | None, str]:
+    """用真实 xray 自检磁盘上的配置。返回 (是否通过, 说明)。
+
+    二进制不可用时返回 (None, ...) —— 这时不做任何自作主张的重写。
+    """
+    from . import services
+
+    binary = services.bin_path("xray")
+    if not binary:
+        return None, "xray 二进制不可用"
+    ok, out = services.run(
+        [binary, "-test", "-c", cfg_path], timeout=60, env={"XRAY_LOCATION_ASSET": geo_dir()}
+    )
+    return ok, (out.strip().splitlines() or [""])[-1][:160]
+
+
+def guard() -> tuple[bool, str]:
+    """启动前自愈: 保证磁盘上的 Xray 配置不会因为缺 geo 数据而起不来。
+
+    为什么需要它: 面板每次重新生成配置时都会检查 `usable()`, 因此**面板路径**
+    是安全的; 但磁盘上已经写好的配置可能在之后失去数据文件 —— 例如磁盘清理、
+    手动删除、恢复备份到新机器 —— 此时 `systemctl restart xray` 或重启机器会
+    让 Xray 直接停止服务 (配置构建阶段就会失败, 不是运行期降级)。
+
+    由 systemd 的 `ExecStartPre` 调用 (xray.service), 每次启动前跑一遍:
+    1. 配置里有 geo 规则但数据文件不在 → 直接重新生成 (usable() 为假时自动
+       不下发 geo 规则);
+    2. 否则用真实 `xray -test` 自检 —— 证书文件丢失等"生成后文件消失"的情况
+       同样会让 Xray 起不来, 自检不过就按当前状态重新生成一次。
+
+    无论哪种路径, 都保证核心能起来 (先可用, 再追求分流完整)。
+    """
+    from . import xray_config
+    from .config import load_state
+
+    cfg_path = paths()["xray_config"]
+    if not os.path.exists(cfg_path):
+        return False, "无配置文件, 跳过"
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as exc:
+        return False, f"读取配置失败: {exc}"
+
+    used_geo = "geoip:" in text or "geosite:" in text
+    reasons: list[str] = []
+    if used_geo and not present():
+        reasons.append("geo 数据文件缺失")
+    else:
+        ok, detail = _xray_test(cfg_path)
+        if ok is True:
+            return False, "配置自检通过, 无需修复"
+        if ok is None:
+            return False, f"跳过自检 ({detail})"
+        reasons.append(f"配置自检未通过 ({detail})")
+
+    # 还没走完初始化时磁盘上只有 install.sh 的占位配置, 不在这里擅自生成
+    if not load_state().get("configured"):
+        return False, "面板尚未初始化, 跳过修复"
+
+    try:
+        xray_config.write_xray_config(load_state())
+    except Exception as exc:  # 自愈失败不能让 systemd 卡住 (ExecStartPre 前缀 '-')
+        return False, f"重新生成配置失败: {exc}"
+
+    with open(cfg_path, "r", encoding="utf-8") as fh:
+        after = fh.read()
+    stripped = "geoip:" not in after and "geosite:" not in after
+    again, detail = _xray_test(cfg_path)
+    verdict = {True: "重新自检通过", False: f"重新自检仍未通过 ({detail})", None: "已跳过重新自检"}[again]
+    return True, (
+        f"{'; '.join(reasons)} → 已按当前状态重新生成配置"
+        f"{' (已移除 geo 规则)' if stripped else ''}; {verdict}"
+    )
+
+
+def _main(argv: list[str]) -> int:
+    cmd = argv[1] if len(argv) > 1 else "guard"
+    if cmd == "guard":
+        _fixed, detail = guard()
+        print(f"[zeroproxy-geodata] {detail}")
+        return 0
+    if cmd == "update":
+        from .config import load_state
+
+        state = load_state()
+        ok, detail, _status = update(state)
+        print(f"[zeroproxy-geodata] {'OK' if ok else 'FAIL'}: {detail}")
+        return 0 if ok else 1
+    print("用法: python -m zeroproxy.geodata [guard|update]", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main(sys.argv))

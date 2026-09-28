@@ -300,6 +300,15 @@ code.inline { background: var(--border); padding: 2px 7px; border-radius: 6px; f
       </div>
       <div class="divider"></div>
       <div class="row" style="justify-content:space-between">
+        <span style="font-weight:600;font-size:13.5px">分流模板</span>
+        <span class="muted" style="font-size:12.5px" id="route-note">订阅即刻生效, 不重启服务</span>
+      </div>
+      <div class="row" style="margin-top:10px;gap:12px">
+        <select id="adv-template" style="max-width:260px"></select>
+        <span class="muted" style="font-size:12px" id="adv-template-desc"></span>
+      </div>
+      <div class="divider"></div>
+      <div class="row" style="justify-content:space-between">
         <span style="font-weight:600;font-size:13.5px">GeoIP 分流防护</span>
         <span class="muted" style="font-size:12.5px" id="geo-status">—</span>
       </div>
@@ -688,7 +697,40 @@ function renderAdvanced(d) {
     )
     .join("");
   $("#btn-save-adv").onclick = saveAdvanced;
+  renderRouting(d);
   renderGeo(d);
+}
+
+function renderRouting(d) {
+  const r = d.routing || {};
+  const templates = r.templates || [];
+  const sel = $("#adv-template");
+  if (!sel) return;
+  sel.innerHTML = templates
+    .map((t) => `<option value="${escAttr(t.id)}">${esc(t.name)}</option>`)
+    .join("");
+  sel.value = r.template || "smart";
+  const showDesc = () => {
+    const t = templates.find((x) => x.id === sel.value);
+    $("#adv-template-desc").textContent = t ? t.desc : "";
+  };
+  showDesc();
+  const previous = sel.value;
+  sel.onchange = async () => {
+    try {
+      dash = await api("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ template: sel.value }),
+      });
+      renderDash(true);
+      toast("分流模板已切换, 订阅即刻生效");
+    } catch (e) {
+      sel.value = previous;
+      showDesc();
+      toast("切换失败: " + e.message);
+    }
+  };
 }
 
 function renderGeo(d) {
