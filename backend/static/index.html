@@ -2513,9 +2513,25 @@ async function doUpdate() {
   btn.disabled = true;
   btn.textContent = "启动中…";
   try {
-    const res = await api("/api/update", { method: "POST" });
+    await api("/api/update", { method: "POST" });
     toast("升级已开始, 正在执行…");
-    updateInfo = res.status || updateInfo;
+    // 后端只回执"已开始"(刻意不查远端版本, 那会让按钮卡住半分钟); 这里先把状态标成"已排队",
+    // 免得这 2.5 秒的空窗里按钮还能再点一次 (再点会撞上 409)。真实进度由轮询补上。
+    updateInfo = {
+      ...updateInfo,
+      running: true,
+      last: {
+        ...((updateInfo || {}).last || {}),
+        state: "queued",
+        from: (updateInfo || {}).current,
+        to: (updateInfo || {}).latest,
+        trigger: "panel",
+        started_at: Math.floor(Date.now() / 1000),
+        finished_at: 0,
+        steps: [],
+        plan: [],
+      },
+    };
     startUpdatePolling();
     renderUpdate();
   } catch (e) {

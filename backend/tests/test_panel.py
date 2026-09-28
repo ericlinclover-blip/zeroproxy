@@ -1231,6 +1231,34 @@ def test_update_start_writes_queued_status(client, configured, home, monkeypatch
     assert status["from"] == update.current_version()
 
 
+def test_update_start_reply_is_local_only(client, configured, home, monkeypatch):
+    """回归: 触发升级的回执不许出网查远端版本。
+
+    之前 `/api/update` 的 POST 回执里带了 `update.status()`, 于是点一下「一键更新」要等
+    4 个镜像依次超时 (国内直连最坏 ~32s) 才拿到响应, 甚至被面板重启掐断 —— 界面上表现为
+    "按钮卡住半分钟, 然后弹一句无法开始升级", 其实升级早在跑了 (v2.6.2 真机复现)。
+    """
+    from zeroproxy import services, update
+
+    monkeypatch.setattr(services, "is_prod", lambda: True)
+    (home / "upgrade.sh").write_text("#!/usr/bin/env bash\nexit 0\n")
+    monkeypatch.setattr(update, "_CACHE", {"at": 0.0, "body": None})   # 缓存故意是冷的
+
+    class _Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(update.subprocess, "run", lambda cmd, **kw: _Proc())
+
+    def boom(timeout=8):
+        raise AssertionError("触发升级不该出网查远端版本")
+
+    monkeypatch.setattr(update, "remote_version", boom)
+    body = client.post("/api/update").json()
+    assert body["ok"] is True
+
+
 def test_update_runs_a_staged_copy(client, configured, home, monkeypatch):
     """回归: 面板必须跑 upgrade.sh 的**临时副本**, 不能就地执行 ZP_HOME 里那一份。
 

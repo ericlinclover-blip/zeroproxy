@@ -1334,7 +1334,13 @@ def update_status(request: Request, force: int = 0):
 
 @router.post("/api/update")
 def update_start(request: Request):
-    """一键更新: 后台拉起 upgrade.sh, 面板会随之重启。"""
+    """一键更新: 后台拉起 upgrade.sh, 面板会随之重启。
+
+    这里**只在本地取值**就回执, 刻意不带 `update.status()` —— 那会顺手做一次远端版本检查
+    (国内直连 GitHub 要等 4 个镜像依次超时, 最坏 ~32s), 而面板大约在 34s 后重启:
+    结果就是"点了按钮, 界面卡住半分钟, 然后弹一句无法开始升级", 其实升级早在跑了。
+    真正的进度由前端 2.5s 一次的 `GET /api/update` 轮询补上。
+    """
     with config.locked():
         state = load_state()
         if not _require_auth(state, request):
@@ -1344,7 +1350,7 @@ def update_start(request: Request):
         save_state(state)
     if not ok:
         return _err(detail, 409)
-    return {"ok": True, "detail": detail, "status": update.status()}
+    return {"ok": True, "detail": detail}
 
 
 @router.get("/api/logs/{service}")
