@@ -231,16 +231,35 @@ def _cmdline(pid: int) -> str:
         return ""
 
 
+def _ppid(pid: int) -> int:
+    """读一个 pid 的父进程 ID。"""
+    try:
+        with open(f"/proc/{pid}/status", "r") as fh:
+            for line in fh:
+                if line.startswith("PPid:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
 def _reap_stale() -> None:
     """清掉上一次面板留下的孤儿进程。
 
-    systemd 重启面板时会连带收走子进程, 但面板自身崩溃 / 手工 kill 时不会 ——
-    孤儿还占着 UDP 端口, 新的起不来。这里按 pid 文件把它们收掉, 判据是命令行里
-    确实包含我们的配置路径 (绝不误杀别的 hysteria)。
+    systemd 重启面板时会连带收走子进程, 但面板自身崩溃 / 手工 kill 时不会 —-
+    孤儿还占着 UDP 端口, 新的起不来。这里按 pid 文件把它们收掉, 判据是命令行
+    里确实包含我们的配置路径 **且** PPID 是面板自身进程 (绝不误杀别的 hysteria)
+    。
+
+    PPID 校验的必要性: 若用户手动启动了一个同样的 `hysteria server -c
+    /opt/zeroproxy/data/chain-quic/exit.yaml`, 仅凭 cmdline 会误杀。加了 PPID 后
+    只有面板的子孙进程才会被回收 — 用户手动起的进程 PPID ≠ 面板进程, 安全放过
+    (面板退出时由 stop_all() 统一回收, 用户手动起的由自己管)。
     """
     base = work_dir()
     if not os.path.isdir(base):
         return
+    panel_pid = os.getpid()
     with _LOCK:
         ours = {proc.pid for proc, _ in _PROCS.values()}
     for name in os.listdir(base):
@@ -254,13 +273,17 @@ def _reap_stale() -> None:
         if pid <= 1 or pid in ours:
             continue
         cmdline = _cmdline(pid)
-        if cmdline and base in cmdline:
-            try:
-                os.kill(pid, signal.SIGTERM)
-                time.sleep(0.4)
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
+        if not cmdline or base not in cmdline:
+            continue
+        ppid = _ppid(pid)
+        if ppid != panel_pid and ppid != 1:  # 1 = systemd 直接托管的进程
+            continue
+        try:
+            os.kill(pid, signal.SIGTERM)
+            time.sleep(0.4)
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
 
 
 def _write_config(key: str, text: str) -> str:

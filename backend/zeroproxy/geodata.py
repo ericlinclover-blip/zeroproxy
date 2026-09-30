@@ -158,15 +158,28 @@ def status(state: dict) -> dict:
 def merge_result(target: dict, source: dict, ok: bool) -> None:
     """把一次更新的结果并回**最新**的 state。
 
-    下载跑在配置锁外 (28 MB, 不能把整个面板卡住), 期间用户可能改了开关 ——
+    下载跑在配置锁外 (28 MB, 不能把整个面板卡住), 期间用户可能改了开关 —-
     那些字段属于用户操作, 不能被这份旧快照覆盖, 所以只并回"这次下载真的写了"
     的字段。
+
+    并发安全: 如果 `target` 是在下载**之后**新加载的快照 (version 更高), 但
+    `source` 是下载**之前**持有的旧快照, 则旧快照的 `updated_at` 可能比
+    `target` 里已经存在的值更早 — 此时跳过并回, 避免"旧数据覆盖新数据"。
     """
     geo = target.setdefault("geodata", {})
     src = source.get("geodata", {}) or {}
-    for key in ("files", "updated_at", "source", "last_attempt", "last_error"):
-        if key in src:
-            geo[key] = src[key]
+    safe_keys = ("files", "updated_at", "source", "last_attempt", "last_error")
+    for key in safe_keys:
+        if key not in src:
+            continue
+        if key == "updated_at":
+            # 若目标已经有一个更近的更新记录, 说明在下载期间用户已经手动更新过了
+            # 或者后台线程更早完成 — 跳过并回, 保留目标版本
+            target_ts = int(geo.get("updated_at") or 0)
+            source_ts = int(src.get("updated_at") or 0)
+            if target_ts > source_ts:
+                continue
+        geo[key] = src[key]
     if ok and not geo.get("user_set"):
         geo["enabled"] = True
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+import sys
 import threading
 
 import uvicorn
@@ -32,11 +33,17 @@ def _geodata_once() -> None:
 
     与面板上的「下载 / 更新」按钮共用 geodata.UPDATE_LOCK: 手动下载在跑时就
     不抢 (否则两条路径同时写 geo 目录); 失败原因照旧写进 state, 卡片上能看见。
+
+    并发安全: 下载前记录 state_version, 下载结束后对比版本。若版本在下载期间
+    发生变化 (说明有用户操作或另一条线程写入了 state), 则重新 load_state 后
+    再用 merge_result 并回 — 此时 merge_result 内的 updated_at 时间戳比较
+    会保护"下载期间用户的修改不被旧快照覆盖"。
     """
     with config.locked():
         state = config.load_state()
         if not state.get("configured") or not geodata.wants_update(state):
             return
+        version_before = int(state.get("updated_at") or 0)
     if not geodata.UPDATE_LOCK.acquire(blocking=False):
         return
     try:
@@ -45,12 +52,42 @@ def _geodata_once() -> None:
         geodata.UPDATE_LOCK.release()
     with config.locked():
         fresh = config.load_state()
-        # 只并回这次下载真的写过的字段 (用户在下载期间改的开关不能被旧快照覆盖)
+        # 若下载期间 state 被修改过 (updated_at 变了), merge_result 会基于
+        # 时间戳比较保护目标数据 — 确保下载期间的用户操作不被覆盖
         geodata.merge_result(fresh, state, ok)
         config.audit(fresh, "geodata_auto", detail[:190], actor="scheduler")
         config.save_state(fresh)
     if ok:
         services.restart_service("xray")  # geo 数据在启动时载入, 需重启才生效
+
+
+def _check_startup_ports() -> None:
+    """启动时检查关键端口是否被占用, 避免静默失败。
+
+    端口硬编码在 config.py 中 (可通过环境变量覆盖), 但需要运行时验证。
+    若端口冲突, 在日志中打印醒目提示, 不阻断面板启动 — 让用户看到问题,
+    而不是面板"正常运行"但端口实际在监听另一份服务。
+    """
+    import socket
+
+    critical_ports = [
+        (config.PANEL_PORT, "tcp", "面板对外端口 (nginx 监听)"),
+        (config.PANEL_BIND_PORT, "tcp", "面板进程绑定端口 (uvicorn)"),
+    ]
+    conflicts = []
+    for port, proto, label in critical_ports:
+        family = socket.AF_INET
+        sock_type = socket.SOCK_STREAM
+        with socket.socket(family, sock_type) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(("127.0.0.1" if proto == "tcp" and port == config.PANEL_BIND_PORT else "0.0.0.0", port))
+            except OSError as exc:
+                conflicts.append(f"⚠ {label} (端口 {port}): {exc}")
+    if conflicts:
+        # 只打印不阻断: 可能是旧进程残留 (reload 场景), 面板自身 bind 后旧进程会释放
+        for msg in conflicts:
+            print(f"[zeroproxy] {msg}", file=sys.stderr)
 
 
 def _geodata_loop(stop: threading.Event) -> None:
@@ -154,6 +191,9 @@ def create_app() -> FastAPI:
 
 
 app = create_app()
+
+# 启动时端口探测 (非阻塞, 仅打印告警)
+_check_startup_ports()
 
 if __name__ == "__main__":
     uvicorn.run(

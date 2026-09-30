@@ -2147,6 +2147,31 @@ def geodata_update(request: Request):
     return body
 
 
+@router.post("/api/geodata/force-check")
+def geodata_force_check(request: Request):
+    """强制刷新 Geo 数据版本检查 (绕过 CDN 缓存 TTL)。
+
+    国内 jsdelivr CDN 对 @release 分支缓存极长, 面板 `status()` 的 600s TTL
+    可能拉到的还是旧版本号 —— 用户会看到"已是最新"但实际数据已过期。这个接口
+    直接调用 `remote_version()` 绕过缓存, 返回最新版号和来源, 供面板"检查更新"
+    按钮使用。
+
+    同时也会更新 `update` 模块的缓存, 所以下一次 `status()` 调用不会再出网。
+    """
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+
+    # 直接刷新缓存
+    update_status = update.status(force=True)
+    geo_status = geodata.status(state)
+    return {
+        **update_status,
+        "geo": geo_status,
+    }
+
+
 # ---------------------------------------------------------------- 订阅 / 二维码
 
 @router.get("/sub/{token}")

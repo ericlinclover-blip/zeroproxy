@@ -172,10 +172,16 @@ def is_running() -> bool:
 
 
 def status(force: bool = False, timeout: int = 8) -> dict:
-    """给面板用的只读快照: 版本 + 上次升级结果 + 日志尾部。"""
+    """给面板用的只读快照: 版本 + 上次升级结果 + 日志尾部。
+
+    `force=True` 时绕过缓存立即刷新 (用户手动点击"检查更新"时使用)。
+    返回的 `cached` 字段标注是否命中缓存, 方便面板显示"上次检查: X 分钟前"
+    和"已过期, 正在刷新"等不同状态。
+    """
     now = time.time()
     cached = _CACHE.get("body")
-    if force or not cached or now - float(_CACHE.get("at") or 0) > CHECK_TTL:
+    hit_cache = bool(cached) and now - float(_CACHE.get("at") or 0) <= CHECK_TTL
+    if force or not hit_cache:
         ok, latest, source = remote_version(timeout=timeout)
         cached = {
             "ok": ok,
@@ -203,6 +209,7 @@ def status(force: bool = False, timeout: int = 8) -> dict:
         "upgrade_script": script,
         "can_update": bool(script) and services.is_prod(),
         "prod": services.is_prod(),
+        "cache_hit": hit_cache,  # 命中缓存 = 刚检查过, 前端可显示"上次检查时间"
         "running": is_running(),
         "last": _read_status(),
         "log_tail": _log_tail(),
