@@ -203,6 +203,8 @@ def server_info() -> dict:
     snapshot = public_ip()
     info["public_ip"] = snapshot["ip"]
     info["public_ip_at"] = snapshot["at"]
+    # 面板目录: 「面板设置」卡片要用它写出"z 敲不动时用哪一条命令"的兜底路径
+    info["panel_home"] = paths()["home"]
     if sys.platform.startswith("linux") and os.path.exists("/etc/os-release"):
         try:
             for line in open("/etc/os-release", encoding="utf-8"):

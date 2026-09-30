@@ -33,6 +33,7 @@ export function renderPanel(d) {
 
 /* ---------------- 管理员账号 ---------------- */
 function accountCard(d) {
+  const home = ((d.system || {}).server || {}).panel_home || "/opt/zeroproxy";
   return `<div class="card">
     <div class="row-between">
       <span class="badge vless">管理员账号</span>
@@ -51,7 +52,8 @@ function accountCard(d) {
     <div class="note">改密码会把<b>其它设备</b>踢下线 (当前这台保持登录)。节点凭据 (UUID / Trojan 与 Hysteria 口令)
       完全不受影响 —— 客户端不用重新导入订阅。</div>
     <div class="note">忘了密码也不怕: SSH 到服务器输入 <b>z</b> 就能改账号密码 / 在线更新
-      (终端快捷管理, 面板登不进去时的兜底入口)。</div>
+      (终端快捷管理, 面板登不进去时的兜底入口)。<br>
+      <span class="muted">敲 z 提示 command not found 时, 用 <b>${esc(home)}/z</b> —— 同一支命令。</span></div>
     <div class="row mt-3">
       <button class="btn small" id="btn-acct-save">保存账号</button>
       <span class="muted fs-sm" id="acct-hint">用户名 2-32 位字母/数字/_-.</span>

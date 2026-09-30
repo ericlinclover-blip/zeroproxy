@@ -2,7 +2,7 @@
 
 ## 1. Project Overview
 
-**ZeroProxy** (v2.6.26) is a self-hosted proxy management panel that orchestrates Xray, Hysteria 2, and Nginx on a single server. It provides a web dashboard — a zero-framework, zero-build SPA (`index.html` + ES modules under `static/app/`, plain JS, no CDN) — that manages proxy nodes, subscriptions, chained proxies, GeoIP-based routing, and service lifecycle.
+**ZeroProxy** (v2.6.27) is a self-hosted proxy management panel that orchestrates Xray, Hysteria 2, and Nginx on a single server. It provides a web dashboard — a zero-framework, zero-build SPA (`index.html` + ES modules under `static/app/`, plain JS, no CDN) — that manages proxy nodes, subscriptions, chained proxies, GeoIP-based routing, and service lifecycle.
 
 - **Root**: `/Users/eric/Desktop/sbpn/zeroproxy/`
 - **Backend**: `/Users/eric/Desktop/sbpn/zeroproxy/backend/zeroproxy/` (Python, FastAPI)
@@ -490,6 +490,7 @@ sockopt = {
 12. **Domain changes are transactional**: issue the certificate first (outside the config lock — certbot can take minutes), then commit, verify the new domain from the server's own side, and roll the domain / certificate / configs back if anything fails. A panel must never become unreachable because a domain change went wrong. The jump itself uses a one-time hand-off token so the browser lands logged in; in dev (no nginx / no public entry) the deploy still saves but the browser is *not* redirected
 13. **Settings never touch node credentials**: changing the panel username / password only changes who can log in. Rotating the VLESS UUID or the Trojan / Hysteria passwords would silently break every client that already imported the subscription
 14. **The terminal (`z`) is the last-resort path, and it reuses the panel's code**: a forgotten panel password would otherwise lock the operator out of their own server's UI, so `install.sh` / `upgrade.sh` drop a `/usr/local/bin/z` wrapper that runs `python -m zeroproxy.cli`. It calls the *same* `account.apply_credentials` and the *same* `upgrade.sh` as the panel — never a second implementation — and it deliberately does not ask for the old password (root already owns `state.json`), instead revoking every existing session. A pre-existing foreign `z` (zoxide and friends) is never overwritten
+15. **Install the shortcut where it can actually be typed**: `/usr/local/bin` is not guaranteed to be in root's `PATH` (minimal images, custom PATHs), and a command that installs but cannot be typed reads to the user as "it did not install". The installer picks `ZP_BIN_DIR` → `/usr/local/bin` → `/usr/bin` → the first writable `PATH` directory (standard dirs only count when they are *in* `PATH`), always leaves a copy at `$ZP_HOME/z`, and warns explicitly when the chosen directory is not on `PATH`
 
 ## 13. Cross-Module Dependencies
 

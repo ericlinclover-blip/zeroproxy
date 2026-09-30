@@ -238,34 +238,75 @@ def _is_ours(path: str) -> bool:
         return False
 
 
+def _writable_dir(path: str, *, create: bool = False) -> bool:
+    """这个目录能不能写。`create=True` 时不存在就建 (标准 bin 目录在极简系统上可能没有);
+    从 PATH 里挑候选时不建 —— 不该因为探测就凭空造出目录来。"""
+    if not os.path.isdir(path):
+        if not create:
+            return False
+        try:
+            os.makedirs(path, exist_ok=True)
+        except OSError:
+            return False
+    return os.access(path, os.W_OK)
+
+
+def _pick_bin_dir(explicit: str | None) -> str:
+    """挑一个**既写得进去、又已经在 PATH 里**的目录放 z。
+
+    只认 /usr/local/bin 是不够的: 真机上见过 root 的 PATH 里没有它 (极简镜像 /
+    自定义 PATH), 那样装好了敲 z 依然是 command not found —— 用户看到的是"没装上"。
+    所以顺序是: 明确指定的 → 标准目录里**在 PATH 中**的那个 → PATH 里第一个可写的。
+    """
+    if explicit:
+        return explicit                       # 用户 / 演练明确指定, 不再自作主张
+    path_dirs = [p for p in (os.environ.get("PATH") or "").split(os.pathsep) if p]
+    for candidate in ("/usr/local/bin", "/usr/bin"):
+        if candidate in path_dirs and _writable_dir(candidate, create=True):
+            return candidate
+    for candidate in path_dirs:
+        if candidate and _writable_dir(candidate):
+            return candidate
+    return "/usr/local/bin"                   # 都不行: 交回默认值, 让下面的警告说清
+
+
 def install_shortcut(bin_dir: str | None = None) -> int:
     """装 `z` 命令 (顺带装一个好记的长名字 `zeroproxy`)。
 
     如果 `z` 已经被别人的程序占用 (比如 zoxide), **不覆盖** —— 装长名字并说清楚,
     免得把用户环境里别的东西踩掉。
 
-    安装目录默认 `/usr/local/bin`, 可用 `ZP_BIN_DIR` 指定 (少数发行版用 `/usr/bin`;
-    升级演练也用它把命令装进沙箱, 免得动到真机的 /usr/local/bin)。
+    安装目录: `ZP_BIN_DIR` → `/usr/local/bin` → `/usr/bin` → PATH 里第一个可写的,
+    **同时**在面板目录下放一份 `$ZP_HOME/z` —— 前面几个都不在 PATH 里时, 那一份
+    一定敲得动 (打印出来告诉用户)。
     """
-    bin_dir = bin_dir or os.environ.get("ZP_BIN_DIR") or "/usr/local/bin"
     home = paths()["home"]
-    target = os.path.join(bin_dir, "z")
-    if os.path.exists(target) and not _is_ours(target):
-        _out(f"! {target} 已存在且不是本程序装的, 保持不变")
+    bin_dir = _pick_bin_dir(bin_dir or os.environ.get("ZP_BIN_DIR"))
+    body = WRAPPER.replace("__ZP_HOME__", home)
+    # 面板目录里那一份一定会被装上: 它是"PATH 里没有 /usr/local/bin"时的兜底
+    targets = [os.path.join(home, "z"), os.path.join(bin_dir, "zeroproxy")]
+    short = os.path.join(bin_dir, "z")
+    if os.path.exists(short) and not _is_ours(short):
+        _out(f"! {short} 已存在且不是本程序装的, 保持不变")
         _out("  请改用 `zeroproxy` 命令 (本次也会一并装好)")
-        target = ""
+    else:
+        targets.insert(1, short)
     try:
         os.makedirs(bin_dir, exist_ok=True)
-        body = WRAPPER.replace("__ZP_HOME__", home)
-        for path in filter(None, (target, os.path.join(bin_dir, "zeroproxy"))):
+        for path in targets:
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(body)
             os.chmod(path, 0o755)
             _out(f"✓ 终端快捷命令: {path}")
     except OSError as exc:
         _out(f"× 安装快捷命令失败: {exc}")
-        _out(f"  需要 root 权限 (sudo), 或手动把命令指向 {home}/venv/bin/python -m zeroproxy.cli")
+        _out(f"  需要 root 权限 (sudo); 也可以直接用 {home}/venv/bin/python -m zeroproxy.cli")
         return 1
+    # 装好了但要敲得动才算数: PATH 里没有这个目录时把话说在前头, 别让用户敲完
+    # z 看到 command not found 再来猜
+    if bin_dir not in (os.environ.get("PATH") or "").split(os.pathsep):
+        _out(f"! {bin_dir} 不在 PATH 里 —— 敲 z 可能报 command not found")
+        _out(f"  两个现成的用法: {home}/z  或  export PATH=\"{bin_dir}:$PATH\"")
     return 0
 
 

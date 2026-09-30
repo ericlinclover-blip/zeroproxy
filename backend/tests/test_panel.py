@@ -1557,8 +1557,40 @@ def test_z_is_not_hijacked_when_taken_by_someone_else(home, tmp_path, capsys):
     assert cli.install_shortcut(str(bin_dir)) == 0
     assert (bin_dir / "z").read_text(encoding="utf-8") == "#!/bin/sh\n# zoxide\n"
     assert "zeroproxy" in (bin_dir / "zeroproxy").read_text(encoding="utf-8")
+    # 面板目录里那份兜底一定会装上: PATH 里没有 /usr/local/bin 时靠它
+    assert (home / "z").exists() and os.access(home / "z", os.X_OK)
     out = capsys.readouterr().out
     assert "已存在且不是本程序装的" in out and "zeroproxy" in out
+
+
+def test_shortcut_warns_when_its_directory_is_not_in_path(home, tmp_path, capsys):
+    """装到 PATH 之外的目录时要当场说清 —— 否则用户敲 z 只会看到 command not found。"""
+    from zeroproxy import cli
+
+    bin_dir = tmp_path / "somewhere-not-in-path"
+    assert cli.install_shortcut(str(bin_dir)) == 0
+    out = capsys.readouterr().out
+    assert "不在 PATH 里" in out and str(home / "z") in out
+
+
+def test_shortcut_prefers_a_standard_dir_that_is_in_path(home, monkeypatch, tmp_path):
+    """标准目录优先, 但必须是 PATH 里的那个 (否则装了也敲不动)。"""
+    from zeroproxy import cli
+
+    custom = f"{tmp_path}/custom-bin"
+    monkeypatch.setenv("PATH", f"/usr/local/bin:/usr/bin:{custom}")
+    # 可写性单独控制, 免得断言依赖"这台机器上 /usr/bin 能不能写"这种环境事实
+    monkeypatch.setattr(cli, "_writable_dir", lambda path, create=False: path == "/usr/local/bin")
+    assert cli._pick_bin_dir(None) == "/usr/local/bin"
+    monkeypatch.setattr(cli, "_writable_dir", lambda path, create=False: path == "/usr/bin")
+    assert cli._pick_bin_dir(None) == "/usr/bin"            # 前者不可写就退到下一个
+    monkeypatch.setattr(cli, "_writable_dir", lambda path, create=False: path == custom)
+    assert cli._pick_bin_dir(None) == custom                # 标准目录都不可写 → PATH 里第一个可写的
+    monkeypatch.setattr(cli, "_writable_dir", lambda path, create=False: True)
+    assert cli._pick_bin_dir("/tmp/explicit") == "/tmp/explicit"   # 明确指定就用它
+    monkeypatch.setenv("PATH", "/nowhere")
+    monkeypatch.setattr(cli, "_writable_dir", lambda path, create=False: False)
+    assert cli._pick_bin_dir(None) == "/usr/local/bin"      # 一个可写的都没有 → 交回默认值
 
 
 def test_installers_wire_up_the_terminal_shortcut():

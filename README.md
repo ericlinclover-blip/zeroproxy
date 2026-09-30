@@ -1103,6 +1103,25 @@ $ z
 路径都认得它);
 `scripts/browser_check.cjs` 151 → **152 项** (账号卡片上写明这条兜底路)。
 
+### 8.19 v2.6.27: `z` 在真机上 command not found —— 把安装路径挑对, 并留一条一定敲得动的
+
+2.6.26 上线后用户在服务器上敲 `z` 得到 `command not found`。这一版把"装不上/敲不动"
+的所有已知成因一次堵掉:
+
+* **不再只认 `/usr/local/bin`**。真机上见过 root 的 `PATH` 里没有它 (极简镜像 / 自定义
+  PATH), 那样文件装好了、敲 `z` 依然是 command not found —— 用户看到的就是"没装上"。
+  现在按 **`ZP_BIN_DIR` → `/usr/local/bin` → `/usr/bin` → PATH 里第一个可写的** 依次挑,
+  而且标准目录必须是**已经在 PATH 里的那个**才会被选中。
+* **面板目录里永远放一份 `$ZP_HOME/z`**: 上面几条都没命中时, 这一份一定敲得动。
+* **装完自己检查一遍 PATH**, 不在就当场说清 (而不是等用户敲完来猜):
+  `! /usr/local/bin 不在 PATH 里 —— 敲 z 可能报 command not found`, 并给出两个现成用法。
+* 「面板设置 → 管理员账号」卡片上的提示也带上了兜底路径: 敲 `z` 提示 command not found
+  时用 `<面板目录>/z` (同一支命令, 路径由仪表盘下发)。
+
+**回归**: `pytest` 200 → **202 项** (新增: 装到 PATH 之外的目录时必须给出提示与兜底路径 /
+选目录的优先级 —— 标准目录优先但必须在 PATH 里、都不行时退到 PATH 里第一个可写的);
+`upgrade_sim` 全部通过 (演练里那条"升级过程中把 z 装好"的断言一并覆盖)。
+
 ---
 
 ## 9. API
@@ -1214,7 +1233,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 
 在 macOS (Apple Silicon, Python 3.14) 上实测通过:
 
-- `python -m pytest tests -q` → **200 passed, 6 skipped** (带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时再补上跳过的那几项, 约 45 秒);
+- `python -m pytest tests -q` → **202 passed, 6 skipped** (带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时再补上跳过的那几项, 约 45 秒);
   含 `/api/update` 鉴权与版本比较、`apply` 的"写不进 /etc/nginx 即失败"语义、CLI 退出码、以及
   `install.sh` 重跑不覆盖已初始化配置 / `upgrade.sh` 随包发布 / 自签证书可补签 Let's Encrypt /
   `systemctl` 参数顺序的回归断言 / Reality 密钥必须是成对的 X25519 (Ed25519 必须判无效) /
