@@ -383,6 +383,20 @@ async function main() {
       `${backupBody.format} v${backupBody.backup_version} · ${backupBody.checksum.slice(0, 12)}`);
     check("恢复入口存在", (await page.locator("#btn-restore").count()) === 1
       && (await page.locator("#restore-file").count()) === 1);
+    // 恢复是覆盖操作: 选完文件要先弹自定义确认框 (原来是浏览器原生 confirm, 长得像系统
+    // 警告、讲不清"哪些东西会被替换")。这里不真的恢复, 只验证这一步与取消路径。
+    const notABackup = path.join(os.tmpdir(), "zp-not-a-backup.json");
+    fs.writeFileSync(notABackup, "{}");
+    await page.setInputFiles("#restore-file", notABackup);
+    await page.waitForSelector("#confirm-mask:not(.hidden)", { timeout: 10000 });
+    const restoreTitle = (await page.locator("#confirm-title").innerText()).trim();
+    check("从备份恢复先弹自定义确认框 (不再是浏览器原生 confirm)",
+      /覆盖当前配置/.test(restoreTitle), restoreTitle);
+    check("确认框写清会被替换的东西与订阅会变",
+      /密钥/.test(await page.locator("#confirm-body").innerText())
+      && /重新导入订阅/.test(await page.locator("#confirm-body").innerText()), "");
+    await page.click("#confirm-cancel");
+    check("取消后弹窗关闭", (await page.locator("#confirm-mask.hidden").count()) === 1, "");
 
     console.log("\n[3d] 程序更新");
     check("程序更新卡片存在", (await page.locator("#update-card").count()) === 1);

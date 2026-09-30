@@ -9,6 +9,7 @@ import { clearDraft } from "../lib/drafts.js";
 import { api, markDisconnected, syncAfterDrop } from "../lib/api.js";
 import { S, rateHist, redrawDash, reloadDash } from "../lib/state.js";
 import { awaitJob, settleApply, applyAction } from "../lib/jobs.js";
+import { openConfirm } from "../lib/dialog.js";
 
 /* ---------------- 流量可视化 ----------------
  * 三块:
@@ -411,29 +412,38 @@ export function renderSystem(d) {
   const fileInput = $("#restore-file");
   if (restoreBtn && fileInput) {
     restoreBtn.onclick = () => fileInput.click();
-    fileInput.onchange = async () => {
+    fileInput.onchange = () => {
       const file = fileInput.files && fileInput.files[0];
+      fileInput.value = "";        // 立刻清掉: 同一个文件再选一次也要能再次触发 change
       if (!file) return;
-      if (!confirm(`用「${file.name}」覆盖当前配置?\n\n当前节点开关、端口、密钥与管理员口令都会被备份内容替换。`)) {
-        fileInput.value = "";
-        return;
-      }
-      restoreBtn.disabled = true;
-      restoreBtn.textContent = "恢复中…";
-      try {
-        S.dash = await api("/api/restore", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: await file.text(),
-        });
-        redrawDash(true);
-        toast("备份已恢复, 配置已重新生成");
-      } catch (e) {
-        toast("恢复失败: " + e.message);
-      }
-      restoreBtn.disabled = false;
-      restoreBtn.textContent = "从备份恢复";
-      fileInput.value = "";
+      // 与升级确认、链式开关一致: 走自定义弹窗而不是浏览器原生 confirm ——
+      // 原生弹窗长得像系统警告、有几行纯文本的容量, 也没法把"哪些东西会被替换"排版讲清。
+      // 文件名来自用户的磁盘, 拼进 innerHTML 前必须转义。
+      openConfirm({
+        title: "用备份覆盖当前配置?",
+        okLabel: "覆盖并恢复",
+        html: `<div class="qr-sub">将用 <b>${esc(file.name)}</b> 覆盖当前配置:<br>
+          节点开关 / 端口 / <b>密钥</b> / 管理员口令都会被备份里的内容替换。<br><br>
+          恢复后会按备份重新生成全部配置并热重载; 订阅地址也会跟着变成备份里的那一个
+          —— 客户端需要重新导入订阅。</div>`,
+        onOk: async () => {
+          restoreBtn.disabled = true;
+          restoreBtn.textContent = "恢复中…";
+          try {
+            S.dash = await api("/api/restore", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: await file.text(),
+            });
+            redrawDash(true);
+            toast("备份已恢复, 配置已重新生成");
+          } catch (e) {
+            toast("恢复失败: " + e.message);
+          }
+          restoreBtn.disabled = false;
+          restoreBtn.textContent = "从备份恢复";
+        },
+      });
     };
   }
 }
