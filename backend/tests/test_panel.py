@@ -1434,6 +1434,30 @@ def test_sidebar_order_matches_the_page_order():
     tops = [positions[name] for name in nav]
     assert tops == sorted(tops), f"菜单顺序与页面顺序不一致: {list(zip(nav, tops))}"
     assert len(set(tops)) == len(tops), "同一个板块被挂到了两个锚点上"
+
+
+def test_node_description_wraps_instead_of_being_cut_off():
+    """节点下面那句"这个协议是干什么的"必须能折行。
+
+    以前是 `white-space: nowrap` + 省略号: 窗口一窄整句就被切成 "…", 而这句恰恰是
+    用户挑协议时唯一的依据 (用户反馈"文字太多会被截断, 也不美观")。这里钉住两条:
+    说明允许折行 (有行数上限), 并且窄屏有一套堆叠布局把整卡宽度让给它。
+    """
+    import re
+    from pathlib import Path
+
+    css = (
+        Path(__file__).resolve().parents[1] / "static" / "app" / "style" / "components.css"
+    ).read_text(encoding="utf-8")
+    rule = re.search(r"\.node-card \.nc-desc \{[^}]*\}", css)
+    assert rule, "找不到 .nc-desc 的样式"
+    body = rule.group(0)
+    assert "nowrap" not in body, "说明文字又变成单行省略号了"
+    assert "line-clamp" in body, "说明文字没有行数上限 (长句会撑破行高)"
+
+    narrow = re.search(r"@media \(max-width: 980px\) \{.*?\n\}", css, re.S)
+    assert narrow, "缺少窄屏断点 (五列塞不下时说明会被压成省略号)"
+    assert "grid-template-areas" in narrow.group(0), "窄屏没有改成堆叠布局"
 #
 # 用户的原始诉求: "预防用户忘记密码 —— SSH 上输入 z 就能进终端管理: 1 改账号密码,
 # 2 在线更新, 0 退出"。这里逐条钉住: 菜单真的列出那三件事、改密码不要求旧密码

@@ -85,7 +85,7 @@ export function renderNodes() {
     .map((n) => {
       const p = pingOf(n.id);
       // 左侧: 名称 / 传输 / 说明 / 链式出口 / 告警
-      const left = `<div>
+      const left = `<div class="nc-info">
           <div class="top">
             <span class="name">${
               n.chain

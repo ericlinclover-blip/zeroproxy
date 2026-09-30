@@ -1299,6 +1299,35 @@ async function main() {
     await page.unroute("**/api/domain");
     await page.locator("#sec-panel").screenshot({ path: path.join(SHOT_DIR, "panel-settings.png") });
 
+    console.log("\n[3k] 节点卡的说明文字不再被省略号截断");
+    // 用户反馈: 每个节点下面那句"这个协议是干什么的"被单行省略号切掉, 又难看又看不清。
+    // 这里量的是**真的没被切**: -webkit-line-clamp 生效时 scrollHeight 会超过 clientHeight。
+    const descStats = () => page.evaluate(() => {
+      return [...document.querySelectorAll("#node-grid .node-card")].map((card) => {
+        const d = card.querySelector(".nc-desc");
+        const info = card.querySelector(".nc-info");
+        return {
+          text: d.textContent.trim(),
+          clipped: d.scrollHeight > d.clientHeight + 1,
+          infoRatio: info.getBoundingClientRect().width / card.getBoundingClientRect().width,
+        };
+      });
+    });
+    const wideDesc = await descStats();
+    check("宽屏: 每个节点的说明文字都完整可见",
+      wideDesc.length >= 5 && wideDesc.every((d) => !d.clipped && d.text.length > 4),
+      `${wideDesc.length} 张卡片, 被截断 ${wideDesc.filter((d) => d.clipped).length} 个`);
+    // 窄屏 (手机 / 分屏): 五列塞不下 → 改成堆叠式, 说明文字拿到整卡宽度
+    await page.setViewportSize({ width: 719, height: 900 });
+    await page.waitForTimeout(400);
+    const narrowDesc = await descStats();
+    check("窄屏: 节点卡改成堆叠式, 说明文字依然完整",
+      narrowDesc.every((d) => !d.clipped) && narrowDesc.every((d) => d.infoRatio > 0.85),
+      `说明块占卡宽 ${narrowDesc.map((d) => Math.round(d.infoRatio * 100) + "%").join(" ")}`);
+    await page.locator("#node-grid").screenshot({ path: path.join(SHOT_DIR, "nodes-narrow.png") });
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await page.waitForTimeout(250);
+
     console.log("\n[4] 控制台与请求");
     check("无 console 错误", consoleErrors.length === 0, consoleErrors.slice(0, 3).join(" | "));
     check("无失败请求", failedRequests.length === 0, failedRequests.slice(0, 3).join(" | "));

@@ -239,7 +239,15 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
 .node-card .addr { font-size: 12.5px; margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .node-card .nc-addr { display: flex; flex-direction: column; gap: 4px; }
 .node-card .nc-addr .state { display: flex; align-items: center; gap: 5px; font-size: 11.5px; }
-.node-card .nc-desc { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 说明文字: 允许折行 (最多两行)。
+ * 以前是单行 + 省略号 —— 在窄屏上整句人话被截成 "…" (用户反馈"文字太多会被截断"),
+ * 而这条恰恰是用户判断"这个协议是干什么的"的唯一一句话。整句在 title 里也留着。 */
+.node-card .nc-desc {
+  font-size: 12px; line-height: 1.45;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  overflow: hidden;
+}
+.node-card .nc-info { display: flex; flex-direction: column; }
 .node-card .actions { display: flex; gap: 6px; align-items: center; justify-content: flex-end; }
 .node-card .actions .btn { flex-shrink: 0; }
 .note { font-size: 11.5px; color: var(--warn); margin-top: 4px; }
@@ -259,6 +267,22 @@ label { display: block; font-size: 12.5px; color: var(--sub); margin: 0 0 6px 3p
 .duo .rail.dn i { background: linear-gradient(90deg, var(--down), #5eead4); }
 #node-grid.probing .node-card { animation: zp-shimmer 1.4s var(--ease) infinite; }
 @keyframes zp-shimmer { 0%, 100% { opacity: 1; } 50% { opacity: 0.62; } }
+
+/* 窄屏 (手机 / 分屏): 5 列塞不下 —— 名称列被压到只剩几十像素, 说明文字整句变省略号。
+ * 改成"名称+说明占满整行, 地址 / 延迟 / 流量 / 按钮排在下面"的堆叠式, 说明拿到整卡宽度。 */
+@media (max-width: 980px) {
+  .node-card {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "info info" "addr act" "lat act" "traf act";
+    align-items: start; row-gap: 7px;
+  }
+  .node-card .nc-info { grid-area: info; }
+  .node-card .nc-addr { grid-area: addr; }
+  .node-card .nc-lat { grid-area: lat; }
+  .node-card .nc-traffic { grid-area: traf; }
+  .node-card .actions { grid-area: act; align-self: center; }
+  .node-card .nc-desc { -webkit-line-clamp: 3; }   /* 整宽之后可以多显示一行 */
+}
 
 /* ---------- 订阅格式 ---------- */
 .fmt-row { display: flex; align-items: center; gap: 10px; padding: 10px 0; border-top: 1px solid var(--border-soft); }
