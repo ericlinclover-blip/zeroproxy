@@ -2048,6 +2048,362 @@ async def restore(request: Request):
     return response
 
 
+# ---------------------------------------------------------------- 面板设置 (账号 / 域名)
+
+#: 换域名后把浏览器带到新地址用的一次性票据: 单次有效, 10 分钟过期。
+HANDOFF_TTL = 600
+#: 换域名的步骤总数 (进度条用): 证书 → 配置落地 (apply.STEP_NAMES) → 验证新域名
+
+
+class AccountIn(BaseModel):
+    """改面板账号 / 密码 (两个都可选: 只改用户名、只改密码、或一起改)。"""
+
+    current_password: str
+    username: str | None = None
+    new_password: str | None = None
+
+
+class DomainIn(BaseModel):
+    domain: str
+
+
+class HandoffIn(BaseModel):
+    token: str
+
+
+def _panel_url_for(domain: str, scheme: str = "https") -> str:
+    """某个域名下面板的对外地址 (端口规则与 share_links.panel_base_url 一致)。"""
+    port = config.PANEL_PORT
+    netloc = domain if port in (80, 443) else f"{domain}:{port}"
+    return f"{scheme}://{netloc}/"
+
+
+def _issue_handoff(state: dict, request: Request) -> str:
+    """签一张一次性交接票据 —— 换域名后跳过去不该让用户重新登录一遍。"""
+    token = "zph_" + crypto.new_token(24)
+    now = int(time.time())
+    live = {
+        t: v for t, v in (state.get("handoffs") or {}).items() if int(v.get("expires") or 0) > now
+    }
+    live[token] = {"expires": now + HANDOFF_TTL, "ip": _client_ip(request)}
+    state["handoffs"] = live
+    return token
+
+
+@router.post("/api/session/handoff")
+def session_handoff(payload: HandoffIn, request: Request):
+    """用交接票据换一个会话 (换域名跳转的落地那一步)。
+
+    票据单次有效、10 分钟过期, 且只有已登录的管理员在换域名那一刻才会被签发;
+    用完立刻作废, 所以它出现在地址栏里的时间只有一跳。
+    """
+    token = (payload.token or "").strip()
+    with config.locked():
+        state = load_state()
+        entry = (state.get("handoffs") or {}).pop(token, None)
+        if not entry or int(entry.get("expires") or 0) < time.time():
+            save_state(state)
+            return _err("交接票据已失效, 请在新域名上用账号密码登录", 401)
+        _clean_sessions(state)
+        response = JSONResponse({"ok": True})
+        _issue_session(state, request, response)
+        config.audit(
+            state, "handoff_login", f"ip={_client_ip(request)}", actor=state["admin"]["username"]
+        )
+        save_state(state)
+    return response
+
+
+@router.post("/api/account")
+def update_account(payload: AccountIn, request: Request):
+    """改面板管理员用户名 / 密码。
+
+    刻意**不碰节点凭据** (VLESS UUID / Trojan / Hysteria 口令都是初始化那一刻定下
+    并写进订阅的): 改这里只影响"谁能登进面板"。否则改个密码就把所有客户端踢下线,
+    用户会以为是改密码改坏了。
+    """
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        admin = state["admin"]
+        if not crypto.verify_password(payload.current_password, admin["password_hash"]):
+            config.audit(state, "account_update_failed", "当前密码不正确", actor=_client_ip(request))
+            save_state(state)
+            return _err("当前密码不正确", 401)
+
+        changed: list[str] = []
+        new_user = (payload.username or "").strip()
+        if new_user and new_user != admin["username"]:
+            if not _USER_RE.match(new_user):
+                return _err("用户名需为 2-32 位字母/数字/_-.")
+            admin["username"] = new_user
+            changed.append(f"用户名改为 {new_user}")
+
+        kicked = 0
+        new_password = payload.new_password or ""
+        if new_password:
+            if new_password == payload.current_password:
+                return _err("新密码不能和当前密码相同")
+            if len(new_password) < 6 or len(new_password) > 128:
+                return _err("密码长度需 6-128 位")
+            admin["password_hash"] = crypto.hash_password(new_password)
+            changed.append("密码已更新")
+            # 改了密码就把别的设备踢下线; 当前这个会话留着, 否则用户自己也掉出去
+            keep = _session_of(state, request)
+            for token in list(state.get("sessions", {})):
+                if token != keep:
+                    state["sessions"].pop(token, None)
+                    kicked += 1
+
+        if not changed:
+            return _err("没有需要修改的内容")
+
+        config.audit(
+            state,
+            "account_update",
+            "; ".join(changed) + (f" (注销其它设备 {kicked} 个)" if kicked else ""),
+            actor=_client_ip(request),
+        )
+        save_state(state)
+        body = _dashboard_body(state, request)
+    body["ok"] = True
+    body["detail"] = "已保存: " + "; ".join(changed)
+    body["kicked"] = kicked
+    return body
+
+
+def _normalize_domain(raw: str) -> str:
+    """把用户可能粘进来的整条地址收敛成主机名。
+
+    "https://proxy.example.com:8899/panel" / "proxy.example.com/" / "PROXY.example.com."
+    都是人能输进来的东西 —— 直接判无效只会让人以为面板在挑刺。端口一律丢掉:
+    面板对外端口由配置决定, 不随域名走。
+    """
+    text = (raw or "").strip().lower()
+    text = re.sub(r"^[a-z][a-z0-9+.-]*://", "", text)   # 去协议 (http:// / https://)
+    text = text.split("/")[0].split("?")[0].split("#")[0]
+    if ":" in text:                                       # 去端口 (IPv6 不支持换域名)
+        text = text.split(":")[0]
+    return text.rstrip(".")
+
+
+def _domain_preflight(new_domain: str, current: str) -> tuple[bool, str]:
+    """换域名前的预检: 新域名是不是已经指向本机。
+
+    解析不到 / 指向别处就当场说清 —— 否则要白等一次最长 300 秒的 certbot, 而
+    Let's Encrypt 一定失败; 失败之后要么回滚 (白折腾) 要么把证书降级成自签 (更糟)。
+    只有"本机地址"这个判据本身拿不到时才放行, 让 certbot 去做最终裁决。
+    """
+    resolved = services.resolve_host(new_domain)
+    if not resolved:
+        return False, (
+            f"域名 {new_domain} 解析不到 —— 先在 DNS 里加一条 A 记录指向本机 IP, 等解析生效再来换"
+        )
+    known: set[str] = set()
+    if current:
+        known |= {current} if _is_ip(current) else services.resolve_host(current)
+    public = services.public_ip().get("ip") or ""
+    if public:
+        known.add(public)
+    known |= services.local_addresses()
+    if known and not (resolved & known):
+        return False, (
+            f"域名 {new_domain} 解析到 {', '.join(sorted(resolved))}, 这台机器不在其中 —— "
+            "先把 DNS 指过来 (用 Cloudflare 的话改成 DNS only / 关掉橙云代理)。换域名要重新签发"
+            "证书, 而 Let's Encrypt 必须能从新域名访问到本机的 80 端口"
+        )
+    return True, ""
+
+
+def _domain_pipeline(new_domain: str, progress=None) -> tuple[list[dict], str]:
+    """换域名的完整闭环。返回 (步骤, 错误)。错误非空 = 已回滚, 域名保持原样。"""
+    steps: list[dict] = []
+    total = 1 + len(apply.STEP_NAMES) + 1
+
+    def record(name: str, ok: bool, detail: str) -> None:
+        steps.append({"name": name, "ok": ok, "detail": detail, "ms": 0})
+        if progress is not None:
+            progress(len(steps), total, detail)
+
+    # ---- 1) 证书: 放在配置锁**外面** (certbot 最长 300 秒, 不能把整个面板按住) ----
+    ok, detail, cert_state = services.install_cert(new_domain)
+    if services.is_prod() and cert_state.get("type") != "letsencrypt":
+        record("申请 TLS 证书", False, detail)
+        return steps, (
+            f"新域名没能拿到受信任证书 ({detail}) —— 面板保持原样, 未做任何改动。"
+            "多半是 DNS 还没指到本机, 或者 80 端口被防火墙/安全组挡着"
+        )
+    record("申请 TLS 证书", True, detail)
+
+    # ---- 2) 提交: 写域名 + 重生成配置 + 热重载 (任一步失败都整份退回) ----
+    with config.locked():
+        state = load_state()
+        old_domain = (state.get("domain") or "").strip()
+        old_cert = copy.deepcopy(state.get("cert") or {})
+        state["domain"] = new_domain
+        state["cert"] = cert_state
+        save_state(state)
+        landed = apply.reapply(
+            state,
+            progress=lambda index, _t, name: (
+                progress(1 + index + 1, total, name) if progress is not None else None
+            ),
+        )
+        steps.extend(landed)
+        failed = apply.failures(landed)
+        if failed:
+            reason = f"{failed[0]['name']}: {failed[0]['detail']}"
+            steps.extend(_rollback_domain(old_domain, old_cert))
+            return steps, f"配置落地失败 ({reason}) —— 已回滚, 面板仍在 {old_domain}"
+
+    # ---- 3) 验证: 新域名上真的能打开面板吗 (证书受信任 + DNS + 端口) ----
+    if services.is_prod():
+        reachable, why = services.probe_public_panel(new_domain, config.PANEL_PORT, timeout=15)
+        if not reachable:
+            with config.locked():
+                steps.extend(_rollback_domain(old_domain, old_cert))
+            return steps, f"新域名访问不通 ({why}) —— 已回滚, 面板仍在 {old_domain}"
+        record("验证新域名", True, why)
+    else:
+        record("验证新域名", True, "跳过 (非生产环境, 无 nginx / 公网入口)")
+
+    with config.locked():
+        fresh = load_state()
+        fresh["steps"] = steps
+        save_state(fresh)
+    return steps, ""
+
+
+def _rollback_domain(old_domain: str, old_cert: dict) -> list[dict]:
+    """把域名 / 证书 / 配置退回换域名之前的样子 (调用方必须已持有配置锁)。"""
+    state = load_state()
+    state["domain"] = old_domain
+    state["cert"] = old_cert
+    save_state(state)
+    reverted = apply.reapply(state)
+    ok = not apply.failures(reverted)
+    return [
+        {
+            "name": "回滚到原域名",
+            "ok": ok,
+            "detail": (
+                f"域名 / 证书 / 配置已退回 {old_domain or '(IP 访问)'}"
+                if ok
+                else f"回滚后仍有步骤告警, 请到「诊断」看详情: {apply.failures(reverted)[0]['name']}"
+            ),
+            "ms": 0,
+        }
+    ]
+
+
+def _run_domain_job(job_id: str, new_domain: str) -> None:
+    steps: list[dict] = []
+    error = ""
+    try:
+        steps, error = _domain_pipeline(
+            new_domain,
+            progress=lambda index, total, name: _job_update(
+                job_id, index=index, total=total, current=name
+            ),
+        )
+        if not error:
+            record = {"name": "新域名已生效", "ok": True, "detail": f"面板现在跑在 {new_domain}", "ms": 0}
+            steps.append(record)
+    except Exception as exc:  # noqa: BLE001 — 后台任务不能把异常吞成"静默失败"
+        error = f"{type(exc).__name__}: {exc}"
+    _finish_job(job_id, steps, error)
+
+
+def _domain_change_sync(new_domain: str, request: Request, handoff: str) -> dict:
+    """同步落地 (ZP_APPLY_ASYNC=0, 测试 / 本地排查用)。"""
+    steps, error = _domain_pipeline(new_domain)
+    with config.locked():
+        fresh = load_state()
+        body = _dashboard_body(fresh, request)
+    body["steps"] = steps
+    body["ok"] = not error
+    body["detail"] = error or f"域名已更换为 {new_domain}"
+    if not error:
+        body["redirect"] = {
+            "url": _panel_url_for(new_domain),
+            "handoff": handoff,
+            "ready": True,
+        }
+    return body
+
+
+@router.post("/api/domain")
+def change_domain(payload: DomainIn, request: Request):
+    """换面板域名: 预检 DNS → 签发证书 → 重写配置 → 热重载 → 验证 → 自动跳转。
+
+    两件 setup 那次域名流程不需要、这里必须做的事:
+      * **先预检**: 新域名解析不到本机就当场拒绝, 别让用户白等一次 certbot;
+      * **会回滚**: 只有"新域名上真的能打开面板"才算成功, 否则域名 / 证书 / 配置
+        整份退回原样 —— 换域名失败不该让面板彻底进不去。
+    """
+    new_domain = _normalize_domain(payload.domain)
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        if not state.get("configured"):
+            return _err("请先完成初始化", 409)
+        current = (state.get("domain") or "").strip()
+        if not new_domain:
+            return _err("请输入新域名")
+        if _is_ip(new_domain) or not _DOMAIN_RE.match(new_domain):
+            return _err("请输入域名 (示例: proxy.example.com) —— 换域名要的是能签证书的域名")
+        if new_domain == current:
+            return _err("与当前域名相同, 无需更换")
+        running = _running_job(request, kind="domain")
+        if running is not None:
+            body = _dashboard_body(state, request)
+            body.update({"ok": True, "detail": "已有换域名任务在进行中", "steps": [], "job": running})
+            return body
+
+    ok, why = _domain_preflight(new_domain, current)
+    if not ok:
+        return _err(why, 400)
+
+    with config.locked():
+        state = load_state()
+        handoff = _issue_handoff(state, request)
+        config.audit(
+            state, "domain_change", f"{current} → {new_domain}", actor=_client_ip(request)
+        )
+        save_state(state)
+
+    if not _apply_async_enabled():
+        return _domain_change_sync(new_domain, request, handoff)
+
+    job_id, job = _new_job(
+        request, 1 + len(apply.STEP_NAMES) + 1, "申请 TLS 证书", kind="domain"
+    )
+    try:
+        threading.Thread(
+            target=_run_domain_job,
+            args=(job_id, new_domain),
+            name=f"zp-domain-{job_id}",
+            daemon=True,
+        ).start()
+    except Exception:
+        _finish_job(job_id, [], "换域名任务启动失败")
+        raise
+    with config.locked():
+        body = _dashboard_body(load_state(), request)
+    body.update(
+        {
+            "ok": True,
+            "detail": f"已开始更换域名为 {new_domain}",
+            "steps": [],
+            "job": _job_snapshot(job),
+            "redirect": {"url": _panel_url_for(new_domain), "handoff": handoff, "ready": False},
+        }
+    )
+    return body
+
+
 # ---------------------------------------------------------------- GeoIP 数据
 
 #: 同一时间只允许一个下载任务 (几十 MB, 不做并发); 与后台自动更新线程共用

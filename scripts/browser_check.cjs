@@ -1187,6 +1187,98 @@ async function main() {
     check("点本机 IP 就能复制", /已复制/.test(copyToast), copyToast);
     await page.unroute("**/api/dashboard");
 
+    console.log("\n[3j] 面板设置 (管理员账号 / 面板域名)");
+    check("侧栏有「面板设置」入口",
+      (await page.locator("#dash-nav a[href='#sec-panel']").count()) === 1);
+    const panelText = await page.locator("#panel-grid").innerText();
+    check("设置里同时有账号与域名两块",
+      /管理员账号/.test(panelText) && /面板域名/.test(panelText)
+      && /更换域名并部署/.test(panelText), panelText.split("\n")[0].slice(0, 40));
+    check("用户名按当前账号预填", (await page.inputValue("#acct-user")) === "admin",
+      await page.inputValue("#acct-user"));
+    // 当前密码不对: 明确报错, 而且什么都不改 (要带上一处真实改动才会打到后端 ——
+    // 没有任何改动时前端本来就该拦住, 那是另一条路径)
+    await page.fill("#acct-now", "definitely-wrong");
+    await page.fill("#acct-user", "operator");
+    await page.evaluate(() => document.querySelector("#toast").classList.remove("show"));
+    // 这个 401 是我们自己故意撞的, 浏览器照例会往控制台打条红字 —— 摘掉, 别掩盖真报错
+    const acctErrMark = consoleErrors.length;
+    await page.click("#btn-acct-save");
+    await page.waitForSelector("#toast.show", { timeout: 10000 });
+    check("改账号必须先验证当前密码",
+      /当前密码不正确/.test(await page.locator("#toast").innerText()),
+      (await page.locator("#toast").innerText()).trim());
+    for (let i = consoleErrors.length - 1; i >= acctErrMark; i -= 1) {
+      if (/401 \(Unauthorized\)/.test(consoleErrors[i])) consoleErrors.splice(i, 1);
+    }
+    await page.waitForFunction(
+      () => document.querySelector("#side-user").innerText.trim() === "admin", { timeout: 5000 });
+    // 密码填对了才真的改; 改完再改回来 (密码不动 —— 后面的登录断言还要用 s3cretpass)
+    await page.fill("#acct-now", "s3cretpass");
+    await page.click("#btn-acct-save");
+    await page.waitForFunction(
+      () => document.querySelector("#side-user").innerText.trim() === "operator", { timeout: 15000 });
+    check("改用户名立即生效 (侧栏同步)", true, "admin → operator");
+    await page.fill("#acct-now", "s3cretpass");
+    await page.fill("#acct-user", "admin");
+    await page.click("#btn-acct-save");
+    await page.waitForFunction(
+      () => document.querySelector("#side-user").innerText.trim() === "admin", { timeout: 15000 });
+    check("用户名能改回来", true, "operator → admin");
+
+    // 域名: 这一格只收域名, IP 当场拒绝
+    await page.fill("#dom-new", "1.2.3.4");
+    await page.evaluate(() => document.querySelector("#toast").classList.remove("show"));
+    await page.click("#btn-dom-save");
+    await page.waitForSelector("#toast.show", { timeout: 8000 });
+    check("换域名那一格只收域名 (填 IP 当场拒绝)",
+      /域名/.test(await page.locator("#toast").innerText()),
+      (await page.locator("#toast").innerText()).trim());
+    // 确认弹窗要把"做什么 / 会变什么 / 失败怎么办"写清 (真按下去会跳到新域名, 所以这里只验弹窗)
+    await page.fill("#dom-new", "proxy2.example.com");
+    await page.click("#btn-dom-save");
+    await page.waitForSelector("#confirm-mask:not(.hidden)");
+    const domBody = (await page.locator("#confirm-body").innerText()).replace(/\s+/g, " ");
+    check("换域名的确认弹窗列出步骤与回滚保证",
+      /申请 TLS 证书/.test(domBody) && /回滚/.test(domBody) && /自动跳转/.test(domBody)
+      && /订阅地址/.test(domBody), domBody.slice(0, 80));
+    await page.click("#confirm-cancel");
+    check("取消后弹窗关闭且域名没变",
+      (await page.locator("#confirm-mask.hidden").count()) === 1
+      && (await page.locator("#dash-domain").innerText()).trim() === "proxy.example.com", "");
+    // 本地开发环境没有 nginx / 公网入口: 部署完**不能**把浏览器扔到 https://新域名:端口
+    // (那是打不开的地址)。这里把 /api/domain 的响应换成一个"已完成"的假任务来验这条保护。
+    await page.route("**/api/domain", (route) => route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        ok: true,
+        detail: "已开始更换域名",
+        steps: [],
+        job: { id: "999999", kind: "domain", state: "done", index: 5, total: 8, current: "验证新域名", steps: [], error: "" },
+        redirect: { url: "https://proxy2.example.com:8899/", handoff: "zph_test", ready: false },
+      }),
+    }));
+    const beforeJump = page.url();
+    // 假任务 id 查不到 → 轮询会撞一次 404, 浏览器照例打红字: 这是脚本自己造的, 摘掉
+    const jumpErrMark = consoleErrors.length;
+    await page.fill("#dom-new", "proxy2.example.com");
+    await page.click("#btn-dom-save");
+    await page.waitForSelector("#confirm-mask:not(.hidden)");
+    await page.click("#confirm-ok");
+    await page.waitForFunction(
+      () => /本地开发环境/.test(document.querySelector("#panel-jump-hint").innerText),
+      { timeout: 20000 });
+    for (let i = consoleErrors.length - 1; i >= jumpErrMark; i -= 1) {
+      if (/404 \(Not Found\)/.test(consoleErrors[i])) consoleErrors.splice(i, 1);
+    }
+    check("本地开发环境不把浏览器扔到打不开的新地址",
+      page.url() === beforeJump
+      && /本地开发环境/.test(await page.locator("#panel-jump-hint").innerText()),
+      (await page.locator("#panel-jump-hint").innerText()).trim());
+    await page.unroute("**/api/domain");
+    await page.locator("#sec-panel").screenshot({ path: path.join(SHOT_DIR, "panel-settings.png") });
+
     console.log("\n[4] 控制台与请求");
     check("无 console 错误", consoleErrors.length === 0, consoleErrors.slice(0, 3).join(" | "));
     check("无失败请求", failedRequests.length === 0, failedRequests.slice(0, 3).join(" | "));

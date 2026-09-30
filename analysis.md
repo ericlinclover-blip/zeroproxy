@@ -2,7 +2,7 @@
 
 ## 1. Project Overview
 
-**ZeroProxy** (v2.6.24) is a self-hosted proxy management panel that orchestrates Xray, Hysteria 2, and Nginx on a single server. It provides a web dashboard — a zero-framework, zero-build SPA (`index.html` + ES modules under `static/app/`, plain JS, no CDN) — that manages proxy nodes, subscriptions, chained proxies, GeoIP-based routing, and service lifecycle.
+**ZeroProxy** (v2.6.25) is a self-hosted proxy management panel that orchestrates Xray, Hysteria 2, and Nginx on a single server. It provides a web dashboard — a zero-framework, zero-build SPA (`index.html` + ES modules under `static/app/`, plain JS, no CDN) — that manages proxy nodes, subscriptions, chained proxies, GeoIP-based routing, and service lifecycle.
 
 - **Root**: `/Users/eric/Desktop/sbpn/zeroproxy/`
 - **Backend**: `/Users/eric/Desktop/sbpn/zeroproxy/backend/zeroproxy/` (Python, FastAPI)
@@ -48,7 +48,7 @@
 | Module | Size | Responsibility |
 |--------|------|----------------|
 | `config.py` | 24KB | Runtime state management, concurrency model (`config.locked()`), constants |
-| `routes.py` | 99KB | All API endpoints (33 router paths + `/`, `/api/info`), session/auth, dashboard, config mutation, **async job table** (`_APPLY_JOBS`) |
+| `routes.py` | 113KB | All API endpoints (36 router paths + `/`, `/api/info`), session/auth, dashboard, config mutation, **async job table** (`_APPLY_JOBS`), panel settings (account / domain change with rollback) |
 | `apply.py` | 26KB | The 6-step landing loop ("generate → real-binary verify → reload → re-check ports"); shared by the panel and `upgrade.sh` |
 | `services.py` | 49KB | Service adaptation layer (systemctl, certbot, firewall), traffic stats, cached public-IP lookup (`ZP_PUBLIC_IP=0` disables) |
 | `xray_config.py` | 16KB | Xray JSON config generator (4 inbounds + chain + routing) |
@@ -154,6 +154,9 @@ nginx / hysteria 不再陪着重启一次)。
 | `/api/traffic` | GET | Per-node traffic stats (via Xray Stats API) |
 | `/api/diagnose` | GET | Multi-check diagnostics (services, config, ports, certs, chain reachability) |
 | `/api/repair` | POST | One-click self-heal (reapply + diagnose) |
+| `/api/account` | POST | Change panel username / password (requires current password; node credentials untouched; other sessions are dropped) |
+| `/api/domain` | POST | Change the panel domain: DNS pre-flight → issue cert → rewrite configs → reload → verify. Any failure rolls the domain, cert and configs back. Returns a redirect payload with a one-time hand-off token |
+| `/api/session/handoff` | POST | Exchange the one-time change-domain token for a session cookie (single use, 10 min TTL) — the browser lands on the new domain already logged in |
 
 ### 5.3 Config Mutation
 
@@ -482,6 +485,8 @@ sockopt = {
 9. **Core binaries are never auto-upgraded**: major Xray/Hysteria releases change config semantics (Xray 25 removed `allowInsecure`, renamed certificate fields, swapped REALITY keys to X25519; geo loading was tightened). The panel exposes an explicit checkbox that sets `ZP_UPDATE_CORE=1` for one run and shows the currently installed versions next to it — the risk stays with the user who accepts it, and the update button never takes it on their behalf
 10. **Status lights report the node, not the daemon**: a node's dot is driven by *that protocol's* state — off = disabled (grey, no pulse), so a lit lamp always means "this protocol works right now". Reading `service_state` directly made a disabled node look healthy just because Xray was still running
 11. **Disabled controls must explain themselves**: the entry-side "inner transport" select greys out QUIC unless the pairing code carries QUIC credentials (the landing side has to enable it). The option label and the hint underneath always state the reason *and* the next step; a greyed-out option with a blank hint reads as a broken dropdown
+12. **Domain changes are transactional**: issue the certificate first (outside the config lock — certbot can take minutes), then commit, verify the new domain from the server's own side, and roll the domain / certificate / configs back if anything fails. A panel must never become unreachable because a domain change went wrong. The jump itself uses a one-time hand-off token so the browser lands logged in; in dev (no nginx / no public entry) the deploy still saves but the browser is *not* redirected
+13. **Settings never touch node credentials**: changing the panel username / password only changes who can log in. Rotating the VLESS UUID or the Trojan / Hysteria passwords would silently break every client that already imported the subscription
 
 ## 13. Cross-Module Dependencies
 

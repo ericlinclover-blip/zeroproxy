@@ -315,6 +315,28 @@ def is_domain(host: str) -> bool:
         return True
 
 
+def resolve_host(host: str) -> set[str]:
+    """把主机名解析成地址集合 (解析失败返回空集, 不抛)。"""
+    try:
+        return {info[4][0] for info in socket.getaddrinfo(host, None)}
+    except OSError:
+        return set()
+
+
+def local_addresses() -> set[str]:
+    """本机网卡上的地址 (含回环)。
+
+    注意云主机的**公网 IP 通常不在这里** (NAT / 弹性 IP), 那条路要靠 public_ip()
+    去回显服务问 —— 换域名前的"这域名指向本机吗"判断两者都要看。
+    """
+    addrs = {"127.0.0.1", "::1"}
+    try:
+        addrs |= {info[4][0] for info in socket.getaddrinfo(socket.gethostname(), None)}
+    except OSError:
+        pass
+    return addrs
+
+
 def generate_self_signed(
     host: str, cert_path: str, key_path: str, days: int = 3650
 ) -> tuple[bool, str]:

@@ -14,6 +14,7 @@ import { renderNodes, renderKpis, renderDashboardBanner, runProbe } from "./stat
 import { renderTraffic, renderAdvanced, renderSystem } from "./traffic.js";
 import { renderChain } from "./chain.js";
 import { loadUpdate, renderUpdate } from "./update.js";
+import { renderPanel } from "./panel.js";
 
 /* ---------------- 仪表盘 ---------------- */
 export async function loadDash(quiet) {
@@ -83,6 +84,7 @@ export function renderDash(quiet) {
   renderAdvanced(S.dash);
   renderChain(S.dash);
   renderSystem(S.dash);
+  renderPanel(S.dash);
   renderAudit(S.dash.audit, S.dash.audit_facets, S.dash.audit_stats, S.dash.audit_more);
   renderKpis();
   renderDashboardBanner();
@@ -165,6 +167,21 @@ export async function boot() {
   // (会话 Cookie 是按 host 存的, 跨到域名必须重新登录 —— 密码绝不会出现在 URL 里)
   const presetUser = params.get("user") || "";
   if (S.bootstrapToken || presetUser) history.replaceState(null, "", location.pathname);
+  // 换域名后跳过来的那一跳带着一次性交接票据 (?handoff=…): 先换成会话, 用户就
+  // 不用在新域名上再登一次。票据从地址栏里立刻抹掉, 只在历史里留下一跳的时间。
+  const handoff = params.get("handoff") || "";
+  if (handoff) {
+    history.replaceState(null, "", location.pathname);
+    try {
+      await api("/api/session/handoff", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: handoff }),
+      });
+    } catch (e) {
+      // 票据过期 / 用过了都走这里: 下面照常走登录页, 不该卡住
+    }
+  }
   try {
     const st = await api("/api/status");
     if (!st.configured) {

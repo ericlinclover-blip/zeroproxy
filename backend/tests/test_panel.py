@@ -10,7 +10,7 @@ import shutil
 import pytest
 
 from conftest import DOMAIN, PASSWORD, USERNAME
-from zeroproxy import config, xray_config
+from zeroproxy import config, crypto, xray_config
 
 
 # ---------------------------------------------------------------- 初始化
@@ -1407,6 +1407,152 @@ def test_geodata_ttl_counts_from_last_check(home):
 
 
 # ---------------------------------------------------------------- 内核升级开关
+
+
+def test_account_update_requires_current_password(client, configured, home):
+    """改账号必须先验证当前密码 —— 面板 cookie 被偷走一个也改不了密码。"""
+    body = client.post(
+        "/api/account", json={"current_password": "wrong-pass", "username": "hacker"}
+    ).json()
+    assert "当前密码不正确" in body["error"]
+    state = config.load_state()
+    assert state["admin"]["username"] == USERNAME
+    assert crypto.verify_password(PASSWORD, state["admin"]["password_hash"])
+
+
+def test_account_update_changes_login_but_keeps_node_credentials(client, configured, home):
+    """改用户名 / 密码只影响"谁能登进面板", 节点凭据一律不动。"""
+    uuid_before = config.load_state()["uuid"]
+    body = client.post(
+        "/api/account",
+        json={"current_password": PASSWORD, "username": "operator", "new_password": "new-pass-2026"},
+    ).json()
+    assert body["ok"], body
+    assert "用户名" in body["detail"] and "密码" in body["detail"]
+
+    state = config.load_state()
+    assert state["admin"]["username"] == "operator"
+    assert state["uuid"] == uuid_before           # 客户端凭据不受影响
+
+    client.post("/api/logout")
+    assert client.post(
+        "/api/login", json={"username": "operator", "password": PASSWORD}
+    ).status_code == 401                          # 旧密码立刻失效
+    assert client.post(
+        "/api/login", json={"username": "operator", "password": "new-pass-2026"}
+    ).status_code == 200
+
+
+def test_account_update_validates_and_kicks_other_devices(client, configured, home):
+    """用户名 / 密码格式要校验; 改密码把别的设备踢下线, 当前这台留着。"""
+    assert "用户名" in client.post("/api/account", json={
+        "current_password": PASSWORD, "username": "x",
+    }).json()["error"]
+    assert "长度" in client.post("/api/account", json={
+        "current_password": PASSWORD, "new_password": "123",
+    }).json()["error"]
+    assert "相同" in client.post("/api/account", json={
+        "current_password": PASSWORD, "new_password": PASSWORD,
+    }).json()["error"]
+
+    client.post("/api/login", json={"username": USERNAME, "password": PASSWORD})  # 第二台设备
+    assert len(config.load_state()["sessions"]) >= 2
+    mine = client.cookies.get("zp_session")
+    body = client.post(
+        "/api/account", json={"current_password": PASSWORD, "new_password": "kick-everyone-else"}
+    ).json()
+    assert body["kicked"] >= 1
+    assert list(config.load_state()["sessions"]) == [mine]
+    # 当前会话仍然有效 (否则用户把自己也踢出去了)
+    assert client.get("/api/dashboard").status_code == 200
+
+
+def test_domain_change_rejects_before_touching_anything(client, configured, home, monkeypatch):
+    """预检不过就当场拒绝, 而且一个字节都不改 (包括证书)。"""
+    from zeroproxy import services
+
+    before = config.load_state()
+    assert client.post("/api/domain", json={"domain": DOMAIN}).status_code == 400       # 同域名
+    assert client.post("/api/domain", json={"domain": "1.2.3.4"}).status_code == 400    # IP
+    assert client.post("/api/domain", json={"domain": "not a domain"}).status_code == 400
+
+    monkeypatch.setattr(services, "resolve_host", lambda host: set())
+    body = client.post("/api/domain", json={"domain": "new.example.com"}).json()
+    assert "解析不到" in body["error"]
+
+    # 粘整条地址进来也要认 (人不会只输主机名): 协议 / 端口 / 路径 / 大小写 / 末尾的点
+    body = client.post(
+        "/api/domain", json={"domain": "  HTTPS://New.Example.com:8899/panel?x=1  "}
+    ).json()
+    assert "new.example.com" in body["error"], body       # 已归一化后再去解析
+
+    # 新域名解析到别人家, 本机自己的域名照常解析 —— 预检必须能分辨这两者
+    monkeypatch.setattr(
+        services, "resolve_host",
+        lambda host: {"198.51.100.9"} if host == "new.example.com" else {"203.0.113.7"},
+    )
+    monkeypatch.setattr(services, "public_ip", lambda: {"ip": "203.0.113.7", "at": 1})
+    body = client.post("/api/domain", json={"domain": "new.example.com"}).json()
+    assert "不在其中" in body["error"]
+
+    after = config.load_state()
+    assert after["domain"] == before["domain"]
+    assert after["cert"] == before["cert"]
+
+
+def test_domain_change_deploys_and_hands_off_session(client, configured, home, monkeypatch):
+    """换域名走完部署: state / nginx 配置 / 订阅地址全换, 并给一张一次性交接票据。"""
+    from zeroproxy import config as _config
+    from zeroproxy import services
+
+    monkeypatch.setattr(services, "resolve_host", lambda host: {"203.0.113.7"})
+    monkeypatch.setattr(services, "public_ip", lambda: {"ip": "203.0.113.7", "at": 1})
+
+    body = client.post("/api/domain", json={"domain": "proxy2.example.com"}).json()
+    assert body["ok"], body.get("detail")
+    state = _config.load_state()
+    assert state["domain"] == "proxy2.example.com"
+    assert "proxy2.example.com" in open(_config.paths()["nginx_home"], encoding="utf-8").read()
+
+    redirect = body["redirect"]
+    assert redirect["url"].startswith("https://proxy2.example.com")
+    assert redirect["handoff"].startswith("zph_")
+    assert redirect["ready"] is True
+
+    dash = client.get("/api/dashboard").json()
+    assert "proxy2.example.com" in dash["subscription_url"]
+    assert "proxy2.example.com" in dash["nodes"][0]["share_link"]
+
+    # 交接票据: 单次有效 (第二次用就失效), 伪造的当然也不行
+    assert client.post("/api/session/handoff", json={"token": "zph_nope"}).status_code == 401
+    assert client.post("/api/session/handoff", json={"token": redirect["handoff"]}).status_code == 200
+    assert client.post("/api/session/handoff", json={"token": redirect["handoff"]}).status_code == 401
+    assert any(e["action"] == "handoff_login" for e in _config.load_state()["audit"])
+
+
+def test_domain_change_rolls_back_when_landing_fails(client, configured, home, monkeypatch):
+    """配置落地失败必须整份退回原域名 —— 换域名失败不该让面板彻底进不去。"""
+    from zeroproxy import apply
+    from zeroproxy import services
+
+    monkeypatch.setattr(services, "resolve_host", lambda host: {"203.0.113.7"})
+    monkeypatch.setattr(services, "public_ip", lambda: {"ip": "203.0.113.7", "at": 1})
+
+    real = apply.reapply
+    calls = {"n": 0}
+
+    def flaky(state, timeout=0, progress=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return [{"name": "生成 Nginx 配置", "ok": False, "detail": "写不进去", "ms": 0}]
+        return real(state, timeout=timeout, progress=progress)
+
+    monkeypatch.setattr(apply, "reapply", flaky)
+    body = client.post("/api/domain", json={"domain": "broken.example.com"}).json()
+    assert not body["ok"] and "回滚" in body["detail"]
+    assert any(s["name"] == "回滚到原域名" for s in body["steps"])
+    assert config.load_state()["domain"] == DOMAIN
+
 
 def test_remote_version_takes_newest_across_mirrors(home, monkeypatch):
     """镜像之间会有一段时间的 CDN 缓存差 —— 版本检查必须取**最新**的那个。
