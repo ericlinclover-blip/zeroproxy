@@ -136,6 +136,34 @@ def test_security_headers(client):
     assert "frame-ancestors 'none'" in response.headers["Content-Security-Policy"]
 
 
+def test_csp_drops_unsafe_inline_but_whitelists_the_theme_bootstrap(client):
+    """script-src 不再放行任意内联脚本, 但 head 里那段"首屏前应用主题"必须仍然跑得起来。
+
+    前者是这次收紧的收益 (注入一个 <script> 已经执行不了); 后者是它的代价, 而且失败方式
+    很安静 —— 脚本被拦下只会让深色模式退回浅色, 面板上几乎看不出来。所以哈希按 index.html
+    的实际内容在启动时算, 并由这条测试盯住。
+    """
+    import base64
+    import hashlib
+
+    from zeroproxy import main as zp_main
+
+    csp = client.get("/api/status").headers["Content-Security-Policy"]
+    script_src = csp.split("script-src", 1)[1].split(";", 1)[0]
+    assert "'unsafe-inline'" not in script_src, "script-src 不该再放行任意内联脚本"
+
+    with open(os.path.join(zp_main._static_dir(), "index.html"), encoding="utf-8") as fh:
+        html = fh.read()
+    blocks = [
+        body
+        for attrs, body in zp_main._INLINE_SCRIPT_RE.findall(html)
+        if "src=" not in attrs.lower()
+    ]
+    assert len(blocks) == 1, f"内联脚本应当只剩主题引导那一段, 实际 {len(blocks)} 段"
+    digest = base64.b64encode(hashlib.sha256(blocks[0].encode("utf-8")).digest()).decode()
+    assert f"'sha256-{digest}'" in script_src, "内联脚本的哈希必须在白名单里, 否则主题会静默失效"
+
+
 # ---------------------------------------------------------------- 订阅
 
 def test_subscription_base64_contains_all_enabled_nodes(client, configured):

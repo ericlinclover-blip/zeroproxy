@@ -9,7 +9,10 @@ Let's Encrypt 证书, 其余 SNI 回退自签 —— 再反向代理到面板 (�
 from __future__ import annotations
 
 import contextlib
+import base64
+import hashlib
 import os
+import re
 import sys
 import threading
 
@@ -121,20 +124,54 @@ async def lifespan(app: FastAPI):
     finally:
         stop.set()
 
-#: 安全响应头。前端是单文件内联 CSS/JS, 因此 CSP 必须允许 'unsafe-inline';
-#: 其余指令仍然收紧 (禁止外域脚本/框架嵌入/跨站引用)。
-SECURITY_HEADERS = {
-    "X-Content-Type-Options": "nosniff",
-    "X-Frame-Options": "DENY",
-    "Referrer-Policy": "no-referrer",
-    "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
-    "Cross-Origin-Opener-Policy": "same-origin",
-    "Content-Security-Policy": (
-        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
-        "script-src 'self' 'unsafe-inline'; connect-src 'self'; form-action 'self'; "
-        "base-uri 'none'; frame-ancestors 'none'"
-    ),
-}
+#: 内联 <script> 块 (带 src 的外链脚本由 'self' 覆盖, 不参与哈希)
+_INLINE_SCRIPT_RE = re.compile(r"<script\b([^>]*)>(.*?)</script>", re.DOTALL | re.IGNORECASE)
+
+
+def inline_script_hashes(static_dir: str) -> list[str]:
+    """index.html 里内联脚本的 sha256 CSP 白名单。
+
+    为什么在启动时按文件算, 而不是把哈希写死在策略里: 写死的话, 以后改一次内联脚本就得
+    同步改常量, 忘了改的后果是**主题脚本被浏览器静默拦下** —— 深色模式失效、控制台之外
+    看不出来。按实际文件算, 源码与策略永远一致。
+    """
+    try:
+        with open(os.path.join(static_dir, "index.html"), encoding="utf-8") as fh:
+            html = fh.read()
+    except OSError:
+        return []
+    hashes = []
+    for attrs, body in _INLINE_SCRIPT_RE.findall(html):
+        if "src=" in attrs.lower():
+            continue
+        digest = hashlib.sha256(body.encode("utf-8")).digest()
+        hashes.append("'sha256-" + base64.b64encode(digest).decode("ascii") + "'")
+    return hashes
+
+
+def security_headers(static_dir: str) -> dict:
+    """安全响应头。
+
+    `script-src` **不再放 'unsafe-inline'**: JS 已经全部搬进 /static/app/ 的外部模块,
+    页面上只剩 head 里那一小段"首屏前应用主题"必须内联 (deferred 的模块跑完已经画过一帧,
+    深色模式会先闪一次白)。这一段用 sha256 白名单放行 —— 于是"往页面里注入一个 <script>"
+    这条路彻底堵死, 而它原来是开的。
+    `style-src` 仍保留 'unsafe-inline': 进度条 / 流量条 / 速率曲线还有 7 处宽度是运行时算的
+    (写在 innerHTML 模板里), 属于内联 style 属性, 收紧它得先把那些改成 CSSOM 赋值。
+    """
+    script_src = " ".join(["'self'", *inline_script_hashes(static_dir)])
+    return {
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "no-referrer",
+        "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
+        "Cross-Origin-Opener-Policy": "same-origin",
+        "Content-Security-Policy": (
+            "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+            f"script-src {script_src}; connect-src 'self'; form-action 'self'; "
+            "base-uri 'none'; frame-ancestors 'none'"
+        ),
+    }
 
 
 def _static_dir() -> str:
@@ -150,21 +187,21 @@ def _static_dir() -> str:
 
 
 def create_app() -> FastAPI:
+    static_dir = _static_dir()
+    headers = security_headers(static_dir)
     app = FastAPI(
         title="ZeroProxy", version=__version__, docs_url=None, redoc_url=None, lifespan=lifespan
     )
 
     @app.middleware("http")
-    async def security_headers(request, call_next):
+    async def add_security_headers(request, call_next):
         """统一附加安全响应头 (面板是同源单页应用, 不需要开放 CORS)。"""
         response = await call_next(request)
-        for key, value in SECURITY_HEADERS.items():
+        for key, value in headers.items():
             response.headers.setdefault(key, value)
         return response
 
     app.include_router(routes.router)
-
-    static_dir = _static_dir()
 
     @app.get("/", include_in_schema=False)
     def index():

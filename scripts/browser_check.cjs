@@ -877,6 +877,35 @@ async function main() {
       themeA.theme !== themeB.theme && themeA.bg !== themeB.bg && themeA.card !== themeB.card,
       `${themeA.theme} ${themeA.bg} → ${themeB.theme} ${themeB.bg} · 截图 ${SHOT_DIR}`);
 
+    // CSP 收紧之后的两条: 一是"该放行的确实跑起来了", 二是"该拦的确实拦住了"。
+    // 第一条失败起来很安静 (主题退回浅色, 面板上几乎看不出来), 所以必须显式盯住。
+    await page.evaluate(() => localStorage.setItem("zp-theme", "dark"));
+    await page.reload();
+    await page.waitForSelector("#view-dash:not(.hidden)", { timeout: 30000 });
+    const bootTheme = await page.evaluate(() => ({
+      theme: document.documentElement.dataset.theme,
+      bg: getComputedStyle(document.body).backgroundColor,
+    }));
+    check("CSP 收紧后内联的主题引导脚本仍然生效 (预置深色, 首屏即深色不闪白)",
+      bootTheme.theme === "dark" && /rgb\(10, 12, 17\)/.test(bootTheme.bg),
+      `${bootTheme.theme} ${bootTheme.bg}`);
+    const injectedBlocked = await page.evaluate(() => {
+      const s = document.createElement("script");
+      s.textContent = "window.__zp_injected = 1";
+      document.body.appendChild(s);
+      s.remove();
+      return window.__zp_injected === undefined;
+    });
+    check("注入的 <script> 执行不了 (script-src 不再放行 unsafe-inline)",
+      injectedBlocked, "");
+    // 上面那次注入是故意的, 浏览器必然记一条 CSP 违规 —— 和"故意输错密码"一样,
+    // 把它从待检查的 console 错误里摘掉, 否则「无 console 错误」会稳挂。
+    for (let i = consoleErrors.length - 1; i >= 0; i -= 1) {
+      if (/Content Security Policy|Refused to execute|violates the following/.test(consoleErrors[i])) {
+        consoleErrors.splice(i, 1);
+      }
+    }
+
     console.log("\n[3h] 后台落地任务的实时进度 (v2.6.9)");
     // 改配置 = 重新生成三份配置 → 重启内核 → 验端口, 真机上 2~4 秒, 而重启 Xray 会
     // 掐断"走本机链路上网"的浏览器。现在接口立刻回执 + 后台任务 + 进度条轮询。
