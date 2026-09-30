@@ -108,6 +108,12 @@ function chainExitCard(d, ex) {
       <div class="note mb-3">
         内层 QUIC 是给跨洋链路的: 默认的 Reality 内层是 TCP over TCP, 长肥管道上
         拥塞窗口爬得慢; 换 UDP 后没有双层重传互相拖累 (需要在安全组放行这个 UDP 端口)。</div>
+      ${
+        ex.hy_available
+          ? ""
+          : `<div class="note mb-3">本机还没装 <b>hysteria</b> 二进制 —— 勾了内层 QUIC 也起不来
+             (那半个 UDP 端口不会有任何东西在监听)。装上之后再回来「保存并应用」一次即可, 配对码不用换。</div>`
+      }
       <div class="row mt-1">
         <button class="btn small" id="btn-chain-exit-gen">生成配对码</button>
         <span class="muted fs-sm">生成后把配对码贴到入口端服务器</span>
@@ -431,16 +437,30 @@ function updateChainTransportHint() {
   const opt = $("#chain-transport-quic");
   if (!sel || !hint || !opt) return;
   const info = chainCodeInfo($("#chain-code").value);
-  const quic = !!(info && info.y && info.y.p && info.y.w);
+  const hasCreds = !!(info && info.y && info.y.p && info.y.w);
+  const quic = hasCreds;
   opt.disabled = !quic;
-  if (quic) {
+  // 选项文字本身带原因: 用户点开下拉看到的是置灰的那一行, 光靠下面的小字
+  // 很容易错过 —— 之前这里只是一句灰色小字, 而且配对码还没粘贴时小字是**空白**的,
+  // 于是"下拉打不开 QUIC"看起来就像个 bug (用户就是这么报的)。
+  opt.textContent = quic
+    ? "QUIC / Hysteria 2 (UDP, 跨洋更快)"
+    : `QUIC / Hysteria 2 (UDP) —— ${hasCreds ? "本机缺少 hysteria 二进制" : "需要落地端开启内层 QUIC"}`;
+  // 本机的 hysteria 二进制: QUIC 内层由它承载, 没有它服务端会直接拒绝这条链
+  const localHy = !!((((S.dash || {}).chain || {}).exit || {}).hy_available);
+  if (quic && !localHy) {
+    hint.textContent =
+      "这份配对码支持 QUIC, 但本机没有 hysteria 二进制 —— 内层 QUIC 由它承载, 连接会被服务端拒绝。装上 hysteria 之后再来选它。";
+  } else if (quic) {
     hint.textContent = "落地端开了内层 QUIC —— 跨洋链路建议选它 (UDP, 没有 TCP over TCP)。";
-  } else {
-    if (sel.value === "hysteria2") sel.value = "reality";
-    hint.textContent = info
-      ? "这份配对码里没有 QUIC 凭据 (落地端没开内层 QUIC), 只能走 Reality。"
-      : "";
+  } else if (!hasCreds && !info) {
+    hint.textContent =
+      "粘贴配对码后这里会告诉你能不能选 QUIC。要用 QUIC, 得先在落地端勾选「同时开放内层 QUIC (Hysteria 2)」再生成配对码。";
+  } else if (!hasCreds) {
+    hint.textContent =
+      "这份配对码里没有 QUIC 凭据 —— 落地端生成时没勾「同时开放内层 QUIC」。想要 QUIC: 在落地端填好内层 QUIC 端口并勾上它, 重新生成配对码, 再回到这里粘贴。";
   }
+  if (sel.value === "hysteria2" && !quic) sel.value = "reality";
 }
 
 function bindChainEntries(entries) {

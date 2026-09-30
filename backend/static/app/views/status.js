@@ -5,7 +5,9 @@
  *  renderDashboardBanner / runProbe。
  */
 import { $, esc, escAttr, toast, copyText } from "../lib/dom.js";
-import { fmtBytes, fmtUptime, fmtTime, STATE_TXT, stateClass, PROTO_BADGE } from "../lib/format.js";
+import {
+  fmtBytes, fmtUptime, fmtTime, STATE_TXT, stateClass, nodeStateClass, nodeStateText, PROTO_BADGE,
+} from "../lib/format.js";
 import { api } from "../lib/api.js";
 import { openQr } from "../lib/dialog.js";
 import { S } from "../lib/state.js";
@@ -108,8 +110,8 @@ export function renderNodes() {
       // 第二列: 地址 + 服务状态
       const addr = `<div class="nc-addr">
           <div class="addr mono" title="${escAttr(n.host + ":" + n.port)}">${esc(n.host)}:${n.port}</div>
-          <div class="state"><span class="dot ${stateClass(n.service_state)}" title="${escAttr(n.service || "")}"></span>
-            <span class="muted">${STATE_TXT[n.service_state] || esc(n.service_state)}</span></div>
+          <div class="state"><span class="dot ${nodeStateClass(n)}" title="${escAttr(n.service || "")}"></span>
+            <span class="muted">${esc(nodeStateText(n))}</span></div>
         </div>`;
 
       // 第三列: 握手延迟 (徽标 + 长度条)
@@ -220,6 +222,17 @@ function chainEgress() {
   return { ip: p.exit_ip, label: hit.label || hit.host, ms: p.ms || 0, tcp_ms: p.tcp_ms || 0 };
 }
 
+/** 可点击复制的 IP。CSP 不允许内联事件, 所以渲染完统一用 bindIpCopy 绑。 */
+function ipChip(ip, title, prefix = "") {
+  return `${prefix}<span class="copy-ip" data-copy-ip="${escAttr(ip)}" title="${escAttr(title)}">${esc(ip)}</span>`;
+}
+
+function bindIpCopy(root) {
+  root.querySelectorAll("[data-copy-ip]").forEach((el) => {
+    el.onclick = () => copyText(el.dataset.copyIp);
+  });
+}
+
 export function renderKpis() {
   if (!S.dash) return;
   const nodes = S.dash.nodes || [];
@@ -231,17 +244,32 @@ export function renderKpis() {
   if (kn) {
     kn.innerHTML = `${on}<small> / ${nodes.length}</small>`;
     $("#kpi-nodes-sub").innerHTML = nodes.length
-      ? nodes.slice(0, 14).map((n) => `<span class="dot ${stateClass(n.service_state)}" title="${escAttr(n.name)}"></span>`).join("") +
+      ? nodes.slice(0, 14).map((n) => `<span class="dot ${nodeStateClass(n)}" title="${escAttr(
+          n.name + " · " + nodeStateText(n))}"></span>`).join("") +
         (on === nodes.length ? " 全部启用" : ` 已停用 ${nodes.length - on} 个`)
       : "—";
   }
   const eg = $("#kpi-egress");
   if (eg) {
     const e = chainEgress();
-    eg.textContent = e ? e.ip : "—";
-    $("#kpi-egress-sub").textContent = e
-      ? `链式 · ${e.label}${e.tcp_ms ? " · 链路 " + Math.round(e.tcp_ms) + "ms" : ""}`
-      : ((S.dash.chain && S.dash.chain.exit && S.dash.chain.exit.enabled) ? "本机是落地端, 等对方接入" : "链式代理未启用");
+    const srv = ((S.dash.system || {}).server || {});
+    const localIp = srv.public_ip || "";
+    // 不挂链时"出口"就是本机; 挂了链才是落地端 —— 但本机 IP 两个场景下都要能看见,
+    // 那才是用户要填进客户端的地址 (以前卡片只显示落地 IP, 本机 IP 无处可查)。
+    const exitIp = e ? e.ip : localIp;
+    eg.innerHTML = exitIp ? ipChip(exitIp, "点击复制出口 IP") : "—";
+    const sub = [];
+    if (e && localIp) sub.push(ipChip(localIp, "点击复制本机 IP", "本机 "));
+    if (e) sub.push(`链式 · ${esc(e.label)}${e.tcp_ms ? " · 链路 " + Math.round(e.tcp_ms) + "ms" : ""}`);
+    else if (localIp) sub.push("本机公网 IP · 点击可复制");
+    else if (srv.public_ip_at) sub.push("本机公网 IP 读取失败 (回显服务不可达)");
+    else sub.push(
+      (S.dash.chain && S.dash.chain.exit && S.dash.chain.exit.enabled)
+        ? "本机是落地端, 等对方接入"
+        : "正在读取本机公网 IP…"
+    );
+    $("#kpi-egress-sub").innerHTML = sub.join(" · ");
+    bindIpCopy(eg.parentElement || document);
   }
   const kl = $("#kpi-lat");
   if (kl) {

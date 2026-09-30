@@ -204,10 +204,40 @@ async function main() {
 
     console.log("\n[3] 交互");
     // 开关的 input 是视觉隐藏的 (opacity:0), 要点它的滑块
+    // 关掉之前先记下这排灯的颜色: 关掉的那颗必须变成"灰 (off)", 其余保持原样
+    const dotsBefore = await page.evaluate(() =>
+      [...document.querySelectorAll("#kpi-nodes-sub .dot")].map((d) => d.className));
     const firstSlider = page.locator("#node-grid .node-card").first().locator(".switch .slider");
     await firstSlider.click();
     await page.waitForSelector("#toast.show", { timeout: 15000 });
     check("节点开关热更新 (Toast 提示)", true, (await page.locator("#toast").innerText()).trim());
+    // 关掉一个协议的节点之后, 它的状态灯必须熄灭变灰 —— 顶部「健康节点」那排点
+    // 和节点卡自己的灯之前都直接取 service_state (Xray 还在跑), 所以关掉之后灯还是绿的。
+    await page.waitForFunction(
+      () => document.querySelector("#kpi-nodes-sub .dot.off"), { timeout: 20000 });
+    const offState = await page.evaluate(() => {
+      const card = document.querySelector("#node-grid .node-card");
+      const dots = [...document.querySelectorAll("#kpi-nodes-sub .dot")];
+      return {
+        classes: dots.map((d) => d.className),
+        off: dots.filter((d) => d.classList.contains("off")).length,
+        count: document.querySelector("#kpi-nodes").innerText.replace(/\s/g, ""),
+        cardDot: (card.querySelector(".nc-addr .dot") || {}).className || "",
+        cardTxt: (card.querySelector(".nc-addr .state") || {}).innerText.trim() || "",
+        sub: document.querySelector("#kpi-nodes-sub").innerText.trim(),
+      };
+    });
+    // 灯的颜色按服务状态给 (生产是绿, 本地开发是黄), 所以这里比的是"关掉的那一颗
+    // 从原状态变成了 off, 其余一颗都没动" —— 不写死颜色, 两种环境都成立。
+    check("关掉的节点在顶部「健康节点」里熄灭成灰灯, 其余不受影响",
+      dotsBefore.length === 5 && !dotsBefore.some((c) => c.includes("off"))
+      && offState.classes[0].includes("off") && offState.off === 1
+      && JSON.stringify(offState.classes.slice(1)) === JSON.stringify(dotsBefore.slice(1))
+      && offState.count === "4/5",
+      `${dotsBefore.length} 颗灯 → 灰 ${offState.off} 颗 · ${offState.count} · ${offState.sub}`);
+    check("节点卡自己的状态灯也一起熄灭, 文案是「已停用」",
+      /off/.test(offState.cardDot) && offState.cardTxt === "已停用",
+      `${offState.cardDot} · ${offState.cardTxt}`);
     await page.locator("#node-grid .node-card").first().locator(".switch .slider").click();
     await page.waitForTimeout(1200);
     const enabledLabels = await page.locator("#node-grid .switch input:checked").count();
@@ -685,6 +715,14 @@ async function main() {
       && (await page.locator("#chain-exit-hy").count()) === 1
       && /内层 QUIC/.test(await page.locator("#chain-exit-card").innerText()),
       await page.inputValue("#chain-exit-hyport"));
+    // 没有 hysteria 二进制时, 这个勾选了也起不来 —— 卡片要先把这件事说出来, 别让用户
+    // 对着一个"开了却没反应"的落地端排查。装了 hysteria 的机器上不该出现这句。
+    const hyReady = (await (await page.request.get(`${base}/api/dashboard`)).json())
+      .chain.exit.hy_available;
+    const exitText = await page.locator("#chain-exit-card").innerText();
+    check("落地端说清本机有没有 hysteria (没有就别让用户白勾)",
+      hyReady ? !/还没装/.test(exitText) : /还没装/.test(exitText),
+      hyReady ? "本机已有 hysteria" : "本机没有 hysteria → 卡片已标注");
 
     // 落地端: 生成配对码 (专用凭据 = 独立 UUID + 独立端口)
     await page.fill("#chain-exit-port", "8666");
@@ -709,6 +747,17 @@ async function main() {
       (await page.locator("#chain-transport").count()) === 1
       && (await page.locator("#chain-transport option").count()) === 2,
       await page.locator("#chain-transport-hint").innerText());
+    // 还没粘配对码时 QUIC 也是置灰的 —— 这里以前**一个字都不显示**, 用户点开下拉
+    // 看到灰选项, 只能以为"下拉坏了"。现在选项文字与提示都要说清: 得先让落地端开内层 QUIC。
+    const emptyGate = await page.evaluate(() => ({
+      disabled: document.querySelector("#chain-transport-quic").disabled,
+      opt: document.querySelector("#chain-transport-quic").innerText.trim(),
+      hint: document.querySelector("#chain-transport-hint").innerText.trim(),
+    }));
+    check("没粘配对码时也写清 QUIC 为什么点不了 (选项文字 + 提示, 不再是空白)",
+      emptyGate.disabled && /落地端/.test(emptyGate.opt) && emptyGate.hint.length > 10
+      && /QUIC/.test(emptyGate.hint),
+      `${emptyGate.opt} | ${emptyGate.hint.slice(0, 44)}`);
     await page.fill("#chain-code", exitCard.code);   // 这份是 v1 码 (没勾内层 QUIC)
     const v1Gate = await page.evaluate(() => ({
       disabled: document.querySelector("#chain-transport-quic").disabled,
@@ -1093,6 +1142,50 @@ async function main() {
     await page.waitForFunction(() => window.scrollY < 40, { timeout: 8000 });
     check("点它真的回到顶部, 且自己隐藏",
       !(await page.evaluate(() => document.querySelector("#to-top").classList.contains("on"))), "");
+
+    console.log("\n[3i-3] 顶部「出口 IP」卡片: 落地 IP 与本机 IP 都在, 都能点复制");
+    // 以前这张卡只显示落地出口 IP, 本机公网 IP (用户要填进客户端的那个) 面板里无处可查,
+    // 也没有任何"点一下复制"的入口。这里把 /api/dashboard 拦下来塞一个本机 IP + 一条
+    // 启用的链, 验两个 IP 同时渲染且都是可复制的芯片。
+    const nowSec2 = Math.floor(Date.now() / 1000);
+    await page.route("**/api/dashboard", async (route) => {
+      const res = await route.fetch();
+      const body = await res.json();
+      body.system.server.public_ip = "203.0.113.9";
+      body.system.server.public_ip_at = nowSec2;
+      body.chain.entries = [{
+        id: "zz-egress", label: "美国落地", host: "198.51.100.7", port: 8666,
+        local_port: 8447, transport: "reality", sni: "www.microsoft.com",
+        enabled: true, default_out: true, has_quic: false,
+        last_probe: {
+          ok: true, probe_ok: true, exit_ip: "198.51.100.7", tcp_ms: 152.4,
+          ms: 3120.5, ts: nowSec2, detail: "经链路读回出口 IP",
+        },
+      }];
+      await route.fulfill({ response: res, json: body });
+    });
+    await page.reload();
+    await page.waitForSelector("#view-dash:not(.hidden)", { timeout: 30000 });
+    await page.waitForFunction(
+      () => document.querySelectorAll("#kpi-egress .copy-ip, #kpi-egress-sub .copy-ip").length === 2,
+      { timeout: 20000 });
+    const ipCard = await page.evaluate(() => ({
+      label: document.querySelector("#kpi-egress").closest(".k").querySelector(".k-lab").innerText.trim(),
+      main: document.querySelector("#kpi-egress").innerText.trim(),
+      chips: [...document.querySelectorAll("#kpi-egress .copy-ip, #kpi-egress-sub .copy-ip")]
+        .map((el) => el.dataset.copyIp),
+      sub: document.querySelector("#kpi-egress-sub").innerText.replace(/\s+/g, " ").trim(),
+    }));
+    check("出口 IP 卡片同时给出落地 IP 和本机 IP",
+      ipCard.main === "198.51.100.7" && ipCard.chips.join(",") === "198.51.100.7,203.0.113.9"
+      && /本机 203\.0\.113\.9/.test(ipCard.sub) && /链路 152ms/.test(ipCard.sub),
+      `${ipCard.label} · ${ipCard.sub}`);
+    await page.evaluate(() => document.querySelector("#toast").classList.remove("show"));
+    await page.click("#kpi-egress-sub .copy-ip");
+    await page.waitForSelector("#toast.show", { timeout: 8000 });
+    const copyToast = (await page.locator("#toast").innerText()).trim();
+    check("点本机 IP 就能复制", /已复制/.test(copyToast), copyToast);
+    await page.unroute("**/api/dashboard");
 
     console.log("\n[4] 控制台与请求");
     check("无 console 错误", consoleErrors.length === 0, consoleErrors.slice(0, 3).join(" | "));

@@ -100,6 +100,9 @@
 .kpi .k-sub { margin-top: 4px; font-size: 11.5px; color: var(--sub); line-height: 1.5; }
 .kpi .k-sub .dot { margin-right: 4px; }
 .kpi .k-spark { display: block; width: 100%; height: 22px; margin-top: 6px; overflow: visible; }
+/* 顶部卡片里的可复制 IP: 平时看着像正文, 鼠标移上去才提示"能点" */
+.copy-ip { cursor: pointer; border-bottom: 1px dashed color-mix(in srgb, var(--sub) 50%, transparent); }
+.copy-ip:hover { color: var(--accent); border-bottom-color: var(--accent); }
 
 /* ---------- 徽标 / 药丸 / 状态点 ---------- */
 .badge { display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: 650; letter-spacing: 0.02em; background: var(--border-soft); color: var(--sub); }
@@ -117,6 +120,8 @@
 .dot.running, .dot.active { animation: zp-pulse 2.4s var(--ease) infinite; }
 .dot.failed, .dot.err { background: var(--err); }
 .dot.other { background: var(--warn); }
+/* 节点被关掉: 灯熄灭 (灰、不呼吸) —— 亮着的灯必须代表"这个协议现在真的能用" */
+.dot.off { background: var(--sub); opacity: 0.42; animation: none; }
 @keyframes zp-pulse {
   0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 45%, transparent); }
   70% { box-shadow: 0 0 0 6px color-mix(in srgb, var(--ok) 0%, transparent); }

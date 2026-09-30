@@ -24,6 +24,9 @@ os.environ.setdefault("ZP_BIND_PORT", "9900")
 # 关闭后台 GeoIP 自动更新线程: 测试必须离线可跑, 不能偷偷发网络请求
 os.environ.setdefault("ZP_GEODATA_AUTO", "0")
 
+# 同理关掉"本机公网 IP"的回显请求 (顶部出口 IP 卡片用): 测试环境不该出网
+os.environ.setdefault("ZP_PUBLIC_IP", "0")
+
 # 改配置默认走后台任务 (v2.6.9): 接口立刻回执 + 前端轮询 /api/apply/job。
 # 测试里必须同步执行 —— 后台线程活过用例就会踩到下一个用例的 $ZP_HOME
 # (每个用例一个临时目录), 所以默认关掉; 专门验证后台任务的用例自己打开。

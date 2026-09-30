@@ -119,6 +119,12 @@ async def lifespan(app: FastAPI):
         target=chain_quic.supervisor_loop, args=(stop,), daemon=True, name="zp-chain-quic"
     )
     keeper.start()
+    # 顶部「出口 IP」卡片要显示本机公网 IP, 而云主机的公网 IP 不在网卡上 (NAT /
+    # 弹性 IP), 只能问一次外部回显服务。启动时先读, 免得用户打开面板看到一片"—";
+    # 之后由 services 按 TTL 在后台自己刷。ZP_PUBLIC_IP=0 可整体关闭 (测试离线跑)。
+    threading.Thread(
+        target=services.refresh_public_ip, daemon=True, name="zp-public-ip"
+    ).start()
     try:
         yield
     finally:

@@ -2,7 +2,7 @@
 
 ## 1. Project Overview
 
-**ZeroProxy** (v2.6.22) is a self-hosted proxy management panel that orchestrates Xray, Hysteria 2, and Nginx on a single server. It provides a web dashboard — a zero-framework, zero-build SPA (`index.html` + ES modules under `static/app/`, plain JS, no CDN) — that manages proxy nodes, subscriptions, chained proxies, GeoIP-based routing, and service lifecycle.
+**ZeroProxy** (v2.6.23) is a self-hosted proxy management panel that orchestrates Xray, Hysteria 2, and Nginx on a single server. It provides a web dashboard — a zero-framework, zero-build SPA (`index.html` + ES modules under `static/app/`, plain JS, no CDN) — that manages proxy nodes, subscriptions, chained proxies, GeoIP-based routing, and service lifecycle.
 
 - **Root**: `/Users/eric/Desktop/sbpn/zeroproxy/`
 - **Backend**: `/Users/eric/Desktop/sbpn/zeroproxy/backend/zeroproxy/` (Python, FastAPI)
@@ -50,7 +50,7 @@
 | `config.py` | 24KB | Runtime state management, concurrency model (`config.locked()`), constants |
 | `routes.py` | 99KB | All API endpoints (33 router paths + `/`, `/api/info`), session/auth, dashboard, config mutation, **async job table** (`_APPLY_JOBS`) |
 | `apply.py` | 26KB | The 6-step landing loop ("generate → real-binary verify → reload → re-check ports"); shared by the panel and `upgrade.sh` |
-| `services.py` | 47KB | Service adaptation layer (systemctl, certbot, firewall), traffic stats |
+| `services.py` | 49KB | Service adaptation layer (systemctl, certbot, firewall), traffic stats, cached public-IP lookup (`ZP_PUBLIC_IP=0` disables) |
 | `xray_config.py` | 16KB | Xray JSON config generator (4 inbounds + chain + routing) |
 | `share_links.py` | 28KB | Client share links, subscriptions (base64/clash/singbox), routing templates |
 | `chain.py` | 32KB | Chained proxy: pairing codes, port allocation, real handshake probing |
@@ -148,7 +148,7 @@ nginx / hysteria 不再陪着重启一次)。
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/dashboard` | GET | Full dashboard data (nodes, traffic, cert, chain, geodata, audit) |
+| `/api/dashboard` | GET | Full dashboard data (nodes, traffic, cert, chain, geodata, audit). `system.server.public_ip` carries the machine's own public IP (echo-service lookup, cached; empty when `ZP_PUBLIC_IP=0` or unreachable) — the top "出口 IP" tile shows it next to the exit IP |
 | `/api/status` | GET | Minimal status check (configured, authenticated) |
 | `/api/audit` | GET | Paginated audit log with filters (category, q, failed) |
 | `/api/traffic` | GET | Per-node traffic stats (via Xray Stats API) |
@@ -480,6 +480,8 @@ sockopt = {
 7. **Pairing code versioning**: v1 (Reality only) / v2 (Reality + QUIC) — forward-compatible parsing with explicit version check
 8. **Subscription format flexibility**: base64 (standard), clash (YAML), singbox (JSON) — routing templates (smart/global/direct) only affect client-side subscription output
 9. **Core binaries are never auto-upgraded**: major Xray/Hysteria releases change config semantics (Xray 25 removed `allowInsecure`, renamed certificate fields, swapped REALITY keys to X25519; geo loading was tightened). The panel exposes an explicit checkbox that sets `ZP_UPDATE_CORE=1` for one run and shows the currently installed versions next to it — the risk stays with the user who accepts it, and the update button never takes it on their behalf
+10. **Status lights report the node, not the daemon**: a node's dot is driven by *that protocol's* state — off = disabled (grey, no pulse), so a lit lamp always means "this protocol works right now". Reading `service_state` directly made a disabled node look healthy just because Xray was still running
+11. **Disabled controls must explain themselves**: the entry-side "inner transport" select greys out QUIC unless the pairing code carries QUIC credentials (the landing side has to enable it). The option label and the hint underneath always state the reason *and* the next step; a greyed-out option with a blank hint reads as a broken dropdown
 
 ## 13. Cross-Module Dependencies
 

@@ -1408,6 +1408,55 @@ def test_geodata_ttl_counts_from_last_check(home):
 
 # ---------------------------------------------------------------- 内核升级开关
 
+def test_dashboard_exposes_server_public_ip(client, configured, home):
+    """顶部「出口 IP」卡片要能同时拿到本机公网 IP。
+
+    链式代理下"本机 IP"和"落地出口 IP"是两个不同的地址, 而以前面板只给落地那个 ——
+    用户要填进客户端的那一个反而无处可查。公网 IP 不在网卡上 (云主机是 NAT /
+    弹性 IP), 只能问外部回显服务; 测试必须离线, 所以 conftest 里 ZP_PUBLIC_IP=0
+    把整个读取关掉: 这时面板如实给空值 + 空时间戳, 绝不编一个地址出来。
+    """
+    from zeroproxy import services
+
+    srv = client.get("/api/dashboard").json()["system"]["server"]
+    for key in ("public_ip", "public_ip_at"):
+        assert key in srv, key
+    assert srv["public_ip"] == ""
+    assert services.public_ip()["ip"] == ""
+
+
+def test_public_ip_reads_echo_and_retries_after_failure(home, monkeypatch):
+    """读回显服务 → 落进缓存; 失败不清掉上次的好值, 但要安排重试而不是等满一小时。"""
+    import time as _time
+    from zeroproxy import services
+
+    monkeypatch.setenv("ZP_PUBLIC_IP", "1")
+    monkeypatch.setattr(services, "IP_ECHO_DIRECT", ("http://echo.invalid/",))
+
+    class _Resp:
+        def read(self, _n=None):
+            return b"203.0.113.55\n"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr(services.urllib.request, "urlopen", lambda *_a, **_k: _Resp())
+    assert services.refresh_public_ip()["ip"] == "203.0.113.55"
+    assert services.public_ip()["ip"] == "203.0.113.55"
+
+    def _down(*_a, **_k):
+        raise OSError("network down")
+
+    monkeypatch.setattr(services.urllib.request, "urlopen", _down)
+    assert services.refresh_public_ip()["ip"] == ""
+    snap = services.public_ip()
+    assert snap["ip"] == "203.0.113.55"           # 网络抖一下不该让卡片变空
+    assert snap["at"] < int(_time.time())         # 时间戳被推回 → 过 PUBLIC_IP_RETRY 秒就重试
+
+
 def _capture_update_start(monkeypatch, tmp_path) -> dict:
     """让 update.start() 走"没有 systemd-run"的兜底分支, 并抓下它给脚本的环境。"""
     from zeroproxy import services, update

@@ -15,6 +15,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -197,6 +198,11 @@ def server_info() -> dict:
         "uptime_s": _uptime(),
         "panel_version": __import__("zeroproxy").__version__,
     }
+    # 本机公网 IP: 面板顶部"出口 IP"卡片要显示"客户端连过来时看到的那个 IP"
+    # (链式代理下它和落地出口 IP 是两个不同的地址, 用户两个都要看)
+    snapshot = public_ip()
+    info["public_ip"] = snapshot["ip"]
+    info["public_ip_at"] = snapshot["at"]
     if sys.platform.startswith("linux") and os.path.exists("/etc/os-release"):
         try:
             for line in open("/etc/os-release", encoding="utf-8"):
@@ -206,6 +212,86 @@ def server_info() -> dict:
         except OSError:
             pass
     return info
+
+
+# ---------------------------------------------------------------- 本机公网 IP
+#
+# 为什么不能从网卡上读: 云主机的公网 IP 是 NAT / 弹性 IP, 不在任何 interface 上
+# (读到的只有 10.x / 172.x 的内网地址)。所以只能直连一个回显服务问一次 ——
+# 读回来的就是"外面看到的那个 IP", 也正是用户要填进客户端的那个。
+#
+# 面板每 20 秒重画一次顶部卡片, 所以这里只返回缓存; 真正出网在后台线程里做,
+# 读不到就如实留空 (卡片显示"—"), 绝不编一个地址出来。
+
+#: 缓存有效期 (换 IP 很少见; 一小时足够了)
+PUBLIC_IP_TTL = 3600
+#: 失败后的重试间隔 —— 部署那一刻网络可能还没就绪, 不能把"读不到"缓存一小时
+PUBLIC_IP_RETRY = 300
+#: 回显服务 (直连, 不走任何代理)。三个都拿不到就认输。
+IP_ECHO_DIRECT = ("http://api.ipify.org", "http://ip.3322.net", "http://ifconfig.me/ip")
+
+_PUBLIC_IP: dict = {"ip": "", "at": 0.0, "detail": "", "busy": False}
+_PUBLIC_IP_LOCK = threading.Lock()
+_IPV4_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+_IPV6_RE = re.compile(r"\b(?:[0-9a-f]{1,4}:){2,7}[0-9a-f]{1,4}\b", re.IGNORECASE)
+
+
+def public_ip_enabled() -> bool:
+    """ZP_PUBLIC_IP=0 时彻底关掉 (测试必须离线可跑, 不能被一个回显请求拖出网)。"""
+    return os.environ.get("ZP_PUBLIC_IP", "1") != "0"
+
+
+def refresh_public_ip(timeout: float = 5.0) -> dict:
+    """直连回显服务读一次本机公网 IP。只写缓存, 从不抛异常。"""
+    if not public_ip_enabled():
+        return {"ip": "", "ok": False}
+    for url in IP_ECHO_DIRECT:
+        try:
+            request = urllib.request.Request(
+                url, headers={"User-Agent": "ZeroProxy/2.0 (public-ip)"}
+            )
+            with urllib.request.urlopen(request, timeout=timeout) as resp:  # noqa: S310 - 固定回显地址
+                body = resp.read(256).decode("utf-8", "replace")
+        except (urllib.error.URLError, OSError, TimeoutError):
+            continue
+        found = _IPV4_RE.search(body) or _IPV6_RE.search(body)
+        if found:
+            with _PUBLIC_IP_LOCK:
+                _PUBLIC_IP.update({"ip": found.group(0), "at": time.time(), "detail": "OK"})
+            return {"ip": found.group(0), "ok": True}
+    with _PUBLIC_IP_LOCK:
+        # 把时间戳推到"再等 PUBLIC_IP_RETRY 秒才算过期", 而不是记成刚成功过
+        _PUBLIC_IP.update(
+            {"at": time.time() - PUBLIC_IP_TTL + PUBLIC_IP_RETRY, "detail": "回显服务不可达"}
+        )
+    return {"ip": "", "ok": False}
+
+
+def _spawn_public_ip_refresh() -> None:
+    with _PUBLIC_IP_LOCK:
+        if _PUBLIC_IP["busy"]:
+            return
+        _PUBLIC_IP["busy"] = True
+
+    def _run() -> None:
+        try:
+            refresh_public_ip()
+        finally:
+            with _PUBLIC_IP_LOCK:
+                _PUBLIC_IP["busy"] = False
+
+    threading.Thread(target=_run, name="zp-public-ip", daemon=True).start()
+
+
+def public_ip() -> dict:
+    """本机公网 IP 的快照 (不做出网 I/O); 缓存过期时顺手在后台刷一次。"""
+    with _PUBLIC_IP_LOCK:
+        ip = str(_PUBLIC_IP["ip"] or "")
+        at = float(_PUBLIC_IP["at"] or 0)
+        busy = bool(_PUBLIC_IP["busy"])
+    if public_ip_enabled() and not busy and (time.time() - at) > PUBLIC_IP_TTL:
+        _spawn_public_ip_refresh()
+    return {"ip": ip, "at": int(at)}
 
 
 def _machine() -> str:
