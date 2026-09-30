@@ -72,22 +72,41 @@ def is_newer(candidate: str, base: str) -> bool:
 
 
 def remote_version(timeout: int = 8) -> tuple[bool, str, str]:
-    """读取远端最新版本号。返回 (成功, 版本号, 来源或错误说明)。"""
-    last_error = "未配置镜像"
-    for template in _MIRRORS:
+    """读取远端最新版本号。返回 (成功, 版本号, 来源或错误说明)。
+
+    为什么是"**问遍所有镜像, 取版本号最高的那个**", 而不是"第一个成功就返回":
+    raw.githubusercontent 的 CDN 缓存约 5 分钟 —— 刚发完版它会继续吐上一版号,
+    面板于是显示"已是最新", 用户以为没发布 (v2.6.23 发布当时实测: raw 说 2.6.22,
+    gh-proxy 已经是 2.6.23)。四个镜像并发问一遍, 谁给的最新就信谁; 全部失败才算失败。
+    并发(而不是依次)是为了让总耗时 ≈ 最慢的那个镜像, 而不是四个之和。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _one(template: str) -> tuple[str, str]:
         url = template.format(repo=DEFAULT_REPO, ref=DEFAULT_REF)
+        host = url.split("/")[2]
         try:
-            request = urllib.request.Request(url, headers={"User-Agent": f"ZeroProxy/{__version__}"})
+            request = urllib.request.Request(
+                url, headers={"User-Agent": f"ZeroProxy/{__version__}"}
+            )
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 text = response.read(8192).decode("utf-8", "replace")
         except (urllib.error.URLError, OSError, ValueError) as exc:
-            last_error = f"{url.split('/')[2]}: {exc}"
-            continue
+            return "", f"{host}: {exc}"
         match = _VERSION_RE.search(text)
-        if match:
-            return True, match.group(1).strip(), url.split("/")[2]
-        last_error = f"{url.split('/')[2]}: 未找到 __version__"
-    return False, "", last_error
+        return (match.group(1).strip(), host) if match else ("", f"{host}: 未找到 __version__")
+
+    seen: list[tuple[str, str]] = []
+    errors: list[str] = []
+    with ThreadPoolExecutor(max_workers=len(_MIRRORS)) as pool:
+        for version, note in pool.map(_one, _MIRRORS):
+            if version:
+                seen.append((version, note))
+            else:
+                errors.append(note)
+    if not seen:
+        return False, "", "; ".join(errors)[:200]
+    return True, *max(seen, key=lambda item: parse_version(item[0]))
 
 
 def _read_status() -> dict:

@@ -1408,6 +1408,49 @@ def test_geodata_ttl_counts_from_last_check(home):
 
 # ---------------------------------------------------------------- 内核升级开关
 
+def test_remote_version_takes_newest_across_mirrors(home, monkeypatch):
+    """镜像之间会有一段时间的 CDN 缓存差 —— 版本检查必须取**最新**的那个。
+
+    以前是"第一个成功的就返回", 而第一个镜像 raw.githubusercontent 的缓存最长:
+    v2.6.23 发布后实测 raw 还在吐 2.6.22, gh-proxy 已经是 2.6.23 —— 面板于是显示
+    "已是最新", 用户以为没发布成功。现在四个镜像并发问一遍, 谁最新信谁。
+    """
+    from zeroproxy import update
+
+    class _Resp:
+        def __init__(self, body):
+            self._body = body
+
+        def read(self, _n=None):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    def _mirrors(request, timeout=None):
+        url = request.full_url
+        # 注意顺序: gh-proxy 的地址里也含 raw.githubusercontent, 先判断它
+        if "gh-proxy" in url:
+            return _Resp(b'__version__ = "2.6.23"\n')      # 已经拿到新版
+        if "raw.githubusercontent" in url:
+            return _Resp(b'__version__ = "2.6.22"\n')      # CDN 还没刷新
+        raise OSError("blocked")
+
+    monkeypatch.setattr(update.urllib.request, "urlopen", _mirrors)
+    ok, latest, source = update.remote_version()
+    assert ok and latest == "2.6.23" and "gh-proxy" in source
+
+    def _down(*_a, **_k):
+        raise OSError("network down")
+
+    monkeypatch.setattr(update.urllib.request, "urlopen", _down)
+    ok, latest, source = update.remote_version()
+    assert not ok and latest == "" and "down" in source
+
+
 def test_dashboard_exposes_server_public_ip(client, configured, home):
     """顶部「出口 IP」卡片要能同时拿到本机公网 IP。
 
