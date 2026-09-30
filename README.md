@@ -1142,6 +1142,23 @@ $ z
 
 **回归**: `pytest` 202 → **203 项**; `scripts/browser_check.cjs` 152 → **153 项**。
 
+### 8.21 v2.6.29: 按分支下载的代码快照会被 CDN 缓存 —— 刚发完版就升级会装到旧版本
+
+查侧栏那个问题的时候发现的: `https://github.com/<repo>/archive/refs/heads/main.tar.gz`
+在推送之后**仍有一小段时间返回上一个提交的内容** (实测: 刚推完 2.6.28, 从那个地址拉
+下来的还是 2.6.27)。而 `install.sh` / `upgrade.sh` 正是从它下载代码的 ——
+于是"我刚说已推送 → 你去升级"这条路可能装到**上一版**, 面板上显示成
+`v2.6.28 → v2.6.28`, 用户以为升级没生效。两处一起改:
+
+* 先 `GET /repos/<repo>/commits/<ref>` 拿到**提交 SHA**, 再下
+  `archive/<sha>.tar.gz` —— 不可变快照, 不存在"是不是最新的"这个问题;
+* 拿不到 SHA (GitHub API 被挡 / 触发限流, 本机实测就撞到过 403) 时退回原来的
+  tag → 分支 → API 三级兜底, 但给分支 / tag 的地址带上 `?t=<时间戳>` **强制回源**
+  (query 进了 CDN 缓存键, 于是拿到的是最新提交)。
+
+**回归**: `pytest` 203 → **204 项** (新增一条: 两个脚本都必须先解析 SHA 再下载,
+且退路带破缓存参数)。
+
 ---
 
 ## 9. API
@@ -1253,7 +1270,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 
 在 macOS (Apple Silicon, Python 3.14) 上实测通过:
 
-- `python -m pytest tests -q` → **203 passed, 6 skipped** (带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时再补上跳过的那几项, 约 45 秒);
+- `python -m pytest tests -q` → **204 passed, 6 skipped** (带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时再补上跳过的那几项, 约 45 秒);
   含 `/api/update` 鉴权与版本比较、`apply` 的"写不进 /etc/nginx 即失败"语义、CLI 退出码、以及
   `install.sh` 重跑不覆盖已初始化配置 / `upgrade.sh` 随包发布 / 自签证书可补签 Let's Encrypt /
   `systemctl` 参数顺序的回归断言 / Reality 密钥必须是成对的 X25519 (Ed25519 必须判无效) /

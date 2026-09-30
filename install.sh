@@ -146,13 +146,23 @@ resolve_zp_ref() {
 # 用 curl (-f 让 404 立刻失败): 实测 wget 遇到 404 会重试到超时, 失败时要多等好几分钟。
 # GitHub 对 tag 会剥掉前导 v 且不同 ref 的顶层目录名不同, 所以统一用 tar 列表定位目录。
 fetch_zp_tarball() {
-  local out="$1" ref="$2" url err
+  local out="$1" ref="$2" url err sha bust
   err="$(mktemp)"
-  for url in \
-    "$GH/$ZP_REPO/archive/refs/tags/$ref.tar.gz" \
-    "$GH/$ZP_REPO/archive/refs/heads/$ref.tar.gz" \
+  # 先把分支 / tag 解析成提交 SHA: `archive/refs/heads/<分支>.tar.gz` 在推送后被 CDN
+  # 缓存住时会**装到上一个版本** (真机上遇到过"刚发版, 装完还是旧号"); 按 SHA 下的是
+  # 不可变快照, 永远是我们要的那一份。拿不到 SHA (API 被挡) 就退回原来的三级兜底,
+  # 并给分支/tag 的地址带上时间戳强制回源。
+  sha="$(curl -fsSL --max-time 20 "$GH_API/repos/$ZP_REPO/commits/$ref" 2>/dev/null \
+        | sed -n 's/.*"sha": *"\([0-9a-f]\{40\}\)".*/\1/p' | head -1 || true)"
+  bust="?t=$(date +%s)"
+  local -a urls=()
+  [ -n "$sha" ] && urls+=("$GH/$ZP_REPO/archive/$sha.tar.gz")
+  urls+=(
+    "$GH/$ZP_REPO/archive/refs/tags/$ref.tar.gz$bust"
+    "$GH/$ZP_REPO/archive/refs/heads/$ref.tar.gz$bust"
     "$GH_API/repos/$ZP_REPO/tarball/$ref"
-  do
+  )
+  for url in "${urls[@]}"; do
     if command -v curl >/dev/null 2>&1; then
       curl -fsSL --connect-timeout 10 --max-time 120 -o "$out" "$url" 2>"$err" || { rm -f "$out"; continue; }
     else

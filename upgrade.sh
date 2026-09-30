@@ -269,13 +269,22 @@ trap on_exit EXIT
 step_log "从 GitHub 下载面板代码 ($ZP_REPO @ $ZP_REF) ..."
 begin_step "下载新版本代码"
 fetch_tarball() { # fetch_tarball <输出文件>
-  local out="$1" url err
+  local out="$1" url err sha
   err="$(mktemp)"
-  for url in \
-    "$GH/$ZP_REPO/archive/refs/heads/$ZP_REF.tar.gz" \
-    "$GH/$ZP_REPO/archive/refs/tags/$ZP_REF.tar.gz" \
+  # 先把分支 / tag 解析成提交 SHA, 再按 SHA 下载 —— `archive/refs/heads/<分支>.tar.gz`
+  # 在推送后会被 CDN 缓存一小会儿, 刚发完版就升级会**装到上一个版本的代码**
+  # (面板上显示成 "v2.6.28 → v2.6.28", 用户以为没升级)。SHA 是不可变快照, 没有这个问题;
+  # 拿不到 SHA (API 被挡) 就退回原来的三级兜底, 并给分支/tag 地址带时间戳强制回源。
+  sha="$(curl -fsSL --max-time 20 "$GH_API/repos/$ZP_REPO/commits/$ZP_REF" 2>/dev/null \
+        | sed -n 's/.*"sha": *"\([0-9a-f]\{40\}\)".*/\1/p' | head -1 || true)"
+  local -a urls=()
+  [ -n "$sha" ] && urls+=("$GH/$ZP_REPO/archive/$sha.tar.gz")
+  urls+=(
+    "$GH/$ZP_REPO/archive/refs/heads/$ZP_REF.tar.gz?t=$(date +%s)"
+    "$GH/$ZP_REPO/archive/refs/tags/$ZP_REF.tar.gz?t=$(date +%s)"
     "$GH_API/repos/$ZP_REPO/tarball/$ZP_REF"
-  do
+  )
+  for url in "${urls[@]}"; do
     curl -fsSL --connect-timeout 10 --max-time 180 -o "$out" "$url" 2>"$err" || { rm -f "$out"; continue; }
     if tar -tzf "$out" >/dev/null 2>&1; then rm -f "$err"; return 0; fi
     rm -f "$out"

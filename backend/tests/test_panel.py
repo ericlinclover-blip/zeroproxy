@@ -1629,6 +1629,23 @@ def test_installers_wire_up_the_terminal_shortcut():
     assert "/usr/local/bin/z" in uninstall and cli_wrapper_mark() in uninstall
 
 
+def test_updaters_fetch_a_fresh_snapshot_not_a_cached_branch():
+    """按分支下载会被 CDN 缓存 —— 推送后几分钟内升级会装到**上一个版本**的代码。
+
+    真机上踩到过: 面板显示 "v2.6.28 → v2.6.28", 用户以为没升级。所以两个脚本都要
+    (a) 先把分支/tag 解析成提交 SHA 并按 SHA 下载 (不可变快照), (b) 拿不到 SHA 时
+    给分支/tag 的地址带上时间戳强制回源。
+    """
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    for name in ("install.sh", "upgrade.sh"):
+        text = (root / name).read_text(encoding="utf-8")
+        assert "repos/$ZP_REPO/commits/$" in text, f"{name}: 没有先解析提交 SHA"
+        assert "archive/$sha.tar.gz" in text, f"{name}: 没有按 SHA 下载"
+        assert "?t=" in text, f"{name}: 退路没有破缓存 (分支快照会被 CDN 缓存住)"
+
+
 def cli_wrapper_mark() -> str:
     from zeroproxy import cli
 
