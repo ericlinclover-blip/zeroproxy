@@ -19,6 +19,7 @@
  *   ZP_CHECK_PORT   面板监听端口 (默认 8899)
  *   ZP_SHOT_DIR     截图目录 (默认 work/browser-check)
  */
+const net = require("net");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
@@ -26,7 +27,7 @@ const { spawn } = require("child_process");
 
 const ROOT = path.resolve(__dirname, "..");
 const PYTHON = process.env.ZP_PYTHON || "python3";
-const PORT = parseInt(process.env.ZP_CHECK_PORT || "8899", 10);
+let PORT = parseInt(process.env.ZP_CHECK_PORT || "8899", 10);
 const TOKEN = "browser-check-token";
 const SHOT_DIR = process.env.ZP_SHOT_DIR || path.join(ROOT, "work", "browser-check");
 
@@ -66,6 +67,28 @@ function retargetCode(code, host) {
   return `${prefix}~${b64}~${sum}`;
 }
 
+/** 端口现在是否空闲 (bind 一次看看)。 */
+function portFree(port) {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.once("error", () => resolve(false));
+    srv.once("listening", () => srv.close(() => resolve(true)));
+    srv.listen(port, "127.0.0.1");
+  });
+}
+
+/** 让系统分一个空闲端口 (listen 0 之后读回来)。 */
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.once("error", reject);
+    srv.listen(0, "127.0.0.1", () => {
+      const { port } = srv.address();
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
 async function waitFor(url, timeoutMs = 20000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -95,6 +118,16 @@ async function waitCardInView(page, sel, timeout = 8000) {
 }
 
 async function main() {
+  // 先把端口确认空闲。否则本机若已经跑着一个面板 (例如你自己开着 ./dev.sh), 这里
+  // spawn 的新面板会因为端口被占而退出, 而 waitFor 却会连上**那个**面板 —— 全部断言
+  // 跑在别人身上, 最后静默退出、exit 0, 给出一份"看起来通过、其实什么都没验证"的结果
+  // (本机踩到过)。被占用就自动换一个空闲端口, 并明说换到了哪里。
+  if (!(await portFree(PORT))) {
+    const fallback = await freePort();
+    console.log(`⚠ 端口 ${PORT} 已被占用 (可能是你自己开着的面板) → 本次改用 ${fallback}`);
+    PORT = fallback;
+  }
+
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "zp-browser-"));
   fs.mkdirSync(path.join(home, "data"), { recursive: true });
   fs.writeFileSync(path.join(home, "data", "bootstrap_token"), TOKEN + "\n", { mode: 0o600 });
@@ -120,8 +153,14 @@ async function main() {
   const base = `http://127.0.0.1:${PORT}`;
   let browser;
   try {
-    console.log(`ZeroProxy 浏览器验证  (ZP_HOME=${home})`);
-    await waitFor(`${base}/api/status`);
+    console.log(`ZeroProxy 浏览器验证  (ZP_HOME=${home}, PORT=${PORT})`);
+    try {
+      await waitFor(`${base}/api/status`);
+    } catch (e) {
+      // 面板没起来时把子进程的输出带出来 —— 否则只能看到一句"未就绪", 不知道是端口
+      // 被占、依赖缺失还是代码报错
+      throw new Error(`${e.message}\n子进程输出:\n${serverLog.split("\n").slice(-10).join("\n").trim() || "(空)"}`);
+    }
 
     // 允许指定 Chromium 可执行文件 (本机 Playwright 版本与已缓存浏览器版本不一致时使用)
     browser = await chromium.launch(
@@ -364,6 +403,11 @@ async function main() {
     await page.click("#btn-update");
     check("点头部的「检查更新」会把更新卡片带到眼前",
       await waitCardInView(page, "#update-card", 20000), "");
+    // 这次点击会真的去查一次远端版本 (处理期间「检查更新」按钮是禁用的)。必须等它收工:
+    // 否则它返回时会用真实状态重画一遍, 把下面几行刚摆好的"可升级"假状态冲掉,
+    // 让后面几条断言莫名其妙地失败 (本机踩到过 —— 这就是个竞态)。
+    await page.waitForFunction(
+      () => !document.querySelector("#btn-update-check").disabled, { timeout: 60000 });
     check("非生产环境不显示一键更新按钮",
       await page.locator("#btn-update-run").isHidden());
     check("自签证书下可点「申请证书」(不再禁用到没机会补签)",
