@@ -215,6 +215,19 @@ python3 -m venv "$ZP_HOME/venv"
 "$ZP_HOME/venv/bin/pip" install -q --upgrade pip
 "$ZP_HOME/venv/bin/pip" install -q -r "$ZP_HOME/requirements.txt"
 
+# ---------------- 6a. 终端快捷管理 (z) ----------------
+# 面板密码只能在面板里改 —— 忘了就彻底进不去; 在线更新按钮也在面板里。SSH 是最后
+# 一条一定走得通的路, 所以这里装一个 `z` 命令 (菜单: 改账号密码 / 在线更新 / 退出)。
+# 生成逻辑在 Python 侧 (zeroproxy.cli install-shortcut), shell 里不再抄一遍;
+# `z` 已被别的东西占用时不覆盖, 只装长名字 zeroproxy 并说明。
+if [ -x "$ZP_HOME/venv/bin/python" ]; then
+  if ZP_HOME="$ZP_HOME" PYTHONPATH="$ZP_HOME" "$ZP_HOME/venv/bin/python" -m zeroproxy.cli install-shortcut; then
+    info "面板登不进去时: SSH 到本机输入 z 即可改账号密码 / 在线更新"
+  else
+    warn "终端快捷命令 z 安装失败 (不影响面板, 可用 $ZP_HOME/venv/bin/python -m zeroproxy.cli)"
+  fi
+fi
+
 # ---------------- 6b. GeoIP / GeoSite 分流数据 ----------------
 # Xray 在配置构建阶段就要读 geoip.dat / geosite.dat, 配置里有 geo 规则而数据
 # 缺失会让整个 xray 服务起不来。这里预下载, 失败也不阻塞部署; 面板检测到数据

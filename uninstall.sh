@@ -31,6 +31,14 @@ if command -v nginx >/dev/null && nginx -t >/dev/null 2>&1; then
   systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
 fi
 
+info "移除终端快捷命令 (z / zeroproxy) ..."
+# 只删我们装的那两个: 万一 `z` 是用户自己/别的东西的, 别替人做主
+for cmd in /usr/local/bin/z /usr/local/bin/zeroproxy; do
+  if [ -f "$cmd" ] && grep -q "ZeroProxy 终端快捷管理" "$cmd" 2>/dev/null; then
+    rm -f "$cmd" && ok "已移除 $cmd"
+  fi
+done
+
 if [ "${ZP_KEEP_CERT:-0}" != "1" ]; then
   DOMAIN="$(python3 -c "import json;print(json.load(open('$ZP_HOME/data/state.json')).get('domain',''))" 2>/dev/null || true)"
   if [ -n "$DOMAIN" ] && command -v certbot >/dev/null; then

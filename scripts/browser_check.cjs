@@ -1196,6 +1196,10 @@ async function main() {
       && /更换域名并部署/.test(panelText), panelText.split("\n")[0].slice(0, 40));
     check("用户名按当前账号预填", (await page.inputValue("#acct-user")) === "admin",
       await page.inputValue("#acct-user"));
+    // 忘记密码的兜底入口要写在卡片上, 否则用户根本不知道有这条路
+    check("账号卡片写明「忘记密码 → SSH 输入 z」这条兜底路",
+      /(忘记|忘了)密码/.test(panelText) && /SSH/.test(panelText) && /\bz\b/.test(panelText),
+      (panelText.match(/忘了密码[^\n]*/) || [""])[0].slice(0, 60));
     // 当前密码不对: 明确报错, 而且什么都不改 (要带上一处真实改动才会打到后端 ——
     // 没有任何改动时前端本来就该拦住, 那是另一条路径)
     await page.fill("#acct-now", "definitely-wrong");

@@ -2,7 +2,7 @@
 
 ## 1. Project Overview
 
-**ZeroProxy** (v2.6.25) is a self-hosted proxy management panel that orchestrates Xray, Hysteria 2, and Nginx on a single server. It provides a web dashboard — a zero-framework, zero-build SPA (`index.html` + ES modules under `static/app/`, plain JS, no CDN) — that manages proxy nodes, subscriptions, chained proxies, GeoIP-based routing, and service lifecycle.
+**ZeroProxy** (v2.6.26) is a self-hosted proxy management panel that orchestrates Xray, Hysteria 2, and Nginx on a single server. It provides a web dashboard — a zero-framework, zero-build SPA (`index.html` + ES modules under `static/app/`, plain JS, no CDN) — that manages proxy nodes, subscriptions, chained proxies, GeoIP-based routing, and service lifecycle.
 
 - **Root**: `/Users/eric/Desktop/sbpn/zeroproxy/`
 - **Backend**: `/Users/eric/Desktop/sbpn/zeroproxy/backend/zeroproxy/` (Python, FastAPI)
@@ -48,19 +48,21 @@
 | Module | Size | Responsibility |
 |--------|------|----------------|
 | `config.py` | 24KB | Runtime state management, concurrency model (`config.locked()`), constants |
-| `routes.py` | 113KB | All API endpoints (36 router paths + `/`, `/api/info`), session/auth, dashboard, config mutation, **async job table** (`_APPLY_JOBS`), panel settings (account / domain change with rollback) |
+| `routes.py` | 112KB | All API endpoints (36 router paths + `/`, `/api/info`), session/auth, dashboard, config mutation, **async job table** (`_APPLY_JOBS`), panel settings (account / domain change with rollback) |
 | `apply.py` | 26KB | The 6-step landing loop ("generate → real-binary verify → reload → re-check ports"); shared by the panel and `upgrade.sh` |
-| `services.py` | 49KB | Service adaptation layer (systemctl, certbot, firewall), traffic stats, cached public-IP lookup (`ZP_PUBLIC_IP=0` disables) |
+| `services.py` | 50KB | Service adaptation layer (systemctl, certbot, firewall), traffic stats, cached public-IP lookup (`ZP_PUBLIC_IP=0` disables) |
 | `xray_config.py` | 16KB | Xray JSON config generator (4 inbounds + chain + routing) |
 | `share_links.py` | 28KB | Client share links, subscriptions (base64/clash/singbox), routing templates |
-| `chain.py` | 32KB | Chained proxy: pairing codes, port allocation, real handshake probing |
+| `chain.py` | 31KB | Chained proxy: pairing codes, port allocation, real handshake probing |
 | `chain_quic.py` | 19KB | QUIC inner-layer: hysteria process management, config sync, supervisor loop |
 | `geodata.py` | 33KB | GeoIP/GeoSite download (multi-mirror fallback), validation, auto-update, **upstream version check** (`check_remote` / `dataset_info` — dataset build date + sha, per-file sha256 fingerprints) |
 | `hysteria_config.py` | 3KB | Hysteria 2 config template (port hopping, masquerade) |
 | `nginx_config.py` | 7KB | Nginx config template (ACME, WS proxy, panel HTTPS, fake homepage) |
 | `crypto.py` | 4KB | Key generation (VLESS UUID, Reality X25519), password hashing (PBKDF2) |
-| `update.py` | 14KB | Panel self-update: version check, `upgrade.sh` staging & execution, opt-in core (Xray/Hysteria 2) upgrade via `ZP_UPDATE_CORE` |
-| `main.py` | 6KB | Entry point, security-header middleware, static mount, startup port check; lifespan runs the GeoIP auto-update loop + chain-QUIC supervisor |
+| `account.py` | 2KB | The single implementation of admin-credential rules (username/password validation, hashing, session invalidation) — used by both `POST /api/account` and the `z` terminal manager |
+| `cli.py` | 10KB | Terminal manager (`z`): menu (change credentials / online update / quit), `passwd` / `update` / `status` subcommands, and the `install-shortcut` generator that writes `/usr/local/bin/z` |
+| `update.py` | 15KB | Panel self-update: version check, `upgrade.sh` staging & execution, opt-in core (Xray/Hysteria 2) upgrade via `ZP_UPDATE_CORE` |
+| `main.py` | 10KB | Entry point, security-header middleware, static mount, startup port check; lifespan runs the GeoIP auto-update loop + chain-QUIC supervisor |
 
 ## 3. Concurrency & State Management
 
@@ -487,6 +489,7 @@ sockopt = {
 11. **Disabled controls must explain themselves**: the entry-side "inner transport" select greys out QUIC unless the pairing code carries QUIC credentials (the landing side has to enable it). The option label and the hint underneath always state the reason *and* the next step; a greyed-out option with a blank hint reads as a broken dropdown
 12. **Domain changes are transactional**: issue the certificate first (outside the config lock — certbot can take minutes), then commit, verify the new domain from the server's own side, and roll the domain / certificate / configs back if anything fails. A panel must never become unreachable because a domain change went wrong. The jump itself uses a one-time hand-off token so the browser lands logged in; in dev (no nginx / no public entry) the deploy still saves but the browser is *not* redirected
 13. **Settings never touch node credentials**: changing the panel username / password only changes who can log in. Rotating the VLESS UUID or the Trojan / Hysteria passwords would silently break every client that already imported the subscription
+14. **The terminal (`z`) is the last-resort path, and it reuses the panel's code**: a forgotten panel password would otherwise lock the operator out of their own server's UI, so `install.sh` / `upgrade.sh` drop a `/usr/local/bin/z` wrapper that runs `python -m zeroproxy.cli`. It calls the *same* `account.apply_credentials` and the *same* `upgrade.sh` as the panel — never a second implementation — and it deliberately does not ask for the old password (root already owns `state.json`), instead revoking every existing session. A pre-existing foreign `z` (zoxide and friends) is never overwritten
 
 ## 13. Cross-Module Dependencies
 

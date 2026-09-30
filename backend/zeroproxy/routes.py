@@ -35,6 +35,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
 from . import (
+    account,
     apply,
     chain,
     chain_quic,
@@ -78,7 +79,6 @@ HOP_OFFSETS = (0, 1000, 2000)
 _DOMAIN_RE = re.compile(
     r"^(?=.{4,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$"
 )
-_USER_RE = re.compile(r"^[A-Za-z0-9._-]{2,32}$")
 _SNI_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?)+$")
 _URL_RE = re.compile(r"^https?://[^\s\"'<>]+$")
 
@@ -447,10 +447,11 @@ def setup(payload: SetupIn, request: Request):
         return _err("请输入域名")
     if not (_DOMAIN_RE.match(domain) or _is_ip(domain)):
         return _err("域名格式无效 (示例: proxy.example.com)")
-    if not _USER_RE.match(username):
-        return _err("用户名需为 2-32 位字母/数字/_-.")
-    if len(password) < 6 or len(password) > 128:
-        return _err("密码长度需 6-128 位")
+    try:   # 与「面板设置」/ 终端 z 命令共用同一份校验 (见 account.py)
+        username = account.validate_username(username)
+        account.validate_password(password)
+    except ValueError as exc:
+        return _err(str(exc))
 
     expected = config.bootstrap_token()
     provided = (payload.token or request.headers.get("x-zp-token", "")).strip()
@@ -2132,32 +2133,16 @@ def update_account(payload: AccountIn, request: Request):
             save_state(state)
             return _err("当前密码不正确", 401)
 
-        changed: list[str] = []
-        new_user = (payload.username or "").strip()
-        if new_user and new_user != admin["username"]:
-            if not _USER_RE.match(new_user):
-                return _err("用户名需为 2-32 位字母/数字/_-.")
-            admin["username"] = new_user
-            changed.append(f"用户名改为 {new_user}")
-
-        kicked = 0
-        new_password = payload.new_password or ""
-        if new_password:
-            if new_password == payload.current_password:
-                return _err("新密码不能和当前密码相同")
-            if len(new_password) < 6 or len(new_password) > 128:
-                return _err("密码长度需 6-128 位")
-            admin["password_hash"] = crypto.hash_password(new_password)
-            changed.append("密码已更新")
-            # 改了密码就把别的设备踢下线; 当前这个会话留着, 否则用户自己也掉出去
-            keep = _session_of(state, request)
-            for token in list(state.get("sessions", {})):
-                if token != keep:
-                    state["sessions"].pop(token, None)
-                    kicked += 1
-
-        if not changed:
-            return _err("没有需要修改的内容")
+        # 校验与写入都在 account.py —— 终端快捷管理 (z) 走的是同一份规则, 免得两边漂
+        try:
+            changed, kicked = account.apply_credentials(
+                state,
+                username=(payload.username or "").strip() or None,
+                new_password=payload.new_password or None,
+                keep_session=_session_of(state, request),
+            )
+        except ValueError as exc:
+            return _err(str(exc))
 
         config.audit(
             state,

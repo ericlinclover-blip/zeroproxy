@@ -58,14 +58,20 @@ git -C "$ROOT" show HEAD:upgrade.sh > "$HOME_DIR/upgrade.sh"
 chmod +x "$HOME_DIR/upgrade.sh"
 [ "$(git -C "$ROOT" show HEAD:uninstall.sh 2>/dev/null | head -c 2)" = "#!" ] \
   && git -C "$ROOT" show HEAD:uninstall.sh > "$HOME_DIR/uninstall.sh" || true
-# 假机器也要有 venv: 优先直接借用项目 venv (依赖齐全); 否则造一个假的 venv/bin
-if [ -d "$ROOT/.venv" ]; then
+# 假机器也要有 venv: 优先直接借用项目 venv (依赖齐全); 否则造一个假的 venv/bin。
+# 借用时必须确认**里面真的有 pip** —— 本仓库的 .venv 就是没装 pip 的 (用 uv 之类
+# 创建的), 直接链过来会让「同步 Python 依赖」以 127 失败, 整场演练从第二步就跑偏,
+# 报出一堆与升级逻辑无关的红 (踩过)。
+if [ -x "$ROOT/.venv/bin/pip" ]; then
   ln -s "$ROOT/.venv" "$HOME_DIR/venv"
 else
   mkdir -p "$HOME_DIR/venv/bin"
   printf '#!/bin/sh\nexit 0\n' > "$HOME_DIR/venv/bin/pip"
-  ln -sf "$PYTHON" "$HOME_DIR/venv/bin/python"
-  chmod +x "$HOME_DIR/venv/bin/pip"
+  # python 用一层 wrapper 而不是符号链接: 直接链到 venv 里的 python, CPython 会顺着
+  # 符号链接解析回**系统**解释器, 于是 import cryptography 直接失败 (整场演练都变成
+  # "命令执行失败", 与升级逻辑无关的红)。wrapper 里 exec 的是 venv 里那条真实路径。
+  printf '#!/bin/sh\nexec "%s" "$@"\n' "$PYTHON" > "$HOME_DIR/venv/bin/python"
+  chmod +x "$HOME_DIR/venv/bin/pip" "$HOME_DIR/venv/bin/python"
 fi
 echo "    升级前版本: v$(sed -n 's/^__version__ *= *"\([^"]*\)".*/\1/p' "$HOME_DIR/zeroproxy/__init__.py")"
 
@@ -123,6 +129,9 @@ rm -rf "$NEW_SRC/backend/zeroproxy/__pycache__" "$NEW_SRC/backend/zeroproxy"/*/_
 tar -czf "$SIM/new.tar.gz" -C "$SIM/newsrc" zeroproxy-main
 
 # ---------- 4. 桩二进制 ----------
+# 终端快捷命令要装进沙箱的 bin 目录, 别动真机的 /usr/local/bin (演练假扮 root,
+# 真去写就写进去了)
+export ZP_BIN_DIR="$BIN_DIR"
 cat > "$BIN_DIR/id" <<'SH'
 #!/bin/sh
 [ "${1:-}" = "-u" ] && { echo 0; exit 0; }
@@ -250,6 +259,13 @@ then
   ok "就地升级后状态是 success 且 plan 与 steps 同序对齐"
 else
   bad "就地升级后 update.json 内容不符合预期"
+fi
+# 忘记面板密码时的兜底入口: 就地升级跑的是**新**脚本, 这时该把 z 命令装好
+# (沙箱里的 bin 目录; 第一次 [2] 跑的是老脚本, 那时还没有这个能力)
+if [ -x "$BIN_DIR/z" ] && grep -q "ZeroProxy 终端快捷管理" "$BIN_DIR/z" 2>/dev/null; then
+  ok "终端快捷命令 z 随升级装好 (忘记面板密码时的兜底入口)"
+else
+  bad "终端快捷命令 z 没装上"
 fi
 
 # ---------- 5c. 新脚本再走一次面板方式 (验证临时副本会自己收尾) ----------

@@ -88,6 +88,11 @@ json_array() { # json_array <字符串...> → ["a","b"]
 #: 名字必须和下面 add_step 用的一字不差, 否则面板对不上号。
 build_plan() {
   PLAN=("备份代码与 state.json" "下载新版本代码" "安装新代码" "同步 Python 依赖" "重载 systemd 单元")
+  # 终端快捷命令: 只有 root 装得了 (/usr/local/bin) —— 条件必须与下面执行处**完全一致**,
+  # 否则计划清单与实际步骤对不上 (面板的"待执行/已完成"清单就会错位)
+  if [ "$(id -u)" -eq 0 ] && [ -x "$VENV/bin/python" ]; then
+    PLAN+=("安装终端快捷命令 (z)")
+  fi
   [ "$ZP_UPDATE_CORE" = "1" ] && PLAN+=("升级 Xray Core" "升级 Hysteria 2")
   if [ -f "$STATE_FILE" ]; then
     PLAN+=("按 state.json 重新生成配置并热重载")
@@ -320,6 +325,18 @@ add_step true "安装新代码" "v$FROM_VERSION → v$TO_VERSION ($ZP_HOME)"
 # ---------- 4. 依赖 ----------
 run_step "同步 Python 依赖" "$VENV/bin/pip" install -q -r "$ZP_HOME/requirements.txt"
 run_step "重载 systemd 单元" systemctl daemon-reload
+# 终端快捷管理 (z): 老部署升级完也要有 —— 它是"忘记面板密码"时的唯一兜底入口。
+# 幂等, 内容随本版本刷新。条件与 build_plan 里那条一模一样 (清单要对得上号)。
+if [ "$(id -u)" -eq 0 ] && [ -x "$VENV/bin/python" ]; then
+  begin_step "安装终端快捷命令 (z)"
+  if ZP_HOME="$ZP_HOME" PYTHONPATH="$ZP_HOME" "$VENV/bin/python" \
+      -m zeroproxy.cli install-shortcut >/tmp/zp-shortcut.log 2>&1; then
+    add_step true "安装终端快捷命令 (z)" "$(tail -1 /tmp/zp-shortcut.log | cut -c1-120)"
+  else
+    add_step false "安装终端快捷命令 (z)" "$(tail -1 /tmp/zp-shortcut.log | cut -c1-120)"
+  fi
+  rm -f /tmp/zp-shortcut.log
+fi
 
 # ---------- 5. 可选: 升级内核二进制 ----------
 if [ "$ZP_UPDATE_CORE" = "1" ]; then

@@ -1409,6 +1409,176 @@ def test_geodata_ttl_counts_from_last_check(home):
 # ---------------------------------------------------------------- 内核升级开关
 
 
+# ---------------------------------------------------------------- 终端快捷管理 (z)
+#
+# 用户的原始诉求: "预防用户忘记密码 —— SSH 上输入 z 就能进终端管理: 1 改账号密码,
+# 2 在线更新, 0 退出"。这里逐条钉住: 菜单真的列出那三件事、改密码不要求旧密码
+# (忘了才用这条路) 且旧会话一起作废、更新走的是与面板同一个 upgrade.sh、
+# 生成的 z 命令真的能跑起来、安装/升级/卸载脚本都认得它。
+
+def test_cli_menu_lists_what_the_user_asked_for(home, capsys, monkeypatch):
+    from zeroproxy import cli
+
+    monkeypatch.setattr(cli, "_ask", lambda prompt="": "0")
+    assert cli.main([]) == 0
+    text = capsys.readouterr().out
+    assert "ZeroProxy 终端管理" in text
+    assert "1) 修改面板账号 / 密码" in text
+    assert "2) 在线更新到最新版本" in text
+    assert "0) 退出" in text
+
+
+def test_cli_menu_rejects_a_bogus_choice_then_exits(home, capsys, monkeypatch):
+    from zeroproxy import cli
+
+    answers = iter(["9", "0"])
+    monkeypatch.setattr(cli, "_ask", lambda prompt="": next(answers))
+    assert cli.main([]) == 0
+    assert "没有这个选项" in capsys.readouterr().out
+
+
+def test_cli_changes_password_without_the_old_one_and_kills_sessions(
+    client, configured, home, capsys, monkeypatch
+):
+    """忘记密码时的兜底: SSH 里直接改 (不要求旧密码), 且旧会话一起作废。"""
+    from zeroproxy import cli, config, crypto
+
+    state = config.load_state()
+    state["sessions"] = {
+        "stale-token": {"username": "admin", "created": 0, "expires": 9999999999, "ip": "1.2.3.4"}
+    }
+    config.save_state(state)
+
+    monkeypatch.setattr(cli, "_ask", lambda prompt="": "boss")
+    answers = iter(["new-password-1", "new-password-1"])
+    monkeypatch.setattr(cli, "_ask_password", lambda prompt="": next(answers))
+    assert cli.main(["passwd"]) == 0
+
+    state = config.load_state()
+    assert state["admin"]["username"] == "boss"
+    assert crypto.verify_password("new-password-1", state["admin"]["password_hash"])
+    assert state["sessions"] == {}                       # 改了密码, 旧会话不该继续有效
+    assert state["uuid"] == config.load_state()["uuid"]  # 节点凭据没被动过
+    assert any(e["action"] == "account_update_cli" for e in state["audit"])
+    out = capsys.readouterr().out
+    assert "boss" in out and "注销其它 1 个登录会话" in out
+
+
+def test_cli_rejects_bad_passwords_without_touching_state(
+    client, configured, home, capsys, monkeypatch
+):
+    from zeroproxy import cli, config
+
+    before = config.load_state()["admin"]["password_hash"]
+    monkeypatch.setattr(cli, "_ask", lambda prompt="": "")
+
+    answers = iter(["123", "123"])
+    monkeypatch.setattr(cli, "_ask_password", lambda prompt="": next(answers))
+    assert cli.main(["passwd"]) == 1
+    assert "密码长度" in capsys.readouterr().out
+
+    answers = iter(["good-password-1", "good-password-2"])
+    monkeypatch.setattr(cli, "_ask_password", lambda prompt="": next(answers))
+    assert cli.main(["passwd"]) == 1
+    assert "不一致" in capsys.readouterr().out
+
+    assert config.load_state()["admin"]["password_hash"] == before
+
+
+def test_cli_update_runs_the_same_script_as_the_panel(home, capsys, monkeypatch):
+    """终端里的"在线更新"必须与面板「一键更新」是同一条路径 (同一个 upgrade.sh)。"""
+    from zeroproxy import cli, config
+
+    script = config.paths()["upgrade_script"]
+    os.makedirs(os.path.dirname(script), exist_ok=True)
+    with open(script, "w", encoding="utf-8") as fh:
+        fh.write("#!/usr/bin/env bash\nexit 0\n")
+    monkeypatch.setattr(cli.update, "remote_version", lambda timeout=8: (True, "9.9.9", "test-mirror"))
+    monkeypatch.setattr(cli, "_ask", lambda prompt="": "y")
+    seen: dict = {}
+
+    def _fake_call(cmd):
+        seen["cmd"] = cmd
+        return 0
+
+    monkeypatch.setattr(cli.subprocess, "call", _fake_call)
+
+    assert cli.main(["update"]) == 0
+    assert seen["cmd"] == ["bash", script]
+    out = capsys.readouterr().out
+    assert "当前版本" in out and "9.9.9" in out
+
+
+def test_cli_update_without_script_says_what_to_do(home, capsys, monkeypatch):
+    from zeroproxy import cli
+
+    monkeypatch.setattr(cli.update, "remote_version", lambda timeout=8: (False, "", "离线"))
+    assert cli.main(["update"]) == 1
+    out = capsys.readouterr().out
+    assert "没找到升级脚本" in out and "一键升级" in out
+
+
+def test_installed_z_command_actually_runs(home, tmp_path, monkeypatch):
+    """生成的 z 命令真能跑起来 (面板进不去时它是唯一入口, 不能只是"看起来装好了")。
+
+    这里用一个假的 `venv/bin/python` 来验**包装脚本本身**: ZP_HOME / PYTHONPATH 有没有
+    注入、参数有没有原样传给 `-m zeroproxy.cli`。真 cli 的行为由上面几条直接调用覆盖
+    —— 造真 venv 要装一遍依赖, 不值得 (而且用符号链接假造的 venv 会让解释器以为自己
+    不在 venv 里, cryptography 直接 import 失败, 那条路验不出真问题)。
+    """
+    import subprocess
+    from pathlib import Path
+
+    from zeroproxy import cli
+
+    fake_python = tmp_path / "venv" / "bin" / "python"
+    fake_python.parent.mkdir(parents=True)
+    fake_python.write_text('#!/bin/sh\necho "ARGS:$*"\necho "ZPHOME:$ZP_HOME"\necho "PY:$PYTHONPATH"\n')
+    fake_python.chmod(0o755)
+    bin_dir = tmp_path / "bin"
+    assert cli.install_shortcut(str(bin_dir)) == 0
+    for name in ("z", "zeroproxy"):
+        text = (bin_dir / name).read_text(encoding="utf-8")
+        assert cli.WRAPPER_MARK in text and str(home) in text
+    done = subprocess.run([str(bin_dir / "z"), "status"], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    assert "ARGS:-m zeroproxy.cli status" in done.stdout      # 参数原样透传
+    assert f"ZPHOME:{home}" in done.stdout                    # ZP_HOME 已注入
+    assert f"PY:{home}" in done.stdout                        # 包能被找到
+
+
+def test_z_is_not_hijacked_when_taken_by_someone_else(home, tmp_path, capsys):
+    """`z` 已被别的东西占用 (比如 zoxide) 时不覆盖, 只装长名字并说清楚。"""
+    from zeroproxy import cli
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "z").write_text("#!/bin/sh\n# zoxide\n", encoding="utf-8")
+    assert cli.install_shortcut(str(bin_dir)) == 0
+    assert (bin_dir / "z").read_text(encoding="utf-8") == "#!/bin/sh\n# zoxide\n"
+    assert "zeroproxy" in (bin_dir / "zeroproxy").read_text(encoding="utf-8")
+    out = capsys.readouterr().out
+    assert "已存在且不是本程序装的" in out and "zeroproxy" in out
+
+
+def test_installers_wire_up_the_terminal_shortcut():
+    """安装 / 升级 / 卸载三条路径都要认得 z (老部署升级完也得有)。"""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    for name in ("install.sh", "upgrade.sh"):
+        text = (root / name).read_text(encoding="utf-8")
+        assert "install-shortcut" in text, name
+    uninstall = (root / "uninstall.sh").read_text(encoding="utf-8")
+    assert "/usr/local/bin/z" in uninstall and cli_wrapper_mark() in uninstall
+
+
+def cli_wrapper_mark() -> str:
+    from zeroproxy import cli
+
+    return cli.WRAPPER_MARK
+
+
 def test_account_update_requires_current_password(client, configured, home):
     """改账号必须先验证当前密码 —— 面板 cookie 被偷走一个也改不了密码。"""
     body = client.post(
