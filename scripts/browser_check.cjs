@@ -78,6 +78,22 @@ async function waitFor(url, timeoutMs = 20000) {
   throw new Error(`服务未在 ${timeoutMs}ms 内就绪: ${url}`);
 }
 
+/** 等某个板块被"带到眼前" —— 头部的按钮点完, 结果卡片应当自己出现, 而不是让用户往下翻。
+ *  判据是"卡片顶边落在视口内, 至少露出 100px", 不是"顶到最上面": 最后一张卡片下面
+ *  没有内容可滚, 它只能停在页面底部, 但它确实已经被完整看见了。
+ *  另外平滑滚动要几百毫秒才停, 所以必须等它, 不能点完立刻量。 */
+async function waitCardInView(page, sel, timeout = 8000) {
+  try {
+    await page.waitForFunction((s) => {
+      const r = document.querySelector(s).getBoundingClientRect();
+      return r.top >= 0 && r.top < innerHeight - 100;
+    }, sel, { timeout });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 async function main() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "zp-browser-"));
   fs.mkdirSync(path.join(home, "data"), { recursive: true });
@@ -201,6 +217,9 @@ async function main() {
     });
     check("节点二维码副标题是人话不是长链接", /:8445/.test(nodeQr.sub) && !nodeQr.sub.includes("://"), nodeQr.sub);
     check("节点二维码卡片不出屏", nodeQr.inside, nodeQr.title);
+    // 等到淡入动画 (zp-fade 0.18s / zp-pop 0.24s) 结束再截图: 动画途中拍照,
+    // 遮罩只有半透明, 底下的仪表盘会透上来, 留证图看起来像"弹窗被内容盖住"。
+    await page.waitForTimeout(350);
     await page.screenshot({ path: path.join(SHOT_DIR, "qr-modal.png") });
     await page.keyboard.press("Escape");
     check("Esc 可关二维码弹窗", await page.locator("#qr-mask.hidden").count() === 1, "");
@@ -210,6 +229,9 @@ async function main() {
     const checks = await page.locator("#diag-list .check").count();
     const summary = await page.locator("#diag-list .muted").first().innerText();
     check("一键诊断出结果", checks >= 5, `${checks} 项 · ${summary}`);
+    // 头部的按钮离「诊断」卡片很远: 点完必须把卡片带到眼前, 否则用户只看到按钮文字变了
+    check("点头部的「一键诊断」会把诊断卡片带到眼前 (不用自己翻)",
+      await waitCardInView(page, "#diag-card"), "");
 
     console.log("\n[3b] 新增能力 (测速 / GeoIP / 备份)");
     // 自动测速在进入仪表盘时就跑了一次, 这里等结果落到节点卡片上
@@ -336,6 +358,12 @@ async function main() {
     const updHint = (await page.locator("#update-hint").innerText()).trim();
     check("本地开发环境明确提示不可面板内升级", /本地开发环境/.test(updHint), updHint.slice(0, 60));
     check("检查更新按钮存在", (await page.locator("#btn-update-check").count()) === 1);
+    // 同上: 头部那颗「检查更新」也走这条路径, 结果卡片要自动滚到眼前
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await page.waitForTimeout(300);
+    await page.click("#btn-update");
+    check("点头部的「检查更新」会把更新卡片带到眼前",
+      await waitCardInView(page, "#update-card", 20000), "");
     check("非生产环境不显示一键更新按钮",
       await page.locator("#btn-update-run").isHidden());
     check("自签证书下可点「申请证书」(不再禁用到没机会补签)",
@@ -368,6 +396,7 @@ async function main() {
       /节点密钥/.test(confirmBox.keeps) && /订阅令牌/.test(confirmBox.keeps), "");
     check("确认按钮写清版本跨度",
       /v2\.3\.10 → v2\.3\.11/.test(confirmBox.ok.replace(/\s+/g, " ")), confirmBox.ok);
+    await page.waitForTimeout(350);   // 同上: 等淡入结束, 免得留证图是半透明的
     await page.locator("#confirm-mask").screenshot({ path: path.join(SHOT_DIR, "update-confirm.png") });
     await page.click("#confirm-cancel");
     check("取消后弹窗关闭且不会开始升级",
@@ -633,6 +662,7 @@ async function main() {
       /链路测试没通过/.test(probeConfirm.title) && /安全组|超时|连不上/.test(probeConfirm.body),
       probeConfirm.title);
     check("确认框给出「仍然添加」的出口", probeConfirm.ok === "仍然添加", probeConfirm.ok);
+    await page.waitForTimeout(350);
     await page.locator("#confirm-mask .modal").screenshot({ path: path.join(SHOT_DIR, "chain-confirm.png") });
     await page.click("#confirm-ok");
     await page.waitForSelector("#chain-entries .chain-entry", { timeout: 40000 });
@@ -885,6 +915,33 @@ async function main() {
     }, { timeout: 10000 });
     check("「回到最近」清掉筛选并恢复默认视图",
       (await page.locator("#audit-list .audit-row").count()) > 0, "");
+
+    console.log("\n[3i-2] 记录管理 (清空) 与回到顶部");
+    const beforeClear = await page.locator("#audit-list .audit-row").count();
+    await page.click("#btn-audit-clear");
+    await page.waitForSelector("#confirm-mask:not(.hidden)");
+    const clearBody = (await page.locator("#confirm-body").innerText()).replace(/\s+/g, " ");
+    check("清空记录先弹确认, 并写清归档文件不受影响",
+      /清空/.test(await page.locator("#confirm-title").innerText()) && /归档文件不会被删除/.test(clearBody),
+      clearBody.slice(0, 60));
+    await page.click("#confirm-ok");
+    await page.waitForFunction(() => {
+      const rows = [...document.querySelectorAll("#audit-list .audit-row")];
+      return rows.length === 1 && /清空操作记录/.test(rows[0].innerText);
+    }, { timeout: 15000 });
+    check("清空后只剩「清空操作记录」这一条 (不会空得看不出谁清过)",
+      beforeClear > 1, `清空前 ${beforeClear} 条`);
+    check("清空这个动作本身带风险标记",
+      (await page.locator("#audit-list .audit-row .risk").count()) === 1, "");
+
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForFunction(
+      () => document.querySelector("#to-top").classList.contains("on"), { timeout: 5000 });
+    check("滚到下方后出现「回到顶部」", true, "");
+    await page.click("#to-top");
+    await page.waitForFunction(() => window.scrollY < 40, { timeout: 8000 });
+    check("点它真的回到顶部, 且自己隐藏",
+      !(await page.evaluate(() => document.querySelector("#to-top").classList.contains("on"))), "");
 
     console.log("\n[4] 控制台与请求");
     check("无 console 错误", consoleErrors.length === 0, consoleErrors.slice(0, 3).join(" | "));

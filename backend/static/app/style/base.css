@@ -1,0 +1,59 @@
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Segoe UI", "Helvetica Neue", sans-serif;
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  transition: background 0.25s, color 0.25s;
+}
+.wrap { max-width: 1220px; margin: 0 auto; padding: 0 22px 80px; }
+.hidden { display: none !important; }
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.muted { color: var(--sub); }
+.row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.grow { flex: 1; }
+.divider { height: 1px; background: var(--border-soft); margin: 16px 0 14px; }
+code.inline { background: var(--border-soft); padding: 3px 8px; border-radius: 7px; font-family: var(--mono); font-size: 12px; }
+
+/* ---------- 尺度工具类 ----------
+   只覆盖"反复出现且含义明确"的组合; 一次性的布局微调仍写在组件 CSS 里,
+   而不是散回模板。测试脚本断言的是 id/class 契约, 不关心这里。 */
+.fs-xs { font-size: var(--fs-xs); }
+.fs-sm { font-size: var(--fs-sm); }
+.fs-md { font-size: var(--fs-md); }
+.fs-lg { font-size: var(--fs-lg); }
+.fs-xl { font-size: var(--fs-xl); }
+.mt-1 { margin-top: var(--sp-1); }
+.mt-2 { margin-top: var(--sp-2); }
+.mt-3 { margin-top: var(--sp-3); }
+.mt-4 { margin-top: var(--sp-4); }
+.mt-0 { margin-top: 0; }
+.mb-1 { margin-bottom: var(--sp-1); }
+.mb-2 { margin-bottom: var(--sp-2); }
+.mb-3 { margin-bottom: var(--sp-3); }
+.mb-4 { margin-bottom: var(--sp-4); }
+.mb-0 { margin-bottom: 0; }
+.m-0 { margin: 0; }
+.w-full { width: 100%; }
+.w-110 { width: 110px; }
+.pointer { cursor: pointer; }
+.center { justify-content: center; }
+.align-top { align-items: flex-start; }
+.row.wide { gap: var(--sp-5); }
+.ta-left { text-align: left; }
+.ta-right { text-align: right; }
+.ta-center { text-align: center; }
+/* 一行两端对齐 (卡片头部 / 设置行) */
+.row-between { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.row-between.top { align-items: flex-start; }
+/* "600 字重 + 小节字号"的组合: 卡片内的小标题 */
+.sub-title { font-weight: 600; font-size: var(--fs-md); }
+/* 卡片标题: 加粗 + 卡片字号 + 与徽标同行 */
+.card-title { font-weight: 600; font-size: var(--fs-lg); display: flex; align-items: center; gap: 8px; }
+/* 小字说明 (代替每个卡片自己写 font-size:12.5px) */
+.note { font-size: var(--fs-sm); color: var(--sub); line-height: 1.6; }
+/* 告警横幅里的跳转链接 (原来靠内联 style 撑) */
+.banner-link { margin-top: var(--sp-2); display: inline-block; }

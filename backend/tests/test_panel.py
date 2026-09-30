@@ -2495,6 +2495,50 @@ def test_audit_api_and_dashboard_expose_view_shape(client, configured):
     assert page["stats"]["retained"] >= 1
 
 
+def test_audit_clear_wipes_buffer_but_keeps_one_record(client, configured, home):
+    """清空只清面板保留的缓冲, 且必须留下"谁清的"这一条。
+
+    服务器上的归档文件 (data/audit.log) 是"更早的记录"的唯一副本 —— 清空不该
+    顺手删掉它, 否则一次误点就永久丢历史。
+    """
+    from zeroproxy import config
+
+    # 先攒几条, 再手动往归档计数器上加一个数, 验证清空会把它归零
+    client.post("/api/nodes/vless-reality/toggle")
+    client.post("/api/nodes/vless-reality/toggle")
+    # 造一份归档文件 (真实运行时由环形缓冲溢出产生), 清空后它必须原样还在
+    archive = os.path.join(str(home), "data", "audit.log")
+    with open(archive, "w", encoding="utf-8") as fh:
+        fh.write('{"id":1,"ts":0,"action":"setup","detail":"更早的记录","actor":"admin","count":1}\n')
+    with config.locked():
+        state = config.load_state()
+        assert len(state["audit"]) >= 3
+        state["audit_dropped"] = 42
+        config.save_state(state)
+
+    body = client.post("/api/audit/clear").json()
+    assert body["cleared"] >= 3
+    # 清完只剩"清空操作记录"本身 —— 面板不会出现"空得看不出谁动过"
+    assert [e["action"] for e in body["entries"]] == ["audit_clear"]
+    assert body["entries"][0]["risk"] is True          # 影响面大的操作要标出来
+    assert body["entries"][0]["actor"] == "testclient"  # TestClient 报的来源
+    assert body["stats"]["retained"] == 1
+    assert body["stats"]["dropped"] == 0               # 归档计数跟着归零
+
+    # 再清一次: 只剩上一条 audit_clear, 数量如实减少, 不会报错
+    again = client.post("/api/audit/clear").json()
+    assert again["cleared"] == 1
+
+    # 归档文件一字未动: 它是"更早的记录"的唯一副本, 不该被一个按钮顺手删掉
+    with open(archive, encoding="utf-8") as fh:
+        assert "更早的记录" in fh.read()
+
+
+def test_audit_clear_requires_auth(client, configured):
+    client.post("/api/logout")
+    assert client.post("/api/audit/clear").status_code == 401
+
+
 # ---------------------------------------------------------------- 升级脚本 / 文档
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

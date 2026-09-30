@@ -432,6 +432,7 @@ AUDIT_ACTIONS: dict[str, tuple[str, str]] = {
     "restore": ("从备份恢复", "data"),
     "update": ("升级面板", "system"),
     "renew_cert": ("证书续期", "system"),
+    "audit_clear": ("清空操作记录", "data"),
 }
 
 #: 分类 → 中文名。字典顺序就是面板上筛选按钮的顺序。
@@ -448,7 +449,7 @@ AUDIT_CATEGORIES: dict[str, str] = {
 AUDIT_FAILING = {"login_failed", "geodata_update_failed"}
 
 #: 不可逆 / 影响面大的动作: 面板上单独标一下, 方便回看"谁动过这一下"。
-AUDIT_RISK = {"setup", "restore", "update", "logout_all", "chain_delete"}
+AUDIT_RISK = {"setup", "restore", "update", "logout_all", "chain_delete", "audit_clear"}
 
 AUDIT_MAX = 500             # state.json 里保留的条数 (再老的滚进 audit.log)
 AUDIT_COALESCE_S = 60       # 同一条记录在这个窗口内重复出现就合并计数

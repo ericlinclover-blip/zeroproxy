@@ -6,7 +6,13 @@
 
 - **Root**: `/Users/eric/Desktop/sbpn/zeroproxy/`
 - **Backend**: `/Users/eric/Desktop/sbpn/zeroproxy/backend/zeroproxy/` (Python, FastAPI)
-- **Frontend**: `/Users/eric/Desktop/sbpn/zeroproxy/backend/static/index.html` (vanilla JS SPA, ~172 KB, no framework/build step)
+- **Frontend**: `/Users/eric/Desktop/sbpn/zeroproxy/backend/static/` — `index.html` (373 lines) holds
+  markup only; everything else is under `static/app/` as native ES modules with no framework and no
+  build step (browsers load `/static/app/main.js` directly):
+  `main.js` (assembly, 43 lines) · `lib/` = dom · format · api · **state** (shared mutable state +
+  redraw hooks) · jobs · drafts · dialog · render · theme · `views/` = dashboard (the only module
+  that imports other views) · status · traffic · chain · update · diag · audit · setup ·
+  `style/` = tokens.css → base.css → components.css
 - **Data Dir**: `$ZP_HOME/data/state.json` (runtime state, version 4)
 - **Tech Stack**: FastAPI + uvicorn (panel), Xray (proxy core), Hysteria 2 (QUIC transport), Nginx (TLS termination + reverse proxy)
 

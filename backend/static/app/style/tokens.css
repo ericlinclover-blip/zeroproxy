@@ -1,0 +1,56 @@
+/* ============================================================
+   ZeroProxy 设计系统 v3 — 控制台 (侧栏 + 密集表格 + 动效)
+   约定: 下面每个类名都被 index.html 的模板或 JS 用到, 改名会打断面板逻辑与回归脚本。
+   动效一律走 transform / opacity / 自绘 rAF; 并整体受 prefers-reduced-motion 约束。
+   ============================================================ */
+:root {
+  --bg: #f3f4f7;
+  --bg-soft: #eaecf1;
+  --card: #ffffff;
+  --card-2: #fafbfc;
+  --text: #101318;
+  --sub: #6b7280;
+  --border: rgba(16, 19, 24, 0.10);
+  --border-soft: rgba(16, 19, 24, 0.055);
+  --accent: #0a84ff;
+  --accent-2: #5e5ce6;
+  --down: #14b8a6;
+  --ok: #22c55e;
+  --warn: #f59e0b;
+  --err: #ef4444;
+  --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --shadow: 0 1px 3px rgba(16, 24, 40, 0.06), 0 14px 36px -18px rgba(16, 24, 40, 0.24);
+  --radius-sm: 10px;
+  --radius: 14px;
+  --radius-lg: 18px;
+  --side-w: 214px;
+  --mono: "SF Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+
+  /* ---------- 尺度: 字号与间距的唯一来源 ----------
+     之前模板里散着 8 档字号 (11 / 11.5 / 12 / 12.5 / 13 / 13.5 / 15.5 / 17) 与
+     各种 margin, 同一层级的文字在不同卡片里大小不同。现在收敛成下面这几档,
+     模板一律用 .fs-* / .mt-* 工具类或语义类, 不再写内联 font-size。 */
+  --fs-xs: 11.5px;   /* 角标、计数、极小辅助信息 */
+  --fs-sm: 12.5px;   /* 说明文字、副标题 (最常用) */
+  --fs-md: 13.5px;   /* 小节标题 */
+  --fs-lg: 15.5px;   /* 卡片标题 */
+  --fs-xl: 17px;     /* KPI 数字 */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+}
+[data-theme="dark"] {
+  --bg: #0a0c11;
+  --bg-soft: #141822;
+  --card: #131822;
+  --card-2: #171d29;
+  --text: #eef1f6;
+  --sub: #8b94a7;
+  --border: rgba(255, 255, 255, 0.10);
+  --border-soft: rgba(255, 255, 255, 0.055);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.40);
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.50), 0 20px 48px -20px rgba(0, 0, 0, 0.80);
+}

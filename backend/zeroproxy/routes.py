@@ -878,6 +878,30 @@ def audit_list(
     )
 
 
+@router.post("/api/audit/clear")
+def audit_clear(request: Request):
+    """清空面板保留的操作记录。
+
+    只清 `state.json` 里的环形缓冲 (最近 500 条), **不动服务器上的归档文件**
+    (`data/audit.log`): 那是"更早的记录"的唯一副本, 删文件是不可逆的动作, 不该由一个
+    按钮顺手做掉 —— 面板上会把这一点写清楚。清空这个动作本身也会记一条, 所以清完不会
+    出现"空得可疑、看不出谁动过"的状态。
+    """
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        cleared = len(state.get("audit") or [])
+        state["audit"] = []
+        # 已归档计数跟着归零: 留着它会让面板显示"已归档 N 条", 而用户刚清过
+        state["audit_dropped"] = 0
+        config.audit(state, "audit_clear", f"cleared={cleared}", actor=_client_ip(request))
+        save_state(state)
+    body = config.audit_query(state, limit=30)
+    body["cleared"] = cleared
+    return body
+
+
 # ---------------------------------------------------------------- 配置修改
 
 @router.post("/api/nodes/{node_id}/toggle")

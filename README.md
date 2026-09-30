@@ -66,7 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 175 项 (169 passed + 6 skipped; 带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时 175 全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (116 项) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 177 项 (171 passed + 6 skipped; 带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (123 项) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 | **看得懂的界面 (v2.6.0)** | 控制台布局: 左侧锚点导航 (带计数角标 + 滚动高亮) + 顶部指标条 (健康节点 / 落地出口 IP / 平均延迟 + 迷你折线 / 运行时长) + 节点密集表格 (名称 / 地址状态 / **握手延迟条** / **上下行双轨** / 开关与复制) + **流量卡 (双弧圆环 + 实时速率曲线 + 逐节点双色流量条)** + 链式链路拓扑 (你的设备 → 本机入口 → 落地端) + 程序更新闭环; 动效全部走 `transform`/自绘 rAF 并受 `prefers-reduced-motion` 约束 |
 
@@ -87,7 +87,29 @@ zeroproxy/
 │   ├── requirements-dev.txt       # + pytest / httpx
 │   ├── tests/                     # pytest 回归测试 (dry-run 全流程 + 安全边界 + 状态迁移)
 │   ├── static/
-│   │   └── index.html             # Apple 风格单文件 UI (零构建, 深浅色, 无 CDN)
+│   │   ├── index.html             # 页面标记 (纯结构; 样式与逻辑都在 app/ 下)
+│   │   └── app/
+│   │       ├── main.js            # 装配层 (43 行): import 各模块 + 挂回归脚本的全局入口 + boot()
+│   │       ├── lib/               # 无视图逻辑的底座
+│   │       │   ├── dom.js         #   $ / esc / escAttr (模板转义) / toast / copyText / show
+│   │       │   ├── format.js      #   字节 / 时长 / 时间 / 状态文案 (纯函数)
+│   │       │   ├── api.js         #   fetch 封装 + "连接中断 ≠ 业务失败" 的 e.dropped 语义
+│   │       │   ├── state.js       #   跨模块共享状态 S + 重画钩子 (打断循环依赖)
+│   │       │   ├── jobs.js        #   后台落地闭环 (轮询进度) + applyAction
+│   │       │   ├── drafts.js      #   重渲染时的输入草稿保护
+│   │       │   ├── dialog.js      #   确认框 / 二维码 (原生 <dialog>)
+│   │       │   ├── render.js      #   告警横幅 + 步骤清单
+│   │       │   └── theme.js       #   主题按钮 (首屏应用主题在 index.html 的 <head>)
+│   │       ├── views/             # 每个文件一个区块, 只依赖 lib (dashboard 是唯一编排者)
+│   │       │   ├── dashboard.js   #   拉取 / 重画 / 侧栏滚动高亮 / boot
+│   │       │   ├── status.js      #   节点表 + 指标条 + 顶部横幅
+│   │       │   ├── traffic.js     #   流量可视化 + 高级设置 + 系统卡片
+│   │       │   ├── chain.js       #   链式代理 (配对码 / 探测 / 内层传输 / 默认出口)
+│   │       │   ├── update.js      #   程序更新 (版本对比 → 确认 → 进度 → 结果)
+│   │       │   ├── diag.js        #   一键诊断 / 修复 / 重新应用
+│   │       │   ├── audit.js       #   操作记录 (筛选 / 搜索 / id 游标分页)
+│   │       │   └── setup.js       #   初始化 + 登录
+│   │       └── style/             # tokens.css → base.css → components.css
 │   └── zeroproxy/
 │       ├── main.py                # FastAPI 入口 + 安全响应头中间件
 │       ├── config.py              # 状态模型 (state.json v4) / 文件锁 / 引导令牌 / 审计日志 / 备份还原
@@ -305,10 +327,20 @@ state.json (唯一事实来源, schema v4, 旧版本自动升级)
 
 ## 8. 前端 UI
 
-单文件 `backend/static/index.html` (原生 JS + CSS, 零构建零 CDN, 离线可用; 设计系统见 17):
+`backend/static/index.html` 只留页面标记, 其余在 `backend/static/app/` 下: **原生 ES 模块 +
+分层 CSS, 仍然是零构建零 CDN 离线可用** (浏览器直接加载 `/static/app/main.js`, 目标机上
+不需要 Node)。设计系统见 17:
 
-- **设计令牌**: 一套 CSS 变量管深浅色 (背景 / 卡片 / 描边 / 阴影 / 圆角 / 语义色),
-  SF 字体栈 + 等宽数字, 吸顶品牌栏带毛玻璃; 深浅色自动跟系统 + 手动切换。
+- **三层样式**: `tokens.css` (设计令牌: 颜色 / **字号 5 档** / **间距 5 档** / 圆角 / 阴影) →
+  `base.css` (元素默认 + 尺度工具类) → `components.css` (组件)。改主题只动 tokens.css;
+  模板里不再写内联 `font-size`/`margin`, 只剩数据驱动的宽度 (进度条 / 流量条)。
+- **模块划分**: `lib/dom.js` (含唯一的转义出口 `esc`/`escAttr`)、`lib/format.js`、
+  `lib/api.js` (含"连接中断 ≠ 业务失败"的 `e.dropped` 语义)、`lib/drafts.js` (草稿保护)、
+  `lib/dialog.js` (确认框 / 二维码, 走原生 `<dialog>`)、`views/*.js`; 首屏主题在
+  `index.html` 的 `<head>` 里同步应用, 避免深色模式闪白。
+- **弹窗用原生 `<dialog>`**: 焦点陷阱 / Esc / 背景 inert / 关闭后焦点回归由浏览器负责,
+  项目自己只剩"同步 `.hidden` 状态 + 清二维码"两件事。
+- **吸顶品牌栏带毛玻璃**, SF 字体栈 + 等宽数字, 深浅色自动跟系统 + 手动切换。
 - **三步交互**: 初始化 (三输入框 + 部署进度逐步打钩) → 登录 → 仪表盘, 每 20s 静默轮询。
 - **控制台骨架 (v2.6.0)**: 左侧锚点导航 (节点 / 订阅 / 流量 / 链式代理 / 高级 / 诊断 / 系统 /
   程序更新) + 右侧主列; 导航带**计数角标** (启用节点数、已接落地端数、诊断结果、有新版本)
@@ -956,7 +988,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 
 在 macOS (Apple Silicon, Python 3.14) 上实测通过:
 
-- `python -m pytest tests -q` → **169 passed, 6 skipped** (带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时 **175 passed**, 约 47 秒);
+- `python -m pytest tests -q` → **171 passed, 6 skipped** (带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时再补上跳过的那几项, 约 47 秒);
   含 `/api/update` 鉴权与版本比较、`apply` 的"写不进 /etc/nginx 即失败"语义、CLI 退出码、以及
   `install.sh` 重跑不覆盖已初始化配置 / `upgrade.sh` 随包发布 / 自签证书可补签 Let's Encrypt /
   `systemctl` 参数顺序的回归断言 / Reality 密钥必须是成对的 X25519 (Ed25519 必须判无效) /
@@ -1020,7 +1052,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   出站指向落地端 `127.0.0.1:8666`; 客户端拿中转端凭据连进去, **真的从落地端出网并读回出口 IP**;
   反向用例: 把落地端的专用 UUID 换掉 (等价于配对码被轮换) 后同一条链立刻读不到 IP —— 证明确实是
   链路上的每一跳在起作用, 而不是"随便走哪条路都能出网"。
-- `scripts/browser_check.cjs` → **116/116 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
+- `scripts/browser_check.cjs` → **123/123 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
   诊断 8/8、节点测速结果落到卡片、GeoIP 开关与状态、**分流模板选择器 (切换 → 订阅内容
   真的变化 → 切回)**、备份下载、**程序更新卡片 (版本行 / 检查更新 / 非生产环境隐藏一键更新)**、
   **自动刷新不吞草稿 (正在编辑的 SNI / 端口在重渲染后原样保留、光标不丢、放弃后回到服务器值) /
