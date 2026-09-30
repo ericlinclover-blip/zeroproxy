@@ -56,7 +56,10 @@
 
   <!-- ============ 视图 2: 登录 ============ -->
   <section id="view-login" class="hidden">
-    <div class="hero"><h1>登录面板</h1><p>ZeroProxy 已初始化</p></div>
+    <!-- 副标题留空: 这个页面只有"已经初始化过"的人才会看到 (没初始化的走初始化页),
+         所以"ZeroProxy 已初始化"是句废话。真正需要说明的情况 (比如从 IP 页切到了域名面板)
+         由下面的 #login-hint 按需显示。 -->
+    <div class="hero"><h1>登录面板</h1></div>
     <div class="card setup-card">
       <div class="hint-box hidden" id="login-hint"></div>
       <div class="field"><label>用户名</label><input id="login-user" spellcheck="false"></div>

@@ -61,7 +61,7 @@ export function renderUpdate() {
   );
 
   const running = !!u.running;
-  const stale = !!S.pageVersion && !!u.current && S.pageVersion !== u.current;   // 本页 JS 落后于服务器
+  const stale = updateNeedsReload();   // 本页 JS 落后于服务器 (自动重载用的是同一个判据)
   if (running) {
     $("#update-hint").textContent = "升级进行中: 面板会在最后重启一次, 本页会在几秒内自动恢复";
   } else if (stale) {
@@ -161,6 +161,20 @@ function updateResultHtml(u, last) {
 const updateNow = () => Math.round(Date.now() / 1000);
 const fmtDuration = (s) => (s >= 60 ? `${Math.floor(s / 60)} 分 ${s % 60} 秒` : `${s} 秒`);
 
+/** 升级完成后是否要自动重新加载本页。
+ *
+ *  判据是「**本页 JS 的版本**」和「服务器现在的版本」不一致 —— 升级前打开的这个页面,
+ *  它加载的 JS 还是旧的, 必须重新加载才会换成新界面。
+ *
+ *  别用 `last.to !== current`: 面板重启之后这两个值本来就相等 (都等于新版本), 那条判据
+ *  永远为假 —— 自动重载永远不会发生, 用户只能自己去点「重新加载面板」(真机踩到)。
+ */
+export function updateNeedsReload() {
+  const u = S.updateInfo || {};
+  return !!(S.pageVersion && u.current && S.pageVersion !== u.current);
+}
+
+
 function startUpdatePolling() {
   clearInterval(S.updateTimer);
   S.updatePollFailures = 0;
@@ -171,13 +185,15 @@ function startUpdatePolling() {
       renderUpdate();
       if (!S.updateInfo.running && S.updateInfo.last && S.updateInfo.last.state === "success") {
         clearInterval(S.updateTimer); S.updateTimer = null;
-        if (S.updateInfo.last.to && S.updateInfo.last.to !== S.updateInfo.current) {
-          // 新版本的前端要重新加载才生效; 卡片里留了「重新加载面板」按钮, 这里再自动跳一次
-          toast(`升级完成: v${S.updateInfo.last.from} → v${S.updateInfo.last.to}`);
-          setTimeout(() => location.reload(), 4000);
+        toast(`升级完成: v${S.updateInfo.last.from} → v${S.updateInfo.last.to}`);
+        if (updateNeedsReload()) {
+          // 本页跑的还是升级前的 JS: 自动重新加载, 省掉"再点一下"。
+          // 留 2.5 秒是为了让上面那条 toast 看得见 —— 面板刚重启完, 这会儿也没有正在进行的操作。
+          const hint = $("#update-hint");
+          if (hint) hint.textContent = "升级完成 — 正在自动重新加载面板…";
+          setTimeout(() => location.reload(), 2500);
         } else {
-          toast(`升级完成: v${S.updateInfo.last.from} → v${S.updateInfo.last.to}`);
-          reloadDash(true);
+          reloadDash(true);   // 本页已经是新版本 (比如刚打开就在新版上): 重画即可, 不必刷新
         }
       } else if (!S.updateInfo.running && S.updateInfo.last && S.updateInfo.last.state === "failed") {
         clearInterval(S.updateTimer); S.updateTimer = null;

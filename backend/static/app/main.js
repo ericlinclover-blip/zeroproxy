@@ -16,7 +16,7 @@ import { clearDraft } from "./lib/drafts.js";
 import { S } from "./lib/state.js";
 import { boot, renderDash, loadDash } from "./views/dashboard.js";
 import { renderChain, chainCodeInfo } from "./views/chain.js";
-import { renderUpdate, loadUpdate, askUpgrade } from "./views/update.js";
+import { renderUpdate, loadUpdate, askUpgrade, updateNeedsReload } from "./views/update.js";
 import { renderDashboardBanner } from "./views/status.js";
 import { showSetupHandoff } from "./views/setup.js";
 // 两个只有副作用的模块 (import 即绑定各自按钮), 名字列出来是为了让 grep 找得到:
@@ -30,6 +30,7 @@ import "./views/diag.js";    // 一键诊断 / 一键修复 / 重新应用
 Object.assign(window, {
   renderDash, renderChain, renderUpdate, renderDashboardBanner,
   loadDash, loadUpdate, clearDraft, askUpgrade, chainCodeInfo, show, showSetupHandoff,
+  updateNeedsReload,   // 「升级完成后是否要自动重新加载」的判据 (回归脚本直接验它)
 });
 // 这几个是被反复重新赋值的模块内变量 (每次刷新都换一个新对象, 测试还会临时改它们来
 // 造"本页 JS 落后于服务器"这类场景): 必须用访问器暴露。直接挂上去的只是某一刻的快照,

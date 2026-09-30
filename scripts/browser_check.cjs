@@ -461,6 +461,26 @@ async function main() {
       (await page.locator("#confirm-mask.hidden").count()) === 1
       && (await page.locator("#btn-update-run").innerText()).includes("2.3.11"), "");
 
+    // 升级完成后的自动重新加载: 判据必须是「本页 JS 的版本 vs 服务器版本」。
+    // 旧判据是 `last.to !== current` —— 面板重启之后这两个值本来就相等 (都等于新版本),
+    // 于是它恒为假, 自动重载永远不发生, 用户只能自己去点「重新加载面板」(真机踩到)。
+    const reloadRule = await page.evaluate(() => {
+      const savedInfo = updateInfo, savedPage = pageVersion;
+      updateInfo = { ...updateInfo, current: "2.3.11", last: { state: "success", from: "2.3.10", to: "2.3.11" } };
+      pageVersion = "2.3.10";                      // 本页还是升级前那份 JS
+      const needsReload = updateNeedsReload();
+      const oldRule = updateInfo.last.to !== updateInfo.current;   // 旧的错误判据
+      pageVersion = "2.3.11";                      // 本页已经是新版本 (比如刚打开就在新版上)
+      const freshPage = updateNeedsReload();
+      updateInfo = savedInfo; pageVersion = savedPage;
+      return { needsReload, oldRule, freshPage };
+    });
+    check("升级完成后会自动重新加载 (旧判据在这种情况下恒为假)",
+      reloadRule.needsReload === true && reloadRule.oldRule === false,
+      `需要重载=${reloadRule.needsReload} 旧判据=${reloadRule.oldRule}`);
+    check("本页已经是新版本时不无谓刷新",
+      reloadRule.freshPage === false, "");
+
     const runningView = await page.evaluate(() => {
       const plan = ["备份代码与 state.json", "下载新版本代码", "安装新代码", "同步 Python 依赖",
         "重载 systemd 单元", "按 state.json 重新生成配置并热重载", "重启面板进程", "面板已就绪"];
@@ -852,6 +872,14 @@ async function main() {
     check("域名面板登录页预填用户名并聚焦密码框", loginPrefill.user === "admin" && loginPrefill.focused, loginPrefill.user);
     check("登录页给出「已切换到域名面板」提示", /已切换到域名面板/.test(loginPrefill.hint), loginPrefill.hint.slice(0, 40));
     check("用户名不留在地址栏", loginPrefill.cleanUrl, new URL(page.url()).search || "(无查询串)");
+    // 这个页面只有"已经初始化过"的人才会看到 (没初始化的走初始化页), 所以副标题里
+    // 再写一句"ZeroProxy 已初始化"是废话; 真正要说的情况由 #login-hint 按需显示
+    const loginHero = await page.evaluate(() => {
+      const el = document.querySelector("#view-login .hero");
+      return { text: el.innerText.replace(/\s+/g, " ").trim(), ps: el.querySelectorAll("p").length };
+    });
+    check("登录页不再有「已初始化」这种废话副标题",
+      loginHero.ps === 0 && !/已初始化/.test(loginHero.text), loginHero.text);
     // 继续用同一套凭据登录, 后面的检查 (深浅色 / 控制台) 仍要有仪表盘
     await page.fill("#login-pass", "s3cretpass");
     await page.click("#btn-login");

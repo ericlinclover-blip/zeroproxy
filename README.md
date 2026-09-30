@@ -66,7 +66,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 178 项 (172 passed + 6 skipped; 带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (128 项) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 178 项 (172 passed + 6 skipped; 带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (131 项) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 | **看得懂的界面 (v2.6.0)** | 控制台布局: 左侧锚点导航 (带计数角标 + 滚动高亮) + 顶部指标条 (健康节点 / 落地出口 IP / 平均延迟 + 迷你折线 / 运行时长) + 节点密集表格 (名称 / 地址状态 / **握手延迟条** / **上下行双轨** / 开关与复制) + **流量卡 (双弧圆环 + 实时速率曲线 + 逐节点双色流量条)** + 链式链路拓扑 (你的设备 → 本机入口 → 落地端) + 程序更新闭环; 动效全部走 `transform`/自绘 rAF 并受 `prefers-reduced-motion` 约束 |
 
@@ -1058,7 +1058,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   出站指向落地端 `127.0.0.1:8666`; 客户端拿中转端凭据连进去, **真的从落地端出网并读回出口 IP**;
   反向用例: 把落地端的专用 UUID 换掉 (等价于配对码被轮换) 后同一条链立刻读不到 IP —— 证明确实是
   链路上的每一跳在起作用, 而不是"随便走哪条路都能出网"。
-- `scripts/browser_check.cjs` → **128/128 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
+- `scripts/browser_check.cjs` → **131/131 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
   诊断 8/8、节点测速结果落到卡片、GeoIP 开关与状态、**分流模板选择器 (切换 → 订阅内容
   真的变化 → 切回)**、备份下载、**程序更新卡片 (版本行 / 检查更新 / 非生产环境隐藏一键更新)**、
   **自动刷新不吞草稿 (正在编辑的 SNI / 端口在重渲染后原样保留、光标不丢、放弃后回到服务器值) /

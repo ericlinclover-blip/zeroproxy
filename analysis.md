@@ -2,7 +2,7 @@
 
 ## 1. Project Overview
 
-**ZeroProxy** (v2.6.20) is a self-hosted proxy management panel that orchestrates Xray, Hysteria 2, and Nginx on a single server. It provides a web dashboard — a zero-framework, zero-build single-file SPA (`index.html`, plain JS, no CDN) — that manages proxy nodes, subscriptions, chained proxies, GeoIP-based routing, and service lifecycle.
+**ZeroProxy** (v2.6.21) is a self-hosted proxy management panel that orchestrates Xray, Hysteria 2, and Nginx on a single server. It provides a web dashboard — a zero-framework, zero-build single-file SPA (`index.html`, plain JS, no CDN) — that manages proxy nodes, subscriptions, chained proxies, GeoIP-based routing, and service lifecycle.
 
 - **Root**: `/Users/eric/Desktop/sbpn/zeroproxy/`
 - **Backend**: `/Users/eric/Desktop/sbpn/zeroproxy/backend/zeroproxy/` (Python, FastAPI)
