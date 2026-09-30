@@ -194,8 +194,56 @@ def _pid_path(key: str) -> str:
     return os.path.join(work_dir(), f"{key}.pid")
 
 
+def _read_pid(key: str) -> tuple[int, str]:
+    """读 pid 文件 → (pid, 配置指纹)。
+
+    格式是 `<pid> <指纹>`; 老版本写的只有 pid, 那种情况指纹返回空串 —— 于是对不上,
+    走正常重启路径, 不会因为认不出指纹就误判"已经在跑"。
+    """
+    try:
+        with open(_pid_path(key), encoding="utf-8") as fh:
+            parts = fh.read().split()
+    except OSError:
+        return 0, ""
+    if not parts:
+        return 0, ""
+    try:
+        return int(parts[0]), (parts[1] if len(parts) > 1 else "")
+    except ValueError:
+        return 0, ""
+
+
 def _fingerprint(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _log_hint(key: str) -> str:
+    """子进程刚退出时, 把它日志的最后一行带出来。
+
+    否则面板上只有一句"启动失败 (见 .../exit.log)", 用户还得 SSH 上去才知道原因 ——
+    最常见的两条 (端口被占 / 证书对不上) 都写在日志里。
+    """
+    for line in reversed(client_log_tail(key, lines=8).splitlines()):
+        line = line.strip()
+        if line:
+            return f": {line[:160]}"
+    return ""
+
+
+def _already_running_elsewhere(key: str, fingerprint: str) -> bool:
+    """这个 key 的进程, 是不是**另一个进程**(通常是面板)已经在跑同一份配置。
+
+    apply 被 upgrade.sh 拉起时是独立进程, 看不到面板内存里的 `_PROCS`; 而落地端那个
+    UDP 端口此刻正被面板起的 hysteria 占着 —— 再去起一个必然 bind 失败, 失败又会让整步
+    「重载服务」判红、升级在第 6 步回滚, 那台机器就**再也升不了级** (真机踩到过)。
+    所以先认领: pid 活着、命令行确实指向我们的配置目录、配置指纹也一致 → 当作在跑。
+    """
+    pid, recorded = _read_pid(key)
+    if pid <= 1 or recorded != fingerprint:
+        return False
+    cmdline = _cmdline(pid)
+    base = work_dir()
+    return bool(cmdline) and base in cmdline and f"{key}.yaml" in cmdline
 
 
 def _terminate(proc: subprocess.Popen, timeout: float = 4.0) -> None:
@@ -265,11 +313,7 @@ def _reap_stale() -> None:
     for name in os.listdir(base):
         if not name.endswith(".pid"):
             continue
-        try:
-            with open(os.path.join(base, name), encoding="utf-8") as fh:
-                pid = int(fh.read().strip())
-        except (OSError, ValueError):
-            continue
+        pid, _recorded = _read_pid(name[: -len(".pid")])
         if pid <= 1 or pid in ours:
             continue
         cmdline = _cmdline(pid)
@@ -298,7 +342,12 @@ def _write_config(key: str, text: str) -> str:
     return path
 
 
-def _spawn(key: str, mode: str, cfg_path: str) -> subprocess.Popen:
+def _spawn(key: str, mode: str, cfg_path: str, fingerprint: str) -> subprocess.Popen:
+    """起一个 hysteria 子进程, 并把**配置指纹和 pid 一起写进 pid 文件**。
+
+    指纹是为了跨进程认领: apply 由 upgrade.sh 拉起时是独立进程, 只能靠这个文件判断
+    "那个端口上跑的到底是不是我们自己那份配置" (见 _already_running_elsewhere)。
+    """
     binary_path = binary()
     # Popen 会自己复制一份 fd, 所以 with 块结束就把句柄关掉 (子进程照写不误)。
     with open(_log_path(key), "a", encoding="utf-8") as log:
@@ -310,11 +359,11 @@ def _spawn(key: str, mode: str, cfg_path: str) -> subprocess.Popen:
         )
     try:
         with open(_pid_path(key), "w", encoding="utf-8") as fh:
-            fh.write(str(proc.pid))
+            fh.write(f"{proc.pid} {fingerprint}")
     except OSError:
         pass
-    with _LOCK, open(cfg_path, encoding="utf-8") as fh:
-        _PROCS[key] = (proc, _fingerprint(fh.read()))
+    with _LOCK:
+        _PROCS[key] = (proc, fingerprint)
     return proc
 
 
@@ -401,10 +450,13 @@ def sync(state: dict, restart_changed: bool = True) -> tuple[bool, str]:
             if item[1] == fingerprint or not restart_changed:
                 continue
             _stop(key)
-        proc = _spawn(key, spec["mode"], cfg_path)
+        elif item is None and _already_running_elsewhere(key, fingerprint):
+            # 别的进程 (面板 / 上一次 apply) 已经在跑同一份配置: 别再去抢那个 UDP 端口
+            continue
+        proc = _spawn(key, spec["mode"], cfg_path, fingerprint)
         time.sleep(0.35)   # 端口是真占上了还是立刻退出, 让它先跑起来再说
         if proc.poll() is not None:
-            failed.append(f"{spec['label']} 启动失败 (见 {_log_path(key)})")
+            failed.append(f"{spec['label']} 启动失败 (见 {_log_path(key)}){_log_hint(key)}")
 
     if failed:
         return False, "; ".join(failed)

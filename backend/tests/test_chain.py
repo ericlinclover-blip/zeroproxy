@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import subprocess
 import time
 import uuid as uuid_mod
 from urllib.parse import unquote
@@ -896,3 +897,86 @@ def test_quic_processes_start_and_stop(client, configured, monkeypatch):
         assert chain_quic.running("exit")          # 落地端不受影响
     finally:
         chain_quic.stop_all()
+
+
+# ---------------------------------------------------------------- 跨进程认领内层 QUIC
+
+def test_quic_adopts_a_process_started_by_another_applier(home):
+    """apply 由 upgrade.sh 拉起时是**独立进程**, 看不到面板内存里的 _PROCS。
+
+    落地端那个 UDP 端口此刻正被面板起的 hysteria 占着 —— 它必须"认领"那个进程, 而不是
+    再起一个。抢的代价不是多一个进程: 新进程 bind 失败退出 → 整步「重载服务」判红 →
+    upgrade.sh 在第 6 步回滚整次升级 → 那台机器**再也升不了级** (真机踩到过)。
+
+    这里直接测认领的判据 (pid 活着 + 命令行指着我们的配置 + 配置指纹一致)。
+    """
+    from zeroproxy import chain_quic
+
+    work = chain_quic.work_dir()
+    os.makedirs(work, exist_ok=True)
+    cfg = os.path.join(work, "exit.yaml")
+    with open(cfg, "w", encoding="utf-8") as fh:
+        fh.write("listen: :8448\n")
+    # 一个活着、命令行里带我们的配置目录与配置文件的进程。
+    # 别用 `sh -c "sleep 30 # <路径>"` 来造: sh 会把这种单命令直接 exec 掉, 命令行
+    # 只剩 `sleep 30`, 路径没了 (实测踩到)。这里让 python 常驻并把 cfg 作为参数带上。
+    import sys
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", cfg])
+    try:
+        fp = chain_quic._fingerprint("listen: :8448\n")
+        assert chain_quic._already_running_elsewhere("exit", fp) is False   # 还没有 pid 文件
+
+        with open(chain_quic._pid_path("exit"), "w", encoding="utf-8") as fh:
+            fh.write(f"{proc.pid} {fp}")
+        assert chain_quic._already_running_elsewhere("exit", fp) is True
+        # 配置变了 (指纹不同) 就不是"同一份配置", 该重启 —— 认领只认完全一致的
+        assert chain_quic._already_running_elsewhere("exit", "另一个指纹") is False
+
+        # 老格式 (只有 pid, 没有指纹) 不能误判成"已经在跑", 否则改了配置也不会重启
+        with open(chain_quic._pid_path("exit"), "w", encoding="utf-8") as fh:
+            fh.write(str(proc.pid))
+        assert chain_quic._already_running_elsewhere("exit", fp) is False
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:  # pragma: no cover - 兜底
+            proc.kill()
+
+
+def test_restart_step_survives_a_broken_inner_quic(configured, monkeypatch):
+    """内层 QUIC 起不来, 不能让「重载服务」判红。
+
+    这一步判红 (`ok=False`) 会让 `python -m zeroproxy.apply` 以退出码 1 结束,
+    upgrade.sh 于是在第 6 步回滚整次升级 —— 一个可选的链路功能把程序升级彻底卡死。
+    核心服务 (nginx / xray / hysteria2) 的结果才决定成败; QUIC 的故障照旧写进说明,
+    并另有出口: 面板链式卡片会显示"内层 QUIC 没在跑", 「一键诊断」有独立一项。
+    """
+    from zeroproxy import apply as zp_apply
+    from zeroproxy import chain as chain_mod, chain_quic, config as zp_config
+
+    monkeypatch.setattr(
+        chain_quic, "sync",
+        lambda state, restart_changed=True: (False, "落地端 QUIC 启动失败 (见 exit.log): bind: address already in use"),
+    )
+    monkeypatch.setattr(chain_mod, "warmup_in_background", lambda state: None)
+    monkeypatch.setattr(zp_apply.services, "bin_path", lambda name: "/bin/true")
+    monkeypatch.setattr(zp_apply.services, "service_state", lambda name: "active")
+    monkeypatch.setattr(zp_apply.services, "restart_service", lambda name, timeout=0: (True, "已重启"))
+    monkeypatch.setattr(zp_apply.services, "reload_service", lambda name, timeout=0: (True, "已重载"))
+
+    ok, detail = zp_apply.restart_services(zp_config.load_state())
+    assert ok is True, detail                              # 步骤成功 → 升级不会被回滚
+    assert "QUIC" in detail and "✗" in detail              # 故障仍然如实写在说明里
+
+
+def test_diagnose_reports_a_dead_inner_quic(client, configured, monkeypatch):
+    """既然「重载服务」不再因内层 QUIC 判红, 它的故障就必须在诊断里有独立一项。"""
+    monkeypatch.setattr(chain, "probe_target", _ok_probe("203.0.113.9"))
+    client.post("/api/chain/exit",
+                json={"action": "generate", "port": 8666, "hy_enabled": True, "hy_port": 8667})
+
+    checks = {c["name"]: c for c in client.get("/api/diagnose").json()["checks"]}
+    assert "链式内层 QUIC" in checks, "要求跑内层 QUIC 却没起进程时, 诊断必须报出来"
+    assert checks["链式内层 QUIC"]["ok"] is False
+    assert checks["链式内层 QUIC"]["fixable"] is True

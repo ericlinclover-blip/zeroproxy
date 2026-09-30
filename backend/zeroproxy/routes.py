@@ -1772,6 +1772,23 @@ def _diagnose(state: dict) -> list[dict]:
             fixable=False,
         )
 
+    # 8. 链式内层 QUIC (Hysteria 2) 的进程 —— 它们由面板托管、不在 systemd 里, 坏了不会
+    #    体现在服务状态上; 而「重载服务」那一步现在只按核心服务判成败 (见 apply.py
+    #    的 core_failed): 内层 QUIC 起不来不再让整次落地/升级失败, 所以它的故障必须
+    #    在这里单独报出来, 否则这条链悄悄断掉没人知道。
+    quic_status = chain_quic.status(state)
+    if quic_status:
+        down_quic = [key for key, alive in quic_status.items() if not alive]
+        add(
+            "链式内层 QUIC",
+            not down_quic,
+            "内层 QUIC 进程全部在运行"
+            if not down_quic
+            else f"未运行: {', '.join(down_quic)} — 用这条内层的链会不通 "
+            "(日志在 data/chain-quic/*.log; 点「一键修复」会重新拉起)",
+            fixable=True,
+        )
+
     return checks
 
 

@@ -264,7 +264,9 @@ def restart_services(
         quic_note = f"✗ 内层 QUIC 同步异常: {exc}"
 
     if not jobs:
-        return (not quic_note.startswith("✗")), (
+        # 同样只看核心服务: 三份配置都没变、服务都在跑, 这一步就是成功的 ——
+        # 内层 QUIC 起不来只是把它写进说明, 不改变结论 (理由见下面 core_failed 那段)
+        return True, (
             "三份配置都没有变化, 无需重启 (服务都在正常运行)"
             + (f"; {quic_note}" if quic_note else "")
         )
@@ -298,6 +300,12 @@ def restart_services(
             chain.warmup_in_background(state)
 
     ordered = [results.get(name, f"{name} ✗ 没有结果") for name, _, _ in jobs]
+    # 这一步的成败只看核心服务 (nginx / xray / hysteria2) —— 内层 QUIC 是可选链路,
+    # 它起不来不该把整步判红。判红的代价很重: `python -m zeroproxy.apply` 以退出码 1
+    # 结束, upgrade.sh 会判定第 6 步失败并**回滚整次升级** —— 那台机器就再也升不了级
+    # (真机踩到过: 落地端 8448/udp 被面板自己起的进程占着)。QUIC 的实际状态另有出处:
+    # 面板链式卡片会显示"内层 QUIC 没在跑", 「一键诊断」也有独立一项。
+    core_failed = any("✗" in row for row in ordered)
     if quic_note:
         # 挂在 Xray 那一行 (QUIC 进程就是给它当出站用的); 这一轮没重启 Xray 时
         # (比如只改了落地端的 QUIC 开关) 就单独占一行, 免得状态被吞掉。
@@ -307,8 +315,7 @@ def restart_services(
             ]
         else:
             ordered.append(quic_note)
-    failed = any("✗" in row for row in ordered)
-    return (not failed), "; ".join(ordered)
+    return (not core_failed), "; ".join(ordered)
 
 
 def _tcp_open(port: int, timeout: float = 0.6) -> bool:
