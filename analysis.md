@@ -2,11 +2,11 @@
 
 ## 1. Project Overview
 
-**ZeroProxy** (v2.6.17) is a self-hosted proxy management panel that orchestrates Xray, Hysteria 2, and Nginx on a single server. It provides a web dashboard (Svelte-based SPA served as a single `index.html`) that manages proxy nodes, subscriptions, chained proxies, GeoIP-based routing, and service lifecycle.
+**ZeroProxy** (v2.6.18) is a self-hosted proxy management panel that orchestrates Xray, Hysteria 2, and Nginx on a single server. It provides a web dashboard — a zero-framework, zero-build single-file SPA (`index.html`, plain JS, no CDN) — that manages proxy nodes, subscriptions, chained proxies, GeoIP-based routing, and service lifecycle.
 
 - **Root**: `/Users/eric/Desktop/sbpn/zeroproxy/`
 - **Backend**: `/Users/eric/Desktop/sbpn/zeroproxy/backend/zeroproxy/` (Python, FastAPI)
-- **Frontend**: `/Users/eric/Desktop/sbpn/zeroproxy/backend/static/index.html` (Svelte SPA)
+- **Frontend**: `/Users/eric/Desktop/sbpn/zeroproxy/backend/static/index.html` (vanilla JS SPA, ~172 KB, no framework/build step)
 - **Data Dir**: `$ZP_HOME/data/state.json` (runtime state, version 4)
 - **Tech Stack**: FastAPI + uvicorn (panel), Xray (proxy core), Hysteria 2 (QUIC transport), Nginx (TLS termination + reverse proxy)
 
@@ -27,11 +27,14 @@
     ┌─────────▼────────┐  ┌────────▼─────────┐  ┌────────▼────────┐
     │ Xray (systemd)   │  │ Hysteria 2       │  │ uvicorn (panel) │
     │ - VLESS-Reality  │  │ - QUIC/UDP       │  │ - FastAPI REST  │
-    │ - VLESS-XHTTP    │  │ - masquerade     │  │ - Svelte SPA    │
-    │ - VLESS-WS       │  └──────────────────┘  │ - WebSocket     │
-    │ - Trojan         │                         │ - async jobs    │
-    │ - Stats API      │                         └─────────────────┘
-    └──────────────────┘
+    │ - VLESS-XHTTP    │  │ - masquerade     │  │ - static SPA    │
+    │ - VLESS-WS       │  └──────────────────┘  │ - async jobs    │
+    │ - Trojan         │                         │ - daemon threads│
+    │ - Stats API      │  ┌──────────────────┐   └─────────────────┘
+    │ - chain-exit     │  │ hysteria children│        ▲
+    │ - chain-<id>     │  │ (panel-managed,  │────────┘ spawned by panel
+    └──────────────────┘  │  chain QUIC only)│
+                          └──────────────────┘
 ```
 
 ### 2.2 Core Modules
@@ -39,8 +42,8 @@
 | Module | Size | Responsibility |
 |--------|------|----------------|
 | `config.py` | 24KB | Runtime state management, concurrency model (`config.locked()`), constants |
-| `routes.py` | 96KB | All FastAPI endpoints (100+), session/auth, dashboard, config mutation |
-| `apply.py` | 26KB | 6-step verification loop ("generate → verify → reload"), async job system |
+| `routes.py` | 96KB | All API endpoints (33 router routes + `/`, `/api/info`), session/auth, dashboard, config mutation, **async job table** (`_APPLY_JOBS`) |
+| `apply.py` | 26KB | The 6-step landing loop ("generate → real-binary verify → reload → re-check ports"); shared by the panel and `upgrade.sh` |
 | `services.py` | 47KB | Service adaptation layer (systemctl, certbot, firewall), traffic stats |
 | `xray_config.py` | 16KB | Xray JSON config generator (4 inbounds + chain + routing) |
 | `share_links.py` | 28KB | Client share links, subscriptions (base64/clash/singbox), routing templates |
@@ -51,7 +54,7 @@
 | `nginx_config.py` | 7KB | Nginx config template (ACME, WS proxy, panel HTTPS, fake homepage) |
 | `crypto.py` | 4KB | Key generation (VLESS UUID, Reality X25519), password hashing (PBKDF2) |
 | `update.py` | 13KB | Panel self-update: version check, `upgrade.sh` staging & execution |
-| `main.py` | 6KB | Entry point, uvicorn setup, GeoIP auto-update loop |
+| `main.py` | 6KB | Entry point, security-header middleware, static mount, startup port check; lifespan runs the GeoIP auto-update loop + chain-QUIC supervisor |
 
 ## 3. Concurrency & State Management
 
@@ -78,15 +81,23 @@
 ### 4.1 6-Step Verification (File: `apply.py`)
 
 ```python
-STEP_NAMES = [
-    "生成 Xray 配置",       # xray_config.write_xray_config(state)
-    "生成 Nginx 配置",     # nginx_config.write_nginx_conf(state)
-    "生成 Hysteria 2 配置", # hysteria_config.write_hysteria_config(state)
-    "重启 Xray",           # systemctl restart xray
-    "重启 Hysteria 2",     # systemctl restart hysteria2
-    "验证端口监听",        # Dynamic polling (not fixed sleep)
-]
+STEP_NAMES = (
+    "校验 Reality 密钥与伪装目标",   # ensure_reality_settings — X25519 配对 + 旧 dest 迁移
+    "重新生成 Xray 配置",           # xray_config.write_xray_config + 真实 `xray -test`
+    "重新生成 Nginx 配置",          # nginx_config.write_nginx_conf + `nginx -t`
+    "重新生成 Hysteria 2 配置",     # hysteria_config.write_hysteria_config
+    "重载服务 (nginx/xray/hysteria2)",  # 并发重启; 只重启配置指纹变了的服务
+    "验证端口监听",                 # 双向校验 (该开的在听 + 该关的关了)
+)
 ```
+
+注意第一步不是"生成配置"而是**前置校验**: v2.3.2 及更早误用 Ed25519 生成的 Reality 密钥对、以及
+证书链超过 REALITY 8KB 缓冲的旧默认伪装目标(`www.microsoft.com`),都会在这里被就地修正 ——
+这两者都会让"服务全绿但四个 TCP 节点全不通"。
+
+第 5 步不再拆成"重启 Xray / 重启 Hysteria 2"两个独立步骤: 三个服务**并发**收敛, 且用
+`_config_digests()` 比对三份配置的 sha256, 只有真正变了的服务才重启(链式操作只动 Xray 时,
+nginx / hysteria 不再陪着重启一次)。
 
 **Verification logic** (`_VERIFY_POLL` + `_VERIFY_PROBE_TIMEOUT`):
 - Dynamic polling instead of fixed sleeps — avoids unnecessary delays on fast loopback
@@ -161,7 +172,7 @@ STEP_NAMES = [
 |----------|--------|-------------|
 | `/api/chain/exit` | POST | Generate/rotate/disable exit node credentials |
 | `/api/chain/entries` | POST | Add chain entry (paste pairing code → probe → land) |
-| `/api/chain/entries/{id}` | PATCH | Enable/disable, set default exit, rename, switch transport |
+| `/api/chain/entries/{id}` | POST | Enable/disable, set default exit, rename, switch transport (Brutal bandwidth) |
 | `/api/chain/entries/{id}/probe` | POST | Single-chain speed test |
 | `/api/chain/entries/{id}` | DELETE | Remove chain entry |
 | `/api/chain/exit/qr` | GET | QR code for pairing code |
@@ -195,7 +206,7 @@ STEP_NAMES = [
 ### 6.1 Dashboard Data Flow
 
 ```
-Frontend (Svelte SPA)
+Frontend (vanilla-JS SPA)
   │
   ├─ GET /api/dashboard (after login)
   │    │
@@ -319,12 +330,16 @@ DEFAULT_REALITY_DEST = "www.cloudflare.com:443"  # Stays under Xray's 8KB cert l
 WS_PATH = "/ws/zeroproxy"
 XHTTP_PATH = "/xhttp-zeroproxy"
 DEFAULT_MASQUERADE = "https://www.microsoft.com/"
-PANEL_PORT = 8899
-PANEL_BIND_PORT = 9900
-SESSION_TTL = 3600  # 1 hour
-GEODATA_TTL = 2592000  # 30 days
+PANEL_PORT = 8899        # 对外 (nginx 在 8899 终结 TLS)
+PANEL_BIND_PORT = 9900   # 面板进程自身 (仅 127.0.0.1, nginx 反代到它)
+SESSION_TTL = 72 * 3600  # 72 hours
+MAX_SESSIONS = 8         # 超出时淘汰最早到期的一个
+GEODATA_TTL = 7 * 86400  # 7 days — 过期后后台线程自动更新
 STATE_VERSION = 4
-HOP_OFFSETS = (0, 1000, 2000)  # Port hopping intervals
+
+# 以下不在 config.py: 端口跳跃的偏移量定义在 routes.py (HOP_OFFSETS),
+# 跳跃端口 = 主端口 + 每个偏移, 并随主端口变更自动重排。
+HOP_OFFSETS = (0, 1000, 2000)
 ```
 
 ## 8. Chained Proxy Details (Files: `chain.py`, `chain_quic.py`)
@@ -420,14 +435,27 @@ sockopt = {
 ## 11. Startup Sequence (File: `main.py`)
 
 ```
-1. Parse config → ZP_HOME, ports, bind address
-2. Bootstrap token check (first-run protection)
-3. Load state from disk
-4. Start uvicorn (panel) on 127.0.0.1:9900
-5. Background GeoIP auto-update thread (checks every 6h)
-6. Background chain warmup thread (on config change)
-7. Background chain QUIC supervisor loop (20s)
+1. Module import: resolve ZP_HOME / PANEL_PORT / PANEL_BIND_HOST / PANEL_BIND_PORT from env
+2. create_app(): attach security-header middleware, include the API router,
+   mount /static, serve index.html with `cache-control: no-cache` (ETag revalidation)
+3. _check_startup_ports(): probe the panel's public port + bind port for conflicts
+   (prints a warning only — never blocks start; a leftover old process must not look
+   like "the panel is running" while another service owns the port)
+4. ASGI lifespan starts two daemon threads:
+     a. zp-geodata  — first tick after 90 s, then every 6 h; downloads only when the
+                      data is missing or past GEODATA_TTL; on change it restarts Xray
+     b. zp-chain-quic — reconciles panel-managed hysteria children every 20 s
+5. __main__: uvicorn binds 127.0.0.1:9900 with proxy_headers=True,
+   forwarded_allow_ips="127.0.0.1" (trusts only the local nginx)
 ```
+
+两处容易误解的地方:
+
+- **引导令牌不是启动时校验**: `main.py` 里没有"首次运行保护"这一步。令牌只在 `POST /api/setup`
+  里常量时间比对(`config.bootstrap_token()` 优先级: 环境变量 → `data/bootstrap_token`),
+  本地开发两者都不存在时允许无令牌初始化。
+- **链式预热不占启动路径**: `chain.warmup_in_background()` 由 `apply.restart_services()` 在
+  Xray 重启成功后触发, 不在 `main.py` 的启动序列里。
 
 ## 12. Key Design Decisions
 
@@ -450,34 +478,59 @@ routes.py ──┬── config.py (state, locked, audit)
             ├── share_links.py (subscription, templates)
             ├── chain.py (parse_code, probe_target, warmup)
             ├── chain_quic.py (sync, status, binary)
-            ├── geodata.py (update, status, guard)
-            ├── nginx_config.py (write_nginx_conf)
-            ├── hysteria_config.py (write_hysteria_config)
+            ├── geodata.py (update, status, UPDATE_LOCK)
+            ├── update.py (panel self-update status/start)
             └── crypto.py (new_reality_keys, derive_uuid)
 
+(nginx_config.py / hysteria_config.py 不直接被 routes 引用 —— 只经 apply.py 落地。)
+
 main.py ────┬── config.py
-            ├── geodata.py (auto_update_thread)
-            ├── chain.py (warmup_in_background)
+            ├── routes.py (create_app / include_router)
+            ├── geodata.py (auto-update loop + `guard` CLI)
             ├── chain_quic.py (supervisor_loop)
-            └── services.py (bin_path, port_available)
+            └── services.py (restart_service, is_prod 等)
 
 apply.py ───┬── xray_config.py (gen_xray)
             ├── nginx_config.py (gen_nginx)
             ├── hysteria_config.py (gen_hysteria)
+            ├── chain.py (warmup_in_background —— 预热挂在重启成功之后)
+            ├── chain_quic.py (sync —— 内层 QUIC 进程在 Xray 之前对齐)
             └── services.py (restart_services, verify_listeners)
 ```
 
 ## 14. Frontend-Backend Synchronization
 
-The frontend (Svelte SPA) communicates with the backend via:
+The frontend (vanilla-JS SPA) is pull-only: **no WebSocket, no server push, no CORS** —
+same-origin `fetch` with `credentials: "same-origin"`.
 
-1. **Session-based auth**: `zp_session` cookie set on login, validated on each request
-2. **Dashboard polling**: `GET /api/dashboard` on mount, `GET /api/apply/job?id=` during apply operations
-3. **Real-time traffic**: `GET /api/traffic` every 10-30s (or on demand)
-4. **Config mutation**: POST endpoints return either:
-   - Sync: `{ok: true, steps: [{name, ok, detail, ms}, ...]}`
-   - Async: `{ok: true, job: {id, state, index, total, current}}`
-5. **Audit log**: Paginated `GET /api/audit?limit=50&before=0&category=toggle_node`
+1. **Session-based auth**: `zp_session` cookie (HttpOnly / SameSite=Lax / Secure when
+   the request is HTTPS or `X-Forwarded-Proto: https`), validated on every request.
+2. **Dashboard polling**: `GET /api/dashboard` on mount and then every 20 s — but the
+   interval is **suspended while `opBusy > 0` or an apply job is running**, otherwise a
+   full re-render would wipe the "in progress" state of a button and let the user click
+   the same chain operation twice.
+3. **Apply-job polling**: `GET /api/apply/job?id=` every 400 ms (budget 120 s for
+   config apply, 480 s for GeoIP download, matching the backend's own 180 s deadline).
+   Update polling is a separate 2.5 s loop on `GET /api/update`.
+4. **Traffic**: read from `dash.traffic` inside the dashboard payload — the frontend
+   **never calls** `GET /api/traffic`; that endpoint exists for external consumers.
+   The rate curve is sampled client-side (24 in-memory points, ~8 min) because the
+   Xray Stats API only exposes cumulative counters.
+5. **Config mutation**: the response body *is* the fresh dashboard payload plus either
+   `steps: [{name, ok, detail, ms}]` (sync mode, `ZP_APPLY_ASYNC=0`) or
+   `job: {id, kind, state, index, total, current}` (async mode, the default).
+6. **Audit log**: the newest 30 entries + per-category facet counts ride along in
+   `/api/dashboard` (zero extra requests). Only once the user filters/pages does the
+   frontend switch to `GET /api/audit?limit=30&before=<id>&category=<auth|config|chain|data|system>&q=&failed=1`
+   — cursor paging by monotonic `id`, never `offset`, so new entries arriving mid-paging
+   cannot shift a row into the next page.
+7. **Dropped connections are not failures**: a `fetch` throw or a 502/504 is marked
+   `e.dropped` and triggers reconnect-and-reconcile (`syncAfterDrop`) instead of an error
+   toast or a redirect to the login view — because restarting Xray legitimately kills the
+   browser's own tunnel when the user is browsing through their own node.
+8. **Draft protection**: every full re-render first snapshots the text/number inputs the
+   user is editing (value + caret) and restores them afterwards, so a 20 s refresh can
+   never overwrite a half-typed SNI, port or pairing code.
 
 The frontend renders:
 - Node cards with traffic graphs, QR codes, share links
