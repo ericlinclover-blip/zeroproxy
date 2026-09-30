@@ -22,6 +22,7 @@ import errno
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -75,6 +76,26 @@ PROBE_RULES = [
     {"type": "field", "outboundTag": "block", "domain": ["geosite:category-ads-all"]},
 ]
 
+#: 上游校验值 (.sha256sum) 的取用超时 —— 只有几十字节, 但它决定"要不要下 28 MB"。
+SUMS_TIMEOUT = 6
+
+#: 一次"核对上游"的总时间上限 (两个校验文件 + 构建信息), 防止镜像卡住拖死请求。
+CHECK_DEADLINE = 20
+
+#: 取数据集构建信息 (发布时间 / 提交 sha) 的超时。
+META_TIMEOUT = 6
+
+#: 数据集的构建信息来源: 仓库 release 分支的最新提交 —— 它自带日期和 sha,
+#: 是"这份数据是哪天构建的"唯一权威答案 (dat 文件本身不带任何版本字符串)。
+#: gh-proxy 是国内可用的 GitHub 反代, 与 update.py 用的是同一套思路。
+META_SOURCES = (
+    "https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/commits/release",
+    "https://gh-proxy.com/https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/commits/release",
+)
+
+#: sha256sum 文件里那一串 64 位十六进制
+_SHA256_RE = re.compile(r"\b([0-9a-fA-F]{64})\b")
+
 UA = "ZeroProxy/2.0 (geodata)"
 
 
@@ -118,13 +139,16 @@ def wants_update(state: dict, now: int | None = None) -> bool:
         return False
     if not present():
         return True
-    updated = int(geo.get("updated_at", 0) or 0)
-    return (now or int(time.time())) - updated > GEODATA_TTL
+    # 用"最后一次和上游核对"而不是"最后一次写文件": 内容没变时我们不会重写文件,
+    # 若只看 updated_at, 数据明明核对过也会被反复判为过期, 每 6 小时白问一次上游。
+    checked = max(int(geo.get("updated_at", 0) or 0), int(geo.get("checked_at", 0) or 0))
+    return (now or int(time.time())) - checked > GEODATA_TTL
 
 
 def status(state: dict) -> dict:
     """给面板 / 诊断用的只读快照。"""
     recorded = state.get("geodata", {}).get("files", {}) or {}
+    expected = state.get("geodata", {}).get("expected", {}) or {}
     files: dict[str, dict] = {}
     for name in SOURCES:
         try:
@@ -133,12 +157,15 @@ def status(state: dict) -> dict:
                 "exists": True,
                 "size": stat.st_size,
                 "mtime": int(stat.st_mtime),
-                "sha256": str(recorded.get(name, {}).get("sha256", ""))[:16],
+                "sha256": str(recorded.get(name, {}).get("sha256", ""))[:12],
+                # 上游当前的 sha256 前缀 (仅在核对过之后才有) —— 面板拿它做对比
+                "expected": str(expected.get(name, ""))[:12],
             }
         except OSError:
-            files[name] = {"exists": False, "size": 0, "mtime": 0, "sha256": ""}
+            files[name] = {"exists": False, "size": 0, "mtime": 0, "sha256": "", "expected": ""}
     geo = state.get("geodata", {})
     updated = int(geo.get("updated_at", 0) or 0)
+    dataset = geo.get("dataset") or {}
     return {
         "enabled": bool(geo.get("enabled")),
         "block_private": bool(geo.get("block_private", True)),
@@ -148,6 +175,14 @@ def status(state: dict) -> dict:
         "updated_at": updated,
         "age_days": int((time.time() - updated) // 86400) if updated else -1,
         "source": geo.get("source", ""),
+        # ---- 数据版本 (用户要的"到底更新成功没有", 见本文件"数据版本"一节) ----
+        #: 上游数据集的构建日期 / 提交短 sha, 例如 2026-09-29 / ef3bc79
+        "dataset_build": str(dataset.get("build", "") or ""),
+        "dataset_sha": str(dataset.get("sha", "") or ""),
+        #: 最后一次和上游核对校验值的时间
+        "checked_at": int(geo.get("checked_at", 0) or 0),
+        #: True 与上游一致 / False 上游有新内容 / None 还没核对过或问不到
+        "up_to_date": geo.get("up_to_date"),
         # 上次尝试的结果 —— 卡片上要能说出"为什么没数据", 不能只显示"数据未下载"
         "last_attempt": int(geo.get("last_attempt", 0) or 0),
         "last_error": str(geo.get("last_error", "") or ""),
@@ -168,15 +203,26 @@ def merge_result(target: dict, source: dict, ok: bool) -> None:
     """
     geo = target.setdefault("geodata", {})
     src = source.get("geodata", {}) or {}
-    safe_keys = ("files", "updated_at", "source", "last_attempt", "last_error")
+    safe_keys = (
+        "files",
+        "updated_at",
+        "checked_at",
+        "up_to_date",
+        "expected",
+        "dataset",
+        "source",
+        "last_attempt",
+        "last_error",
+    )
+    #: 这两个是"只许前进"的时间戳: 下载/核对是在配置锁外跑的, 期间用户可能手动
+    #: 又更新过一次 —— 旧快照不许把新的时间戳覆盖回去。
+    monotonic = ("updated_at", "checked_at")
     for key in safe_keys:
         if key not in src:
             continue
-        if key == "updated_at":
-            # 若目标已经有一个更近的更新记录, 说明在下载期间用户已经手动更新过了
-            # 或者后台线程更早完成 — 跳过并回, 保留目标版本
-            target_ts = int(geo.get("updated_at") or 0)
-            source_ts = int(src.get("updated_at") or 0)
+        if key in monotonic:
+            target_ts = int(geo.get(key) or 0)
+            source_ts = int(src.get(key) or 0)
             if target_ts > source_ts:
                 continue
         geo[key] = src[key]
@@ -287,6 +333,132 @@ def _source_label(url: str) -> str:
     return url.split("/")[2] if "//" in url else url
 
 
+# ---------------------------------------------------------------- 数据版本
+#
+# 用户的原始问题: "GeoIP 数据到底更新成功没有?" —— geoip.dat / geosite.dat
+# 里**没有任何版本字符串**, 光看文件只有体积和修改时间, 而一天一版的日常更新
+# 在体积上完全看不出来。所以版本必须从上游取, 分两层:
+#
+#   1. 内容身份: 仓库随数据集一起发布的 `<文件>.sha256sum` (几十字节), 走的是
+#      和数据本身**同一批镜像** —— 拿它和本地文件的 sha256 比对, 就能在不下载
+#      28 MB 的前提下回答"我这份是不是上游当前那一份";
+#   2. 人类可读版本: 仓库 release 分支最新提交的日期 + sha, 面板显示成
+#      「数据集 2026-09-29 (ef3bc79)」, 用户一眼能看出数据是哪天的。
+
+
+def _sum_urls(name: str) -> list[str]:
+    """该文件校验值小文件的候选地址 (与 SOURCES 同序、同镜像)。"""
+    return [f"{url}.sha256sum" for url in SOURCES[name]]
+
+
+def fetch_expected(name: str, *, timeout: int = SUMS_TIMEOUT) -> tuple[bool, str, str]:
+    """取上游该文件的 sha256。返回 (是否拿到, 哈希, 生效源)。
+
+    拿到的是仓库自己发布的校验值, 不写 state、不碰数据文件 —— 怎么用由调用方决定。
+    """
+    for url in _sum_urls(name):
+        try:
+            request = urllib.request.Request(url, headers={"User-Agent": UA})
+            with urllib.request.urlopen(request, timeout=timeout) as resp:
+                status = getattr(resp, "status", 200)
+                if status is not None and status != 200:
+                    continue
+                text = resp.read(4096).decode("utf-8", "replace")
+        except (urllib.error.URLError, OSError, TimeoutError):
+            continue
+        match = _SHA256_RE.search(text)
+        if match:
+            return True, match.group(1).lower(), url
+    return False, "", ""
+
+
+def local_sha256(name: str) -> str:
+    """本地数据文件的 sha256 (文件不在就返回空串)。"""
+    try:
+        return sha256(file_path(name))
+    except OSError:
+        return ""
+
+
+def dataset_info(*, timeout: int = META_TIMEOUT) -> tuple[bool, dict]:
+    """取数据集的构建信息: {"build": "2026-09-29", "sha": "ef3bc79"}。"""
+    for url in META_SOURCES:
+        try:
+            request = urllib.request.Request(
+                url, headers={"User-Agent": UA, "Accept": "application/vnd.github+json"}
+            )
+            with urllib.request.urlopen(request, timeout=timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8", "replace"))
+        except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+            continue
+        sha = str(payload.get("sha") or "")
+        date = str(((payload.get("commit") or {}).get("author") or {}).get("date") or "")
+        if sha:
+            return True, {"build": date[:10], "sha": sha[:7]}
+    return False, {}
+
+
+def check_remote(*, deadline: float | None = None) -> dict:
+    """只下两个几十字节的校验值, 和本地文件比一次。不写 state, 不碰数据文件。
+
+    返回的 `up_to_date` 是三态: True 一致 / False 上游有新内容 / None 问不到上游
+    (镜像不可达)。None 必须和 False 分得开 —— "不知道"和"有新版"在面板上是
+    完全不同的两句话。
+    """
+    started = time.time()
+    if deadline is None:
+        deadline = started + CHECK_DEADLINE
+    report: dict = {"checked_at": int(started), "files": {}, "up_to_date": None, "error": ""}
+    known: list[bool] = []
+    for name in SOURCES:
+        remaining = deadline - time.time()
+        if remaining <= 1:
+            break
+        budget = max(2, int(min(SUMS_TIMEOUT, remaining)))
+        ok, expected, _source = fetch_expected(name, timeout=budget)
+        local = local_sha256(name)
+        matched = bool(expected) and expected == local
+        report["files"][name] = {"expected": expected, "local": local, "match": matched}
+        if ok:
+            known.append(matched)
+    report["ok"] = bool(known) and len(known) == len(SOURCES)
+    if report["ok"]:
+        report["up_to_date"] = all(known)
+    elif known:
+        report["error"] = "部分数据文件的校验值不可用"
+    else:
+        report["error"] = "无法获取上游校验值 (镜像不可达)"
+    return report
+
+
+def record_check(state: dict, report: dict, meta: dict | None = None) -> None:
+    """把一次核对的结果写进 state (纯本地操作, 由调用方负责 save_state)。"""
+    geo = state.setdefault("geodata", {})
+    geo["checked_at"] = int(report.get("checked_at") or time.time())
+    geo["up_to_date"] = report.get("up_to_date")
+    geo["expected"] = {
+        name: str(entry.get("expected") or "")
+        for name, entry in (report.get("files") or {}).items()
+    }
+    # 核对时刚刚算过每个本地文件的 sha256, 顺手把指纹记下来: 面板显示的内容标识
+    # 因此永远来自**磁盘上现在的文件**, 而不是某次下载时的旧记录 (老版本装的数据
+    # 甚至根本没有这条记录, 卡片上就只能显示空白)。
+    files = geo.setdefault("files", {})
+    for name, entry in (report.get("files") or {}).items():
+        local = str(entry.get("local") or "")
+        if not local:
+            continue
+        slot = files.setdefault(name, {})
+        slot["sha256"] = local
+        if not slot.get("size"):
+            try:
+                slot["size"] = os.path.getsize(file_path(name))
+            except OSError:
+                pass
+    if meta:
+        geo["dataset"] = meta
+
+
 def atomic_install(src: str, dst: str) -> None:
     """把一个临时文件换到 dst 的位置 (同名覆盖, 不会留半个文件)。
 
@@ -348,8 +520,9 @@ def update(
     validate: bool = True,
     deadline: float | None = None,
     progress=None,
+    force: bool = False,
 ) -> tuple[bool, str, dict]:
-    """下载两个数据文件并原子替换。
+    """核对上游 → (有变化才) 下载两个数据文件并原子替换。
 
     先全部落到临时目录, 校验通过后才 rename 到位 —— 任一步失败都保持现有文件
     不变, 不会出现"半个数据集"导致 Xray 起不来。
@@ -358,6 +531,10 @@ def update(
     `deadline` 是这次更新的绝对时间上限 (超时放弃剩余源, 而不是无限等下去)。
     结果会写进 `state["geodata"]` 的 `last_attempt` / `last_error` —— 失败原因
     要留在状态里, 面板才有东西可显示。
+
+    为什么先核对: 数据集一天一版, 但**绝大多数日子里内容并没有变**。以前每 7 天
+    无条件重下 28 MB, 用户得到的只有一句"已更新" —— 既费流量又印证不了什么。
+    现在先取两个几十字节的校验值, 一致就直接返回 (force=True 可跳过这一步强制重下)。
     """
     target = geo_dir()
     os.makedirs(target, exist_ok=True)
@@ -365,6 +542,26 @@ def update(
     geo = state.setdefault("geodata", {})
     geo["last_attempt"] = int(time.time())
     geo["last_error"] = ""
+
+    # ---- 第 0 步: 核对上游 (不下载数据本体) ----
+    remote = {"files": {}, "up_to_date": None, "checked_at": int(time.time())}
+    if not force:
+        remote = check_remote(deadline=time.time() + CHECK_DEADLINE)
+    expected = {name: str(e.get("expected") or "") for name, e in remote["files"].items()}
+    geo["checked_at"] = int(remote["checked_at"])
+    geo["up_to_date"] = remote.get("up_to_date")
+    geo["expected"] = expected
+    # 构建信息 (哪天构建的 / 哪个提交) 每次都顺手刷一次: 它只有几百字节, 而且
+    # 用户看的就是它。拿不到就保留上次的值, 不能因为 GitHub 不通就把已有信息抹掉。
+    info_ok, build_info = dataset_info()
+    if info_ok:
+        geo["dataset"] = build_info
+    if not force and remote.get("up_to_date") and present():
+        detail = "数据已是最新 (与上游校验值一致, 未重新下载)"
+        if progress is not None:
+            progress(1, 1, detail)
+        return True, detail, status(state)
+
     if deadline is None:
         deadline = time.time() + UPDATE_DEADLINE
 
@@ -422,10 +619,22 @@ def update(
     geo["files"] = {name: {"size": m["size"], "sha256": m["sha256"]} for name, m in meta.items()}
     geo["updated_at"] = int(time.time())
     geo["source"] = _source_label(meta[list(meta)[0]]["source"]) if meta else ""
+    # 下载完再对一次账: 镜像的 CDN 边缘可能还在吐上一版 (jsDelivr 对 @release 的
+    # 缓存是 12 小时)。这不是失败, 但必须如实反映在"是否最新"上, 否则用户点完
+    # 更新看到"已是最新", 其实拿到的还是旧数据 —— 正是要修掉的那种"说不清"。
+    compared = [expected.get(name) for name in names if expected.get(name)]
+    if compared:
+        geo["up_to_date"] = all(expected[name] == meta[name]["sha256"] for name in names
+                                if expected.get(name))
+    else:
+        geo["up_to_date"] = None     # 问不到上游校验值 → 不知道, 不是"有新版"
     # 首次下载自动启用分流; 用户手动关过 (user_set) 则尊重其选择
     if not geo.get("user_set"):
         geo["enabled"] = True
-    return True, "; ".join(details), status(state)
+    summary = "; ".join(details)
+    if geo.get("up_to_date") is False:
+        summary += " (提示: 与上游校验值不一致, 镜像可能仍在吐缓存版本)"
+    return True, summary, status(state)
 
 
 def auto_tick(state: dict, *, validate: bool = False) -> tuple[bool, str]:
@@ -531,15 +740,60 @@ def _main(argv: list[str]) -> int:
         _fixed, detail = guard()
         print(f"[zeroproxy-geodata] {detail}")
         return 0
+    if cmd == "check":
+        # 服务器上肉眼核对数据版本: 本地 / 上游校验值比对 + 数据集构建日期与提交
+        report = check_remote()
+        ok_meta, meta = dataset_info()
+        _persist_check(report, meta if ok_meta else None)
+        if ok_meta:
+            print(f"[zeroproxy-geodata] 数据集: {meta.get('build', '')} ({meta.get('sha', '')})")
+        else:
+            print("[zeroproxy-geodata] 数据集构建信息不可用 (GitHub API 不可达)")
+        for name, entry in report["files"].items():
+            verdict = "未知"
+            if entry["expected"]:
+                verdict = "一致" if entry["match"] else "不一致"
+            print(
+                f"[zeroproxy-geodata] {name}: 本地 {entry['local'][:12] or '(缺失)'}"
+                f" / 上游 {entry['expected'][:12] or '(不可用)'} → {verdict}"
+            )
+        if report["up_to_date"] is None:
+            print(f"[zeroproxy-geodata] 结论: 无法判断 ({report['error']})")
+            return 2
+        print("[zeroproxy-geodata] 结论: 已是最新" if report["up_to_date"]
+              else "[zeroproxy-geodata] 结论: 上游有新版本, 执行 update 即可")
+        return 0
     if cmd == "update":
-        from .config import load_state
+        from .config import load_state, locked, save_state
 
         state = load_state()
-        ok, detail, _status = update(state)
+        ok, detail, _status = update(state, force="--force" in argv)
+        # 命令行跑完也要落盘 —— 面板读的是 state.json。以前这里只在内存里改,
+        # 命令行升级完面板上什么变化都看不到 (失败原因同样会消失)。
+        with locked():
+            fresh = load_state()
+            merge_result(fresh, state, ok)
+            save_state(fresh)
         print(f"[zeroproxy-geodata] {'OK' if ok else 'FAIL'}: {detail}")
         return 0 if ok else 1
-    print("用法: python -m zeroproxy.geodata [guard|update]", file=sys.stderr)
+    print("用法: python -m zeroproxy.geodata [guard|check|update [--force]]", file=sys.stderr)
     return 2
+
+
+def _persist_check(report: dict, meta: dict | None) -> None:
+    """把一次命令行核对的结果落进 state, 让面板卡片跟着变。
+
+    面板目录不存在时 (纯 CLI 环境) 静默跳过 —— 核对结果已经打到 stdout 了。
+    """
+    try:
+        from .config import load_state, locked, save_state
+
+        with locked():
+            state = load_state()
+            record_check(state, report, meta)
+            save_state(state)
+    except Exception:  # noqa: BLE001 — 落不了盘不该让一次成功的核对变成失败
+        pass
 
 
 if __name__ == "__main__":

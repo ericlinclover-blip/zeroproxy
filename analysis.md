@@ -2,7 +2,7 @@
 
 ## 1. Project Overview
 
-**ZeroProxy** (v2.6.21) is a self-hosted proxy management panel that orchestrates Xray, Hysteria 2, and Nginx on a single server. It provides a web dashboard — a zero-framework, zero-build single-file SPA (`index.html`, plain JS, no CDN) — that manages proxy nodes, subscriptions, chained proxies, GeoIP-based routing, and service lifecycle.
+**ZeroProxy** (v2.6.22) is a self-hosted proxy management panel that orchestrates Xray, Hysteria 2, and Nginx on a single server. It provides a web dashboard — a zero-framework, zero-build SPA (`index.html` + ES modules under `static/app/`, plain JS, no CDN) — that manages proxy nodes, subscriptions, chained proxies, GeoIP-based routing, and service lifecycle.
 
 - **Root**: `/Users/eric/Desktop/sbpn/zeroproxy/`
 - **Backend**: `/Users/eric/Desktop/sbpn/zeroproxy/backend/zeroproxy/` (Python, FastAPI)
@@ -48,18 +48,18 @@
 | Module | Size | Responsibility |
 |--------|------|----------------|
 | `config.py` | 24KB | Runtime state management, concurrency model (`config.locked()`), constants |
-| `routes.py` | 96KB | All API endpoints (33 router routes + `/`, `/api/info`), session/auth, dashboard, config mutation, **async job table** (`_APPLY_JOBS`) |
+| `routes.py` | 99KB | All API endpoints (33 router paths + `/`, `/api/info`), session/auth, dashboard, config mutation, **async job table** (`_APPLY_JOBS`) |
 | `apply.py` | 26KB | The 6-step landing loop ("generate → real-binary verify → reload → re-check ports"); shared by the panel and `upgrade.sh` |
 | `services.py` | 47KB | Service adaptation layer (systemctl, certbot, firewall), traffic stats |
 | `xray_config.py` | 16KB | Xray JSON config generator (4 inbounds + chain + routing) |
 | `share_links.py` | 28KB | Client share links, subscriptions (base64/clash/singbox), routing templates |
 | `chain.py` | 32KB | Chained proxy: pairing codes, port allocation, real handshake probing |
 | `chain_quic.py` | 19KB | QUIC inner-layer: hysteria process management, config sync, supervisor loop |
-| `geodata.py` | 22KB | GeoIP/GeoSite download (multi-mirror fallback), validation, auto-update |
+| `geodata.py` | 33KB | GeoIP/GeoSite download (multi-mirror fallback), validation, auto-update, **upstream version check** (`check_remote` / `dataset_info` — dataset build date + sha, per-file sha256 fingerprints) |
 | `hysteria_config.py` | 3KB | Hysteria 2 config template (port hopping, masquerade) |
 | `nginx_config.py` | 7KB | Nginx config template (ACME, WS proxy, panel HTTPS, fake homepage) |
 | `crypto.py` | 4KB | Key generation (VLESS UUID, Reality X25519), password hashing (PBKDF2) |
-| `update.py` | 13KB | Panel self-update: version check, `upgrade.sh` staging & execution |
+| `update.py` | 14KB | Panel self-update: version check, `upgrade.sh` staging & execution, opt-in core (Xray/Hysteria 2) upgrade via `ZP_UPDATE_CORE` |
 | `main.py` | 6KB | Entry point, security-header middleware, static mount, startup port check; lifespan runs the GeoIP auto-update loop + chain-QUIC supervisor |
 
 ## 3. Concurrency & State Management
@@ -187,7 +187,9 @@ nginx / hysteria 不再陪着重启一次)。
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/geodata/update` | POST | Download & verify GeoIP/GeoSite data + reapply |
+| `/api/geodata/update` | POST | **Check upstream first, download only when the content changed**, verify + reapply. `?force=1` skips the check |
+| `/api/geodata/check` | GET | Compare local files against the upstream `<file>.sha256sum` (a few dozen bytes — no 28 MB download). Returns tri-state `up_to_date`: `true` current / `false` upstream moved / `null` upstream unreachable, plus `dataset_build` + `dataset_sha` |
+| `/api/update` | POST | Panel self-update. Optional body `{"core": true}` additionally upgrades the Xray / Hysteria 2 binaries (user opt-in only) |
 
 ### 5.6 Subscription
 
@@ -309,10 +311,13 @@ Client requests: GET /sub/{subscription_token}?format=clash
 Auto-update thread (main.py):
   │
   └─ Every 6 hours: geodata.auto_tick(state)
-       ├─ If data missing or TTL expired (GEODATA_TTL):
-       │   ├─ Download from multi-mirror sources (jsdelivr CDN × 4 + GitHub Release)
+       ├─ If data missing or TTL expired (GEODATA_TTL counts from the last *check*, not the last write):
+       │   ├─ Step 0 — geodata.check_remote(): fetch the two tiny `<file>.sha256sum` files
+       │   │   and compare with the local sha256. Identical → return "already current", no download
+       │   ├─ Otherwise download from multi-mirror sources (jsdelivr CDN × 4 + GitHub Release)
        │   ├─ Size validation (min 1MB each file)
-       │   ├─ SHA256 checksum
+       │   ├─ SHA256 checksum + cross-check against the upstream value (a mismatch means the CDN
+       │   │   edge is still serving a cached copy — reported as up_to_date=false, not as failure)
        │   ├─ Real xray -test validation (config with geoip:private rule)
        │   └─ Atomic install (staging dir in same filesystem → rename)
        │
@@ -468,11 +473,13 @@ sockopt = {
 1. **Single-process panel**: All config mutation serializes through `config.locked()` — no distributed state complexity
 2. **Async apply pattern**: Frontend polls for progress instead of blocking HTTP — prevents "request killed during Xray restart"
 3. **Multi-mirror GeoIP download**: 4 jsdelivr CDN endpoints + GitHub Release with size validation — resilient to partial CDN failures
+3b. **Check before download**: the dataset has no version string inside it, so "is my data current?" is answered by comparing the repo-published `<file>.sha256sum` (a few dozen bytes) against the local file — no 28 MB transfer, and the panel can honestly report "current" / "upstream moved" / "upstream unreachable" (tri-state, never conflated)
 4. **Atomic config writes**: Staging directory → validate → rename — prevents partial writes corrupting running configs
 5. **Panel-managed Hysteria processes**: Not systemd units — enables on-demand lifecycle, dev/prod parity, and auto-restart via supervisor loop
 6. **Reality cold-start mitigation**: `chain.warmup()` proactively hits each Reality listener to absorb the ~5s first-handshake penalty
 7. **Pairing code versioning**: v1 (Reality only) / v2 (Reality + QUIC) — forward-compatible parsing with explicit version check
 8. **Subscription format flexibility**: base64 (standard), clash (YAML), singbox (JSON) — routing templates (smart/global/direct) only affect client-side subscription output
+9. **Core binaries are never auto-upgraded**: major Xray/Hysteria releases change config semantics (Xray 25 removed `allowInsecure`, renamed certificate fields, swapped REALITY keys to X25519; geo loading was tightened). The panel exposes an explicit checkbox that sets `ZP_UPDATE_CORE=1` for one run and shows the currently installed versions next to it — the risk stays with the user who accepts it, and the update button never takes it on their behalf
 
 ## 13. Cross-Module Dependencies
 

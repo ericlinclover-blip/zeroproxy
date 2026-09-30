@@ -974,6 +974,16 @@ class SettingsIn(BaseModel):
     block_ads: bool | None = None
 
 
+class UpdateIn(BaseModel):
+    """一键更新的可选项。
+
+    `core` 默认 False: 内核 (Xray / Hysteria 2) 升级会改变配置语义, 只由用户在
+    面板上显式勾选才会执行 —— 详见 update.start 的说明。
+    """
+
+    core: bool = False
+
+
 @router.post("/api/settings")
 def update_settings(payload: SettingsIn, request: Request):
     """高级设置: Reality 伪装 SNI / Hysteria 伪装站点 / 节点端口。"""
@@ -1844,19 +1854,21 @@ def update_status(request: Request, force: int = 0):
 
 
 @router.post("/api/update")
-def update_start(request: Request):
+def update_start(request: Request, payload: UpdateIn | None = None):
     """一键更新: 后台拉起 upgrade.sh, 面板会随之重启。
 
     这里**只在本地取值**就回执, 刻意不带 `update.status()` —— 那会顺手做一次远端版本检查
     (国内直连 GitHub 要等 4 个镜像依次超时, 最坏 ~32s), 而面板大约在 34s 后重启:
     结果就是"点了按钮, 界面卡住半分钟, 然后弹一句无法开始升级", 其实升级早在跑了。
     真正的进度由前端 2.5s 一次的 `GET /api/update` 轮询补上。
+
+    `payload.core=true` 时**同时**升级 Xray / Hysteria 2 内核 (见 update.start)。
     """
     with config.locked():
         state = load_state()
         if not _require_auth(state, request):
             return _err("未登录", 401)
-        ok, detail = update.start(trigger="panel")
+        ok, detail = update.start(trigger="panel", core=bool(payload and payload.core))
         config.audit(state, "update", detail[:190], actor=_client_ip(request))
         save_state(state)
     if not ok:
@@ -2045,10 +2057,10 @@ _GEO_UPDATE_LOCK = geodata.UPDATE_LOCK
 
 def _geo_steps(detail: str) -> list[dict]:
     """GeoIP 下载这一步本身, 塞进落地步骤列表里 (和改配置共用同一套展示)。"""
-    return [{"name": "下载并校验 GeoIP 数据", "ok": True, "detail": detail, "ms": 0}]
+    return [{"name": "核对并更新 GeoIP 数据", "ok": True, "detail": detail, "ms": 0}]
 
 
-def _run_geo_job(job_id: str, actor: str) -> None:
+def _run_geo_job(job_id: str, actor: str, force: bool = False) -> None:
     """后台线程: 下载 → 校验 → 重新落地配置, 全程把进度写进任务表。
 
     为什么不能同步等: 28 MB 从镜像拉下来, 国内线路可能几十秒到几分钟; 而且
@@ -2068,6 +2080,7 @@ def _run_geo_job(job_id: str, actor: str) -> None:
             progress=lambda index, _total, name: _job_update(
                 job_id, index=index, total=total, current=name
             ),
+            force=force,
         )
         with config.locked():
             fresh = load_state()
@@ -2095,7 +2108,7 @@ def _run_geo_job(job_id: str, actor: str) -> None:
             save_state(fresh)
     except Exception as exc:  # noqa: BLE001 — 后台任务不能把异常吞成"静默失败"
         error = f"{type(exc).__name__}: {exc}"
-        steps = steps or [{"name": "下载并校验 GeoIP 数据", "ok": False, "detail": error, "ms": 0}]
+        steps = steps or [{"name": "核对并更新 GeoIP 数据", "ok": False, "detail": error, "ms": 0}]
         # 意外异常 (不是 update 自己 return False 的那种失败) 走不到上面的存档路径,
         # 但失败原因一样要落地: 否则 toast 闪 2.4 秒之后, 卡片上只剩"数据未下载",
         # 用户完全不知道发生了什么。用户的 "OSError: [Errno 18] Invalid
@@ -2115,9 +2128,9 @@ def _run_geo_job(job_id: str, actor: str) -> None:
     _finish_job(job_id, steps, error)
 
 
-def _geodata_update_sync(state: dict, request: Request) -> dict:
+def _geodata_update_sync(state: dict, request: Request, force: bool = False) -> dict:
     """同步落地 (ZP_APPLY_ASYNC=0, 测试 / 本地排查用) —— 行为与以前一致。"""
-    ok, detail, _info = geodata.update(state)
+    ok, detail, _info = geodata.update(state, force=force)
     with config.locked():
         fresh = load_state()
         geodata.merge_result(fresh, state, ok)
@@ -2137,8 +2150,12 @@ def _geodata_update_sync(state: dict, request: Request) -> dict:
 
 
 @router.post("/api/geodata/update")
-def geodata_update(request: Request):
-    """下载/刷新 GeoIP + GeoSite 数据, 然后重新生成配置并热重载。"""
+def geodata_update(request: Request, force: int = 0):
+    """核对上游 → 有变化才下载 GeoIP + GeoSite 数据, 然后重新生成配置并热重载。
+
+    `?force=1` 跳过"内容一致就不下"的短路, 强制重新下载 (数据被怀疑损坏时的兜底)。
+    """
+    want_force = bool(force)
     with config.locked():
         state = load_state()
         if not _require_auth(state, request):
@@ -2163,7 +2180,7 @@ def geodata_update(request: Request):
         return _err("GeoIP 数据正在更新中 (后台自动更新或上一次任务还没结束), 请稍等再点", 409)
     if not _apply_async_enabled():
         try:
-            return _geodata_update_sync(state, request)
+            return _geodata_update_sync(state, request, force=want_force)
         finally:
             _GEO_UPDATE_LOCK.release()
 
@@ -2173,7 +2190,7 @@ def geodata_update(request: Request):
     try:
         threading.Thread(
             target=_run_geo_job,
-            args=(job_id, _client_ip(request)),
+            args=(job_id, _client_ip(request), want_force),
             name=f"zp-geo-{job_id}",
             daemon=True,
         ).start()
@@ -2186,6 +2203,38 @@ def geodata_update(request: Request):
     body["steps"] = []
     body["job"] = _job_snapshot(job)
     return body
+
+
+@router.get("/api/geodata/check")
+def geodata_check(request: Request):
+    """核对本地 Geo 数据与上游当前版本 (只下两个几十字节的校验值)。
+
+    「我这份数据到底是不是最新的」以前答不上来: dat 文件里没有版本号, 一天一版
+    的更新在体积上也看不出来。这里拿仓库随数据集发布的 `<文件>.sha256sum` 和本地
+    文件的 sha256 比一次, 外加 release 分支最新提交的日期 / sha 作为人类可读版本,
+    结果落进 state, 面板卡片直接显示。
+
+    刻意**不加下载锁**: 一次核对只读几个 KB, 没理由让用户在一个跑着的下载后面排队。
+    数据文件是原子替换的, 读到的要么是旧的完整文件, 要么是新的完整文件。
+    """
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+    report = geodata.check_remote()
+    _ok, build_info = geodata.dataset_info()
+    with config.locked():
+        fresh = load_state()
+        # 下载期间用户可能动过开关 —— record_check 只写版本相关的字段, 不碰用户设置
+        geodata.record_check(fresh, report, build_info or None)
+        save_state(fresh)
+        geo = geodata.status(fresh)
+    return {
+        "ok": True,
+        "geo": geo,
+        "up_to_date": geo.get("up_to_date"),
+        "detail": report.get("error", ""),
+    }
 
 
 @router.post("/api/geodata/force-check")

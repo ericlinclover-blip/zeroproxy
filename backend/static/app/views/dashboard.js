@@ -13,7 +13,7 @@ import { renderAudit } from "./audit.js";
 import { renderNodes, renderKpis, renderDashboardBanner, runProbe } from "./status.js";
 import { renderTraffic, renderAdvanced, renderSystem } from "./traffic.js";
 import { renderChain } from "./chain.js";
-import { loadUpdate } from "./update.js";
+import { loadUpdate, renderUpdate } from "./update.js";
 
 /* ---------------- 仪表盘 ---------------- */
 export async function loadDash(quiet) {
@@ -86,7 +86,9 @@ export function renderDash(quiet) {
   renderAudit(S.dash.audit, S.dash.audit_facets, S.dash.audit_stats, S.dash.audit_more);
   renderKpis();
   renderDashboardBanner();
+  // 内核版本行取自仪表盘数据, 所以已有 updateInfo 时也要重画一次 (纯 DOM, 不出网)
   if (!S.updateInfo) loadUpdate(false);
+  else renderUpdate();
   if (!quiet) { $("#diag-list").innerHTML = ""; $("#diag-actions").classList.add("hidden"); }
   restoreDraftInputs(drafts);
 }

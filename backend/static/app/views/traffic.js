@@ -218,6 +218,52 @@ function renderRouting(d) {
   };
 }
 
+/* ---------------- GeoIP 数据版本 ----------------
+ * 用户的问题: "数据到底更新成功没有?" —— geoip.dat / geosite.dat 里**没有版本
+ * 字符串**, 只有体积和修改时间, 而一天一版的日常更新在体积上完全看不出来。
+ * 所以版本要从上游取: 数据集构建日期 + 提交 sha 是"哪天的数据", 每个文件的
+ * sha256 前缀是"内容指纹" (更新前后对一眼就知道有没有换过), up_to_date 是后端
+ * 拿仓库发布的 .sha256sum 和本地文件比对后的结论。
+ * 三态是刻意的: "已是最新" / "上游有新版本" / "未能核对" 是三件事, 不能合并成一句。 */
+const GEO_CHECK_TTL = 12 * 3600;   // 12 小时内有结论就不再自动核对
+let geoCheckInflight = false;
+
+function geoVersionText(g) {
+  const files = g.files || {};
+  const installed = Object.keys(files).filter((n) => files[n] && files[n].exists);
+  if (!installed.length) return "数据版本: 未安装 (点「下载 / 更新」获取)";
+  const build = g.dataset_build
+    ? `数据集 ${g.dataset_build}${g.dataset_sha ? " (" + g.dataset_sha + ")" : ""}`
+    : "数据集日期未知";
+  const prints = installed
+    .map((n) => `${n} ${String(files[n].sha256 || "").slice(0, 8) || "—"}`)
+    .join(" · ");
+  let verdict = "尚未核对上游";
+  if (g.up_to_date === true) verdict = "已是最新";
+  else if (g.up_to_date === false) verdict = "⚠ 上游有新版本, 点「下载 / 更新」";
+  else if (g.checked_at) verdict = "未能核对上游";
+  return `数据版本: ${build} · ${prints} · ${verdict}`;
+}
+
+/** 打开面板时顺手核对一次 (超过 TTL 才做), 让版本信息不用手点也是新的。 */
+function autoCheckGeo(g) {
+  const files = g.files || {};
+  const installed = Object.keys(files).some((n) => files[n] && files[n].exists);
+  if (!installed || geoCheckInflight) return;
+  const age = Math.floor(Date.now() / 1000) - (g.checked_at || 0);
+  if (g.checked_at && age < GEO_CHECK_TTL) return;
+  geoCheckInflight = true;
+  api("/api/geodata/check")
+    .then((res) => {
+      if (res && res.geo && S.dash) {
+        S.dash.geodata = res.geo;
+        renderGeo(S.dash);           // 只重画这张卡, 不动整页
+      }
+    })
+    .catch(() => {})                 // 核对失败不是错误: 卡片上照旧显示上次结论
+    .finally(() => { geoCheckInflight = false; });
+}
+
 function renderGeo(d) {
   const g = d.geodata || {};
   const files = g.files || {};
@@ -229,6 +275,9 @@ function renderGeo(d) {
   else if (g.active) text = `${g.age_days >= 0 ? g.age_days + " 天前更新" : "已就绪"} · 分流已启用`;
   else text = `${g.age_days >= 0 ? g.age_days + " 天前更新" : "已就绪"} · 分流已关闭`;
   $("#geo-status").textContent = text;
+  const versionEl = $("#geo-version");
+  if (versionEl) versionEl.textContent = geoVersionText(g);
+  autoCheckGeo(g);
   // 上次为什么没下下来 —— 以前只在 toast 里闪 2.4 秒, 用户回头再看就只剩
   // "数据未下载"这几个字, 完全不知道是镜像不可达还是校验没过
   const note = $("#geo-note");
@@ -301,6 +350,29 @@ function renderGeo(d) {
     }
     btn.disabled = false;
     btn.textContent = "下载 / 更新 GeoIP 数据";
+  };
+
+  const checkBtn = $("#btn-geo-check");
+  if (checkBtn) checkBtn.onclick = async () => {
+    checkBtn.disabled = true;
+    checkBtn.textContent = "核对中…";
+    try {
+      const res = await api("/api/geodata/check");
+      if (res && res.geo && S.dash) {
+        S.dash.geodata = res.geo;
+        renderGeo(S.dash);
+      }
+      if (res.up_to_date === true) toast("数据已是最新 (与上游校验值一致)");
+      else if (res.up_to_date === false) toast("上游有新版本, 点「下载 / 更新」即可");
+      else toast("未能核对上游: " + (res.detail || "镜像不可达"));
+    } catch (e) {
+      toast("核对失败: " + e.message);
+    }
+    const after = $("#btn-geo-check");
+    if (after) {
+      after.disabled = false;
+      after.textContent = "检查数据版本";
+    }
   };
 }
 

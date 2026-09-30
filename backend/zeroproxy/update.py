@@ -216,10 +216,20 @@ def status(force: bool = False, timeout: int = 8) -> dict:
     }
 
 
-def start(trigger: str = "panel", timeout: int = 30) -> tuple[bool, str]:
-    """在后台启动 upgrade.sh。返回 (是否已开始, 说明)。"""
+def start(trigger: str = "panel", timeout: int = 30, core: bool = False) -> tuple[bool, str]:
+    """在后台启动 upgrade.sh。返回 (是否已开始, 说明)。
+
+    `core=True` 时同时把 Xray / Hysteria 2 二进制升到最新 (upgrade.sh 的
+    `ZP_UPDATE_CORE=1`)。**默认关闭, 且只由用户显式勾选触发**: 内核升级会改变
+    配置语义 —— 本项目已经为此踩过好几次 (Xray 25 去掉 allowInsecure、证书字段
+    改名、REALITY 密钥从 Ed25519 换 X25519、geo 数据加载策略收紧)。这种风险不该
+    由"程序更新"按钮顺手替用户承担, 但也不该完全不给出路: 勾选框把选择权交回用户。
+    """
     if not services.is_prod():
         return False, "本地开发环境不支持面板内升级, 请在服务器上运行 upgrade.sh"
+    # 回执与 update.json 都要写清这次动没动内核 —— 面板的成功提示只说"升级完成",
+    # 事后回看"那次到底升没升内核"必须能从记录里读出来
+    core_note = " (含 Xray / Hysteria 2 内核)" if core else ""
     script = upgrade_script()
     if not script:
         return False, (
@@ -240,7 +250,8 @@ def start(trigger: str = "panel", timeout: int = 30) -> tuple[bool, str]:
             "trigger": trigger,
             "started_at": int(time.time()),
             "finished_at": 0,
-            "message": "升级任务已排队",
+            "core": bool(core),
+            "message": f"升级任务已排队{core_note}",
             "steps": [],
         }
     )
@@ -255,6 +266,7 @@ def start(trigger: str = "panel", timeout: int = 30) -> tuple[bool, str]:
         "ZP_REPO": DEFAULT_REPO,
         "ZP_REF": DEFAULT_REF,
         "ZP_SELF_DIR": os.path.dirname(staged),
+        "ZP_UPDATE_CORE": "1" if core else "0",
     }
     runner = shutil.which("systemd-run")
     if runner:
@@ -274,6 +286,7 @@ def start(trigger: str = "panel", timeout: int = 30) -> tuple[bool, str]:
             f"--setenv=ZP_REPO={DEFAULT_REPO}",
             f"--setenv=ZP_REF={DEFAULT_REF}",
             f"--setenv=ZP_SELF_DIR={os.path.dirname(staged)}",
+            f"--setenv=ZP_UPDATE_CORE={'1' if core else '0'}",
             "/bin/bash",
             staged,
         ]

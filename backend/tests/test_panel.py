@@ -1289,6 +1289,174 @@ def test_geodata_rejects_too_small_download(client, configured, home, monkeypatc
     assert geodata.present() is False
 
 
+# ---------------------------------------------------------------- GeoIP 数据版本
+#
+# 用户的原始问题: "GeoIP 数据应该有个版本信息显示, 不然用户不知道究竟是否已经
+# 正确更新了"。dat 文件里没有版本字符串, 所以版本 = 上游发布的 sha256sum 比对
+# + release 分支最新提交的日期 / sha。下面用 file:// 假镜像覆盖三条路径:
+# 一致 (跳过下载) / 上游换版 (如实报"有新版本") / 问不到上游 (三态里的 None)。
+
+def _geo_sources_with_sums(tmp_path, size: int = 1_200_000, *, sums: str = "match") -> dict:
+    """假数据源 + 随数据集一起发布的 `<文件>.sha256sum`。
+
+    `_sum_urls()` 是在数据源 URL 后面接 `.sha256sum`, 所以 file:// 镜像天然可用 ——
+    测试不需要任何网络, 走的却是和线上同一段代码。
+    """
+    import hashlib
+
+    source = tmp_path / "geo-src-sums"
+    source.mkdir(exist_ok=True)
+    for name in ("geoip.dat", "geosite.dat"):
+        (source / name).write_bytes(b"ZP" * (size // 2))
+        if sums == "absent":
+            continue
+        digest = (
+            hashlib.sha256((source / name).read_bytes()).hexdigest()
+            if sums == "match"
+            else "f" * 64                      # 上游换了一版, 本地还是旧的
+        )
+        (source / f"{name}.sha256sum").write_text(f"{digest}  {name}\n")
+    return {name: [(source / name).as_uri()] for name in ("geoip.dat", "geosite.dat")}
+
+
+def test_geodata_version_visible_and_up_to_date(client, configured, home, monkeypatch, tmp_path):
+    """装好数据后, 面板要能说出"数据是哪一版、是不是最新的"。"""
+    from zeroproxy import geodata
+
+    monkeypatch.setattr(geodata, "SOURCES", _geo_sources_with_sums(tmp_path))
+    state = config.load_state()
+    assert geodata.update(state, validate=False)[0] is True
+    assert state["geodata"]["up_to_date"] is True
+
+    body = client.get("/api/geodata/check").json()
+    assert body["up_to_date"] is True
+    # 卡片显示的是每个文件的内容指纹 (sha256 前缀), 更新前后对一眼就知道换没换
+    assert body["geo"]["files"]["geoip.dat"]["sha256"]
+    assert body["geo"]["checked_at"] > 0
+
+    dash = client.get("/api/dashboard").json()["geodata"]
+    for key in ("dataset_build", "dataset_sha", "checked_at", "up_to_date"):
+        assert key in dash, key
+    assert dash["up_to_date"] is True
+
+
+def test_geodata_update_skips_download_when_content_unchanged(client, configured, home, monkeypatch, tmp_path):
+    """内容一致就不该再下 28 MB —— 但仍要记一次"核对时间"。"""
+    from zeroproxy import geodata
+
+    monkeypatch.setattr(geodata, "SOURCES", _geo_sources_with_sums(tmp_path))
+    state = config.load_state()
+    assert geodata.update(state, validate=False)[0] is True
+    written_at = state["geodata"]["updated_at"]
+    fingerprint = state["geodata"]["files"]["geoip.dat"]["sha256"]
+
+    ok, detail, _ = geodata.update(state, validate=False)
+    assert ok and "已是最新" in detail
+    assert state["geodata"]["updated_at"] == written_at          # 文件没有被重写
+    assert state["geodata"]["files"]["geoip.dat"]["sha256"] == fingerprint
+    assert state["geodata"]["checked_at"] >= written_at          # 但核对记录刷新了
+
+
+def test_geodata_check_detects_newer_upstream(client, configured, home, monkeypatch, tmp_path):
+    """上游换版时要如实说"有新版本", 不能因为本地文件还在就报"已是最新"。"""
+    from zeroproxy import geodata
+
+    monkeypatch.setattr(geodata, "SOURCES", _geo_sources_with_sums(tmp_path))
+    state = config.load_state()
+    assert geodata.update(state, validate=False)[0] is True
+
+    monkeypatch.setattr(geodata, "SOURCES", _geo_sources_with_sums(tmp_path, sums="newer"))
+    body = client.get("/api/geodata/check").json()
+    assert body["up_to_date"] is False
+    assert body["geo"]["up_to_date"] is False
+    assert body["geo"]["files"]["geoip.dat"]["expected"][:8] == "ffffffff"
+
+
+def test_geodata_check_unknown_when_mirror_unreachable(client, configured, home, monkeypatch, tmp_path):
+    """问不到上游是 None, 不是 False —— "不知道"和"有新版"在面板上是两句话。"""
+    from zeroproxy import geodata
+
+    monkeypatch.setattr(geodata, "SOURCES", _geo_sources_with_sums(tmp_path, sums="absent"))
+    state = config.load_state()
+    assert geodata.update(state, validate=False)[0] is True
+    assert state["geodata"]["up_to_date"] is None
+
+    body = client.get("/api/geodata/check").json()
+    assert body["up_to_date"] is None
+    assert body["detail"]                     # 面板要能说出为什么核对不了
+
+
+def test_geodata_ttl_counts_from_last_check(home):
+    """核对过 (内容没变) 之后 TTL 从"上次核对"起算, 否则每 6 小时白问一次上游。"""
+    import time as _time
+    from zeroproxy import config as _config
+    from zeroproxy import geodata
+
+    geo_dir = _config.paths()["geo_dir"]
+    os.makedirs(geo_dir, exist_ok=True)
+    for name, minimum in geodata.MIN_BYTES.items():
+        with open(os.path.join(geo_dir, name), "wb") as fh:
+            fh.write(b"ZP" * (minimum // 2 + 8))
+
+    now = int(_time.time())
+    stale = now - geodata.GEODATA_TTL - 60
+    fresh_check = {"geodata": {"enabled": True, "updated_at": stale, "checked_at": now - 5}}
+    assert geodata.wants_update(fresh_check, now=now) is False
+    stale_check = {"geodata": {"enabled": True, "updated_at": stale, "checked_at": stale}}
+    assert geodata.wants_update(stale_check, now=now) is True
+
+
+# ---------------------------------------------------------------- 内核升级开关
+
+def _capture_update_start(monkeypatch, tmp_path) -> dict:
+    """让 update.start() 走"没有 systemd-run"的兜底分支, 并抓下它给脚本的环境。"""
+    from zeroproxy import services, update
+
+    script = tmp_path / "upgrade.sh"
+    script.write_text("#!/usr/bin/env bash\nexit 0\n")
+    monkeypatch.setattr(services, "is_prod", lambda: True)
+    monkeypatch.setattr(update, "upgrade_script", lambda: str(script))
+    monkeypatch.setattr(update.shutil, "which", lambda _name: None)
+    seen: dict = {}
+
+    class _FakePopen:
+        def __init__(self, cmd, **kwargs):
+            seen["cmd"] = cmd
+            seen["env"] = kwargs.get("env") or {}
+
+    monkeypatch.setattr(update.subprocess, "Popen", _FakePopen)
+    return seen
+
+
+def test_update_start_passes_core_flag(client, configured, home, monkeypatch, tmp_path):
+    """"同时升级内核"必须真的把 ZP_UPDATE_CORE=1 交到 upgrade.sh 手里。
+
+    内核 (Xray / Hysteria 2) 升级会改变配置语义 —— 本项目为 Xray 25 的
+    allowInsecure / 证书字段改名、REALITY 密钥换算法都踩过坑, 所以它默认关闭,
+    只由用户显式勾选触发。整条链路 (勾选 → /api/update → update.start →
+    upgrade.sh) 任何一环静默丢掉这个开关, 都会变成"我勾了却没升 / 它自己升了"。
+    """
+    from zeroproxy import update
+
+    seen = _capture_update_start(monkeypatch, tmp_path)
+    ok, detail = update.start(trigger="panel", core=True)
+    assert ok, detail
+    assert seen["env"]["ZP_UPDATE_CORE"] == "1"
+    assert seen["env"]["ZP_TRIGGER"] == "panel"
+    assert update._read_status()["core"] is True
+
+
+def test_update_start_defaults_to_panel_only(client, configured, home, monkeypatch, tmp_path):
+    """不勾选时内核一律不动 (默认路径必须是"只换面板代码")。"""
+    from zeroproxy import update
+
+    seen = _capture_update_start(monkeypatch, tmp_path)
+    ok, detail = update.start(trigger="panel")
+    assert ok, detail
+    assert seen["env"]["ZP_UPDATE_CORE"] == "0"
+    assert update._read_status()["core"] is False
+
+
 def _geo_local_sources(tmp_path, size: int = 1_200_000) -> dict:
     """file:// 假数据源 (不依赖网络), 但要是**合法的** geoip/geosite 数据。
 
@@ -1419,7 +1587,7 @@ def test_geodata_update_runs_as_background_job(client, configured, home, monkeyp
     snap = _wait_job(client, job["id"])
     assert snap["state"] == "done", snap
     names = [s["name"] for s in snap["steps"]]
-    assert names[0] == "下载并校验 GeoIP 数据", names
+    assert names[0] == "核对并更新 GeoIP 数据", names
     assert names[1:] == list(apply.STEP_NAMES), names
     assert all(s["ok"] for s in snap["steps"]), snap
 

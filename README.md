@@ -891,6 +891,72 @@ login_failed …), 混在一起不分类, 看不出哪条失败、哪条影响�
 v2 码下 QUIC 可选 / 卡片 meta 标出内层传输且 v1 码不给 QUIC 切换按钮 /
 **「链路 187ms」与「探测用时 3.1s」分开显示**)。
 
+### 8.15 v2.6.22: GeoIP 数据"版本"可见 + 内核升级交回用户勾选
+
+用户提的两件事: 「GeoIP 数据应该有个版本信息显示, 不然用户不知道究竟是否已经正确更新了」,
+以及「Xray 核心、Hysteria 2 版本是否也需要智能自动化更新」。第二件是个**判断题**, 结论写在下面。
+
+**问题一: 数据版本为什么以前说不出来**
+
+`geoip.dat` / `geosite.dat` 里**没有任何版本字符串** —— 只有体积和修改时间, 而数据集**一天一版**,
+日常更新在体积上完全看不出来 (几十字节的差异)。所以"更新成功了吗"以前只能回答"我下载了",
+回答不了"我这份是最新的"。
+
+现在版本从两处上游信息拼出来, 都写进 state、由 `GET /api/geodata/check` 刷新:
+
+* **人类可读**: 仓库 `release` 分支最新提交的日期 + 短 sha (`api.github.com/repos/.../commits/release`,
+  拿不到时走 gh-proxy 兜底) → 面板显示 `数据集 2026-09-29 (ef3bc79)`。**这才是"哪天的数据"**。
+* **内容指纹**: 仓库随数据集一起发布的 `<文件>.sha256sum` (几十字节), 与本地文件实际 sha256 比对 ——
+  面板显示 `geoip.dat 3cf2236c · geosite.dat 51211fde`, 更新前后对一眼就知道有没有换过。
+
+结论是**三态**而不是两态: 「已是最新」/「⚠ 上游有新版本」/「未能核对上游」。三态是刻意的 ——
+镜像不可达时说"已是最新"是撒谎, 说"有新版本"是误报; `up_to_date=None` 与 `False` 在后端就分开
+(`check_remote()` 的返回值), 面板也分开显示。卡片上任何时刻还留着"上次更新失败的原因"。
+
+**问题二: 顺便治掉"每 7 天白下 28 MB"**
+
+以前每 7 天无条件重下 geoip + geosite (约 28 MB), 而**绝大多数日子里上游内容根本没变** ——
+用户付出流量和时间, 换到一句无从验证的"已更新"。现在 `update()` 的第 0 步是**核对**:
+先取那两个几十字节的校验值, 一致就直接返回「数据已是最新 (与上游校验值一致, 未重新下载)」,
+只有内容真的变了才下载。`POST /api/geodata/update?force=1` 保留强制重下的兜底。
+下载完成后还会再对一次账: 若 CDN 边缘仍在吐缓存版本 (jsDelivr 对 `@release` 的 s-maxage 是 12 小时),
+`up_to_date` 如实置 False 并在结论里提示 —— 不再出现"点了更新、显示已是最新、其实拿的是旧数据"。
+
+TTL 也随之改成从**最后一次核对**起算 (`max(updated_at, checked_at)`): 内容没变时我们不会重写文件,
+若只看"写文件的时间", 数据明明核对过也会被反复判为过期。
+
+**问题三: 内核 (Xray / Hysteria 2) 要不要自动升级 —— 不, 但给出口**
+
+**默认不自动升, 理由是配置语义会变**: 这个代码库已经为此踩过好几次 —— Xray 25 移除
+`allowInsecure`、证书字段从 `certificate` 改名 `certificateFile`、REALITY 密钥从 Ed25519 换成 X25519、
+geo 数据加载策略收紧 (缺文件直接构建失败)。这些都是**内核版本一换、面板生成的配置就变味**的类型,
+而面板没有能力替用户判断"换了之后你那些客户端还认不认"。这种风险不该由「程序更新」按钮顺手承担。
+
+但也**不该不给出口**, 所以做成了一个显式开关:
+
+* 面板「程序更新」卡片多一行「同时升级 Xray / Hysteria 2 内核」勾选框,**默认不勾**, 只在能升级时显示;
+  旁边直接显示**当前内核版本** (取仪表盘的 `system.xray.version` / `system.hysteria2.version`) ——
+  要判断"要不要升", 至少得先看得见自己在跑什么。
+* 勾上之后: 确认弹窗会把「升级 Xray / Hysteria 2 内核」作为**独立一步**列进计划, 并说明失败会保留现有版本;
+  `POST /api/update` 收 `{"core": true}` → `update.start(core=True)` → 透传 `ZP_UPDATE_CORE=1` 给 `upgrade.sh`
+  (走 systemd 时用 `--setenv`, 兜底走 `Popen(env=...)`)。这条链路任何一环静默丢掉开关,
+  都会变成"我勾了却没升 / 它自己升了", 所以回归里专门钉住了它。
+
+**顺手修掉的一个真 bug (它正是"更新完要手动点重新加载"的元凶)**
+
+v2.6.21 修了自动重载的**判据**, 但 `doUpdate()` 里另有一个更早的错: `S.updateInfo = { ...updateInfo, ... }`
+引用了**不存在的变量** `updateInfo`。于是每次点「一键更新」: POST 已经成功、升级已经在跑, 赋值却抛
+`ReferenceError` → 被同一个 `try` 的 `catch` 吞成一句"无法开始升级: updateInfo is not defined",
+**轮询根本没启动** —— 用户看到的是报错, 升级在后台照跑, 页面再也不会自己刷新, 只能手动点按钮。
+现在改成 `...(S.updateInfo || {})`, 并把这段来龙去脉写在代码注释里。
+
+**回归**: `pytest` 175 → **182 项** (182 passed + 6 skipped, 新增 7 条: 数据版本进入 `/api/geodata/check`
+与仪表盘 payload / 内容一致时**跳过下载**但仍刷新核对时间 / 上游换版时如实报"有新版本" /
+校验值取不到时是 `None` 而不是 `False` / TTL 从最后一次核对起算 / 内核开关的传参断言
+(勾选 → `ZP_UPDATE_CORE=1`, 不勾 → `0`));
+`scripts/browser_check.cjs` 131 → **135 项** (新增: GeoIP 数据版本行存在 / 核对结论进 toast /
+版本行显示「数据集 2026-09-29 (ef3bc79)」与文件指纹 / 内核开关存在且在不能升级时收起)。
+
 ---
 
 ## 9. API
@@ -906,14 +972,15 @@ v2 码下 QUIC 可选 / 卡片 meta 标出内层传输且 v1 码不给 QUIC 切�
 | POST | `/api/hysteria/hopping` | 会话 | 端口跳跃开关 → 热重载 |
 | POST | `/api/settings` | 会话 | 改 Reality SNI / Hysteria 伪装站点 / 节点端口 / 分流模板 (含端口占用校验; 只改模板时不重载服务) |
 | GET | `/api/probe` | 会话 | 节点探测 + 服务器出口 RTT (`?deep=1` 用临时 Xray 客户端真的从每个节点穿一次外网, 生产环境面板默认走它; 3s / 20s 缓存) |
-| POST | `/api/geodata/update` | 会话 | 下载/刷新 GeoIP + GeoSite 数据并热重载。从 v2.6.12 起和改配置一样**立刻回执 + 带 `job`** (前端轮询 `/api/apply/job` 看"下载 geoip.dat 4.0 MB"这样的实时进度), 下载与校验跑在后台; 已有任务在跑时返回同一个任务 (与后台自动更新共用一把锁, 真正冲突才 409) |
+| POST | `/api/geodata/update` | 会话 | 核对上游 → **内容变了才下载** GeoIP + GeoSite 数据并热重载 (从 v2.6.22 起; 一致时直接返回「数据已是最新」, 省掉 28 MB)。`?force=1` 跳过核对强制重下。从 v2.6.12 起和改配置一样**立刻回执 + 带 `job`** (前端轮询 `/api/apply/job` 看"下载 geoip.dat 4.0 MB"这样的实时进度), 下载与校验跑在后台; 已有任务在跑时返回同一个任务 (与后台自动更新共用一把锁, 真正冲突才 409) |
+| GET | `/api/geodata/check` | 会话 | 核对本地 Geo 数据与上游当前版本 (只下两个几十字节的 `.sha256sum`): 返回 `{up_to_date, detail, geo}`。`up_to_date` 是三态 —— `true` 一致 / `false` 上游有新内容 / `null` 问不到上游; `geo` 里带 `dataset_build`(如 `2026-09-29`)、`dataset_sha`、`checked_at` 与每个文件的 sha256 指纹。见 8.15 |
 | GET | `/api/backup` | 会话 | 导出备份 JSON (含密钥与令牌, 带 SHA-256 校验和, 不含会话) |
 | POST | `/api/restore` | 会话 | 从备份恢复并热重载 (校验和/必填字段/版本三重校验) |
 | POST | `/api/apply` | 会话 | 重新生成全部配置并热重载 |
 | GET | `/api/apply/job?id=` | 会话 (发起任务的那个) | 后台落地任务的进度: `{state, index, total, current, steps, error, elapsed_ms}`。改配置的接口 (节点开关 / 端口跳跃 / 设置 / 链式 / 重新应用) 从 v2.6.9 起一律**立刻回执 + 带 `job`**, 前端每 400ms 轮询这里画进度条 (见 8.7); `ZP_APPLY_ASYNC=0` 时接口直接返回 `steps`、不带 `job` |
 | POST | `/api/renew` | 会话 | `certbot renew` + reload nginx |
 | GET | `/api/update` | 会话 | 当前版本 / 远端最新版本 (600s 缓存, `?force=1` 强刷) / 上次升级进度与日志尾部; `last` 里含 `plan` (这次要做哪几步) 与 `current` (正在做哪一步), 面板据此渲染实时清单 |
-| POST | `/api/update` | 会话 | 一键更新: 后台拉起 `upgrade.sh` (systemd 瞬时单元, 面板重启不打断); 已有任务或本地开发环境返回 409 |
+| POST | `/api/update` | 会话 | 一键更新: 后台拉起 `upgrade.sh` (systemd 瞬时单元, 面板重启不打断); 已有任务或本地开发环境返回 409。可选 body `{"core": true}` —— 只由用户在「程序更新」卡片显式勾选, 会同时升级 Xray / Hysteria 2 二进制 (等价 `ZP_UPDATE_CORE=1`, 见 8.15) |
 | GET | `/api/diagnose` / POST `/api/repair` | 会话 | 自检 / 一键自愈 |
 | GET | `/api/traffic` | 会话 | 流量统计 (Stats API) |
 | GET | `/api/logs/{service}` | 会话 | 服务日志尾部 (journalctl) |
@@ -994,7 +1061,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
 
 在 macOS (Apple Silicon, Python 3.14) 上实测通过:
 
-- `python -m pytest tests -q` → **172 passed, 6 skipped** (带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时再补上跳过的那几项, 约 47 秒);
+- `python -m pytest tests -q` → **182 passed, 6 skipped** (带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时再补上跳过的那几项, 约 50 秒);
   含 `/api/update` 鉴权与版本比较、`apply` 的"写不进 /etc/nginx 即失败"语义、CLI 退出码、以及
   `install.sh` 重跑不覆盖已初始化配置 / `upgrade.sh` 随包发布 / 自签证书可补签 Let's Encrypt /
   `systemctl` 参数顺序的回归断言 / Reality 密钥必须是成对的 X25519 (Ed25519 必须判无效) /
@@ -1058,7 +1125,7 @@ ZP_PYTHON=$PWD/.venv/bin/python bash scripts/upgrade_sim.sh
   出站指向落地端 `127.0.0.1:8666`; 客户端拿中转端凭据连进去, **真的从落地端出网并读回出口 IP**;
   反向用例: 把落地端的专用 UUID 换掉 (等价于配对码被轮换) 后同一条链立刻读不到 IP —— 证明确实是
   链路上的每一跳在起作用, 而不是"随便走哪条路都能出网"。
-- `scripts/browser_check.cjs` → **131/131 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
+- `scripts/browser_check.cjs` → **135/135 项通过**: 初始化→仪表盘全流程、5 张节点卡、三种订阅、
   诊断 8/8、节点测速结果落到卡片、GeoIP 开关与状态、**分流模板选择器 (切换 → 订阅内容
   真的变化 → 切回)**、备份下载、**程序更新卡片 (版本行 / 检查更新 / 非生产环境隐藏一键更新)**、
   **自动刷新不吞草稿 (正在编辑的 SNI / 端口在重渲染后原样保留、光标不丢、放弃后回到服务器值) /
@@ -1235,7 +1302,11 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 ZP_REPO=your-name/zeroproxy ZP_REF=main bash -c "$(curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/upgrade.sh)"
 
 # 顺带把 Xray / Hysteria 2 二进制升到最新版 (默认不动)
+#   面板上等价于「程序更新」卡片里勾选「同时升级 Xray / Hysteria 2 内核」
 ZP_UPDATE_CORE=1 bash /opt/zeroproxy/upgrade.sh
+
+# 只看 Geo 数据版本 (本地指纹 vs 上游校验值, 不下数据本体)
+/opt/zeroproxy/venv/bin/python -m zeroproxy.geodata check
 
 # 只看版本, 不做任何改动
 ZP_CHECK_ONLY=1 bash /opt/zeroproxy/upgrade.sh
@@ -1343,12 +1414,15 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 - 订阅文件由面板实时生成, 未做 CDN 缓存与 ETag 协商 (单用户场景无影响)。
 - 节点测速给的是「入站握手是否成功 + 出口 RTT」; 客户端到服务器的 RTT 服务端无法自测。
 - Hysteria 2 无法用 TCP 探测, 只能检测 UDP 端口是否被监听 (Windows 上可能显示「无法主动探测」)。
-- GeoIP 数据自动更新依赖 jsdelivr / GitHub 至少一个可达; 全部不可达时保留旧数据并记录审计。
+- GeoIP 数据自动更新依赖 jsdelivr / GitHub 至少一个可达; 全部不可达时保留旧数据并记录审计,
+  面板上的数据版本行会如实显示「未能核对上游」(而不是谎称已是最新 —— 见 8.15)。
 - 分流模板是三档预设 (智能/全局/直连), 暂不支持用户自定义规则集; `?rules=` 只能选这三档。
 - 面向 sing-box ≥1.14 的 `?format=singbox-next` 是**手选格式**: 面板无法识别客户端版本,
   默认格式 (`download_detour`) 才能同时兼容 1.13 与 1.14。等 1.16 发布 (该字段移除) 后默认值会切到新版写法。
-- 尚未内置: 用户自定义分流规则、多域名与多证书、多用户与配额。(核心二进制升级已可选:
-  面板「程序更新」只换面板代码, 需要连 Xray / Hysteria 2 一起升级时用 `ZP_UPDATE_CORE=1`)。
+- 尚未内置: 用户自定义分流规则、多域名与多证书、多用户与配额。内核二进制升级是**显式可选**:
+  面板「程序更新」默认只换面板代码, 要连 Xray / Hysteria 2 一起升级就在那张卡片上勾
+  「同时升级 Xray / Hysteria 2 内核」(命令行等价于 `ZP_UPDATE_CORE=1`)。**刻意不做自动升级** ——
+  内核大版本会改变配置语义 (Xray 25 移除 `allowInsecure`、证书字段改名、REALITY 换密钥算法), 见 8.15。
 - 面板内「一键更新」依赖 `systemd-run` 把升级脚本放到独立单元里跑; 极老系统没有它时会退化为
   直接后台执行 (面板重启可能打断升级), 这种情况下建议改用命令行 `upgrade.sh`。
 - 升级脚本按 `ZP_HOME`(默认 `/opt/zeroproxy`) 布局工作, 只覆盖 `zeroproxy/` `static/`

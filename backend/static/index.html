@@ -262,8 +262,11 @@
       </div>
       <div class="row mt-3">
         <button class="btn ghost small" id="btn-geo-update">下载 / 更新 GeoIP 数据</button>
-        <span class="muted fs-sm">数据源 Loyalsoldier/v2ray-rules-dat, 每 7 天自动更新</span>
+        <button class="btn ghost small" id="btn-geo-check">检查数据版本</button>
+        <span class="muted fs-sm">数据源 Loyalsoldier/v2ray-rules-dat, 每 7 天自动核对</span>
       </div>
+      <!-- 数据版本: dat 文件本身不带版本号, 这里显示的是"上游数据集构建日期 + 内容指纹" -->
+      <div class="muted fs-xs mt-2" id="geo-version">数据版本: —</div>
       <!-- 上次下载的结论: 失败原因要一直留在卡片上, 不能只在 2 秒的 toast 里说一遍 -->
       <div class="err-box hidden mt-3" id="geo-note"></div>
     </section>
@@ -328,6 +331,10 @@
         <span class="muted fs-sm ta-right" id="update-status-line">—</span>
       </div>
       <div id="update-body" class="mt-3"></div>
+      <div class="row mt-3 hidden" id="update-core-row">
+        <label class="chk"><input type="checkbox" id="update-core"> 同时升级 Xray / Hysteria 2 内核</label>
+        <span class="muted fs-xs" id="update-core-note">默认只更新面板代码</span>
+      </div>
       <div class="row mt-4">
         <button class="btn ghost small" id="btn-update-check">检查更新</button>
         <button class="btn small hidden" id="btn-update-run">一键更新</button>

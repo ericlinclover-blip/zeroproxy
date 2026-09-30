@@ -82,6 +82,22 @@ export function renderUpdate() {
   runBtn.textContent = running ? "升级中…" : `一键更新到 v${latest}`;
   $("#btn-update-reload").classList.toggle("hidden", !stale || running);
   topBtn.textContent = running ? "升级中…" : u.update_available ? `一键更新 v${latest}` : "检查更新";
+
+  // 「同时升级内核」只在能升级、且没在升级时才有意义。旁边的注释顺带把**当前**
+  // 内核版本摆出来 —— 用户要判断"要不要升内核", 至少得先看见自己在跑什么版本。
+  const coreRow = $("#update-core-row");
+  if (coreRow) {
+    const usable = !!u.can_update && !running;
+    coreRow.classList.toggle("hidden", !usable);
+    const box = $("#update-core");
+    if (box && !usable) box.checked = false;   // 藏起来时不留一个"已勾选"的隐形开关
+    const note = $("#update-core-note");
+    if (note && usable) {
+      const sys = (S.dash || {}).system || {};
+      const ver = (svc) => (svc && svc.version ? svc.version : "未知");
+      note.textContent = `当前: Xray ${ver(sys.xray)} · Hysteria 2 ${ver(sys.hysteria2)}`;
+    }
+  }
   renderSidebar();   // 侧栏「程序更新」角标跟着变
 }
 
@@ -209,18 +225,26 @@ function startUpdatePolling() {
 }
 
 /* 升级确认: 一步步写清会做什么, 以及什么不会被碰 */
+/** 「同时升级内核」勾选状态 (内核升级只由用户显式勾选触发, 见后端 update.start)。 */
+const coreWanted = () => {
+  const box = $("#update-core");
+  return !!(box && box.checked && !box.disabled);
+};
+
 export function askUpgrade() {
   const u = S.updateInfo || {};
   const from = u.current || "当前版本";
   const to = u.latest || "最新版";
+  const core = coreWanted();
   const plan = [
     ["1", "备份当前代码与 state.json", "异常自动回滚"],
     ["2", `从 GitHub 下载 v${esc(to)} 代码`, esc(u.repo || "")],
     ["3", "替换面板程序代码", "只换代码, 不动数据"],
     ["4", "同步 Python 依赖 + 重载 systemd 单元", ""],
     ["5", "按 state.json 重新生成配置并热重载", "xray / nginx / hysteria"],
-    ["6", "重启面板进程", "本页失联约 10 秒后自动恢复"],
   ];
+  if (core) plan.push(["6", "升级 Xray / Hysteria 2 内核", "下载失败则保留现有版本"]);
+  plan.push([core ? "7" : "6", "重启面板进程", "本页失联约 10 秒后自动恢复"]);
   openConfirm({
     title: `确认升级到 v${to}?`,
     okLabel: `开始升级 v${esc(from)} → v${to}`,
@@ -231,6 +255,11 @@ export function askUpgrade() {
             <span class="uname">${name}</span>${detail ? `<span class="udetail">${detail}</span>` : ""}</div>`
         )
         .join("")}</div>
+      ${core
+        ? `<div class="banner info mt-3"><span class="ico">!</span><span>已勾选内核升级: Xray / Hysteria 2 会被替换成上游最新版。
+           <br><span class="muted">内核大版本可能改变配置语义 (例如 Xray 25 移除 allowInsecure、改证书字段名),
+           升级后若节点异常, 在「运行状态 → 一键诊断」能直接看出是哪一项不一致。</span></span></div>`
+        : ""}
       <div class="confirm-keep">不会动的部分: 节点密钥 / 订阅令牌 / 管理员账号 / 节点开关与端口设置。
       升级过程中面板会重启一次, 页面会在几秒内自动恢复。</div>`,
     onOk: doUpdate,
@@ -239,15 +268,23 @@ export function askUpgrade() {
 
 async function doUpdate() {
   const btn = $("#btn-update-run");
+  const core = coreWanted();
   btn.disabled = true;
   btn.textContent = "启动中…";
   try {
-    await api("/api/update", { method: "POST" });
+    await api("/api/update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ core }),
+    });
     toast("升级已开始, 正在执行…");
     // 后端只回执"已开始"(刻意不查远端版本, 那会让按钮卡住半分钟); 这里先把状态标成"已排队",
     // 免得这 2.5 秒的空窗里按钮还能再点一次 (再点会撞上 409)。真实进度由轮询补上。
     S.updateInfo = {
-      ...updateInfo,
+      // 这里曾写成 `...updateInfo` —— 一个不存在的变量, 于是每次点「一键更新」都会在
+      // POST 成功后抛 ReferenceError, 轮询根本没启动: 用户看到的是一句"无法开始升级",
+      // 实际升级在跑, 页面却再也不会自己刷新。
+      ...(S.updateInfo || {}),
       running: true,
       last: {
         ...((S.updateInfo || {}).last || {}),
@@ -255,6 +292,7 @@ async function doUpdate() {
         from: (S.updateInfo || {}).current,
         to: (S.updateInfo || {}).latest,
         trigger: "panel",
+        core,
         started_at: Math.floor(Date.now() / 1000),
         finished_at: 0,
         steps: [],

@@ -289,6 +289,37 @@ async function main() {
       && (await page.locator("#geo-ads").count()) === 1);
     const geoStatus = (await page.locator("#geo-status").innerText()).trim();
     check("GeoIP 数据状态可见", geoStatus.length > 0, geoStatus);
+    // 数据版本: dat 文件里没有版本号, 卡片要能说出"上游数据集是哪天构建的 + 内容指纹
+    // + 是不是最新的", 否则用户点完更新根本无从判断到底有没有生效
+    const geoVersion = (await page.locator("#geo-version").innerText()).trim();
+    check("GeoIP 数据版本行存在", /^数据版本: /.test(geoVersion), geoVersion.slice(0, 80));
+    const nowSec = Math.floor(Date.now() / 1000);
+    const geoFile = (sha) => ({ exists: true, size: 1, mtime: 0, sha256: sha, expected: sha });
+    await page.route("**/api/geodata/check", (route) => route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        ok: true, up_to_date: true, detail: "",
+        geo: {
+          enabled: true, block_private: true, block_ads: true, active: true,
+          updated_at: nowSec - 86400, age_days: 1,
+          dataset_build: "2026-09-29", dataset_sha: "ef3bc79", checked_at: nowSec,
+          up_to_date: true, last_error: "",
+          files: { "geoip.dat": geoFile("3cf2236c1906"), "geosite.dat": geoFile("51211fde2169") },
+        },
+      }),
+    }));
+    await page.evaluate(() => document.querySelector("#toast").classList.remove("show"));
+    await page.click("#btn-geo-check");
+    await page.waitForSelector("#toast.show", { timeout: 10000 });
+    const checkToast = (await page.locator("#toast").innerText()).trim();
+    check("核对数据版本: 结论进 toast", /已是最新/.test(checkToast), checkToast);
+    const geoVersion2 = (await page.locator("#geo-version").innerText()).trim();
+    check("数据版本行显示数据集构建日期与内容指纹",
+      /数据集 2026-09-29 \(ef3bc79\)/.test(geoVersion2)
+      && /geoip\.dat 3cf2236c/.test(geoVersion2) && /已是最新/.test(geoVersion2),
+      geoVersion2.slice(0, 120));
+    await page.unroute("**/api/geodata/check");
 
     // v2.6.14: 后台自动更新正占着下载锁时, 手动点按钮以前会弹一句"更新失败: 已有更新任务在进行中",
     // 用户以为按钮坏了。现在要明确说"等一下", 并且按钮自己恢复 (不能卡在"下载中…")。
@@ -424,6 +455,11 @@ async function main() {
       () => !document.querySelector("#btn-update-check").disabled, { timeout: 60000 });
     check("非生产环境不显示一键更新按钮",
       await page.locator("#btn-update-run").isHidden());
+    // 内核升级只由用户显式勾选触发: 开关必须在卡片里, 但非生产环境没有一键更新按钮,
+    // 所以整行是收起的 (露出一个升不了级的勾选框只会让人以为自己漏了什么)
+    check("内核升级开关存在且在不能升级时收起",
+      (await page.locator("#update-core").count()) === 1
+      && (await page.locator("#update-core-row").isHidden()), "");
     check("自签证书下可点「申请证书」(不再禁用到没机会补签)",
       (await page.locator("#btn-renew").innerText()).trim() === "申请证书"
       && !(await page.locator("#btn-renew").isDisabled()));

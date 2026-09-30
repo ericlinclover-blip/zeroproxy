@@ -168,15 +168,18 @@ Xray 的 VLESS/Trojan 用 `user:pass@` 是 **HTTP Basic 风格的 URI 语法糖*
 3. **无 Docker 交付** — 目前是 Shell 一行部署, 未提供镜像。
 4. **无多域名/多证书** — 单域名单证书。
 5. **IPv6 未专门处理** — 双栈环境需手动确认。
-6. **核心二进制更新非自动 (opt-in)** — 面板「一键更新」只换面板代码; 要连 Xray / Hysteria 2
-   一起升到最新, 需显式给 `upgrade.sh` 加 `ZP_UPDATE_CORE=1` (默认不执行, 避免动到正在跑的内核)。
+6. **核心二进制更新非自动 (故意)** — 面板「一键更新」只换面板代码; 要连 Xray / Hysteria 2
+   一起升到最新, 需在「程序更新」卡片上勾「同时升级内核」(命令行等价 `ZP_UPDATE_CORE=1`)。
+   默认不执行是**有意的**: 内核大版本会改变配置语义 (Xray 25 移除 `allowInsecure` / 证书字段改名 /
+   REALITY 换密钥算法 / geo 数据加载策略收紧), 这种风险应由用户决定, 而不是由更新按钮顺手承担。
 
 ### 已补齐 (本轮)
 
 | 原差距 | 现状 |
 |---|---|
 | 无节点健康/延迟探测 | `GET /api/probe`: Reality/Trojan 走**完整 TLS 握手**, WS 走 TCP, Hysteria 走 UDP 监听检测, 另测出口 RTT |
-| 无分流数据自动更新 | GeoIP/GeoSite 多镜像下载 + `xray -test` 真机校验 + 原子替换, 面板后台每 6 小时检查、7 天 TTL |
+| 无分流数据自动更新 | GeoIP/GeoSite 多镜像下载 + `xray -test` 真机校验 + 原子替换, 面板后台每 6 小时检查、7 天 TTL; **版本可见** (上游数据集构建日期 + 提交 sha + 每个文件的 sha256 指纹, 见 `GET /api/geodata/check`) |
+| 更新数据只能靠"重下 28 MB" | v2.6.22 起先比对仓库发布的 `<文件>.sha256sum` (几十字节), 内容一致就跳过下载; 只在真的变了才下 |
 | 无备份/恢复 | `GET /api/backup` / `POST /api/restore`, 带 SHA-256 校验和与三重校验 |
 | 订阅只有一条硬编码规则 | 三档**客户端分流模板** (智能分流 / 全局代理 / 全部直连), 面板切换或 `?rules=` 覆盖; Clash 侧带 5 个策略组, sing-box 侧带 selector/urltest 出站组 |
 | 启动期可能被 geo 数据卡死 | `systemd ExecStartPre` 调用 `python -m zeroproxy.geodata guard`: 数据缺失或配置自检不过就按当前状态重新生成, 保证核心先起来 (证书丢失同路径兜底) |
