@@ -220,6 +220,23 @@
       </div>
     </section>
 
+    <section class="card reveal" id="chain-intro">
+      <div class="tile-head">
+        <h2>链式代理</h2><span class="hint">两台机器接成一条链: 近的做入口加速, 远的做落地出口</span>
+        <span class="grow"></span>
+        <span class="muted fs-xs">客户端只连本机, 出口 IP 是落地服务器</span>
+      </div>
+      <div class="chain-path" id="chain-path"></div>
+      <div class="note mb-3">
+        典型用法: 香港机器离你近 (延迟低) 做 <b>入口</b>, 美国机器做 <b>落地</b> (出口 IP 显示为美国)。
+        两台都装本程序 → 落地端点「生成配对码」→ 入口端粘贴那行码点「连接并测试」即可。
+        链式节点对你手机 / 电脑上的客户端就是一个普通节点 (订阅里多一条), 不用手写 Clash relay /
+        sing-box detour 配置; 也不需要在客户端装任何东西。
+      </div>
+      <div class="grid" id="chain-grid"></div>
+      <div id="chain-entries"></div>
+    </section>
+
     <section class="card reveal" id="sec-adv">
       <div class="tile-head"><h2>高级设置</h2><span class="hint">改动热重载, 不重启服务</span></div>
       <div class="adv-grid">
@@ -270,23 +287,6 @@
       <div class="muted fs-xs mt-2" id="geo-version">数据版本: —</div>
       <!-- 上次下载的结论: 失败原因要一直留在卡片上, 不能只在 2 秒的 toast 里说一遍 -->
       <div class="err-box hidden mt-3" id="geo-note"></div>
-    </section>
-
-    <section class="card reveal" id="chain-intro">
-      <div class="tile-head">
-        <h2>链式代理</h2><span class="hint">两台机器接成一条链: 近的做入口加速, 远的做落地出口</span>
-        <span class="grow"></span>
-        <span class="muted fs-xs">客户端只连本机, 出口 IP 是落地服务器</span>
-      </div>
-      <div class="chain-path" id="chain-path"></div>
-      <div class="note mb-3">
-        典型用法: 香港机器离你近 (延迟低) 做 <b>入口</b>, 美国机器做 <b>落地</b> (出口 IP 显示为美国)。
-        两台都装本程序 → 落地端点「生成配对码」→ 入口端粘贴那行码点「连接并测试」即可。
-        链式节点对你手机 / 电脑上的客户端就是一个普通节点 (订阅里多一条), 不用手写 Clash relay /
-        sing-box detour 配置; 也不需要在客户端装任何东西。
-      </div>
-      <div class="grid" id="chain-grid"></div>
-      <div id="chain-entries"></div>
     </section>
 
     <section class="card reveal" id="diag-card">

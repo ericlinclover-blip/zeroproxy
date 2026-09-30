@@ -202,6 +202,22 @@ async function main() {
     const certText = await page.locator("#sys-grid").innerText();
     check("证书卡片", certText.includes("TLS 证书"), certText.split("\n").slice(0, 4).join(" "));
 
+    // 侧栏菜单的顺序必须与页面板块的顺序一致 —— 否则会出现"点上一个却滚到下面",
+    // 滚动高亮也会往回跳。曾经 链式代理 与 高级/分流 在菜单里是正序、页面里是反序。
+    const navOrder = await page.evaluate(() => {
+      const hrefs = [...document.querySelectorAll("#dash-nav a[href^='#']")]
+        .map((a) => a.getAttribute("href").slice(1));
+      const tops = hrefs.map((id) => {
+        const el = document.getElementById(id);
+        return el ? Math.round(el.getBoundingClientRect().top + window.scrollY) : -1;
+      });
+      return { hrefs, tops };
+    });
+    check("侧栏顺序 = 页面板块顺序 (点哪去哪, 高亮不往回跳)",
+      !navOrder.tops.includes(-1)
+      && navOrder.tops.every((top, i) => i === 0 || top > navOrder.tops[i - 1]),
+      navOrder.hrefs.map((h, i) => `${h}@${navOrder.tops[i]}`).join(" "));
+
     console.log("\n[3] 交互");
     // 开关的 input 是视觉隐藏的 (opacity:0), 要点它的滑块
     // 关掉之前先记下这排灯的颜色: 关掉的那颗必须变成"灰 (off)", 其余保持原样

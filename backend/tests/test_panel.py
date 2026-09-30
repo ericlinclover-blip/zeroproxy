@@ -1410,6 +1410,30 @@ def test_geodata_ttl_counts_from_last_check(home):
 
 
 # ---------------------------------------------------------------- 终端快捷管理 (z)
+
+
+def test_sidebar_order_matches_the_page_order():
+    """侧栏菜单的顺序必须与页面板块的顺序一致。
+
+    用户看到的症状: 「链式代理」和「高级 / 分流」两个按钮点下去跑到的板块是反的
+    (菜单里链式在前, 页面里高级在前) —— 于是点上一个会滚到下面, 滚动高亮也往回跳。
+    这类"两个列表各改一处"的错位在浏览器里才看得出来, 所以在这里钉死。
+    """
+    import re
+    from pathlib import Path
+
+    html = (Path(__file__).resolve().parents[1] / "static" / "index.html").read_text(encoding="utf-8")
+    dash = html[html.index('id="view-dash"'):]
+    nav = re.findall(r'<a href="#([\w-]+)"', dash)
+    assert len(nav) >= 8, nav                                  # 侧栏锚点
+    positions = {}
+    for match in re.finditer(r'id="([\w-]+)"', dash):
+        positions.setdefault(match.group(1), match.start())     # 只记第一次出现
+    missing = [name for name in nav if name not in positions]
+    assert not missing, f"侧栏指向了不存在的板块: {missing}"
+    tops = [positions[name] for name in nav]
+    assert tops == sorted(tops), f"菜单顺序与页面顺序不一致: {list(zip(nav, tops))}"
+    assert len(set(tops)) == len(tops), "同一个板块被挂到了两个锚点上"
 #
 # 用户的原始诉求: "预防用户忘记密码 —— SSH 上输入 z 就能进终端管理: 1 改账号密码,
 # 2 在线更新, 0 退出"。这里逐条钉住: 菜单真的列出那三件事、改密码不要求旧密码
