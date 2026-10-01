@@ -2861,6 +2861,28 @@ def device_delete(device_id: str, request: Request):
 # 下面四个接口走设备凭据, 不校验面板会话 —— 但要求面板已初始化。
 
 
+@router.get("/c/install.sh")
+def client_install_script_pinned(request: Request):
+    """更新用的安装脚本: **不带配对码**。
+
+    已经装过的机器重跑它即可升级客户端 (界面、agent、配置生成逻辑), 不会重新配对、
+    不会在面板上多出一台设备 —— 配对码是一次性的, 拿它去更新等于每次都要清一遍设备,
+    那是把用户拖进循环。这个地址是固定的, 可以写进笔记里长期用。
+    """
+    state = load_state()
+    if not state["configured"]:
+        return _err("面板尚未初始化", 409)
+    try:
+        body = router_client.render_script(share_links.panel_base_url(request, state), "")
+    except (OSError, ValueError) as exc:
+        return _err(f"安装脚本不可用: {exc}", 500)
+    return Response(
+        body,
+        media_type="text/x-shellscript; charset=utf-8",
+        headers={"cache-control": "no-store"},
+    )
+
+
 @router.get("/c/{code}")
 def client_install_script(code: str, request: Request):
     """安装脚本本体 (`wget -qO- <面板>/c/<配对码> | sh` 拉的就是它)。"""

@@ -72,6 +72,10 @@ function routerTab(dash, routers) {
       <button class="btn ghost small" id="btn-add-device">＋ 再接入一台路由器</button>
       <span class="muted fs-xs">换节点 / 改分流请在面板改 —— 路由器会自动同步, 不用再登上去。</span>
     </div>
+    <div class="muted fs-xs mt-2">
+      升级路由器上的客户端 (界面 / agent) 用这条固定的更新命令, <b>不需要配对码, 也不会多出一台设备</b>:
+      <code class="mono">wget -qO- &lt;面板地址&gt;/c/install.sh | sh</code>
+    </div>
     ${pairInfo ? pairCard() : ""}`;
 }
 

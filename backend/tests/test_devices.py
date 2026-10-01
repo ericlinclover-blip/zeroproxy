@@ -347,3 +347,15 @@ def test_remove_device_revokes_credentials(client, configured):
     assert client.get(f"/c/sub/{device['id']}?k={device['secret']}").status_code == 403
     assert client.get("/api/devices").json()["devices"]["count"] == 0
     assert client.delete(f"/api/devices/{device['id']}").status_code == 404
+
+
+def test_update_endpoint_needs_no_pairing_code(client, configured):
+    """更新用的安装脚本不带配对码: 已装好的机器重跑它升级, 不会多出一台设备。
+
+    用户反馈的原话: "重跑命令我就要先把原来的移除, 然后再生成一个新的" —— 那是把
+    一次性配对码当成日常更新入口的必然结果。这个固定地址才是更新入口。
+    """
+    res = client.get("/c/install.sh")
+    assert res.status_code == 200
+    assert 'ZP_CODE=""' in res.text, "更新脚本不该带配对码"
+    assert "用本次配对码重新接入" not in res.text.split("更新模式")[0]
