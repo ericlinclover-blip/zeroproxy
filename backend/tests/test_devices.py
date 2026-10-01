@@ -362,3 +362,38 @@ def test_update_endpoint_needs_no_pairing_code(client, configured):
     assert res.status_code == 200
     assert 'ZP_CODE=""' in res.text, "更新脚本不该带配对码"
     assert "用本次配对码重新接入" not in res.text.split("更新模式")[0]
+
+
+def test_landing_rules_route_hard_region_sites(client, configured):
+    """必须走落地的站点 (OpenAI / Netflix / Disney+ / Gemini / Claude ...)。
+
+    链式节点的延迟永远高于直连节点, 所以"自动选择"不会选它; 而这类服务只认落地地区的
+    IP —— 不单独指过去就是"能上网但站点打不开"。规则同时对三端生效 (路由器/手机/电脑),
+    没配落地的用户由组里的兜底成员保证行为不变。
+    """
+    _login(client)
+    device = _register(client, _pair_code(client)["code"])
+    for path_ in (f"/c/sub/{device['id']}?k={device['secret']}",
+                  configured["subscription_url"].split("testserver")[-1] + "?format=clash"):
+        profile = yaml.safe_load(client.get(path_).text)
+        rules = "\n".join(profile["rules"])
+        for domain in ("chatgpt.com", "claude.ai", "gemini.google.com", "netflix"):
+            assert domain in rules, (path_, domain)
+        landing = [g for g in profile["proxy-groups"] if g["name"] == "🌍 落地节点"]
+        assert landing, "必须有落地组"
+        assert landing[0]["proxies"][-1] == "🚀 节点选择", "没有链式节点时要兜底到节点选择"
+        # 落地规则必须在国内直连之前, 否则会被 cn 规则抢先放行
+        assert rules.index("chatgpt.com") < rules.index("GEOIP,CN"), "落地规则要排在直连规则之前"
+
+
+def test_skeleton_landing_group_filters_chain_nodes(client, configured):
+    """多服务器模式的落地组用 filter 从 provider 里挑"链式"节点, 并留兜底成员。"""
+    _login(client)
+    device = _register(client, _pair_code(client)["code"])
+    skeleton = yaml.safe_load(
+        client.get(f"/c/sub/{device['id']}?k={device['secret']}&format=skeleton").text
+    )
+    landing = [g for g in skeleton["proxy-groups"] if g["name"] == "🌍 落地节点"][0]
+    assert landing["use"] == [], "use 要留给路由器填 provider"
+    assert "链式" in landing["filter"]
+    assert landing["proxies"] == ["🚀 节点选择"]

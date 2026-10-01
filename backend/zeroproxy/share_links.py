@@ -73,6 +73,42 @@ G_FINAL = "🐟 漏网之鱼"
 G_ADS = "🛑 广告拦截"
 G_DIRECT = "🎯 全球直连"
 
+#: 落地节点组 + "必须走落地"的站点。
+#:
+#: 为什么需要它: 链式节点 (中转 → 落地) 的延迟永远高于直连节点, 所以"自动选择"不会选它;
+#: 而 OpenAI / Netflix 这类服务**只认落地地区的 IP** —— 结果是香港直连节点能上网, 但这些
+#: 站点一律拒绝。解决办法不是全局切到落地 (那会很慢), 而是把这几类域名单独指过去:
+#: 默认走最快的节点, 只有它们走落地。
+#:
+#: 规则写法有两类, 缺一不可:
+#:   * GEOSITE/GEOIP: 覆盖广 (一个分类几百上千个域名), 但依赖 geo 数据库里有这个分类;
+#:   * DOMAIN-SUFFIX: 显式域名, 不依赖数据库 —— 对"必须能通"的服务用这种兜底。
+G_LANDING = "🌍 落地节点"
+
+#: AI 服务: 地域限制最硬的一类, 用显式域名 (不依赖 geo 数据库的收录情况)
+LANDING_DOMAINS = (
+    "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
+    "anthropic.com", "claude.ai",
+    "gemini.google.com", "bard.google.com", "aistudio.google.com",
+    "generativelanguage.googleapis.com",
+    "perplexity.ai", "x.ai", "grok.com", "midjourney.com",
+    "poe.com", "character.ai", "sora.com",
+    "primevideo.com", "hulu.com", "max.com", "hbomax.com",
+    "disneyplus.com", "spotify.com", "soundcloud.com", "deezer.com",
+    "pandora.com", "crunchyroll.com", "paramountplus.com", "peacocktv.com",
+)
+
+#: 流媒体/服务分类 (geo 数据库收录广, 一个分类顶几百个域名)
+LANDING_GEOSITES = ("netflix", "disney", "hbo", "primevideo", "youtube")
+
+
+def _landing_rules() -> list[str]:
+    """"必须走落地"的规则 (放在最前面, 早于国内直连)。"""
+    rules = [f"DOMAIN-SUFFIX,{d},{G_LANDING}" for d in LANDING_DOMAINS]
+    rules += [f"GEOSITE,{g},{G_LANDING}" for g in LANDING_GEOSITES]
+    return rules
+
+
 #: 健康检查目标 (url-test 用它判断哪个节点/哪台服务器可用)
 HEALTH_URL = "http://www.gstatic.com/generate_204"
 
@@ -467,8 +503,12 @@ def _groups_for(names: list[str], tpl: str) -> list[dict]:
         groups.append(
             {"name": G_AUTO, "type": "url-test", "url": HEALTH_URL, "interval": 300, "proxies": names}
         )
+    # 落地组: 成员是链式节点 (中转→落地)。没有链式节点时兜底成员就是"节点选择",
+    # 于是行为与从前完全一致 —— 没配落地的用户无感。
+    landing = [n for n in names if "链式" in n]
     groups += [
         {"name": G_SELECT, "type": "select", "proxies": select_members},
+        {"name": G_LANDING, "type": "select", "proxies": landing + [G_SELECT]},
         {"name": G_DIRECT, "type": "select", "proxies": ["DIRECT", G_SELECT]},
         {"name": G_ADS, "type": "select", "proxies": ["REJECT", "DIRECT"]},
         {
@@ -518,6 +558,16 @@ def clash_profile(
             # 多服务器模式的默认选择就变成"直连"—— 真机表现: 节点全在, 但所有流量直连、
             # 境外全超时。把自动选择组放在首位, DIRECT 仍然可选。
             {"name": G_SELECT, "type": "select", "use": [], "proxies": [G_AUTO, "DIRECT"]},
+            # 落地组: 从各 provider 的节点里挑名字含"链式"的 (多服务器模式的节点名
+            # 带面板域名前缀, 但"链式"这个标记保留)。filter 匹配不到任何节点时,
+            # 兜底成员"节点选择"保证这个组永远可用。
+            {
+                "name": G_LANDING,
+                "type": "select",
+                "use": [],
+                "filter": "(?i)链式",
+                "proxies": [G_SELECT],
+            },
             {"name": G_DIRECT, "type": "select", "proxies": ["DIRECT", G_SELECT]},
             {"name": G_ADS, "type": "select", "proxies": ["REJECT", "DIRECT"]},
             {
@@ -530,9 +580,11 @@ def clash_profile(
         groups = _groups_for(names, tpl)
 
     if tpl == "smart":
-        # 国内 / 私有地址直连, 广告拦截, 其余走"漏网之鱼"
+        # 国内 / 私有地址直连, 广告拦截, 其余走"漏网之鱼"。
+        # 落地规则放在最前面: 这些站点必须用落地 IP, 不能等到国内规则把它们放过去。
         rules = [
             f"GEOSITE,category-ads-all,{G_ADS}",
+            *_landing_rules(),
             f"GEOSITE,private,{G_DIRECT}",
             f"GEOSITE,cn,{G_DIRECT}",
             f"GEOIP,LAN,{G_DIRECT},no-resolve",
@@ -542,6 +594,7 @@ def clash_profile(
     elif tpl == "global":
         rules = [
             f"GEOSITE,category-ads-all,{G_ADS}",
+            *_landing_rules(),
             f"GEOIP,LAN,{G_DIRECT},no-resolve",
             f"MATCH,{G_SELECT}",
         ]

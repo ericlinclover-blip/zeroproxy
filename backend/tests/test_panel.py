@@ -341,10 +341,11 @@ def test_clash_templates(client, configured):
     assert "GEOSITE,category-ads-all" in rules and "GEOSITE,cn," in rules
     assert "GEOIP,LAN," in rules and "GEOIP,CN," in rules
     assert smart["rules"][-1] == "MATCH,🐟 漏网之鱼"
+    # 落地组 (🌍 落地节点) 是 v2.9.0 加的: 只放链式节点, 没链式节点时兜底到节点选择
     assert [g["name"] for g in smart["proxy-groups"]] == [
         "♻️ 自动选择",
         "🚀 节点选择",
-        "🎯 全球直连",
+        "🌍 落地节点", "🎯 全球直连",
         "🛑 广告拦截",
         "🐟 漏网之鱼",
     ]
