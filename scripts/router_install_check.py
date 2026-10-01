@@ -271,6 +271,10 @@ def main() -> int:
               "proxy-providers:" in merged and "proxies:" not in merged.split("proxy-groups")[0],
               f"providers={len(merged_yaml.get('proxy-providers', {}))}")
         check("两个 provider 都在", len(merged_yaml.get("proxy-providers", {})) == 2)
+        sel = [g for g in merged_yaml["proxy-groups"] if g["name"] == "🚀 节点选择"][0]
+        check("节点选择的第一个成员是自动选择 (不是 DIRECT)",
+              sel["proxies"][0] == "♻️ 自动选择" and sel["proxies"][-1] == "DIRECT",
+              str(sel["proxies"]))
         auto = [g for g in merged_yaml["proxy-groups"] if g["name"] == "♻️ 自动选择"][0]
         check("组的 use 填上了两个 provider 键", len(auto.get("use", [])) == 2, str(auto.get("use")))
         check("节点不再内联 (交给 provider 拉)", "proxies" not in merged_yaml)

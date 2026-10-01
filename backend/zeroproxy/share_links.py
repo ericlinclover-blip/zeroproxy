@@ -509,7 +509,11 @@ def clash_profile(
     if skeleton:
         groups = [
             {"name": G_AUTO, "type": "url-test", "url": HEALTH_URL, "interval": 300, "use": []},
-            {"name": G_SELECT, "type": "select", "use": [], "proxies": ["DIRECT"]},
+            # 注意成员顺序: mihomo 组装 select 组时**先把内联 proxies 放前面**, provider
+            # 的节点跟在后面, 而 select 的默认值就是第一个成员。这里若只写 [DIRECT],
+            # 多服务器模式的默认选择就变成"直连"—— 真机表现: 节点全在, 但所有流量直连、
+            # 境外全超时。把自动选择组放在首位, DIRECT 仍然可选。
+            {"name": G_SELECT, "type": "select", "use": [], "proxies": [G_AUTO, "DIRECT"]},
             {"name": G_DIRECT, "type": "select", "proxies": ["DIRECT", G_SELECT]},
             {"name": G_ADS, "type": "select", "proxies": ["REJECT", "DIRECT"]},
             {
