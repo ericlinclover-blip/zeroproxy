@@ -39,6 +39,11 @@ ZP_REPO="${ZP_REPO:-ericlinclover-blip/zeroproxy}"
 ZP_REF="${ZP_REF:-main}"
 GH="https://github.com"
 GH_API="https://api.github.com"
+#: 代码下载的反代前缀 (按顺序回退)。内核二进制、分流数据库、版本号检查都有镜像, 只有
+#: **升级脚本自己**以前只认 GitHub 直连 —— 受限网络上面板会卡在"下载新版本代码", 而
+#: 更新通道恰恰是用户唯一的自救手段 (真机上就是这样: 面板停在旧版本, 点更新没反应)。
+#: gh-proxy 这类反代对 /archive/<sha>.tar.gz 与分支 tarball 都直接透传。
+GH_MIRRORS=("$GH" "https://gh-proxy.com/$GH" "https://hk.gh-proxy.com/$GH")
 VENV="$ZP_HOME/venv"
 STATE_FILE="$ZP_HOME/data/state.json"
 STATUS_FILE="$ZP_HOME/data/update.json"
@@ -269,7 +274,7 @@ trap on_exit EXIT
 step_log "从 GitHub 下载面板代码 ($ZP_REPO @ $ZP_REF) ..."
 begin_step "下载新版本代码"
 fetch_tarball() { # fetch_tarball <输出文件>
-  local out="$1" url err sha
+  local out="$1" url err sha prefix
   err="$(mktemp)"
   # 先把分支 / tag 解析成提交 SHA, 再按 SHA 下载 —— `archive/refs/heads/<分支>.tar.gz`
   # 在推送后会被 CDN 缓存一小会儿, 刚发完版就升级会**装到上一个版本的代码**
@@ -277,13 +282,18 @@ fetch_tarball() { # fetch_tarball <输出文件>
   # 拿不到 SHA (API 被挡) 就退回原来的三级兜底, 并给分支/tag 地址带时间戳强制回源。
   sha="$(curl -fsSL --max-time 20 "$GH_API/repos/$ZP_REPO/commits/$ZP_REF" 2>/dev/null \
         | sed -n 's/.*"sha": *"\([0-9a-f]\{40\}\)".*/\1/p' | head -1 || true)"
-  local -a urls=()
-  [ -n "$sha" ] && urls+=("$GH/$ZP_REPO/archive/$sha.tar.gz")
-  urls+=(
-    "$GH/$ZP_REPO/archive/refs/heads/$ZP_REF.tar.gz?t=$(date +%s)"
-    "$GH/$ZP_REPO/archive/refs/tags/$ZP_REF.tar.gz?t=$(date +%s)"
-    "$GH_API/repos/$ZP_REPO/tarball/$ZP_REF"
-  )
+  # 每个前缀 (直连 / gh-proxy / hk.gh-proxy) 依次试 SHA 快照与带时间戳的分支、tag:
+  # 直连不通的机器靠反代照样能升级 —— 这是用户唯一的自救通道。
+  local -a urls=() stamp
+  stamp="$(date +%s)"
+  for prefix in "${GH_MIRRORS[@]}"; do
+    [ -n "$sha" ] && urls+=("$prefix/$ZP_REPO/archive/$sha.tar.gz")
+    urls+=(
+      "$prefix/$ZP_REPO/archive/refs/heads/$ZP_REF.tar.gz?t=$stamp"
+      "$prefix/$ZP_REPO/archive/refs/tags/$ZP_REF.tar.gz?t=$stamp"
+    )
+  done
+  urls+=("$GH_API/repos/$ZP_REPO/tarball/$ZP_REF")
   for url in "${urls[@]}"; do
     curl -fsSL --connect-timeout 10 --max-time 180 -o "$out" "$url" 2>"$err" || { rm -f "$out"; continue; }
     if tar -tzf "$out" >/dev/null 2>&1; then rm -f "$err"; return 0; fi
