@@ -832,6 +832,40 @@ CLIEOF
 }
 
 # ---------------------------------------------------------------- 启动与自检
+# 网页管理界面 (LuCI 菜单 + /www/zeroproxy/ 页面 + /cgi-bin 数据接口)。
+# 失败不致命: 命令行 (zeroproxy) 一直是可用的兜底。
+install_ui() {
+    step "安装网页管理界面"
+    if [ ! -d /www ]; then
+        warn "这台设备没有 uhttpd/LuCI, 跳过网页界面 (命令行仍然可用: zeroproxy status)"
+        return 0
+    fi
+    mkdir -p /www/zeroproxy /www/cgi-bin
+    for f in index.html app.js; do
+        http_get "$ZP_BASE/c/ui/$f" > "/www/zeroproxy/$f" 2>/dev/null || {
+            warn "面板没有提供界面文件 (面板版本较旧?), 跳过网页界面"
+            rm -rf /www/zeroproxy
+            return 0
+        }
+    done
+    http_get "$ZP_BASE/c/ui/cgi" > /www/cgi-bin/zeroproxy 2>/dev/null || true
+    chmod 755 /www/cgi-bin/zeroproxy
+    UI_URL="http://$(uci get network.lan.ipaddr 2>/dev/null || echo 192.168.1.1)/zeroproxy/"
+
+    # LuCI 菜单 / 权限 / 承载页 —— 只有装了 LuCI 才写, 否则上面那个地址一样能用
+    if [ -d /usr/share/luci/menu.d ]; then
+        mkdir -p /www/luci-static/resources/view/zeroproxy /usr/share/rpcd/acl.d
+        http_get "$ZP_BASE/c/ui/status.js" > /www/luci-static/resources/view/zeroproxy/status.js 2>/dev/null || true
+        http_get "$ZP_BASE/c/ui/menu.json" > /usr/share/luci/menu.d/luci-app-zeroproxy.json 2>/dev/null || true
+        http_get "$ZP_BASE/c/ui/acl.json" > /usr/share/rpcd/acl.d/luci-app-zeroproxy.json 2>/dev/null || true
+        # rpcd 缓存 ACL, 重载后菜单才会出现
+        /etc/init.d/rpcd reload >/dev/null 2>&1 || /etc/init.d/rpcd restart >/dev/null 2>&1 || true
+        ok "管理界面已装好: $UI_URL (LuCI 菜单: 服务 → ZeroProxy)"
+    else
+        ok "管理界面已装好: $UI_URL"
+    fi
+}
+
 verify() {
     step "启动并自检"
     /etc/init.d/zeroproxy enable >/dev/null 2>&1 || true
@@ -905,6 +939,7 @@ main() {
     install_deps
     install_core
     write_files
+    install_ui
     verify
     report_up
     finish

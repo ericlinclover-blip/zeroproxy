@@ -1,0 +1,13 @@
+{
+	"admin/services/zeroproxy": {
+		"title": "ZeroProxy",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "zeroproxy/status"
+		},
+		"depends": {
+			"acl": [ "luci-app-zeroproxy" ]
+		}
+	}
+}

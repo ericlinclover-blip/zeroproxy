@@ -2903,6 +2903,23 @@ def client_core_binary(arch: str, request: Request):
     )
 
 
+@router.get("/c/ui/{name}")
+def client_ui_file(name: str, request: Request):
+    """路由器管理界面的文件 (index.html / app.js / cgi / 菜单 JSON)。
+
+    名字走白名单, 不接受路径 —— 这个端点是匿名可达的 (安装时来取), 不能变成面板上的
+    任意文件读取。内容本身不含任何密钥, 是公开的界面代码。
+    """
+    state = load_state()
+    if not state["configured"]:
+        return _err("面板尚未初始化", 409)
+    got = router_client.ui_file(name)
+    if got is None:
+        return _err("没有这个界面文件", 404)
+    body, media, _filename = got
+    return Response(body, media_type=media, headers={"cache-control": "no-store"})
+
+
 @router.post("/c/pair")
 def client_pair(payload: DeviceRegisterIn, request: Request):
     """一次性配对码 → 设备凭据 (只在这次响应里出现, 服务端只存 hash)。"""

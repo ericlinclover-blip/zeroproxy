@@ -163,6 +163,34 @@ def script_path() -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "client", "router-install.sh")
 
 
+#: 路由器管理界面会用到的文件 (由面板分发, 路由器只负责落盘 —— 于是界面的更新
+#: 只要重跑一次安装命令, 不需要重新打包客户端)。
+#: 键 = URL 里的名字, 值 = (相对 client/luci 的路径, media_type)
+UI_FILES: dict[str, tuple[str, str]] = {
+    "index.html": ("index.html", "text/html; charset=utf-8"),
+    "app.js": ("app.js", "text/javascript; charset=utf-8"),
+    "cgi": ("cgi", "text/plain; charset=utf-8"),
+    "menu.json": ("menu.json", "application/json; charset=utf-8"),
+    "acl.json": ("acl.json", "application/json; charset=utf-8"),
+    "status.js": ("status.js", "text/javascript; charset=utf-8"),
+}
+
+
+def ui_file(name: str) -> tuple[str, str, str] | None:
+    """读取一个界面文件。返回 (正文, media_type, 文件名), 未登记的名字返回 None。
+
+    只允许白名单里的名字 —— 这个端点是匿名可达的 (路由器安装时来取), 所以绝不能
+    接受任意路径 (否则就是给面板开了个任意文件读取)。
+    """
+    entry = UI_FILES.get(name)
+    if not entry:
+        return None
+    rel, media = entry
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "client", "luci", rel)
+    with open(path, "r", encoding="utf-8") as fh:
+        return fh.read(), media, os.path.basename(rel)
+
+
 def render_script(base: str, code: str) -> str:
     """把面板地址与配对码烘进安装脚本。
 

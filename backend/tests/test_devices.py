@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import pytest
 import yaml
 
 from conftest import DOMAIN, PASSWORD, USERNAME
@@ -117,6 +118,7 @@ def test_core_binary_endpoint(client, configured, tmp_path, monkeypatch):
 
 
 def test_install_script_sticks_to_busybox_tools():
+    """(见下) 安装脚本只能用路由器上确实有的命令。"""
     """路由器上的可用命令比服务器少得多, 这条测试盯住"用了 OpenWrt 没有的工具"。
 
     真机事故 (2.7.0): 用 `od -An -tx1` 读文件前两个字节来判断下载到的是不是 gzip。
@@ -158,6 +160,31 @@ def test_install_script_self_heals_rejected_credentials():
     assert "重新接入失败" in text and "重新生成一条安装命令" in text, "重接也失败时要给出可执行的下一步"
     # 换面板 (stored base ≠ 本次 base) 必须能识别出来, 而不是继续用旧凭据撞 403
     assert "_old_base" in text and "本次改用" in text
+
+
+@pytest.mark.parametrize("name", ["index.html", "app.js", "cgi", "menu.json", "acl.json", "status.js"])
+def test_ui_files_are_served(client, configured, name):
+    """路由器管理界面的文件由面板分发 (路由器只负责落盘, 于是界面更新=重跑安装命令)。"""
+    res = client.get(f"/c/ui/{name}")
+    assert res.status_code == 200, name
+    assert res.text.strip(), name
+
+
+def test_ui_endpoint_refuses_unknown_names(client, configured):
+    """这个端点是匿名可达的 (安装时来取), 所以必须只认白名单 —— 不能变成任意文件读取。"""
+    for bad in ("../../etc/passwd", "..%2f..%2fetc%2fpasswd", "router-install.sh", "luci"):
+        assert client.get(f"/c/ui/{bad}").status_code == 404, bad
+
+
+def test_ui_files_contain_no_secrets(client, configured):
+    """界面代码里不该夹带任何凭据: 它落到 /www 之后是局域网可读的。"""
+    code = client.get("/c/ui/cgi").text
+    page = client.get("/c/ui/app.js").text
+    for text in (code, page):
+        assert "sub" not in text or "secret" not in text.lower(), "界面里不该出现 secret"
+        assert "subscription_token" not in text
+    # cgi 必须真的做会话校验, 而不是"局域网内谁都能调"
+    assert "sysauth" in code and "ubus" in code and "session get" in code
 
 
 # ---------------------------------------------------------------- 配置生成

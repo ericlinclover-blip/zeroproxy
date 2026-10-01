@@ -1,0 +1,11 @@
+{
+	"luci-app-zeroproxy": {
+		"description": "ZeroProxy 路由器客户端 (管理页面 + 会话校验)",
+		"read": {
+			"ubus": {
+				"session": [ "get" ]
+			}
+		},
+		"write": {}
+	}
+}

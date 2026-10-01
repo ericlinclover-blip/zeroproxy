@@ -1,0 +1,105 @@
+#!/bin/sh
+# ZeroProxy 路由器管理界面的数据接口 (uhttpd 在 /cgi-bin/zeroproxy 执行)。
+#
+# 为什么不自己起一个监听端口: 路由器上的每一个监听端口都是一个可能被扫的入口。
+# 这里复用 uhttpd, 并且**逐次校验 LuCI 会话** —— 只有已登录 LuCI 的浏览器才能
+# 拿到数据, 也不需要再发明一套登录。
+#
+# 输出一律是 JSON: {"ok":true,...} / {"ok":false,"error":"..."}
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+ZP_DIR=/etc/zeroproxy
+CLI=/usr/bin/zeroproxy
+
+header() {
+    printf 'Content-Type: application/json; charset=utf-8\r\n'
+    printf 'Cache-Control: no-store\r\n'
+    printf '\r\n'
+}
+fail() { header; printf '{"ok":false,"error":"%s"}\n' "$1"; exit 0; }
+
+# ---------------------------------------------------------------- 鉴权
+# LuCI 把会话 id 放在 cookie 里 (sysauth / sysauth_http / sysauth_https 随协议变),
+# 拿它问一次 ubus: 能取回会话对象才算登录。
+sid="$(printf '%s' "${HTTP_COOKIE:-}" | tr ';' '\n' | sed -n 's/^ *sysauth[^=]*=\(.*\)$/\1/p' | head -n1)"
+[ -n "$sid" ] || fail "未登录 LuCI"
+command -v ubus >/dev/null 2>&1 || fail "路由器缺少 ubus, 无法校验会话"
+ubus -S "$sid" call session get '{}' 2>/dev/null | grep -q '"ubus_rpc_session"' \
+    || fail "LuCI 会话已过期, 请重新登录后再操作"
+
+# ---------------------------------------------------------------- 工具
+BODY="$(cat 2>/dev/null || true)"
+
+jval() {
+    if command -v jsonfilter >/dev/null 2>&1; then
+        printf '%s' "$BODY" | jsonfilter -e "@.$1" 2>/dev/null | head -n1
+    else
+        printf '%s' "$BODY" | sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1
+    fi
+}
+# 把任意文本塞进 JSON 字符串 (换行转义成 \n, 由前端还原)
+jstr() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\r' | awk '{printf "%s\\n", $0}'; }
+
+# 动作名: /cgi-bin/zeroproxy/add → add (PATH_INFO 或 REQUEST_URI 里取最后一段)
+action="$(printf '%s' "${PATH_INFO:-}" | sed -e 's#^/*##' -e 's#/.*$##')"
+if [ -z "$action" ]; then
+    action="$(printf '%s' "${REQUEST_URI:-}" | sed -e 's/[?].*$//' -e 's#/*$##' -e 's#.*/##')"
+fi
+
+run_cli() {
+    if [ -x "$CLI" ]; then
+        out="$("$CLI" "$@" 2>&1)"
+        header
+        printf '{"ok":true,"message":"%s"}\n' "$(jstr "$out")"
+    else
+        fail "路由器上找不到 zeroproxy 命令, 请重跑一次安装命令"
+    fi
+}
+
+case "$action" in
+    status)
+        core="stopped"
+        /etc/init.d/zeroproxy running >/dev/null 2>&1 && core="running"
+        mode="tproxy"
+        [ -c /dev/net/tun ] && mode="tun"
+        ver=""
+        [ -f "$ZP_DIR/version" ] && ver="$(cat "$ZP_DIR/version" 2>/dev/null)"
+        items=""
+        for f in "$ZP_DIR"/servers/*.json; do
+            [ -f "$f" ] || continue
+            base="$(sed -n 's/.*"base"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n1)"
+            did="$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n1)"
+            key="$(basename "$f" .json)"
+            items="${items:+$items,}{\"key\":\"$(jstr "$key")\",\"base\":\"$(jstr "$base")\",\"id\":\"$(jstr "$did")\"}"
+        done
+        header
+        printf '{"ok":true,"core":"%s","mode":"%s","client":"%s","servers":[%s]}\n' \
+            "$core" "$mode" "$(jstr "$ver")" "$items"
+        ;;
+    add)
+        url="$(jval url)"
+        [ -n "$url" ] || fail "没有收到服务器链接"
+        run_cli add "$url"
+        ;;
+    drop)
+        key="$(jval key)"
+        [ -n "$key" ] || fail "没有指定要移除的服务器"
+        run_cli drop "$key"
+        ;;
+    toggle)
+        on="$(jval on)"
+        if [ "$on" = "true" ] || [ "$on" = "1" ]; then run_cli on; else run_cli off; fi
+        ;;
+    refresh)
+        run_cli refresh
+        ;;
+    log)
+        lines="$(logread -e zeroproxy 2>/dev/null | tail -n 60)"
+        header
+        printf '{"ok":true,"log":"%s"}\n' "$(jstr "$lines")"
+        ;;
+    *)
+        fail "未知操作: $action"
+        ;;
+esac
