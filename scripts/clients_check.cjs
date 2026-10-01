@@ -146,6 +146,16 @@ async function main() {
     check("开关处于打开状态", await page.locator(".bigswitch input").isChecked());
     const glow = await page.locator(".bigswitch input:checked + .track").count();
     check("开关打开时有发光样式", glow === 1);
+    // 真机上这里是"看起来像个按钮"的下拉 —— 用计算样式盯住它 (自绘箭头 + ghost 同款边框)
+    const sel = await page.evaluate(() => {
+      const s = document.querySelector(".dev-tpl select");
+      const cs = getComputedStyle(s);
+      return { appearance: cs.appearance, arrow: cs.backgroundImage, radius: cs.borderRadius };
+    });
+    check("分流模板是下拉而不是按钮样式",
+      sel.appearance === "none" && /linear-gradient/.test(sel.arrow) && sel.radius === "9px",
+      JSON.stringify(sel));
+
     check("卡片写明分流模板与内核状态",
       /分流 · /.test(await page.locator(".dev-card").innerText()) &&
       /内核运行中/.test(await page.locator(".dev-card").innerText()));

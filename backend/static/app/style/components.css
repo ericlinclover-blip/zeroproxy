@@ -667,7 +667,29 @@ dialog.modal-mask::backdrop { background: transparent; }
 .bigswitch input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 2px; }
 .dev-switch-label { font-size: 11.5px; color: var(--sub); font-weight: 600; }
 .dev-actions { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; border-top: 1px solid var(--border-soft); padding-top: 10px; }
-.dev-tpl select { font-size: 12px; padding: 5px 8px; }
+/* 分流模板下拉: 之前只改了字号, 于是它用浏览器默认外观 —— 夹在两个 ghost 按钮中间
+   看起来像"被选中的按钮", 而且没有任何"这是下拉"的暗示 (真机上被一眼看出来)。
+   现在与邻居同高同圆角, 右侧自绘一个箭头。 */
+.dev-tpl { display: flex; align-items: center; margin: 0; }
+.dev-tpl select {
+  appearance: none; -webkit-appearance: none;
+  font: 12px/1.4 inherit; color: var(--sub); cursor: pointer;
+  padding: 6px 26px 6px 11px; border-radius: 9px;
+  border: 1px solid var(--border); background-color: var(--card);
+  /* 两个小斜块拼出箭头 (用渐变画, 不引外部图片) */
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--sub) 50%),
+    linear-gradient(135deg, var(--sub) 50%, transparent 50%);
+  background-position: calc(100% - 15px) 50%, calc(100% - 10px) 50%;
+  background-size: 5px 5px, 5px 5px;
+  background-repeat: no-repeat;
+  transition: color .18s var(--ease), border-color .18s var(--ease);
+}
+.dev-tpl select:hover, .dev-tpl select:focus {
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  outline: none;
+}
 
 .dev-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(220px, 100%), 1fr)); gap: 12px; }
 .mini-card { border: 1px solid var(--border); border-radius: var(--radius); background: var(--card-2); padding: 12px 14px; }
