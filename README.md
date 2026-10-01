@@ -68,7 +68,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 251 项 (245 passed + 6 skipped; 带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/router_install_check.py` (39 项, **真的用 shell 跑一遍路由器安装脚本**) + `scripts/browser_check.cjs` (155 项) + `scripts/clients_check.cjs` (20 项, 真实浏览器点开关) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 252 项 (246 passed + 6 skipped; 带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/router_install_check.py` (39 项, **真的用 shell 跑一遍路由器安装脚本**) + `scripts/browser_check.cjs` (155 项) + `scripts/clients_check.cjs` (20 项, 真实浏览器点开关) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 | **看得懂的界面 (v2.6.0)** | 控制台布局: 左侧锚点导航 (带计数角标 + 滚动高亮) + 顶部指标条 (健康节点 / 落地出口 IP / 平均延迟 + 迷你折线 / 运行时长) + 节点密集表格 (名称 / 地址状态 / **握手延迟条** / **上下行双轨** / 开关与复制) + **流量卡 (双弧圆环 + 实时速率曲线 + 逐节点双色流量条)** + 链式链路拓扑 (你的设备 → 本机入口 → 落地端) + 程序更新闭环; 动效全部走 `transform`/自绘 rAF 并受 `prefers-reduced-motion` 约束 |
 
@@ -2364,3 +2364,30 @@ agent 上报的客户端版本号一直硬编码 `1.0.0`, 现在跟着 `SCRIPT_V
 
 **回归**: `scripts/upgrade_sim.sh` 23 项全过 —— 包括"下载失败"那条路径 (所有镜像都失败时
 仍然正确地回滚, 现有部署不被破坏)。
+
+### 8.39 v2.9.5: 路由器界面那半个开关 —— 未授权时它只是"读不到", 不是在关着
+
+真机反馈: "路由器的网络已经连上面板了, 但路由器后台那个全屋代理开关是关的, 而且点不开,
+是 bug 吗?" —— 截图里的页面正是**未授权态**: 顶部一行红字"未授权 — 在路由器上执行
+`zeroproxy ui` 拿到带令牌的地址", 开关停在初始位置、服务器卡在"正在读取…"。
+
+代理本身没问题: 那个页面只认两样东西 —— 地址里的 `?k=…` 令牌, 或者一个有效的 LuCI 会话
+(GL.iNet 的后台不是 LuCI, 登录它什么都没有), 拿不到任何一个时 `status` 接口就拒答,
+`render()` 根本不会执行。问题在于它**看起来像坏了**: 一个真的能点、点了没反应的开关,
+比一句"未授权"更容易被理解成故障。
+
+两处一起改:
+
+* 页面 (`client/luci/app.js` + `index.html`): 读不到状态时进入明确的只读说明态 ——
+  开关与按钮全部禁用 (灰掉, 不再是"看起来能点"), 并把下一步直接写出来:
+  `zeroproxy ui` → 用它打印的带 `?k=` 的地址打开一次, 之后同一浏览器用普通地址也认;
+  不想开浏览器就用 `zeroproxy status | on | off`;
+* 安装脚本: 令牌的生成原来挂在"有没有 LuCI"分支里面 —— 没装 LuCI 的固件上
+  `zeroproxy ui` 会打印一条**没有令牌**的死地址 (页面永远未授权)。现在无条件生成;
+  安装摘要里打印的也改成**带令牌**的那条 (`http://<路由器>/cgi-bin/zeroproxy?k=…`),
+  并提示"打开一次即可"。
+
+**回归**: `scripts/router_ui_check.cjs` 13 → **16 项** (未授权时: 开关禁用 / 按钮禁用 /
+页面里必须出现 `zeroproxy ui` 这条可执行的下一步); `pytest` 251 → **252 项** (安装脚本的
+令牌必须在 LuCI 分支之前无条件生成, 且摘要里打印的地址必须带 `?k=`)。界面截图见
+`work/browser-check/router-ui.png`。

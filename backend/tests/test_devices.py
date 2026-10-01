@@ -222,6 +222,28 @@ def test_install_script_never_fetches_geo_from_the_internet():
     assert "PANEL_GEO" in text
 
 
+def test_install_ui_always_makes_a_token_and_prints_it():
+    """路由器管理界面的地址必须带令牌, 令牌也必须无条件生成。
+
+    真机反馈: 用户照着安装摘要里的地址打开, 看到的是一个"读不到状态、开关点也点不动"的
+    页面, 第一反应是"这开关坏了"。原因是那个页面只认两样东西 —— 地址里的 ?k=令牌, 或者
+    一个有效的 LuCI 会话 —— 而 GL.iNet 的后台不是 LuCI, 登录它什么都没有。
+
+    所以: (1) 令牌的生成不能挂在"有没有 LuCI"下面 (老版本就是挂着的, 没装 LuCI 的固件上
+    `zeroproxy ui` 会打印一条没有令牌的死地址); (2) 安装摘要里打印的必须是带令牌的那条。
+    """
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+    token_at = text.index('if [ ! -s "$ZP_DIR/ui.token" ]')
+    luci_at = text.index('if [ -d /usr/share/luci/menu.d ]')
+    assert token_at < luci_at, "令牌要在 LuCI 分支之前无条件生成"
+    assert 'UI_URL_K="$UI_URL?k=$(cat "$ZP_DIR/ui.token"' in text, "要拼出带令牌的地址"
+    assert 'ok "浏览器打开: $UI_URL_K"' in text, "安装摘要要打印带令牌的地址"
+    # CLI 的 `zeroproxy ui` 一直就是打印带令牌的地址 —— 别把它改成裸地址
+    assert 'echo "http://$_ip/cgi-bin/zeroproxy?k=$(cat "$ZP_DIR/ui.token"' in text
+
+
 def test_install_script_parses_booleans_on_any_sed():
     """能力位与开关位都靠 json_get_bool 读。原来的写法用 `\\(true\\|false\\)`, 而 `\\|` 是
     GNU 扩展 —— BSD sed (macOS 演练环境 / 没有 jsonfilter 的固件) 会**静默取空**, 于是

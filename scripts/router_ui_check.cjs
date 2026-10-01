@@ -129,6 +129,14 @@ async function main() {
     await page.waitForFunction(() => /未登录/.test(document.getElementById("sub").textContent));
     check("未登录时明确提示, 而不是空白页", true, await page.locator("#sub").innerText());
     check("未登录时不显示服务器列表", await page.locator(".srv").count() === 0);
+    // 真机反馈: 用户看到一个"关着且点不动"的开关, 以为是 bug (其实是未授权)。所以这里
+    // 盯死三件事: 开关禁用、按钮禁用、页面明说下一步该敲什么命令。
+    check("未授权时总开关是禁用的 (不再是「看起来能点」)", await page.locator("#toggle").isDisabled());
+    check("未授权时添加 / 重新拉取也禁用",
+      await page.locator("#add").isDisabled() && await page.locator("#refresh").isDisabled());
+    check("未授权时给出可执行的下一步 (zeroproxy ui)",
+      /zeroproxy ui/.test(await page.locator("#servers").innerText()),
+      (await page.locator("#servers").innerText()).split("\n")[0]);
 
     console.log("\n[2] 已登录 (带上 LuCI 会话 cookie)");
     await ctx.addCookies([{ name: "sysauth_http", value: "mock-session", url: `http://127.0.0.1:${PORT}` }]);

@@ -1004,6 +1004,7 @@ EOF
     ui)
         _ip="$(uci get network.lan.ipaddr 2>/dev/null || echo 192.168.1.1)"
         echo "http://$_ip/cgi-bin/zeroproxy?k=$(cat "$ZP_DIR/ui.token" 2>/dev/null)"
+        [ -s "$ZP_DIR/ui.token" ] || echo "(令牌文件不见了 —— 重跑一次安装命令会重新生成)"
         echo "(打开一次即可; 之后同一浏览器不用再带令牌)"
         ;;
     log)        logread -e zeroproxy | tail -n "${2:-40}" ;;
@@ -1071,6 +1072,19 @@ install_ui() {
     # 在浏览器能到的地方, 而 /cgi-bin/ 一定通 (LuCI 自己就走它)
     UI_URL="http://$(uci get network.lan.ipaddr 2>/dev/null || echo 192.168.1.1)/cgi-bin/zeroproxy"
 
+    # 界面令牌: 数据接口要么认这个 (地址里带 ?k=…, 打开一次种成 cookie), 要么认一个有效的
+    # LuCI 会话。GL.iNet 的后台**不是** LuCI, 登录它拿不到 LuCI 会话 —— 所以这个令牌是
+    # 那类固件上唯一能授权的方式, 必须在**任何**固件上都生成, 不能挂在"有没有 LuCI"下面
+    # (否则 `zeroproxy ui` 打印不出令牌, 页面永远停在"未授权", 开关看着就是坏的)。
+    if [ ! -s "$ZP_DIR/ui.token" ]; then
+        umask 077
+        head -c 16 /dev/urandom | md5sum | cut -c1-32 > "$ZP_DIR/ui.token" 2>/dev/null || \
+            printf '%s' "$(date +%s)$$" > "$ZP_DIR/ui.token"
+        umask 022
+        chmod 600 "$ZP_DIR/ui.token"
+    fi
+    UI_URL_K="$UI_URL?k=$(cat "$ZP_DIR/ui.token" 2>/dev/null)"
+
     # LuCI 菜单 / 权限 / 承载页 —— 只有装了 LuCI 才写, 否则上面那个地址一样能用
     if [ -d /usr/share/luci/menu.d ]; then
         mkdir -p /www/luci-static/resources/view/zeroproxy /usr/share/rpcd/acl.d
@@ -1082,29 +1096,26 @@ install_ui() {
         # 最常见的原因)
         /etc/init.d/rpcd reload >/dev/null 2>&1 || /etc/init.d/rpcd restart >/dev/null 2>&1 || true
         rm -f /tmp/luci-indexcache* /tmp/luci-modulecache/* 2>/dev/null || true
-        ok "管理界面已装好: $UI_URL (LuCI 菜单: 服务 → ZeroProxy)"
-        # 本机自检: 页面真能被服务器发出来才算装好。这台固件 80 端口可能是 nginx
-        # 而不是 uhttpd, 文档路径不一定是我们以为的 /www —— 与其让用户看到 403,
-        # 不如当场说清楚并给出排查命令。
-        # 界面令牌: GL.iNet 的后台不是 LuCI, 登录它没有 LuCI 会话可校验, 所以界面还有
-    # 这套自带令牌 (0600)。`zeroproxy ui` 打印带令牌的地址。
-    if [ ! -s "$ZP_DIR/ui.token" ]; then
-        umask 077
-        head -c 16 /dev/urandom | md5sum | cut -c1-32 > "$ZP_DIR/ui.token" 2>/dev/null ||             printf '%s' "$(date +%s)$$" > "$ZP_DIR/ui.token"
-        umask 022
-        chmod 600 "$ZP_DIR/ui.token"
+        ok "管理界面已装好 (LuCI 菜单: 服务 → ZeroProxy)"
+    else
+        ok "管理界面已装好"
     fi
+
+    # 打印出来的一定是**带令牌**的那条: 不带令牌打开就是一个"读不到状态、开关也点不动"的
+    # 页面 (真机反馈: 用户照着打印的地址打开, 看到开关是关的、点不开, 以为是 bug)。
+    ok "浏览器打开: $UI_URL_K"
+    ok "  (令牌只用来授权这一个页面, 打开一次即可; 忘了就用 zeroproxy ui 再打印)"
+    # 本机自检: 页面真能被服务器发出来才算装好。这台固件 80 端口可能是 nginx
+    # 而不是 uhttpd, 文档路径不一定是我们以为的 /www —— 与其让用户看到 403,
+    # 不如当场说清楚并给出排查命令。
     _probe="$(http_get "http://127.0.0.1/cgi-bin/zeroproxy?k=$(cat "$ZP_DIR/ui.token")" 2>/dev/null | head -c 300)"
-        case "$_probe" in
-            *ZeroProxy*) ok "本机自检: 页面可访问" ;;
-            *) warn "本机自检没通过 —— 浏览器打开 $UI_URL 可能看到 403/404。
+    case "$_probe" in
+        *ZeroProxy*) ok "本机自检: 页面可访问" ;;
+        *) warn "本机自检没通过 —— 浏览器打开上面的地址可能看到 403/404。
   这台设备的 Web 服务不是标准的 uhttpd(/www) 时会出现这种情况, 请把下面三行的输出发回:
     grep -rl 'root ' /etc/nginx/conf.d/ 2>/dev/null | head -3; grep -rn 'root \|cgi' /etc/nginx/conf.d/*.conf 2>/dev/null | head -10
     ls -ld /www /www/zeroproxy; netstat -lntp 2>/dev/null | grep -E ':(80|443)\\b'" ;;
-        esac
-    else
-        ok "管理界面已装好: $UI_URL"
-    fi
+    esac
 }
 
 verify() {
@@ -1198,7 +1209,8 @@ finish() {
         printf '  分流     智能分流 (国内直连 + 广告拦截, 其余走代理)\n'
     fi
     printf '  管理     面板「客户端」页可看状态、开关、改分流、移除设备\n'
-    printf '  本机命令 zeroproxy status | on | off | geo | log | uninstall\n'
+    printf '  网页管理 在路由器上执行 zeroproxy ui, 用打印出来的地址打开\n'
+    printf '  本机命令 zeroproxy status | on | off | ui | geo | log | uninstall\n'
     printf '\n  以后换节点 / 改分流不用再登录路由器, 面板改完自动同步。\n'
     printf '%s────────────────────────────────────────────%s\n' "$C_B" "$C_R"
 }

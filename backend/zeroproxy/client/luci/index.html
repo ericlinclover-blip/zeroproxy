@@ -67,6 +67,8 @@ input[type=text]:focus{outline:2px solid color-mix(in srgb,var(--accent) 45%,tra
 .switch input:checked + .track{background:linear-gradient(135deg,var(--ok),#16a34a);border-color:transparent;
   box-shadow:0 0 0 4px color-mix(in srgb,var(--ok) 16%,transparent),0 8px 22px -10px var(--ok)}
 .switch input:checked + .track .knob{transform:translateX(28px)}
+/* 未授权时它是禁用的 —— 必须看得出来 (灰掉 + 不给手型光标), 否则用户会以为"点不开是坏了" */
+.switch input:disabled + .track{opacity:.5;cursor:not-allowed}
 .swwrap{display:flex;flex-direction:column;align-items:center;gap:5px}
 pre{margin:0;padding:12px;background:var(--card2);border:1px solid var(--border-soft);border-radius:10px;
     font:12px/1.5 var(--mono);color:var(--sub);max-height:260px;overflow:auto;white-space:pre-wrap}

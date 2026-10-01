@@ -87,12 +87,35 @@ const esc = (s) => String(s == null ? '' : s)
 
 const unesc = (s) => String(s || '').replace(/\\n/g, '\n');
 
+/* 读不到状态时 (没有令牌 / 没有 LuCI 会话): 这个页面既显示不了任何真实状态, 也改不了
+   任何东西 —— 那就把控件全部禁用并明确说清楚, 而不是留一个"看起来关着、点了没反应"的
+   开关让用户猜 (真机反馈: "那个开关是关闭的, 而且也无法打开, 是 bug 吗?")。
+   令牌从哪来: 路由器终端里 `zeroproxy ui` 打印的那条带 ?k=… 的地址。 */
+function locked(msg) {
+  $('sub').textContent = msg;
+  $('sub').style.color = 'var(--err)';
+  $('toggle').disabled = true;
+  $('toggle-txt').textContent = '未授权';
+  for (const id of ['add', 'refresh', 'url', 'toggle']) {
+    const el = $(id);
+    if (el) el.disabled = true;
+  }
+  $('servers').innerHTML = `
+    <div class="empty">
+      未授权 — 这个页面读不到状态, 开关和按钮也都不可用。<br><br>
+      在路由器终端 (SSH) 里执行 <b class="mono">zeroproxy ui</b>, 用它打印出来的带
+      <span class="mono">?k=…</span> 的地址打开本页; 打开一次之后, 同一浏览器再用普通地址
+      进来也认。<br>
+      不开浏览器也行: <span class="mono">zeroproxy status | on | off</span>。
+    </div>`;
+}
+
 async function load() {
   try {
     render(await call('status'));
   } catch (e) {
-    $('sub').textContent = e.message;
-    $('sub').style.color = 'var(--err)';
+    // status 拿不到 = 这个页面看不到任何真实状态, 于是进入"未授权"的只读说明态
+    locked(e.message);
   }
 }
 
@@ -103,8 +126,9 @@ $('toggle').onchange = async (ev) => {
     toast(unesc(r.message).split('\n')[0]);
     setTimeout(load, 1500);
   } catch (e) {
-    toast(e.message);
     ev.target.checked = !on;
+    toast(e.message);
+    locked(e.message);
   }
 };
 
