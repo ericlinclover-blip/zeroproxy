@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import os
+
 import pytest
 import yaml
 
@@ -117,6 +119,135 @@ def test_core_binary_endpoint(client, configured, tmp_path, monkeypatch):
     assert res.content == blob.read_bytes()
 
 
+def test_geo_files_are_served_and_name_whitelisted(client, configured, tmp_path, monkeypatch):
+    """分流数据库 (GeoIP / GeoSite) 也由面板分发 —— 和内核二进制同一条思路。
+
+    真机 (GL-MT3000) 现场: mihomo 在 `-t` 时去 GitHub 拉 geoip.metadb, 拉不到就
+    `can't download MMDB: context deadline exceeded` → 整份配置校验失败, 装机停在
+    "写入运行文件"。所以这两份数据必须由面板给 (面板去取上游, 路由器只访问面板)。
+    """
+    from zeroproxy import router_client
+
+    # 文件名是 mihomo 在 `-d` 目录里找来用的, 一个字节都不能改
+    assert set(router_client.GEO_FILES) == {"geoip.metadb", "geosite.dat"}
+
+    blob = tmp_path / "geoip.metadb"
+    blob.write_bytes(b"M" * 128)
+    monkeypatch.setattr(router_client, "fetch_geo", lambda name, **kw: (True, "已缓存", str(blob)))
+
+    assert client.get("/c/geo/nope").status_code == 404
+    assert client.get("/c/geo/..%2fstate.json").status_code == 404
+    assert client.get("/c/geo/geoip.dat").status_code == 404
+    res = client.get("/c/geo/geoip.metadb")
+    assert res.status_code == 200
+    assert res.content == blob.read_bytes()
+
+
+def test_geo_cache_avoids_second_download(client, configured, home, monkeypatch):
+    """同一份数据只下第一次: 第二台路由器装机时面板不再跑一趟 4 MB。"""
+    from zeroproxy import router_client
+
+    monkeypatch.setattr(router_client, "GEO_MIN_OVERRIDE", 16)
+    dst = router_client.geo_file("geoip.metadb")
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    with open(dst, "wb") as fh:
+        fh.write(b"x" * 32)
+
+    def boom(*args, **kwargs):  # pragma: no cover - 走到这里就是失败
+        raise AssertionError("本地已有数据时不该联网")
+
+    monkeypatch.setattr(router_client.urllib.request, "urlopen", boom)
+    ok, detail, path = router_client.fetch_geo("geoip.metadb")
+    assert ok and path == dst and "缓存" in detail
+
+
+def test_router_profile_takes_geo_from_the_panel(client, configured):
+    """路由器端配置里的 geox-url 指向面板自己 —— 装机时它连不上 GitHub。"""
+    _login(client)
+    device = _register(client, _pair_code(client)["code"])
+    sub = f"/c/sub/{device['id']}?k={device['secret']}"
+    base = f"http://{DOMAIN}:8899"
+
+    profile = yaml.safe_load(client.get(sub).text)
+    assert profile["geox-url"]["mmdb"] == base + "/c/geo/geoip.metadb"
+    assert profile["geox-url"]["geosite"] == base + "/c/geo/geosite.dat"
+
+    # 手机 / 电脑端不受影响: 它们本来就能上网, 用公共镜像更快
+    path = configured["subscription_url"].split("testserver")[-1]
+    phone = yaml.safe_load(client.get(path + "?format=clash").text)
+    assert phone["geox-url"]["mmdb"].startswith("https://")
+    assert "/c/geo/" not in phone["geox-url"]["mmdb"]
+
+
+def test_router_profile_degrades_when_panel_has_no_geo_data(client, configured):
+    """面板暂时给不出分流数据库时, 配置里不能留任何 geo 规则。
+
+    mihomo 缺数据不是"跳过那几条规则", 而是整份配置加载失败 —— 少一层国内直连还能
+    上网, 起不来就是全屋断网。所以降级配置里一条 geo 规则都不能有 (GEOIP,LAN 例外:
+    私有地址是内建判断, 不需要数据库)。
+    """
+    _login(client)
+    device = _register(client, _pair_code(client)["code"])
+    sub = f"/c/sub/{device['id']}?k={device['secret']}"
+
+    profile = yaml.safe_load(client.get(sub + "&geo=0").text)
+    rules = "\n".join(profile["rules"])
+    assert "GEOSITE," not in rules
+    assert "GEOIP,CN" not in rules
+    assert "GEOIP,LAN," in rules
+    assert profile["rules"][-1] == "MATCH,🐟 漏网之鱼"
+    assert "nameserver-policy" not in profile["dns"]   # 它的键也是 geosite:… , 要数据库
+    assert profile["tun"]["enable"] is True
+    # 多服务器模式 (骨架) 同样要能降级
+    skeleton = yaml.safe_load(client.get(sub + "&format=skeleton&geo=0").text)
+    assert "GEOSITE," not in "\n".join(skeleton["rules"])
+
+
+def test_install_script_never_fetches_geo_from_the_internet():
+    """安装脚本不许自己去找 GitHub / jsDelivr: 装机时路由器还没有代理可用,
+    那条路就是真机上的超时。数据只能来自面板 (/c/geo), 而且要在生成配置之前就位。
+    """
+    from zeroproxy import router_client
+
+    raw = open(router_client.script_path(), encoding="utf-8").read()
+    text = "\n".join(line for line in raw.splitlines() if not line.lstrip().startswith("#"))
+    assert "/c/geo/" in text, "分流数据要从面板取"
+    for host in ("github.com", "githubusercontent", "jsdelivr", "MetaCubeX", "ghproxy", "gh-proxy"):
+        assert host not in text, f"安装脚本不该直接去 {host} 拿数据"
+    # 取数据的实现只有一份 (agent.sh 里), 安装脚本通过它触发; 生成配置的判据是本机文件
+    assert '"$ZP_DIR/agent.sh" geo force' in text
+    assert "geo_ok" in text and "&geo=" in text
+    # 旧面板 (没有 /c/geo) 必须在装机当场被认出来, 而不是让用户拿到
+    # "拉取/校验配置失败, 请回面板确认已有可用节点" 这种无从下手的报错
+    assert "PANEL_GEO" in text
+
+
+def test_install_script_parses_booleans_on_any_sed():
+    """能力位与开关位都靠 json_get_bool 读。原来的写法用 `\\(true\\|false\\)`, 而 `\\|` 是
+    GNU 扩展 —— BSD sed (macOS 演练环境 / 没有 jsonfilter 的固件) 会**静默取空**, 于是
+    "面板说不支持分流数据"被读成"没这个字段", 该拦下的旧面板就漏过去了。
+
+    这里真的把脚本里那段函数抠出来, 用 sh 跑一遍。
+    """
+    import re
+    import subprocess
+
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+    body = re.search(r"json_get_bool\(\) \{.*?\n\}", text, re.S)
+    assert body, "安装脚本里应当有 json_get_bool"
+    script = body.group(0) + (
+        "\njson_get_bool '{\"id\":\"dv1\",\"geo\":true}' geo\n"
+        "json_get_bool '{\"id\":\"dv1\",\"geo\":false}' geo\n"
+        "json_get_bool '{\"desired\": true, \"geo\": false}' desired\n"
+        "json_get_bool '{\"id\":\"dv1\"}' geo\n"
+    )
+    out = subprocess.run(["sh", "-c", script], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["true", "false", "true"]
+
+
 def test_install_script_sticks_to_busybox_tools():
     """(见下) 安装脚本只能用路由器上确实有的命令。"""
     """路由器上的可用命令比服务器少得多, 这条测试盯住"用了 OpenWrt 没有的工具"。
@@ -218,6 +349,18 @@ def test_device_subscription_requires_secret(client, configured):
     assert client.get(f"/c/sub/{device['id']}?k=wrong").status_code == 403
     assert client.get(f"/c/sub/{device['id']}").status_code == 403
     assert client.get(f"/c/sub/dv-nope?k={device['secret']}").status_code == 403
+
+
+def test_pair_response_advertises_geo_capability(client, configured):
+    """客户端要在装机当场就知道"这台面板给不给分流数据"。
+
+    旧面板没有 /c/geo, 而它给出的配置一定带 geo 规则 —— 路由器只能去 GitHub 拉并超时
+    (真机就是这个现象)。所以配对响应里带一个能力位, 客户端据此决定是"停下来让用户先升级
+    面板"还是"降级装上去"。
+    """
+    _login(client)
+    data = _register(client, _pair_code(client)["code"])
+    assert data["geo"] is True
 
 
 def test_provider_format_is_nodes_only_with_domain_prefix(client, configured):

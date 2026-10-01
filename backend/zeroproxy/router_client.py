@@ -12,6 +12,7 @@ release 域名经常不可达, 用户看到的是"装到一半卡住"。所以�
 from __future__ import annotations
 
 import os
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -19,7 +20,7 @@ import urllib.request
 from .config import paths
 
 #: 路由器端脚本版本 (会显示在面板的设备卡上; 改了脚本就 +1)
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.0"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"
@@ -157,6 +158,173 @@ def fetch_core(arch: str, *, timeout: int = 180) -> tuple[bool, str, str]:
     return False, "; ".join(errors)[-300:], ""
 
 
+# ---------------------------------------------------------------- 分流数据库
+# mihomo 加载 GEOSITE / GEOIP 规则时**必须**有分流数据库: 缺文件不是"跳过这条规则",
+# 而是整份配置直接加载失败。它自己的默认行为是当场去 GitHub 拉 (geox-url 的默认值),
+# 真机上那一步就是"安装卡住"的来源:
+#
+#     level=error msg="can't initial GeoIP: can't download MMDB: context deadline exceeded"
+#     level=error msg="rules[38] [GEOIP,CN,🎯 全球直连] error: ... context deadline exceeded"
+#     configuration file /etc/zeroproxy/config.yaml.new test failed
+#
+# 路由器端的网络正好是最难访问 GitHub 的那一类 (装机时它还没有任何代理可用)。所以和
+# 内核二进制一样: **面板去下, 路由器只访问面板一个地址**。路由器把文件放进自己的工作
+# 目录, mihomo 看到文件就不再下载 —— 整条装机链路不再需要外网。
+#
+# 选文件的原则是"路由器闪存要小": 规则真正用到的只有 CN 的 IP 段和几个域名分类, 上游
+# 为此专门出了 lite 版 (geoip-lite.metadb, 0.4 MB)。再配一份完整的 geosite.dat
+# (4 MB, 含 cn / private / category-ads-all / netflix / disney / hbo / primevideo /
+# youtube), 一共 4.4 MB —— 是面板自己那两份 (Loyalsoldier, 28 MB) 的六分之一。
+#
+# 文件名不能改: mihomo 在 `-d` 目录里按名字找 (大小写不敏感) —— GEOIP 认
+# Country.mmdb / geoip.db / geoip.metadb, GEOSITE 认 geosite.dat。
+GEO_FILES: dict[str, tuple[str, int]] = {
+    "geoip.metadb": (
+        "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip-lite.metadb",
+        200 << 10,
+    ),
+    "geosite.dat": (
+        "https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat",
+        2 << 20,
+    ),
+}
+
+#: 数据过期时间: 超过就从上游重取 (分流数据不是"越新越好", 但也不能永远不更新 —— 一周
+#: 一次足够, 而且只在路由器安装/重装时才下载)。
+GEO_TTL = int(os.environ.get("ZP_GEO_TTL", str(7 * 86400)))
+
+#: 单个镜像的超时 (4 MB 的文件, 90 秒足够; 与 mihomo 自己的下载超时同量级)。
+GEO_SOURCE_TIMEOUT = 90
+
+#: 分流数据库的镜像顺序: 与内核不同, 把国内可用的反代放前面。GitHub 直连在受限出口上
+#: 是"卡满超时再失败", 排第一会白吃掉整个时间预算 (真机网络就是这样: 直连与 ghfast
+#: 都超时, 只有 gh-proxy 通)。
+GEO_MIRRORS = (
+    "https://gh-proxy.com/{url}",
+    "https://hk.gh-proxy.com/{url}",
+    "{url}",
+    "https://ghfast.top/{url}",
+    "https://ghproxy.net/{url}",
+)
+
+#: 一次下载的总时间上限。5 个镜像各 90 秒最坏是 7 分钟, 而路由器正在**同步等**这份
+#: 数据 —— 它不可能给一台面板几分钟去翻墙。到点就如实报错, 让路由器先降级装上。
+GEO_DEADLINE = int(os.environ.get("ZP_GEO_DEADLINE", "200"))
+
+#: 体积下限 (挡 404 页面 / 限流提示)。演练里用 ZP_GEO_MIN_BYTES 调低: 一个几百字节的
+#: 假文件就能把"路由器从面板取数据"这条路整条跑通。
+GEO_MIN_OVERRIDE = int(os.environ.get("ZP_GEO_MIN_BYTES", "0") or 0)
+
+#: 同一时间只允许一个下载任务: 两台路由器同时装机时不该把 4 MB 的文件拉两遍。
+GEO_LOCK = threading.Lock()
+
+
+def geo_min_bytes(name: str) -> int:
+    if GEO_MIN_OVERRIDE > 0:
+        return GEO_MIN_OVERRIDE
+    return GEO_FILES[name][1]
+
+
+def geo_dir() -> str:
+    return os.path.join(paths()["data_dir"], "client", "geo")
+
+
+def geo_file(name: str) -> str:
+    return os.path.join(geo_dir(), name)
+
+
+def geo_ready(name: str) -> bool:
+    try:
+        return os.path.getsize(geo_file(name)) >= geo_min_bytes(name)
+    except (OSError, KeyError):
+        return False
+
+
+def geo_stale(name: str) -> bool:
+    try:
+        return (time.time() - os.path.getmtime(geo_file(name))) > GEO_TTL
+    except OSError:
+        return True
+
+
+def cached_geo() -> list[dict]:
+    """面板上「路由器分流数据」的展示信息。"""
+    out = []
+    for name in GEO_FILES:
+        try:
+            size = os.path.getsize(geo_file(name))
+        except OSError:
+            continue
+        out.append({
+            "name": name,
+            "size": size,
+            "fresh": not geo_stale(name),
+            "mtime": int(os.path.getmtime(geo_file(name))),
+        })
+    return out
+
+
+def fetch_geo(
+    name: str, *, timeout: int = GEO_SOURCE_TIMEOUT, force: bool = False
+) -> tuple[bool, str, str]:
+    """按镜像顺序取一份分流数据库。返回 (ok, 说明, 本地路径)。
+
+    已缓存且没过期就直接返回 —— 路由器重装 / 多台设备复用时不再重复下载 (4 MB 也是流量)。
+    """
+    if name not in GEO_FILES:
+        return False, f"未知的数据文件: {name}", ""
+    dst = geo_file(name)
+    if not force and geo_ready(name) and not geo_stale(name):
+        return True, "已缓存", dst
+
+    url, _default_min = GEO_FILES[name]
+    minimum = geo_min_bytes(name)
+    errors: list[str] = []
+    with GEO_LOCK:
+        # 等锁期间别的请求可能已经下好了
+        if not force and geo_ready(name) and not geo_stale(name):
+            return True, "已缓存", dst
+        os.makedirs(geo_dir(), exist_ok=True)
+        tmp = dst + ".part"
+        deadline = time.time() + GEO_DEADLINE
+        for template in GEO_MIRRORS:
+            source = template.format(url=url)
+            left = deadline - time.time()
+            if left <= 1:
+                errors.append("总时间超限, 放弃剩余镜像")
+                break
+            try:
+                request = urllib.request.Request(source, headers={"User-Agent": UA})
+                per_try = max(5, min(timeout, int(left)))
+                with urllib.request.urlopen(request, timeout=per_try) as resp:
+                    status = getattr(resp, "status", 200)
+                    if status is not None and status != 200:
+                        errors.append(f"{source} HTTP {status}")
+                        continue
+                    size = 0
+                    with open(tmp, "wb") as fh:
+                        while True:
+                            chunk = resp.read(1 << 18)
+                            if not chunk:
+                                break
+                            fh.write(chunk)
+                            size += len(chunk)
+                if size < minimum:
+                    errors.append(f"{source} 体积异常 ({size} 字节)")
+                    continue
+                os.replace(tmp, dst)
+                return True, f"已下载 {size // 1024} KB", dst
+            except (urllib.error.URLError, OSError, TimeoutError) as exc:
+                errors.append(f"{source} {exc}")
+            finally:
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+    return False, "; ".join(errors)[-300:], ""
+
+
 # ---------------------------------------------------------------- 安装脚本
 
 def script_path() -> str:
@@ -217,5 +385,7 @@ def summary() -> dict:
         "core_version": CORE_VERSION,
         "arches": [{"id": a, "label": ARCH_LABEL.get(a, a)} for a in ARCHES],
         "cached": cached_arches(),
+        "geo": cached_geo(),
+        "geo_names": list(GEO_FILES),
         "cached_at": int(time.time()),
     }

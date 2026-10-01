@@ -2925,6 +2925,33 @@ def client_core_binary(arch: str, request: Request):
     )
 
 
+@router.get("/c/geo/{name}")
+def client_geo_file(name: str, request: Request):
+    """路由器端的分流数据库 (mihomo 的 GeoIP / GeoSite)。
+
+    为什么由面板发: mihomo 缺这两份文件时不是"跳过 geo 规则"而是**整份配置加载失败**,
+    而它默认会当场去 GitHub 拉 —— 真机 (GL-MT3000) 上那一步是
+    `can't download MMDB: context deadline exceeded`, 装机直接卡死在这里。
+    所以和内核二进制同一条思路: 面板下好、缓存好, 路由器只访问面板。
+
+    名字走白名单 (只有 geoip.metadb / geosite.dat), 内容不含任何凭据。
+    """
+    state = load_state()
+    if not state["configured"]:
+        return _err("面板尚未初始化", 409)
+    if name not in router_client.GEO_FILES:
+        return _err("没有这个数据文件", 404)
+    ok, detail, path = router_client.fetch_geo(name)
+    if not ok or not path:
+        return _err(f"分流数据库下载失败: {detail}", 502)
+    return FileResponse(
+        path,
+        media_type="application/octet-stream",
+        headers={"cache-control": "no-store"},
+        filename=name,
+    )
+
+
 @router.get("/c/ui/{name}")
 def client_ui_file(name: str, request: Request):
     """路由器管理界面的文件 (index.html / app.js / cgi / 菜单 JSON)。
@@ -2971,6 +2998,10 @@ def client_pair(payload: DeviceRegisterIn, request: Request):
             "name": device["name"],
             "desired": bool(device["desired"]),
             "rev": devices.config_rev(state),
+            # 能力位: 客户端据此判断"这台面板给不给分流数据库"。旧面板没有 /c/geo,
+            # 拿到的配置却带 geo 规则 —— 路由器只能去 GitHub 拉并超时, 所以客户端
+            # 需要在装机时就发现这一点并当场说清楚 (见 router-install.sh 的 install_geo)。
+            "geo": True,
             "sub": f"{base}/c/sub/{device['id']}?k={secret}&format=clash&rules=smart",
             "report": f"{base}/c/report",
         }
@@ -2984,10 +3015,13 @@ def client_subscription(
     format: str = "clash",
     rules: str = "",
     prefix: str = "",
+    geo: int = 1,
 ):
     """设备专属订阅。设备不该拿到主订阅令牌, 所以它走自己的凭据。
 
     单个设备可以用 `?rules=` 覆盖分流模板 (面板上那台设备的设置优先)。
+    `?geo=0` 表示这台设备现在拿不到分流数据库 (面板暂时取不到, 或路由器上还没有):
+    这时不给它任何 geo 规则 —— mihomo 缺数据库不是"跳过规则"而是整份配置加载失败。
     三种输出:
       format=clash     整份路由器配置 (单服务器模式, 内联节点)
       format=skeleton  骨架 (多服务器模式: providers 与组的 use 留空, 由路由器填)
@@ -3015,6 +3049,9 @@ def client_subscription(
             router=True,
             device=str(device.get("name") or ""),
             prefix=(prefix or "").strip()[:40],
+            geo=bool(geo),
+            # 分流数据库的下载地址指向面板自己 (路由器只需要能访问面板)
+            base=share_links.panel_base_url(request, state),
         )
         # 拉配置也算一次"设备还活着": 装完立刻在面板上显示在线, 不用等下一轮心跳
         if devices.touch(state, device, {"ip": _client_ip(request), "rev": devices.config_rev(state)}):

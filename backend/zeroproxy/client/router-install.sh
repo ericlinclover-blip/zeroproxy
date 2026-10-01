@@ -36,6 +36,10 @@ TLS_OPTS=""
 ARCH=""
 DEPENDENCY_NOTE=""
 ACTIVE_MODE=""
+# 面板是否提供分流数据库接口 (/c/geo)。空 = 没问过 (更新模式), true = 有
+PANEL_GEO=""
+# 非空 = 这次只能装降级配置 (面板暂时给不出分流数据库), 结尾要如实说明
+DEGRADED=""
 # 设备凭据与配对结果 (set -u 下必须预置: 只有在真的走过那条分支时才会被赋值)
 DEV_ID=""
 DEV_SECRET=""
@@ -88,6 +92,19 @@ http_get() {
     esac
 }
 
+# 大文件下载 (内核 20 MB / 分流数据库 4 MB)。30 秒的通用超时是给接口用的: 4 Mbps 的
+# 线路上光内核就要 40 秒, 卡在这里会变成"下载内核失败"这种看不懂的报错。
+http_get_file() {
+    case "$HTTP" in
+        curl)
+            if [ "$TLS_OPTS" = "insecure" ]; then curl -fsSk -m 600 "$1"
+            else curl -fsS -m 600 "$1"; fi ;;
+        *)
+            if [ "$TLS_OPTS" = "insecure" ]; then "$HTTP" -q --no-check-certificate -T 600 -O - "$1"
+            else "$HTTP" -q -T 600 -O - "$1"; fi ;;
+    esac
+}
+
 http_post() {
     _url="$1"; _body="$2"
     case "$HTTP" in
@@ -127,8 +144,15 @@ json_get_bool() {
     _json="$1"; _key="$2"
     if command -v jsonfilter >/dev/null 2>&1; then
         printf '%s' "$_json" | jsonfilter -e "@.$_key" 2>/dev/null | head -n1
-    else
-        printf '%s' "$_json" | sed -n 's/.*"'"$_key"'"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' | head -n1
+        return 0
+    fi
+    # 不用 `sed -n 's/...\(true\|false\).../\1/p'`: `\|` 是 GNU 扩展, BSD sed (macOS) 不认,
+    # 会**静默取到空值** —— 能力位读成空, 旧面板该被拦下的就拦不下 (本机演练抓到过)。
+    # 两次固定串匹配在 busybox / BSD / GNU 上行为一致。
+    if printf '%s' "$_json" | grep -q "\"$_key\"[[:space:]]*:[[:space:]]*true"; then
+        printf 'true\n'
+    elif printf '%s' "$_json" | grep -q "\"$_key\"[[:space:]]*:[[:space:]]*false"; then
+        printf 'false\n'
     fi
 }
 
@@ -229,6 +253,10 @@ do_pair() {
     _resp="$(http_post "$ZP_BASE/c/pair" "$_body" || true)"
     DEV_ID="$(json_get "$_resp" id)"
     DEV_SECRET="$(json_get "$_resp" secret)"
+    # 面板的能力位: 有没有 /c/geo 分流数据库接口。旧面板没有 —— 那种面板给出的配置
+    # 一定带 geo 规则, 而这台路由器上没有数据库, 内核会去 GitHub 拉并超时。所以这个
+    # 标记是"要不要当场拦住用户"的唯一依据 (见 install_geo)。
+    PANEL_GEO="$(json_get_bool "$_resp" geo)"
     if [ -z "$DEV_ID" ] || [ -z "$DEV_SECRET" ]; then
         PAIR_ERROR="$(json_get "$_resp" error)"
         [ -n "$PAIR_ERROR" ] || PAIR_ERROR="面板没有返回设备凭据 (配对码可能已过期)"
@@ -295,7 +323,8 @@ install_deps() {
 install_core() {
     step "下载代理内核 (mihomo · $ARCH)"
     # 清掉上一次中断留下的半截下载: 路由器闪存很小, 20 MB 的临时文件不该长期躺着
-    rm -f "$ZP_DIR/.mihomo.gz" "$ZP_DIR"/*.new 2>/dev/null || true
+    # (.geo-*.part 是分流数据库的; 中断后重跑会重新下, 旧的没必要留着占地方)
+    rm -f "$ZP_DIR/.mihomo.gz" "$ZP_DIR"/*.new "$ZP_DIR"/.geo-*.part 2>/dev/null || true
     # 复用旧文件前必须确认它真的跑得起来: 上一次失败可能留下一个没解开的 gz
     # (chmod 是成功的, 只看 -x 会以为装好了, 于是每次重跑都在同一个地方再挂一次)。
     if [ -x "$ZP_BIN" ] && "$ZP_BIN" -v >/dev/null 2>&1; then
@@ -305,7 +334,7 @@ install_core() {
     rm -f "$ZP_BIN"
     _tmp="$ZP_DIR/.mihomo.gz"
     mkdir -p "$ZP_DIR"
-    http_get "$ZP_BASE/c/bin/$ARCH" > "$_tmp" || die "下载内核失败 (面板上该架构的二进制没有缓存成功, 请稍后重试)"
+    http_get_file "$ZP_BASE/c/bin/$ARCH" > "$_tmp" || die "下载内核失败 (面板上该架构的二进制没有缓存成功, 请稍后重试)"
     [ -s "$_tmp" ] || die "下载到的内核是空文件"
     # 判断"是不是 gzip"只能用 gzip -t, 不能用 `od -An -tx1` 看魔数 ——
     # OpenWrt 的 busybox 默认不带 od, 命令不存在时那一行会静默失败, 于是 gz 被当成
@@ -364,6 +393,56 @@ fetch_config() {
 }
 
 # ---------------------------------------------------------------- 落文件
+# ---------------------------------------------------------------- 分流数据库
+# mihomo 缺 GeoIP / GeoSite 时**不是**跳过那几条规则, 而是整份配置加载失败 —— 它自己
+# 会当场去 GitHub 拉, 而路由器装机时还没有任何代理可用。真机 (GL-MT3000) 上就是:
+#
+#     level=error msg="can't initial GeoIP: can't download MMDB: context deadline exceeded"
+#     configuration file /etc/zeroproxy/config.yaml.new test failed
+#     安装失败: 拉取/校验配置失败, 请回面板确认已有可用节点
+#
+# 所以数据由面板分发 (和内核二进制同一条思路): 面板去取上游, 路由器只访问面板一个地址。
+# 取不到时**不装死**: 装一份不含 geo 规则的降级配置 (能上网), 面板恢复后 agent 自动换回。
+# (agent.sh 里有一个同名函数 —— 两边是不同进程, 判据只能是"这两个文件在不在"。)
+geo_ok() { [ -s "$ZP_DIR/geoip.metadb" ] && [ -s "$ZP_DIR/geosite.dat" ]; }
+
+install_geo() {
+    step "准备分流数据库 (GeoIP / GeoSite)"
+    if "$ZP_DIR/agent.sh" geo force >/dev/null 2>&1; then
+        ok "分流数据库就绪 ($(wc -c < "$ZP_DIR/geoip.metadb" 2>/dev/null | tr -d ' ') + $(wc -c < "$ZP_DIR/geosite.dat" 2>/dev/null | tr -d ' ') 字节)"
+        return 0
+    fi
+    if geo_ok; then
+        warn "本次刷新失败, 继续用本机已有的分流数据库"
+        return 0
+    fi
+    # 面板明说自己没有这个接口 = 这台面板比客户端旧。这种情况下它的配置一定带 geo 规则,
+    # 而这台路由器上没有数据 —— 与其让人对着"拉取/校验配置失败"发呆, 不如当场说清楚。
+    # (更新模式没有配对回执, 这里未知 —— 交给 config_failure 收尾。)
+    if [ -n "$PANEL_GEO" ] && [ "$PANEL_GEO" != "true" ]; then
+        die "这台面板没有提供分流数据库 (它的程序版本比路由器客户端旧)。
+  配置里的国内直连 / 广告拦截依赖 GeoIP / GeoSite, 缺了内核起不来, 所以这里停住 ——
+  请先在面板上点「程序更新」升级, 再重跑这条安装命令。"
+    fi
+    # 面板说有, 但这次没取到 (面板自己访问不了上游 / 网络抖动): 先让它能上网。
+    warn "这次没取到分流数据库 (面板暂时取不到上游数据?)"
+    warn "按降级配置安装: 不含国内直连与广告拦截, 其余照常走节点"
+    warn "数据到位后这台路由器会自动换回完整分流, 不用再登录路由器"
+    DEGRADED="geo"
+    return 0
+}
+
+# 配置落不下去时给一句对症的话。旧面板是这里最常见的坑: 它给的配置带 geo 规则, 而它
+# 没有 /c/geo 接口 —— 路由器只能去 GitHub 拉, 于是表现为"拉取/校验配置失败"。
+config_failure() {
+    if ! geo_ok; then
+        die "配置校验失败: 本机没有分流数据库 (GeoIP / GeoSite)。
+  这台面板的程序版本可能比路由器客户端旧 (没有 /c/geo 分流数据接口)。请先在面板上
+  点「程序更新」升级到最新版, 再重跑这条安装命令。"
+    fi
+    die "拉取/校验配置失败, 请回面板确认已有可用节点"
+}
+
 write_files() {
     step "写入运行文件"
     mkdir -p "$ZP_DIR"
@@ -411,6 +490,13 @@ SERVERS="$ZP_DIR/servers"
 DEV="$ZP_DIR/device.json"
 CONF="$ZP_DIR/config.yaml"
 STATE="$ZP_DIR/state"
+#: 分流数据库 (mihomo 的 GEOSITE / GEOIP 规则要用)。缺了**不是**跳过那几条规则, 而是
+#: 整份配置加载失败 —— 而 mihomo 会当场去 GitHub 拉, 装机时这台路由器还没有任何代理
+#: 可用, 真机上就是 `can't download MMDB: context deadline exceeded`。所以和内核一样
+#: 由面板分发: 面板去取上游, 路由器只访问面板。文件名是 mihomo 认死的, 不能改。
+GEO_FILES="geoip.metadb geosite.dat"
+#: 客户端版本 (占位符在落盘后被替换成真实版本号, 见安装脚本 write_files 里的 sed)
+ZP_VERSION="__ZP_CLIENT_VERSION__"
 
 log() { logger -t zeroproxy-agent "$*"; }
 
@@ -473,6 +559,38 @@ providers_yaml() {
     done
 }
 
+# 分流数据库是否就位 (两份都要): 配置里的 GEOSITE / GEOIP,CN 规则靠它
+geo_ok() { [ -s "$ZP_DIR/geoip.metadb" ] && [ -s "$ZP_DIR/geosite.dat" ]; }
+
+# 从面板取分流数据库 (参数 force 时即使本地已有也重取)。返回 0 = 两份都齐了。
+# 一份都取不到时返回非 0: 调用方据此输出"不含 geo 规则"的降级配置 —— 能上网, 而且
+# 面板恢复后下一次重建配置会自动换回完整分流。
+ensure_geo() {
+    _force="${1:-}"
+    _need=""
+    for _g in $GEO_FILES; do
+        if [ "$_force" = "force" ] || [ ! -s "$ZP_DIR/$_g" ]; then _need="$_need $_g"; fi
+    done
+    [ -n "$_need" ] || return 0
+    for _f in $(server_files); do
+        _b="$(field_of "$_f" base)"
+        [ -n "$_b" ] || continue
+        _got=1
+        for _g in $_need; do
+            _tmp="$ZP_DIR/.geo-$$.part"
+            if http_get_file "$_b/c/geo/$_g" > "$_tmp" 2>/dev/null && [ -s "$_tmp" ]; then
+                mv "$_tmp" "$ZP_DIR/$_g"
+            else
+                rm -f "$_tmp"
+                _got=0
+                break
+            fi
+        done
+        [ "$_got" = "1" ] && return 0
+    done
+    geo_ok
+}
+
 # 生成最终配置并打到标准输出。
 #   单服务器: 直接用面板给的整份配置 (已验证的老路径)
 #   多服务器: 取第一台的骨架, 把 providers 与组的 use 填上 (按行替换, 不做 YAML 解析)
@@ -482,11 +600,14 @@ build_config() {
     [ -n "$_first" ] || return 1
     _b="$(field_of "$_first" base)"; _i="$(field_of "$_first" id)"; _k="$(field_of "$_first" secret)"
     _n="$(count_servers)"
+    # 没有分流数据库就不能要 geo 规则 (面板知道这件事, 会给一份降级规则)。判据必须是
+    # 本机文件: 数据库在路由器上, 面板看不到它。
+    _geo="1"; geo_ok || _geo="0"
     if [ "$_n" -le 1 ]; then
-        http_get "$_b/c/sub/$_i?k=$_k&format=clash&rules=smart"
+        http_get "$_b/c/sub/$_i?k=$_k&format=clash&rules=smart&geo=$_geo"
         return $?
     fi
-    _skel="$(http_get "$_b/c/sub/$_i?k=$_k&format=skeleton&rules=smart")" || return 1
+    _skel="$(http_get "$_b/c/sub/$_i?k=$_k&format=skeleton&rules=smart&geo=$_geo")" || return 1
     [ -n "$_skel" ] || return 1
     # provider 段落走临时文件而不是 `awk -v block=...`: -v 的值里带换行时, BSD awk
     # 直接报 "newline in string", busybox awk 的转义处理也不一致 (本机演练抓到的)。
@@ -514,7 +635,16 @@ json_get() {
         printf '%s' "$1" | sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1
     fi
 }
-json_get_bool() { printf '%s' "$1" | sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' | head -n1; }
+# 布尔位解析 (面板回的 desired / geo)。与安装脚本里那份同理: `\|` 是 GNU 扩展, BSD sed
+# 会静默取空, 于是"面板要求关"被读成"没要求" —— 这是本机演练会踩到的坑。
+json_get_bool() {
+    _json="$1"; _key="$2"
+    if printf '%s' "$_json" | grep -q "\"$_key\"[[:space:]]*:[[:space:]]*true"; then
+        printf 'true\n'
+    elif printf '%s' "$_json" | grep -q "\"$_key\"[[:space:]]*:[[:space:]]*false"; then
+        printf 'false\n'
+    fi
+}
 
 http_post() {
     _url="$1"; _body="$2"
@@ -529,6 +659,13 @@ http_get() {
     if command -v curl >/dev/null 2>&1; then curl -fsSk -m 30 "$1" 2>/dev/null
     else uclient-fetch -q --no-check-certificate -O - "$1" 2>/dev/null \
         || wget -q --no-check-certificate -O - "$1" 2>/dev/null
+    fi
+}
+# 大文件下载 (分流数据库 4 MB): 30 秒的接口超时对它是太紧了, 慢宽带会直接失败
+http_get_file() {
+    if command -v curl >/dev/null 2>&1; then curl -fsSk -m 600 "$1" 2>/dev/null
+    else uclient-fetch -q --no-check-certificate -T 600 -O - "$1" 2>/dev/null \
+        || wget -q --no-check-certificate -T 600 -O - "$1" 2>/dev/null
     fi
 }
 
@@ -562,6 +699,9 @@ switch_core() {
 }
 
 apply_config() {
+    # 分流数据库不在就先补一次: 上一次装机降级 (面板取不到上游) 或被人清过时, 这里
+    # 自动回到完整分流 —— 用户不用再登录路由器做任何事。
+    ensure_geo >/dev/null 2>&1 || true
     # 原子替换: 新配置先落 .new, 校验通过才替换, 失败保留旧配置继续用。
     build_config > "$CONF.new" 2>/dev/null || { rm -f "$CONF.new"; return 1; }
     # 单服务器模式带内联 proxies, 多服务器模式带 proxy-providers —— 唯一共同的锚点是
@@ -584,6 +724,7 @@ apply_config() {
 # agent.sh once 只跑一轮心跳 (排查用)。默认无参数 = 常驻循环。
 case "${1:-}" in
     config) migrate_servers; build_config; exit $? ;;
+    geo)    migrate_servers; ensure_geo "${2:-}"; exit $? ;;
     once)   RUN_ONCE=1 ;;
 esac
 
@@ -603,7 +744,7 @@ while true; do
     for _f in $(server_files); do
         _b="$(field_of "$_f" base)"; _i="$(field_of "$_f" id)"; _k="$(field_of "$_f" secret)"
         [ -n "$_b" ] || continue
-        BODY='{"device":"'"$_i"'","k":"'"$_k"'","version":"1.0.0"'
+        BODY='{"device":"'"$_i"'","k":"'"$_k"'","version":"'"$ZP_VERSION"'"'
         if core_up; then BODY="$BODY"',"actual":true'; else BODY="$BODY"',"actual":false'; fi
         [ -n "$LAST_REV" ] && BODY="$BODY"',"rev":"'"$LAST_REV"'"'
         BODY="$BODY"'}'
@@ -717,6 +858,7 @@ AGENTINITEOF
 #!/bin/sh
 # ZeroProxy 路由器客户端运维命令
 ZP_DIR=/etc/zeroproxy
+ZP_VERSION="__ZP_CLIENT_VERSION__"
 SERVERS="$ZP_DIR/servers"
 FIRST="$(ls "$SERVERS"/*.json 2>/dev/null | head -n1)"
 
@@ -762,7 +904,7 @@ case "${1:-status}" in
         echo "正在与 $_base 配对…"
         _model="$(cat /tmp/sysinfo/model 2>/dev/null || uname -m)"; _hn="$(cat /proc/sys/kernel/hostname 2>/dev/null || echo router)"
         _model="$(printf %s "$_model" | tr -d '"')"
-        _body='{"code":"'"$_code"'","kind":"router","model":"'"$_model"'","hostname":"'"$_hn"'","arch":"'"$(uname -m)"'","os":"OpenWrt","version":"1.0.0"}'
+        _body='{"code":"'"$_code"'","kind":"router","model":"'"$_model"'","hostname":"'"$_hn"'","arch":"'"$(uname -m)"'","os":"OpenWrt","version":"'"$ZP_VERSION"'"}'
         if command -v curl >/dev/null 2>&1; then
             _resp="$(curl -fsSk -m 30 -H 'Content-Type: application/json' --data "$_body" "$_base/c/pair" 2>/dev/null)"
         else
@@ -849,6 +991,11 @@ EOF
         echo "(打开一次即可; 之后同一浏览器不用再带令牌)"
         ;;
     log)        logread -e zeroproxy | tail -n "${2:-40}" ;;
+    geo)
+        # 重新取分流数据库 (面板换了 / 数据更新了, 不用重跑安装)
+        "$ZP_DIR/agent.sh" geo force && echo "分流数据库已更新" \
+            || echo "取分流数据库失败 (面板不可达, 或面板自己取不到上游数据)"
+        ;;
     update)
         echo "重新执行面板上的安装命令即可升级 (配置与凭据会保留)"
         ;;
@@ -863,13 +1010,24 @@ EOF
         rm -rf "$ZP_DIR" /etc/init.d/zeroproxy /etc/init.d/zeroproxy-agent /usr/bin/zeroproxy
         echo "已卸载。这台设备在面板上仍然存在, 请在面板「客户端」里一并移除。"
         ;;
-    *) echo "用法: zeroproxy [status|ui|servers|add <链接>|drop <键>|refresh|on|off|log|uninstall]" ;;
+    *) echo "用法: zeroproxy [status|ui|servers|add <链接>|drop <键>|refresh|geo|on|off|log|uninstall]" ;;
 esac
 CLIEOF
     chmod 755 "$ZP_CLI"
+    # 版本号在 heredoc 里是占位符 (带引号的 heredoc 不做变量替换), 落盘后再替换一次 ——
+    # 免得"agent 上报的版本"和"面板显示的客户端版本"各写一个常量, 改一处漏一处。
+    # 用临时文件 + mv 而不是 sed -i: BSD sed 的 -i 要跟备份后缀, 演练时跑在 macOS 上。
+    # 注意 chmod 要在替换之后: mv 过来的是一个新文件, 权限是新建时的默认值 (0644) ——
+    # 少这一步 agent 与 CLI 就不可执行, 安装会以 "Permission denied" 结束 (演练抓到过)。
+    for _f in "$ZP_DIR/agent.sh" "$ZP_CLI"; do
+        sed "s/__ZP_CLIENT_VERSION__/$ZP_CLIENT_VERSION/g" "$_f" > "$_f.ver" \
+            && { chmod 755 "$_f.ver"; mv "$_f.ver" "$_f"; } || rm -f "$_f.ver"
+    done
+    # 分流数据库要在生成配置**之前**就位: 配置里要不要带 geo 规则, 由本机有没有数据决定。
+    install_geo
     # 配置在所有运行文件就位之后才生成 (agent 的 config 模式要用到 agent.sh 自己);
     # 生成失败时那条自愈路径还能用本次命令里的配对码重新接入。
-    fetch_config "$ZP_CONF" || die "拉取/校验配置失败, 请回面板确认已有可用节点"
+    fetch_config "$ZP_CONF" || config_failure
     ok "配置已写入 $ZP_CONF"
     ok "已写入 $ZP_INIT / $ZP_AGENT_INIT / $ZP_DIR/agent.sh / $ZP_CLI"
 }
@@ -1017,9 +1175,14 @@ finish() {
     ok "全屋代理已开启 —— 手机 / 电脑 / 电视连上这台路由器即可用"
     printf '  设备名   %s\n' "$MODEL"
     printf '  模式     %s\n' "$( [ "${ACTIVE_MODE:-tproxy}" = "tun" ] && echo 'TUN 全屋透明代理' || echo 'tproxy 全屋透明代理 (本机自身流量除外)' )"
-    printf '  分流     智能分流 (国内直连 + 广告拦截, 其余走代理)\n'
+    if [ -n "$DEGRADED" ]; then
+        printf '  分流     降级模式 (未拿到 GeoIP/GeoSite 数据): 全部流量走节点\n'
+        printf '           %s\n' "面板恢复后会自动切回「智能分流」(国内直连 + 广告拦截)"
+    else
+        printf '  分流     智能分流 (国内直连 + 广告拦截, 其余走代理)\n'
+    fi
     printf '  管理     面板「客户端」页可看状态、开关、改分流、移除设备\n'
-    printf '  本机命令 zeroproxy status | on | off | log | uninstall\n'
+    printf '  本机命令 zeroproxy status | on | off | geo | log | uninstall\n'
     printf '\n  以后换节点 / 改分流不用再登录路由器, 面板改完自动同步。\n'
     printf '%s────────────────────────────────────────────%s\n' "$C_B" "$C_R"
 }

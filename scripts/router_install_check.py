@@ -111,6 +111,7 @@ class Panel:
             "ZP_GEODATA_AUTO": "0",
             "ZP_APPLY_ASYNC": "0",
             "ZP_CORE_MIN_BYTES": "16",   # 假内核只有几百字节
+            "ZP_GEO_MIN_BYTES": "16",    # 分流数据库同理 (演练不下载真的 4 MB)
         }
         self.proc = subprocess.Popen(
             [PYTHON, "-m", "zeroproxy.main"], cwd=BACKEND, env=self.env,
@@ -194,9 +195,16 @@ def main() -> int:
         with gzip.open(os.path.join(cache, f"mihomo-arm64-{router_client.CORE_VERSION}.gz"), "wb") as fh:
             fh.write(stub.encode())
 
-        def run_install(label: str) -> tuple[bool, str]:
-            code = panel.pair_code(label)
-            _, script, _ = http("GET", f"/c/{code}")
+        # 面板侧再缓存两份分流数据库: 真机上是面板去 GitHub 取 (多镜像), 路由器只访问
+        # 面板 —— 演练里预置好, 于是整条"路由器从面板取 geo"的链路真的跑一遍。
+        for panel_ in panels:
+            geo_cache = os.path.join(panel_.home, "data", "client", "geo")
+            os.makedirs(geo_cache, exist_ok=True)
+            for name in ("geoip.metadb", "geosite.dat"):
+                with open(os.path.join(geo_cache, name), "wb") as fh:
+                    fh.write(f"fake-geo-{panel_.name}-{name}".encode())
+
+        def run_script(script: str, label: str) -> tuple[bool, str]:
             path = os.path.join(tmp, f"install-{label}.sh")
             with open(path, "w") as fh:
                 fh.write(patch_for_local_run(script, fake_root))
@@ -206,6 +214,11 @@ def main() -> int:
             if proc.returncode:
                 print(proc.stderr[-800:])
             return proc.returncode == 0, proc.stdout
+
+        def run_install(label: str) -> tuple[bool, str]:
+            code = panel.pair_code(label)
+            _, script, _ = http("GET", f"/c/{code}")
+            return run_script(script, label)
 
         print("\n[1] 首次安装")
         ok, out = run_install("first")
@@ -219,10 +232,35 @@ def main() -> int:
         for name in ("device.json", "agent.sh", "initd", "initd-agent", "cli", "tproxy.nft"):
             check(f"生成 {name}", os.path.exists(os.path.join(fake_root, name)))
 
+        # 分流数据库 (真机上这一步失败 = mihomo 去 GitHub 拉超时, 整份配置校验不过)
+        for name in ("geoip.metadb", "geosite.dat"):
+            check(f"分流数据库落到路由器 ({name})",
+                  os.path.exists(os.path.join(fake_root, name)))
+        check("geox-url 指向面板而不是 GitHub",
+              "/c/geo/geosite.dat" in config_text and "github.com" not in config_text)
+        check("有数据时配置带完整分流 (GEOIP,CN)", "GEOIP,CN" in config_text)
+        # 版本号是落盘后 sed 替换的: 既不能残留占位符, 也不能把执行位弄丢 (演练抓到过)
+        agent_text = open(os.path.join(fake_root, "agent.sh"), encoding="utf-8").read()
+        cli_text = open(os.path.join(fake_root, "cli"), encoding="utf-8").read()
+        check("落盘的 agent / CLI 没有残留版本占位符",
+              "__ZP_CLIENT_VERSION__" not in agent_text
+              and "__ZP_CLIENT_VERSION__" not in cli_text)
+        check("agent 与 CLI 仍然可执行 (替换之后要补 chmod)",
+              os.access(os.path.join(fake_root, "agent.sh"), os.X_OK)
+              and os.access(os.path.join(fake_root, "cli"), os.X_OK))
+
         import yaml
         profile = yaml.safe_load(config_text)
         check("配置可被 YAML 解析且含全部节点",
               isinstance(profile, dict) and len(profile.get("proxies", [])) == 5)
+
+        print("\n[1b] 更新命令 (/c/install.sh, 不带配对码): 刷新数据, 但不许再多一台设备")
+        _, upd_script, _ = http("GET", "/c/install.sh")
+        ok_upd, upd_out = run_script(upd_script, "update")
+        check("更新命令跑通", ok_upd and "分流数据库就绪" in upd_out)
+        _, body, _ = http("GET", "/api/devices")
+        check("更新不会在面板上多出设备 (配对码是一次性的, 不该拿它当更新入口)",
+              len(json.loads(body)["devices"]["items"]) == 1)
 
         print("\n[2] 控制 agent 与面板对话")
         agent = open(os.path.join(fake_root, "agent.sh"), encoding="utf-8").read()
@@ -240,6 +278,21 @@ def main() -> int:
         device = json.loads(body)["devices"]["items"][0]
         check("agent 上报后设备显示在线", device["online"] is True)
         check("总开关默认开启且面板能看到期望状态", device["desired"] is True)
+
+        print("\n[2b] 面板给不出分流数据库时自动降级 (不留 geo 规则), 数据回来再自动恢复")
+        for name in ("geoip.metadb", "geosite.dat"):
+            os.remove(os.path.join(fake_root, name))
+        degraded = subprocess.run(["sh", agent_path, "config"], capture_output=True, text=True)
+        check("没有数据库时不再要 geo 规则",
+              degraded.returncode == 0 and "GEOIP,CN" not in degraded.stdout
+              and "GEOSITE," not in degraded.stdout)
+        check("降级配置仍是完整的路由器配置 (tun + 策略组)",
+              "tun:" in degraded.stdout and "proxy-groups:" in degraded.stdout)
+        again = subprocess.run(["sh", agent_path, "geo"], capture_output=True, text=True)
+        check("agent 能把数据自己取回来", again.returncode == 0
+              and os.path.exists(os.path.join(fake_root, "geoip.metadb")))
+        restored = subprocess.run(["sh", agent_path, "config"], capture_output=True, text=True)
+        check("数据回来后又变回完整分流", "GEOIP,CN" in restored.stdout)
 
         print("\n[3] 加入第二台服务器 (面板 B) → 自动聚合成多个 provider")
         panel_b = panels[1]

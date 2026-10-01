@@ -54,7 +54,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **配置落地可验证** | 每次应用配置都用真实二进制校验 (`xray -test` / `nginx -t`) 并**复查端口是否真的在监听**; 任一步失败会在面板顶部标红, 不再出现「服务全绿但节点全不通」 |
 | **5 个节点** | VLESS Reality (TCP+Vision)、VLESS XHTTP Reality、VLESS WebSocket、Trojan TLS、Hysteria 2 (QUIC+端口跳跃) |
 | **链式代理 (中转 → 落地)** | 两台机器各装一份本面板, 在面板里用一行**配对码**把它们接成一条链: 近的机器做入口 (延迟低), 远的机器做落地 (出口 IP 换成它)。对客户端只是「订阅里多了一个普通节点」——不用手写 Clash relay / sing-box detour, 手机也能用; 落地凭据是**独立 UUID + 独立端口**, 可单独轮换 / 吊销, 不影响自己的订阅 |
-| **客户端 (路由器全自动)** | 面板「客户端」页生成一行命令, 在路由器终端粘一次: 自动配对 → 装 mihomo 静态内核 → 落 tun/dns/嗅探配置 → 起服 → 自检。此后这台路由器下的**所有设备** (手机/电脑/电视) 自动走分流代理, 不用每台各装客户端; 面板上一个总开关控制全屋, 开关颜色取自**设备回报的真实状态** (不是前端点一下就变绿); 每台设备独立凭据, 可单独改名 / 换分流模板 / 吊销 |
+| **客户端 (路由器全自动)** | 面板「客户端」页生成一行命令, 在路由器终端粘一次: 自动配对 → 装 mihomo 静态内核 → 落 tun/dns/嗅探配置 → 起服 → 自检。此后这台路由器下的**所有设备** (手机/电脑/电视) 自动走分流代理, 不用每台各装客户端; 面板上一个总开关控制全屋, 开关颜色取自**设备回报的真实状态** (不是前端点一下就变绿); 每台设备独立凭据, 可单独改名 / 换分流模板 / 吊销。**内核与分流数据库 (GeoIP/GeoSite) 都由面板分发** —— 装机时路由器还没有代理可用, 整条链路只访问面板一个地址, 不需要它能连 GitHub |
 | **路由器聚合多台面板** | 同一台路由器可以接多台服务器: 在第二台面板「客户端」页生成一条链接, 在路由器上 `zeroproxy add <链接>` 即可接入 (**不用重跑安装**)。节点由 mihomo 以 `proxy-providers` 聚合, 一台挂了自动走另一台; 各面板互不认识 (凭据不跨服务器流转), 节点名自动带面板域名前缀以免同名冲突 |
 | **3 种订阅格式** | 同一订阅地址 `?format=` 切换: Base64 通用 / Clash(mihomo) YAML / sing-box JSON |
 | **3 档分流模板** | 智能分流 (国内直连+广告拦截) / 全局代理 / 全部直连; 面板一键切换或 `?rules=` 单客户端覆盖, 切换不重启服务 |
@@ -68,7 +68,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 225 项 (219 passed + 6 skipped; 带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/router_install_check.py` (15 项, **真的用 shell 跑一遍路由器安装脚本**) + `scripts/browser_check.cjs` (155 项) + `scripts/clients_check.cjs` (20 项, 真实浏览器点开关) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 251 项 (245 passed + 6 skipped; 带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/router_install_check.py` (37 项, **真的用 shell 跑一遍路由器安装脚本**) + `scripts/browser_check.cjs` (155 项) + `scripts/clients_check.cjs` (20 项, 真实浏览器点开关) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 | **看得懂的界面 (v2.6.0)** | 控制台布局: 左侧锚点导航 (带计数角标 + 滚动高亮) + 顶部指标条 (健康节点 / 落地出口 IP / 平均延迟 + 迷你折线 / 运行时长) + 节点密集表格 (名称 / 地址状态 / **握手延迟条** / **上下行双轨** / 开关与复制) + **流量卡 (双弧圆环 + 实时速率曲线 + 逐节点双色流量条)** + 链式链路拓扑 (你的设备 → 本机入口 → 落地端) + 程序更新闭环; 动效全部走 `transform`/自绘 rAF 并受 `prefers-reduced-motion` 约束 |
 
@@ -2261,3 +2261,52 @@ LuCI 会话, 于是这台设备上永远是"未登录"。
 **回归**: `pytest` 236 → **238 项** (落地规则在两种订阅里都存在、在国内直连之前、
 组里的兜底成员正确; 多服务器骨架的落地组必须是空 use + filter + 兜底成员)。
 路由器演练 25 项全过。
+
+### 8.36 v2.9.2: 真机第三次: 分流数据库下载超时 —— GeoIP / GeoSite 也由面板分发
+
+MT3000 上第三次跑安装命令, 这次停在"写入运行文件"的下一行:
+
+```
+==> 写入运行文件
+time=... level=error msg="can't initial GeoIP: can't download MMDB: context deadline exceeded"
+time=... level=error msg="rules[38] [GEOIP,CN,🎯 全球直连] error: ... context deadline exceeded"
+configuration file /etc/zeroproxy/config.yaml.new test failed
+安装失败: 拉取/校验配置失败, 请回面板确认已有可用节点
+```
+
+**这不是配置写错了, 是数据拿不到。** mihomo 加载 `GEOSITE` / `GEOIP` 规则时必须有分流
+数据库, 而**缺数据不是"跳过那几条规则", 是整份配置加载失败**(上游 `component/geodata/init.go`:
+`InitGeoIP` 找不到文件就去 `geox-url` 下载, 失败即返回错误; `NewGEOIP` 把它冒泡成
+`rules[N] ... error`)。它自己的默认下载地址是 GitHub Release —— 而路由器装机时**还没有
+任何代理可用**, 那一步在国内宽带上就是 90 秒超时。
+
+写成"给配置加个超时/重试"都治不了本: 路由器需要的是一个**它一定能连上的地址**。这个项目
+早就有一条这样的路 —— 内核二进制就是面板去下、缓存、再分发的 (`/c/bin/{arch}`), 于是
+分流数据库照同一套做:
+
+* 面板: `/c/geo/{name}` —— 只有两个名字 (`geoip.metadb` / `geosite.dat`, 白名单), 面板侧
+  按内核那套多镜像顺序下载并缓存 (`data/client/geo/`, `ZP_GEO_MIN_BYTES` 可调下限,
+  一周过期重取)。体积是挑过的: 上游给路由器准备的 `geoip-lite.metadb` 只含 CN/私有地址
+  (0.4 MB), 配一份完整 `geosite.dat` (4 MB) 一共 4.4 MB —— 是面板自己那两份 Loyalsoldier
+  (28 MB) 的六分之一, 路由器闪存吃得下;
+* 路由器: 安装时从面板把这两份文件取到 `/etc/zeroproxy/` (mihomo 在 `-d` 目录里按名字
+  找, 大小写不敏感), 之后**整个装机链路不再需要外网**; 配置里的 `geox-url` 也一并指向
+  面板 —— 万一文件被删, 它补的也是面板, 不是 GitHub;
+* 拿不到数据时不装死: 面板会给一份**降级配置**(只去掉 geo 规则, 保留 tun / DNS / 分组 /
+  MATCH), 先让它能上网, `agent` 每轮重建配置前都会再试一次取数据, 面板恢复后自动换回
+  完整分流 —— 用户不用再登录路由器做任何事;
+* **旧面板要在装机当场被认出来**: `/c/pair` 现在带回一个能力位 `geo`, 没有它 + 本地没有
+  数据, 安装直接停下并说明"先在面板上点「程序更新」" —— 而不是让人对着"拉取/校验配置失败,
+  请回面板确认已有可用节点"发呆 (旧面板给的配置一定带 geo 规则, 而它没有 `/c/geo`)。
+
+顺带修掉同一段代码里的两处: 路由器配置里那个 `global-client-fingerprint` 在 v1.19.32 已经
+被移除 (每条 proxy 自己都有 `client-fingerprint`), 每次启动都往日志里写一条 error; 以及
+agent 上报的客户端版本号一直硬编码 `1.0.0`, 现在跟着 `SCRIPT_VERSION` 走。
+
+**回归**: `pytest` 244 → **251 项** (分流数据库必须由面板发、文件名必须是 mihomo 认的那两个、
+本地已有数据时不许联网、路由器配置的 geox-url 指向面板而手机端仍走公共镜像、降级配置里
+一条 geo 规则都不许留、安装脚本里不许出现 github/jsdelivr/MetaCubeX)。`scripts/router_install_check.py`
+24 → **37 项** —— 演练里真的从面板取一遍数据、真的删掉数据看它降级、再让 agent 自己取回来。
+另外用**真的 mihomo v1.19.32 + 真的上游分流数据**在本地跑通了整条链路 (下载 → 落盘 →
+`mihomo -t` 通过), 对照实验: 同样一份配置在空目录里就是真机那条
+`can't download MMDB` / `test failed`。

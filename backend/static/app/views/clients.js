@@ -143,7 +143,9 @@ function installCard(dash) {
     </div>
     <div class="muted fs-xs mt-2">
       支持 OpenWrt / GL.iNet / 小米 / 华硕等基于 OpenWrt 的设备; 需要 ≥ 90 MB 可用空间
-      (内核约占 57 MB)。装完后每台路由器在面板上是一张卡片, 可以单独开关和移除。
+      (内核约占 57 MB, 另有约 5 MB 分流数据)。内核与分流数据都由面板分发, 路由器只需要
+      能连上面板 —— 装机时它还没有代理可用, 不该去 GitHub 拉任何东西。<br>
+      装完后每台路由器在面板上是一张卡片, 可以单独开关和移除。
     </div>
   </details>`;
 }
@@ -161,8 +163,8 @@ function pairCard() {
       <button class="btn small" id="btn-copy-cmd">复制</button>
     </div>
     <div class="muted fs-xs mt-2">
-      安装过程约 1 分钟 (含 20 MB 内核下载); 结束后终端会告诉你是 TUN 还是 tproxy 模式。
-      刷新本页即可看到设备卡片。
+      安装过程约 1 分钟 (含 20 MB 内核 + 4 MB 分流数据下载); 结束后终端会告诉你是 TUN
+      还是 tproxy 模式, 以及分流是否已就绪。刷新本页即可看到设备卡片。
     </div>
   </div>`;
 }

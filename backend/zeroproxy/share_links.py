@@ -35,7 +35,14 @@ from .config import WS_PATH, XHTTP_PATH
 
 #: 客户端分流数据库镜像 (mihomo geox-url)。GitHub Release 在受限网络下不可达,
 #: 客户端首次导入订阅若拉不到 geoip.metadb 会直接报配置失败, 因此换成可用镜像。
+#:
+#: 手机/电脑端只有这一条路。**路由器端不走这里**: 它由面板自己分发 (见
+#: router_client.GEO_FILES 与 /c/geo/…) —— 装机时它还没有任何代理可用, 让它去
+#: GitHub 拉 4 MB 的 geox 数据就是"安装卡在写入运行文件"的那个 bug。
 GEOX_BASE = "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/"
+
+#: 面板自己的分流数据接口 (路由器端 geox-url 指向这里)。
+GEO_PATH = "/c/geo/"
 
 #: sing-box 1.12 起内置 geoip/geosite 字段被彻底移除 (实测报错
 #: "geosite database is deprecated in sing-box 1.8.0 and removed in 1.12.0"),
@@ -102,10 +109,15 @@ LANDING_DOMAINS = (
 LANDING_GEOSITES = ("netflix", "disney", "hbo", "primevideo", "youtube")
 
 
-def _landing_rules() -> list[str]:
-    """"必须走落地"的规则 (放在最前面, 早于国内直连)。"""
+def _landing_rules(geo: bool = True) -> list[str]:
+    """"必须走落地"的规则 (放在最前面, 早于国内直连)。
+
+    `geo=False` 时只留显式域名那批: GEOSITE 需要分流数据库, 而这一步的意思是
+    "这台设备现在拿不到数据库"。
+    """
     rules = [f"DOMAIN-SUFFIX,{d},{G_LANDING}" for d in LANDING_DOMAINS]
-    rules += [f"GEOSITE,{g},{G_LANDING}" for g in LANDING_GEOSITES]
+    if geo:
+        rules += [f"GEOSITE,{g},{G_LANDING}" for g in LANDING_GEOSITES]
     return rules
 
 
@@ -205,6 +217,15 @@ ROUTER_TUN = {
     "mtu": 1500,
     "dns-hijack": ["any:53"],
 }
+
+
+#: 路由器端 `dns` 段在**没有**分流数据库时的样子: nameserver-policy 的键是
+#: `geosite:private,cn`, 它自己也要 geosite.dat 才成立 (mihomo 会为它去加载数据库)。
+#: 数据库实在取不到时, 宁可少一条"国内域名走国内 DNS"的优化, 也不能让配置加载失败。
+def router_dns(geo: bool = True) -> dict:
+    if geo:
+        return ROUTER_DNS
+    return {k: v for k, v in ROUTER_DNS.items() if k != "nameserver-policy"}
 
 
 def template_of(state: dict, override: str | None = None) -> str:
@@ -527,12 +548,19 @@ def clash_profile(
     router: bool = False,
     device: str = "",
     skeleton: bool = False,
+    geo: bool = True,
+    base: str = "",
 ) -> str:
     """Clash / mihomo 配置。
 
     `router=True` 时输出路由器端专用版本: 多出 tun / dns / 嗅探三段, 由路由器
     整机接管全屋流量 (见 ROUTER_DNS / ROUTER_TUN 上面的说明)。
     `device` 只用于注释里标注是哪台设备拉的, 不影响配置内容。
+
+    `base` 是面板自己的对外地址 (仅路由器端用): 分流数据库的下载地址指向面板,
+    而不是让路由器自己翻墙去 GitHub —— 装机时它还没有任何代理可用。
+    `geo=False` 是**降级**: 面板暂时给不出数据库时, 输出一份不引用 geo 的规则
+    (少一层国内直连与广告拦截, 但能跑起来), 等数据到位后 agent 会自己换回来。
     """
     proxies: list[dict] = []
     skipped: list[str] = []
@@ -582,22 +610,23 @@ def clash_profile(
     if tpl == "smart":
         # 国内 / 私有地址直连, 广告拦截, 其余走"漏网之鱼"。
         # 落地规则放在最前面: 这些站点必须用落地 IP, 不能等到国内规则把它们放过去。
-        rules = [
-            f"GEOSITE,category-ads-all,{G_ADS}",
-            *_landing_rules(),
-            f"GEOSITE,private,{G_DIRECT}",
-            f"GEOSITE,cn,{G_DIRECT}",
-            f"GEOIP,LAN,{G_DIRECT},no-resolve",
-            f"GEOIP,CN,{G_DIRECT}",
-            f"MATCH,{G_FINAL}",
-        ]
+        rules = []
+        if geo:
+            rules.append(f"GEOSITE,category-ads-all,{G_ADS}")
+        rules += _landing_rules(geo)
+        if geo:
+            rules += [f"GEOSITE,private,{G_DIRECT}", f"GEOSITE,cn,{G_DIRECT}"]
+        # GEOIP,LAN 是内建判断 (私有地址), 不需要数据库 —— 降级时也留着
+        rules.append(f"GEOIP,LAN,{G_DIRECT},no-resolve")
+        if geo:
+            rules.append(f"GEOIP,CN,{G_DIRECT}")
+        rules.append(f"MATCH,{G_FINAL}")
     elif tpl == "global":
-        rules = [
-            f"GEOSITE,category-ads-all,{G_ADS}",
-            *_landing_rules(),
-            f"GEOIP,LAN,{G_DIRECT},no-resolve",
-            f"MATCH,{G_SELECT}",
-        ]
+        rules = []
+        if geo:
+            rules.append(f"GEOSITE,category-ads-all,{G_ADS}")
+        rules += _landing_rules(geo)
+        rules += [f"GEOIP,LAN,{G_DIRECT},no-resolve", f"MATCH,{G_SELECT}"]
     else:  # direct: 不依赖任何 geo 数据 (无需下载), 只做广告拦截与手动切换
         rules = [f"MATCH,{G_FINAL}"]
 
@@ -610,6 +639,11 @@ def clash_profile(
         "geosite": GEOX_BASE + "geosite.dat",
         "asn": GEOX_BASE + "GeoLite2-ASN.mmdb",
     }
+    if router and base:
+        # 路由器端: 数据库由面板分发 —— 路由器只需要能访问面板 (它装机时没有任何代理,
+        # 连不上 GitHub 是常态)。命令里两边都是同一个地址, 所以有面板就不该再回 GitHub。
+        geox["mmdb"] = base.rstrip("/") + GEO_PATH + "geoip.metadb"
+        geox["geosite"] = base.rstrip("/") + GEO_PATH + "geosite.dat"
     if router:
         # 路由器端: 键的书写顺序 = 运维时 cat 一眼的阅读顺序 (端口 → 内核参数 →
         # 分流数据 → 节点)。
@@ -627,7 +661,6 @@ def clash_profile(
             "unified-delay": True,
             # 路由器没有进程匹配能力, 关掉省 CPU
             "find-process-mode": "off",
-            "global-client-fingerprint": "chrome",
             "keep-alive-interval": 30,
             # 本机控制口: 安装脚本用它做健康检查, 也留作以后"只重载不断连"的入口
             "external-controller": "127.0.0.1:9090",
@@ -646,7 +679,7 @@ def clash_profile(
                 # 这两类域名被嗅探后推送/米家设备的证书校验会出问题, 跳过
                 "skip-domain": ["Mijia Cloud", "+.push.apple.com"],
             },
-            "dns": ROUTER_DNS,
+            "dns": router_dns(geo),
             "tun": ROUTER_TUN,
             "geox-url": geox,
             # 多服务器模式: 节点由路由器挂成 proxy-providers, 这里留一个空 map 当锚点
@@ -680,6 +713,13 @@ def clash_profile(
         ]
         if device:
             head.append(f"# 设备: {device}")
+        if tpl != "direct":
+            head.append(
+                "# 分流数据库 (GeoIP / GeoSite) 随安装由面板下发, 已放在本目录; "
+                "geox-url 也指向面板, 无需访问 GitHub"
+                if geo
+                else "# 注意: 本机没有分流数据库, 这份配置不含国内直连与广告拦截规则"
+            )
     else:
         head = [
             "# ZeroProxy 订阅 — Clash / mihomo",
@@ -687,7 +727,7 @@ def clash_profile(
             f"# 分流模板: {tpl}{tpl_note}",
             "# 切换模板: 面板「高级设置 → 分流模板」, 或在订阅 URL 后加 ?rules=smart|global|direct",
         ]
-    if tpl != "direct":
+    if tpl != "direct" and not router:
         head.append("# 分流依赖客户端 geo 数据; 已内置 geox-url 镜像, 首次导入会自动下载")
     if skipped:
         head.append(f"# 本客户端不支持的节点已跳过: {', '.join(skipped)} (请用 sing-box / 单节点链接)")
@@ -960,13 +1000,17 @@ def provider_profile(state: dict, prefix: str = "") -> str:
     return "\n".join(head) + "\n" + body
 
 
-def router_skeleton(state: dict, template: str | None = None, device: str = "") -> str:
+def router_skeleton(
+    state: dict, template: str | None = None, device: str = "", geo: bool = True, base: str = ""
+) -> str:
     """路由器端多服务器模式的骨架 (`?format=skeleton`)。
 
     端口 / DNS / tun / 嗅探 / 分流规则都在, `proxy-providers` 是空 map、组的
     `use` 是空列表 —— 路由器按行填进它自己那几台服务器的 provider 定义。
     """
-    return clash_profile(state, template, router=True, device=device, skeleton=True)
+    return clash_profile(
+        state, template, router=True, device=device, skeleton=True, geo=geo, base=base
+    )
 
 
 def subscription_body(
@@ -976,6 +1020,8 @@ def subscription_body(
     router: bool = False,
     device: str = "",
     prefix: str = "",
+    geo: bool = True,
+    base: str = "",
 ) -> tuple[str, str]:
     """返回 (响应体, media_type)。
 
@@ -986,9 +1032,11 @@ def subscription_body(
     if fmt in ("provider", "nodes"):
         return provider_profile(state, prefix=prefix), "text/yaml; charset=utf-8"
     if fmt in ("skeleton", "router-skeleton"):
-        return router_skeleton(state, template, device=device), "text/yaml; charset=utf-8"
+        return router_skeleton(state, template, device=device, geo=geo, base=base), "text/yaml; charset=utf-8"
     if fmt in ("clash", "mihomo", "yaml", "yml"):
-        return clash_profile(state, template, router=router, device=device), "text/yaml; charset=utf-8"
+        return clash_profile(
+            state, template, router=router, device=device, geo=geo, base=base
+        ), "text/yaml; charset=utf-8"
     if fmt in ("singbox-next", "singbox14", "singbox-1.14", "singbox-new"):
         # 面向 sing-box ≥1.14: 用 http_clients 指定下载出口 (无废弃警告)
         return singbox_profile(state, template, next_gen=True), "application/json; charset=utf-8"
