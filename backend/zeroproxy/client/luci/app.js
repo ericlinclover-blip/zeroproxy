@@ -8,6 +8,10 @@
 'use strict';
 
 const API = '/cgi-bin/zeroproxy';
+/* 令牌直接从地址栏带过来, 每个请求都附上 (?k=…)。
+   原本靠第一次响应种的 cookie, 但真机上 fcgiwrap 那条路上 cookie 没落地 —— 与其查它,
+   不如不去依赖它: 这个地址本来就是 `zeroproxy ui` 打印给用户看的。 */
+const TOKEN = (new URLSearchParams(location.search).get('k') || '');
 /* 接口一律走 query (?a=status): GL.iNet 固件的 80 端口是 nginx + fcgiwrap,
    PATH_INFO 不保证传给脚本, 而 query 一定会到。 */
 const $ = (id) => document.getElementById(id);
@@ -21,7 +25,7 @@ function toast(msg) {
 }
 
 async function call(path, body) {
-  const res = await fetch(API + '?a=' + path, body === undefined ? {} : {
+  const res = await fetch(API + '?a=' + path + (TOKEN ? '&k=' + encodeURIComponent(TOKEN) : ''), body === undefined ? {} : {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
