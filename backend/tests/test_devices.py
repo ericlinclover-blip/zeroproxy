@@ -142,6 +142,24 @@ def test_install_script_sticks_to_busybox_tools():
     assert '"$ZP_BIN" -v >/dev/null 2>&1; then' in text
 
 
+def test_install_script_self_heals_rejected_credentials():
+    """凭据在面板上失效 (被移除 / 换成另一台面板) 时, 安装脚本要能自己重接。
+
+    真机反馈 (2.7.2): 走到最后一步 403 —— 路由器本地只看得见"我有凭据",
+    看不出面板那边还认不认; 于是报"拉取配置失败, 请回面板确认已有可用节点",
+    用户完全无从下手。现在拉不到就用**本次命令里的配对码**重新配对再试一次 ——
+    那行命令本来就是用户刚生成的, 码是新的。
+    """
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+    assert "do_pair()" in text, "配对逻辑要能被复用 (首次接入与凭据失效重接走同一条路)"
+    assert "用本次配对码重新接入" in text, "凭据被拒时必须自动重接, 而不是直接失败"
+    assert "重新接入失败" in text and "重新生成一条安装命令" in text, "重接也失败时要给出可执行的下一步"
+    # 换面板 (stored base ≠ 本次 base) 必须能识别出来, 而不是继续用旧凭据撞 403
+    assert "_old_base" in text and "本次改用" in text
+
+
 # ---------------------------------------------------------------- 配置生成
 
 def test_router_profile_has_router_only_blocks(client, configured):

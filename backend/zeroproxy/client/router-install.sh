@@ -35,6 +35,11 @@ ZP_MIXED=7890
 TLS_OPTS=""
 ARCH=""
 DEPENDENCY_NOTE=""
+# 设备凭据与配对结果 (set -u 下必须预置: 只有在真的走过那条分支时才会被赋值)
+DEV_ID=""
+DEV_SECRET=""
+DEV_NAME=""
+PAIR_ERROR=""
 
 # ---------------------------------------------------------------- 输出
 # 全部输出走 stderr 之外的标准输出, 但用颜色区分层级 —— 用户是在 SSH 里看,
@@ -176,14 +181,27 @@ preflight() {
 pair() {
     step "接入账号"
     if [ -f "$ZP_DEV" ] && grep -q '"id"' "$ZP_DEV" 2>/dev/null; then
+        _old_base="$(sed -n 's/.*"base"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ZP_DEV" | head -n1)"
         DEV_ID="$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ZP_DEV" | head -n1)"
         DEV_SECRET="$(sed -n 's/.*"secret"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ZP_DEV" | head -n1)"
         if [ -n "$DEV_ID" ] && [ -n "$DEV_SECRET" ]; then
-            ok "已接入过 (设备 $DEV_ID), 沿用原有凭据"
-            return 0
+            if [ -n "$_old_base" ] && [ "$_old_base" != "$ZP_BASE" ]; then
+                # 换了面板: 这台路由器之前接的是别人。凭据在这里一定不认, 直接重新配对。
+                warn "这台路由器原来接的是 $_old_base, 本次改用 $ZP_BASE"
+            else
+                ok "已接入过 (设备 $DEV_ID), 先沿用原有凭据"
+                return 0
+            fi
         fi
     fi
 
+    do_pair || die "接入失败: $PAIR_ERROR"
+    ok "已接入: $DEV_NAME ($DEV_ID)"
+}
+
+# 用本次命令里的配对码换一份新凭据 (写进 device.json)。失败时把面板的话放进
+# PAIR_ERROR —— 用户看到的必须是"配对码过期了, 回面板重新生成", 不是一句无解的报错。
+do_pair() {
     _body='{"code":"'"$(json_escape "$ZP_CODE")"'","kind":"router"'
     _body="$_body"',"hostname":"'"$(json_escape "$HOSTNAME_NOW")"'"'
     _body="$_body"',"model":"'"$(json_escape "$MODEL")"'"'
@@ -195,10 +213,11 @@ pair() {
     DEV_ID="$(json_get "$_resp" id)"
     DEV_SECRET="$(json_get "$_resp" secret)"
     if [ -z "$DEV_ID" ] || [ -z "$DEV_SECRET" ]; then
-        _msg="$(json_get "$_resp" error)"
-        [ -n "$_msg" ] || _msg="面板没有返回设备凭据"
-        die "接入失败: $_msg"
+        PAIR_ERROR="$(json_get "$_resp" error)"
+        [ -n "$PAIR_ERROR" ] || PAIR_ERROR="面板没有返回设备凭据 (配对码可能已过期)"
+        return 1
     fi
+    DEV_NAME="$(json_get "$_resp" name)"
 
     mkdir -p "$ZP_DIR"
     umask 077
@@ -207,12 +226,12 @@ pair() {
   "id": "$DEV_ID",
   "secret": "$DEV_SECRET",
   "base": "$ZP_BASE",
-  "name": "$(json_get "$_resp" name)"
+  "name": "$DEV_NAME"
 }
 EOF
     umask 022
     chmod 600 "$ZP_DEV"
-    ok "已接入: $(json_get "$_resp" name) ($DEV_ID)"
+    return 0
 }
 
 # ---------------------------------------------------------------- 依赖
@@ -276,9 +295,24 @@ install_core() {
 # ---------------------------------------------------------------- 配置
 fetch_config() {
     _dest="${1:-$ZP_CONF}"
-    _url="$ZP_BASE/c/sub/$DEV_ID?k=$DEV_SECRET&format=clash&rules=smart"
     _tmp="$_dest.new"
-    http_get "$_url" > "$_tmp" || return 1
+    _sub_path="c/sub/$DEV_ID?k=$DEV_SECRET&format=clash&rules=smart"
+    if ! http_get "$ZP_BASE/$_sub_path" > "$_tmp" 2>/dev/null; then
+        rm -f "$_tmp"
+        # 凭据被拒 (403) 是最常见的"看起来莫名其妙"的失败: 面板上把这台设备移除过,
+        # 或者路由器上留的是另一台面板发的凭据。本地文件看不出问题, 只有真的去拉一次
+        # 才知道 —— 所以不在这里猜, 直接用本次命令里的配对码重新接入再试。
+        warn "面板拒绝了这台设备的凭据 (可能已在面板上移除, 或凭据来自另一台面板)"
+        step "用本次配对码重新接入"
+        if ! do_pair; then
+            die "重新接入失败: $PAIR_ERROR
+  请回面板「客户端」重新生成一条安装命令, 再在路由器上跑一次。"
+        fi
+        ok "已重新接入: $DEV_NAME ($DEV_ID)"
+        _sub_path="c/sub/$DEV_ID?k=$DEV_SECRET&format=clash&rules=smart"
+        http_get "$ZP_BASE/$_sub_path" > "$_tmp" 2>/dev/null \
+            || die "重新接入后仍然拉不到配置, 请回面板确认已有可用节点"
+    fi
     grep -q '^proxies:' "$_tmp" || { rm -f "$_tmp"; return 1; }
     # 先用内核自己校验再替换 —— 配置写坏就等于全屋断网, 必须先测后换
     if ! "$ZP_BIN" -t -d "$ZP_DIR" -f "$_tmp" >/dev/null 2>&1; then
