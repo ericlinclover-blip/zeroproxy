@@ -198,7 +198,10 @@ def test_router_profile_has_router_only_blocks(client, configured):
     assert profile["tun"]["enable"] is True
     assert profile["tun"]["auto-route"] is True
     assert profile["dns"]["enhanced-mode"] == "fake-ip"
-    assert "geosite:geolocation-!cn" in profile["dns"]["nameserver-policy"]
+    # 国外域名故意不配 DoH-经-代理: 那会让首屏每解析一个域名都付两个跨洋来回
+    # (真机: YouTube 首屏十几秒, 播放却满速)。被代理的域名交给落地节点解析。
+    assert set(profile["dns"]["nameserver-policy"]) == {"geosite:private,cn"}
+    assert "dns.google" not in str(profile["dns"])
     assert profile["sniffer"]["enable"] is True
     assert profile["find-process-mode"] == "off"
     assert profile["allow-lan"] is True
