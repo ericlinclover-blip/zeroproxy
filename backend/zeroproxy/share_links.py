@@ -73,6 +73,9 @@ G_FINAL = "🐟 漏网之鱼"
 G_ADS = "🛑 广告拦截"
 G_DIRECT = "🎯 全球直连"
 
+#: 健康检查目标 (url-test 用它判断哪个节点/哪台服务器可用)
+HEALTH_URL = "http://www.gstatic.com/generate_204"
+
 #: 路由器端配置文件 (profile=router)。手机/电脑端导入订阅就完事, 路由器端不一样:
 #: 它要接管**全屋**流量, 配置里少一个字段就是"某类 App 用不了"的工单。这里逐项说明
 #: 为什么这么写 —— 这些都是"上网体验不受影响"的关键, 不是随手加的调优参数。
@@ -442,8 +445,40 @@ def _clash_proxy(state: dict, node_id: str) -> dict | None:
     return None
 
 
+def _groups_for(names: list[str], tpl: str) -> list[dict]:
+    """节点直接内联时的策略组 (手机/电脑端订阅, 以及单服务器的路由器配置)。
+
+    节点全关时也要产出可用的配置: 策略组退化为只含 DIRECT。
+    `♻️ 自动选择` 只在有节点时才定义, 所以候选列表里也必须跟着省掉 —— 以前无条件把它
+    写进 `🚀 节点选择`, 于是"节点全关"时 mihomo 会因为引用到一个不存在的策略组直接
+    拒绝加载整份订阅。
+    """
+    select_members = _dedup(([G_AUTO] if names else []) + names + ["DIRECT"])
+    groups: list[dict] = []
+    if names:
+        groups.append(
+            {"name": G_AUTO, "type": "url-test", "url": HEALTH_URL, "interval": 300, "proxies": names}
+        )
+    groups += [
+        {"name": G_SELECT, "type": "select", "proxies": select_members},
+        {"name": G_DIRECT, "type": "select", "proxies": ["DIRECT", G_SELECT]},
+        {"name": G_ADS, "type": "select", "proxies": ["REJECT", "DIRECT"]},
+        {
+            "name": G_FINAL,
+            "type": "select",
+            # direct 模板下"漏网之鱼"默认直连, 其余模板默认交给节点选择
+            "proxies": [G_SELECT, "DIRECT"] if tpl != "direct" else ["DIRECT", G_SELECT],
+        },
+    ]
+    return groups
+
+
 def clash_profile(
-    state: dict, template: str | None = None, router: bool = False, device: str = ""
+    state: dict,
+    template: str | None = None,
+    router: bool = False,
+    device: str = "",
+    skeleton: bool = False,
 ) -> str:
     """Clash / mihomo 配置。
 
@@ -462,33 +497,25 @@ def clash_profile(
 
     tpl = template_of(state, template)
     names = [p["name"] for p in proxies]
-    # 节点全关时也要产出可用的配置: 策略组退化为只含 DIRECT。
-    # `♻️ 自动选择` 只在有节点时才定义, 所以候选列表里也必须跟着省掉 —— 以前
-    # 无条件把它写进 `🚀 节点选择`, 于是"节点全关"时 mihomo 会因为引用到一个
-    # 不存在的策略组直接拒绝加载整份订阅。
-    select_members = _dedup(([G_AUTO] if names else []) + names + ["DIRECT"])
-    groups: list[dict] = []
-    if names:
-        groups.append(
+    # 多服务器模式 (skeleton): 节点不在这份配置里, 而是由路由器挂成若干个
+    # proxy-provider。这里只出"骨架" —— 端口 / DNS / tun / 嗅探 / 规则都在,
+    # 唯独 providers 与组的成员留空, 由路由器按行填 (见 router-install.sh)。
+    # 用"空结构"而不是自定义标记, 是为了让骨架本身就一份合法的 mihomo 配置:
+    # 出问题时能直接拿它去跑, 不用先做文本替换。
+    if skeleton:
+        groups = [
+            {"name": G_AUTO, "type": "url-test", "url": HEALTH_URL, "interval": 300, "use": []},
+            {"name": G_SELECT, "type": "select", "use": [], "proxies": ["DIRECT"]},
+            {"name": G_DIRECT, "type": "select", "proxies": ["DIRECT", G_SELECT]},
+            {"name": G_ADS, "type": "select", "proxies": ["REJECT", "DIRECT"]},
             {
-                "name": G_AUTO,
-                "type": "url-test",
-                "url": "http://www.gstatic.com/generate_204",
-                "interval": 300,
-                "proxies": names,
-            }
-        )
-    groups += [
-        {"name": G_SELECT, "type": "select", "proxies": select_members},
-        {"name": G_DIRECT, "type": "select", "proxies": ["DIRECT", G_SELECT]},
-        {"name": G_ADS, "type": "select", "proxies": ["REJECT", "DIRECT"]},
-        {
-            "name": G_FINAL,
-            "type": "select",
-            # direct 模板下"漏网之鱼"默认直连, 其余模板默认交给节点选择
-            "proxies": [G_SELECT, "DIRECT"] if tpl != "direct" else ["DIRECT", G_SELECT],
-        },
-    ]
+                "name": G_FINAL,
+                "type": "select",
+                "proxies": [G_SELECT, "DIRECT"] if tpl != "direct" else ["DIRECT", G_SELECT],
+            },
+        ]
+    else:
+        groups = _groups_for(names, tpl)
 
     if tpl == "smart":
         # 国内 / 私有地址直连, 广告拦截, 其余走"漏网之鱼"
@@ -553,7 +580,8 @@ def clash_profile(
             "dns": ROUTER_DNS,
             "tun": ROUTER_TUN,
             "geox-url": geox,
-            "proxies": proxies,
+            # 多服务器模式: 节点由路由器挂成 proxy-providers, 这里留一个空 map 当锚点
+            **({"proxy-providers": {}} if skeleton else {"proxies": proxies}),
             "proxy-groups": groups,
             "rules": rules,
         }
@@ -834,12 +862,51 @@ def singbox_profile(state: dict, template: str | None = None, next_gen: bool = F
 
 # ---------------------------------------------------------------- 订阅出口
 
+def provider_profile(state: dict, prefix: str = "") -> str:
+    """路由器端多服务器模式: 单台面板的节点列表 (`?format=provider`)。
+
+    只出 `proxies`, 不出 rules / groups —— 路由器把每台面板的这份内容挂成一个
+    mihomo `proxy-provider`, 合并与健康检查都由 mihomo 自己做, 面板之间不需要
+    互相认识 (也就不会互相泄露凭据)。
+
+    节点名带面板域名的前缀, 这是**必须**的: 两台面板各自有一个"东京-01"时, 同名
+    节点会让 mihomo 拒绝加载整份配置 (README 里"两条链同名导不进来"是同一个原因)。
+    用域名当默认前缀不需要路由器传任何参数 —— 域名本来就是每台面板唯一的。
+    """
+    label = (prefix or str(state.get("domain") or "")).strip()
+    proxies: list[dict] = []
+    for node_id, _ in enabled_links(state):
+        proxy = _clash_proxy(state, node_id)
+        if not proxy:
+            continue
+        if label:
+            proxy["name"] = f"{label} · {proxy['name']}"
+        proxies.append(proxy)
+    head = [
+        "# ZeroProxy 节点源 (mihomo proxy-provider) — 路由器端多服务器聚合用",
+        "# 本文件只含节点; 规则 / DNS / tun 由路由器侧的骨架提供",
+        f"# 节点名前缀: {label or '(无)'}",
+    ]
+    body = yaml.safe_dump({"proxies": proxies}, allow_unicode=True, sort_keys=False)
+    return "\n".join(head) + "\n" + body
+
+
+def router_skeleton(state: dict, template: str | None = None, device: str = "") -> str:
+    """路由器端多服务器模式的骨架 (`?format=skeleton`)。
+
+    端口 / DNS / tun / 嗅探 / 分流规则都在, `proxy-providers` 是空 map、组的
+    `use` 是空列表 —— 路由器按行填进它自己那几台服务器的 provider 定义。
+    """
+    return clash_profile(state, template, router=True, device=device, skeleton=True)
+
+
 def subscription_body(
     state: dict,
     fmt: str = "base64",
     template: str | None = None,
     router: bool = False,
     device: str = "",
+    prefix: str = "",
 ) -> tuple[str, str]:
     """返回 (响应体, media_type)。
 
@@ -847,6 +914,10 @@ def subscription_body(
     路由器端要的是"整机接管"的配置, 不是一份节点清单。
     """
     fmt = (fmt or "base64").lower()
+    if fmt in ("provider", "nodes"):
+        return provider_profile(state, prefix=prefix), "text/yaml; charset=utf-8"
+    if fmt in ("skeleton", "router-skeleton"):
+        return router_skeleton(state, template, device=device), "text/yaml; charset=utf-8"
     if fmt in ("clash", "mihomo", "yaml", "yml"):
         return clash_profile(state, template, router=router, device=device), "text/yaml; charset=utf-8"
     if fmt in ("singbox-next", "singbox14", "singbox-1.14", "singbox-new"):

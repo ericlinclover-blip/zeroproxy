@@ -91,60 +91,98 @@ def patch_for_local_run(script: str, root: str) -> str:
     return out
 
 
-def main() -> int:
-    tmp = tempfile.mkdtemp(prefix="zp-router-check-")
-    home, fake_root = os.path.join(tmp, "home"), os.path.join(tmp, "root")
-    os.makedirs(os.path.join(home, "data"), exist_ok=True)
-    os.makedirs(fake_root, exist_ok=True)
-    with open(os.path.join(home, "data", "bootstrap_token"), "w") as fh:
-        fh.write(TOKEN + "\n")
+class Panel:
+    """一台演练用的面板 (真起 uvicorn, 真注册设备)。"""
 
-    env = {
-        **os.environ,
-        "ZP_HOME": home,
-        "ZP_STATIC": os.path.join(BACKEND, "static"),
-        "ZP_BIND_HOST": "127.0.0.1",
-        "ZP_BIND_PORT": str(PORT),
-        "ZP_PORT": str(PORT),
-        "ZP_PUBLIC_IP": "0",
-        "ZP_GEODATA_AUTO": "0",
-        "ZP_APPLY_ASYNC": "0",
-        # 演练用的假内核只有几百字节, 把"太小=下载失败"的下限调下来
-        "ZP_CORE_MIN_BYTES": "16",
-    }
+    def __init__(self, port: int, home: str, name: str):
+        self.port, self.home, self.name = port, home, name
+        self.base = f"http://127.0.0.1:{port}"
+        os.makedirs(os.path.join(home, "data"), exist_ok=True)
+        with open(os.path.join(home, "data", "bootstrap_token"), "w") as fh:
+            fh.write(TOKEN + "\n")
+        self.env = {
+            **os.environ,
+            "ZP_HOME": home,
+            "ZP_STATIC": os.path.join(BACKEND, "static"),
+            "ZP_BIND_HOST": "127.0.0.1",
+            "ZP_BIND_PORT": str(port),
+            "ZP_PORT": str(port),
+            "ZP_PUBLIC_IP": "0",
+            "ZP_GEODATA_AUTO": "0",
+            "ZP_APPLY_ASYNC": "0",
+            "ZP_CORE_MIN_BYTES": "16",   # 假内核只有几百字节
+        }
+        self.proc = subprocess.Popen(
+            [PYTHON, "-m", "zeroproxy.main"], cwd=BACKEND, env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+        self.cookie = ""
+        self.log = ""
 
-    sys.path.insert(0, BACKEND)
-    os.environ.update(env)
-    from zeroproxy import config as zp_config  # noqa: E402
-    from zeroproxy import router_client  # noqa: E402
-
-    print(f"ZeroProxy 路由器安装演练  (ZP_HOME={home}, PORT={PORT})")
-    server = subprocess.Popen(
-        [PYTHON, "-m", "zeroproxy.main"], cwd=BACKEND, env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-    )
-    log = ""
-    try:
+    def wait(self) -> bool:
         for _ in range(60):
             time.sleep(0.5)
             try:
-                http("GET", "/api/info")
-                break
+                self.req("GET", "/api/info")
+                return True
             except (urllib.error.URLError, OSError):
                 pass
-        else:
-            print("面板没起来:\n" + (server.stdout.read() or "")[-2000:])
-            return 1
+        self.log = (self.proc.stdout.read() or "") if self.proc.stdout else ""
+        return False
 
-        http("POST", "/api/setup", {
-            "domain": "127.0.0.1", "username": "admin", "password": "s3cretpass", "token": TOKEN,
+    def configure(self, domain: str) -> None:
+        self.req("POST", "/api/setup", {
+            "domain": domain, "username": "admin", "password": "s3cretpass", "token": TOKEN,
         })
-        _, _, headers = http("POST", "/api/login", {"username": "admin", "password": "s3cretpass"})
-        cookie = headers.get("set-cookie", "").split(";")[0]
+        _, _, headers = self.req("POST", "/api/login", {"username": "admin", "password": "s3cretpass"})
+        self.cookie = headers.get("set-cookie", "").split(";")[0]
+
+    def req(self, method: str, path: str, body=None):
+        req = urllib.request.Request(self.base + path, method=method)
+        if body is not None:
+            req.add_header("Content-Type", "application/json")
+            req.data = json.dumps(body).encode()
+        if self.cookie:
+            req.add_header("Cookie", self.cookie)
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            return resp.status, resp.read().decode(), resp.headers
+
+    def pair_code(self, label: str) -> str:
+        _, body, _ = self.req("POST", "/api/devices/pair", {"label": label})
+        return json.loads(body)["code"]
+
+    def stop(self) -> None:
+        self.proc.send_signal(signal.SIGTERM)
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+
+def main() -> int:
+    tmp = tempfile.mkdtemp(prefix="zp-router-check-")
+    fake_root = os.path.join(tmp, "root")
+    os.makedirs(fake_root, exist_ok=True)
+    env = {**os.environ, "ZP_GEODATA_AUTO": "0", "ZP_PUBLIC_IP": "0"}
+    os.environ.update(env)
+    sys.path.insert(0, BACKEND)
+    from zeroproxy import router_client  # noqa: E402
+
+    print(f"ZeroProxy 路由器安装演练  (PORT={PORT}, 第二台面板 {PORT + 1})")
+    panels = [Panel(PORT, os.path.join(tmp, "home-a"), "A"),
+              Panel(PORT + 1, os.path.join(tmp, "home-b"), "B")]
+    try:
+        for panel in panels:
+            if not panel.wait():
+                print(f"面板 {panel.name} 没起来:\n" + panel.log[-2000:])
+                return 1
+            panel.configure(f"127.0.0.1" if panel.name == "A" else "127.0.0.2")
+        panel = panels[0]
+        http = panel.req
 
         # 面板侧缓存一个"压缩过的假内核": 让安装脚本真的走 gzip 判定 + 解压 + 执行
         import gzip
-        cache = os.path.join(home, "data", "client", "cores")
+        cache = os.path.join(panels[0].home, "data", "client", "cores")
         os.makedirs(cache, exist_ok=True)
         stub = (
             '#!/bin/sh\ncase "$*" in\n'
@@ -157,8 +195,7 @@ def main() -> int:
             fh.write(stub.encode())
 
         def run_install(label: str) -> tuple[bool, str]:
-            _, body, _ = http("POST", "/api/devices/pair", {"label": label}, cookie=cookie)
-            code = json.loads(body)["code"]
+            code = panel.pair_code(label)
             _, script, _ = http("GET", f"/c/{code}")
             path = os.path.join(tmp, f"install-{label}.sh")
             with open(path, "w") as fh:
@@ -199,27 +236,76 @@ def main() -> int:
         proc = subprocess.Popen(["sh", agent_path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         time.sleep(8)
         proc.kill()
-        _, body, _ = http("GET", "/api/devices", cookie=cookie)
+        _, body, _ = http("GET", "/api/devices")
         device = json.loads(body)["devices"]["items"][0]
         check("agent 上报后设备显示在线", device["online"] is True)
         check("总开关默认开启且面板能看到期望状态", device["desired"] is True)
 
-        print("\n[3] 凭据在面板上失效后重跑")
+        print("\n[3] 加入第二台服务器 (面板 B) → 自动聚合成多个 provider")
+        panel_b = panels[1]
+        code_b = panel_b.pair_code("第二台")
+        cli = os.path.join(fake_root, "cli-check.sh")
+        with open(cli, "w") as fh:
+            fh.write(
+                open(os.path.join(fake_root, "cli"), encoding="utf-8").read()
+                .replace("/etc/zeroproxy", fake_root)
+                # 本机没有 procd: 把 init 调用换成 true (macOS 自带的 /etc/rc.common 被
+                # 当成脚本执行时会真的去跑 launchd 那套, 演练会挂住)
+                .replace("/etc/init.d/zeroproxy", "true")
+            )
+        out = subprocess.run(
+            ["sh", cli, "add", f"{panel_b.base}/c/{code_b}"], capture_output=True, text=True
+        )
+        print(out.stdout.strip() or out.stderr[-400:])
+        if "配置更新失败" in out.stdout:
+            dbg = subprocess.run(["sh", os.path.join(fake_root, "agent.sh"), "config"],
+                                 capture_output=True, text=True)
+            print("--- agent config 调试 ---")
+            print("rc:", dbg.returncode)
+            print("stderr:", dbg.stderr[-600:])
+            print("stdout 前几行:", "\n".join(dbg.stdout.splitlines()[:6]))
+        merged = open(os.path.join(fake_root, "config.yaml"), encoding="utf-8").read()
+        merged_yaml = yaml.safe_load(merged)
+        check("第二台服务器接入成功", out.returncode == 0 and "已接入" in out.stdout)
+        check("配置改成多 provider 模式",
+              "proxy-providers:" in merged and "proxies:" not in merged.split("proxy-groups")[0],
+              f"providers={len(merged_yaml.get('proxy-providers', {}))}")
+        check("两个 provider 都在", len(merged_yaml.get("proxy-providers", {})) == 2)
+        auto = [g for g in merged_yaml["proxy-groups"] if g["name"] == "♻️ 自动选择"][0]
+        check("组的 use 填上了两个 provider 键", len(auto.get("use", [])) == 2, str(auto.get("use")))
+        check("节点不再内联 (交给 provider 拉)", "proxies" not in merged_yaml)
+
+        out = subprocess.run(["sh", cli, "servers"], capture_output=True, text=True)
+        check("zeroproxy servers 列出两台", out.stdout.count("127.0.0.") == 2, out.stdout.strip().splitlines()[0] if out.stdout else "")
+
+        key_b = re.sub(r"[^A-Za-z0-9]", "_", panel_b.base.split("://", 1)[-1])[:32]
+        out = subprocess.run(["sh", cli, "drop", key_b], capture_output=True, text=True)
+        after = yaml.safe_load(open(os.path.join(fake_root, "config.yaml"), encoding="utf-8").read())
+        # 剩一台时退回"面板给整份配置"的老路径 (内联节点), 不再挂 provider —— 这条路径
+        # 是真机验证过的, 没必要为了统一形式让它也绕一圈 provider
+        check("drop 之后退回单服务器路径 (内联节点)",
+              "proxy-providers" not in after and len(after.get("proxies", [])) == 5,
+              out.stdout.strip()[:60])
+
+        print("\n[4] 凭据在面板上失效后重跑")
+        _, body, _ = http("GET", "/api/devices")
+        device = json.loads(body)["devices"]["items"][0]
         old_id = device["id"]
-        http("DELETE", f"/api/devices/{old_id}", cookie=cookie)
+        http("DELETE", f"/api/devices/{old_id}")
         ok, out = run_install("rejoin")
-        _, body, _ = http("GET", "/api/devices", cookie=cookie)
+        _, body, _ = http("GET", "/api/devices")
         items = json.loads(body)["devices"]["items"]
         check("旧凭据被拒后自动重新接入", ok and "重新接入" in out, f"旧 {old_id}")
         check("面板上换成一台新设备 (没有卡死在旧凭据)",
               len(items) == 1 and items[0]["id"] != old_id, items[0]["id"] if items else "无")
     finally:
-        server.send_signal(signal.SIGTERM)
-        try:
-            server.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            server.kill()
-        log = server.stdout.read() if server.stdout else ""
+        logs = []
+        for panel in panels:
+            # 先停再读: 反过来会先卡在读管道上 (进程还活着, read() 等不到 EOF)
+            panel.stop()
+            panel.log = panel.proc.stdout.read() if panel.proc.stdout else ""
+            logs.append(panel.log)
+        log = "\n".join(logs)
         shutil.rmtree(tmp, ignore_errors=True)
 
     failed = [r for r in results if not r[1]]

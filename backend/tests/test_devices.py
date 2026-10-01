@@ -190,6 +190,42 @@ def test_device_subscription_requires_secret(client, configured):
     assert client.get(f"/c/sub/dv-nope?k={device['secret']}").status_code == 403
 
 
+def test_provider_format_is_nodes_only_with_domain_prefix(client, configured):
+    """路由器端多服务器聚合: 每台面板出一个"只有节点"的文件, 挂成 mihomo provider。
+
+    前缀不是装饰: 两台面板各自有一个"东京-01"时, 同名节点会让 mihomo 拒绝加载
+    整份配置。用域名当前缀不需要路由器传参 —— 域名本来就是每台面板唯一的。
+    """
+    _login(client)
+    device = _register(client, _pair_code(client)["code"])
+    body = client.get(f"/c/sub/{device['id']}?k={device['secret']}&format=provider").text
+    profile = yaml.safe_load(body)
+    assert set(profile) == {"proxies"}, "provider 文件只能有 proxies, 不能带 rules/groups"
+    assert len(profile["proxies"]) == 5
+    assert all(p["name"].startswith(f"{DOMAIN} · ") for p in profile["proxies"]), profile["proxies"][0]
+
+    # 名字仍是可读的, 前缀只是"哪台服务器"的标注
+    assert any("VLESS Reality" in p["name"] for p in profile["proxies"])
+
+
+def test_skeleton_format_leaves_providers_and_use_empty(client, configured):
+    """多服务器模式的骨架: 端口/DNS/tun/规则齐全, 只有 providers 与组成员留空,
+    等路由器填。留"空结构"而不是自定义标记, 是为了让骨架本身仍是合法配置。"""
+    _login(client)
+    device = _register(client, _pair_code(client)["code"])
+    body = client.get(f"/c/sub/{device['id']}?k={device['secret']}&format=skeleton").text
+    skeleton = yaml.safe_load(body)
+    assert skeleton["proxy-providers"] == {}, "providers 必须是空 map (路由器按行填)"
+    assert "proxies" not in skeleton, "多服务器模式不该内联节点"
+    auto = [g for g in skeleton["proxy-groups"] if g["name"] == "♻️ 自动选择"][0]
+    assert auto["use"] == [], "组的 use 必须留空给路由器填"
+    # 骨架的其余部分与单服务器配置一致
+    assert skeleton["tun"]["enable"] is True
+    assert skeleton["dns"]["enhanced-mode"] == "fake-ip"
+    assert any(r.startswith("GEOIP,CN,") for r in skeleton["rules"])
+    assert "provider" not in body.split("proxy-providers", 1)[0].lower()  # 头部注释别误导
+
+
 def test_device_template_override(client, configured):
     _login(client)
     device = _register(client, _pair_code(client)["code"])

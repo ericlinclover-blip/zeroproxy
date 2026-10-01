@@ -107,6 +107,11 @@ http_post() {
 
 json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\r\n'; }
 
+# 面板地址 → 服务器清单里的键 (与 agent 里的 key_of 一致): hkk.i3.pub:8899 → hkk_i3_pub
+srv_key() {
+    printf '%s' "$1" | sed -e 's#^https*://##' -e 's/[^A-Za-z0-9]/_/g' | cut -c1-32
+}
+
 # 取一个扁平 JSON 字段 (busybox 里没有 jq, 好在面板返回的都是浅结构)。
 json_get() {
     _json="$1"; _key="$2"
@@ -229,6 +234,18 @@ do_pair() {
   "name": "$DEV_NAME"
 }
 EOF
+    # 多服务器清单: 每台面板一条。device.json 保留是为了让老版本的 agent 与
+    # CLI 不至于读不到东西 (首次运行会把它迁移成 servers/ 下的一条)。
+    mkdir -p "$ZP_DIR/servers"
+    cat > "$ZP_DIR/servers/$(srv_key "$ZP_BASE").json" <<EOF
+{
+  "base": "$ZP_BASE",
+  "id": "$DEV_ID",
+  "secret": "$DEV_SECRET",
+  "name": "${DEV_NAME:-$ZP_BASE}"
+}
+EOF
+    chmod 600 "$ZP_DIR/servers/$(srv_key "$ZP_BASE").json"
     umask 022
     chmod 600 "$ZP_DEV"
     return 0
@@ -296,8 +313,9 @@ install_core() {
 fetch_config() {
     _dest="${1:-$ZP_CONF}"
     _tmp="$_dest.new"
-    _sub_path="c/sub/$DEV_ID?k=$DEV_SECRET&format=clash&rules=smart"
-    if ! http_get "$ZP_BASE/$_sub_path" > "$_tmp" 2>/dev/null; then
+    # 配置怎么生成只有一份实现: agent 的 `config` 模式 (单服务器用面板给的整份配置,
+    # 多服务器用骨架 + 本地挂 provider)。安装脚本不再自己拼配置, 免得两处走偏。
+    if ! "$ZP_DIR/agent.sh" config > "$_tmp" 2>/dev/null; then
         rm -f "$_tmp"
         # 凭据被拒 (403) 是最常见的"看起来莫名其妙"的失败: 面板上把这台设备移除过,
         # 或者路由器上留的是另一台面板发的凭据。本地文件看不出问题, 只有真的去拉一次
@@ -309,11 +327,12 @@ fetch_config() {
   请回面板「客户端」重新生成一条安装命令, 再在路由器上跑一次。"
         fi
         ok "已重新接入: $DEV_NAME ($DEV_ID)"
-        _sub_path="c/sub/$DEV_ID?k=$DEV_SECRET&format=clash&rules=smart"
-        http_get "$ZP_BASE/$_sub_path" > "$_tmp" 2>/dev/null \
+        "$ZP_DIR/agent.sh" config > "$_tmp" 2>/dev/null \
             || die "重新接入后仍然拉不到配置, 请回面板确认已有可用节点"
     fi
-    grep -q '^proxies:' "$_tmp" || { rm -f "$_tmp"; return 1; }
+    # 单服务器模式带内联 proxies, 多服务器模式带 proxy-providers: 共同锚点是策略组
+    grep -q '^proxy-groups:' "$_tmp" || { rm -f "$_tmp"; return 1; }
+    mkdir -p "$ZP_DIR/providers"
     # 先用内核自己校验再替换 —— 配置写坏就等于全屋断网, 必须先测后换
     if ! "$ZP_BIN" -t -d "$ZP_DIR" -f "$_tmp" >/dev/null 2>&1; then
         "$ZP_BIN" -t -d "$ZP_DIR" -f "$_tmp" 2>&1 | tail -n3 >&2
@@ -328,9 +347,6 @@ fetch_config() {
 write_files() {
     step "写入运行文件"
     mkdir -p "$ZP_DIR"
-
-    fetch_config "$ZP_CONF" || die "拉取/校验配置失败, 请回面板确认已有可用节点"
-    ok "配置已写入 $ZP_CONF"
 
     # tproxy 回退方案用的 nft 规则 (只在 TUN 不可用时由 init 脚本加载)。
     # 优先级用数字而不是符号名 (dstnat/mangle): 数字在各版本 nft 上行为一致。
@@ -368,13 +384,109 @@ NFTEOF
 # ZeroProxy 路由器控制 agent (由 procd 常驻)。
 SLEEP=15
 ZP_DIR=/etc/zeroproxy
+#: 每台面板一条凭据。多服务器模式下路由器把它们挂成多个 mihomo proxy-provider,
+#: 由 mihomo 自己合并节点并做健康检查 —— 面板之间不需要互相认识。
+SERVERS="$ZP_DIR/servers"
+#: 老版本只有一个 device.json; 首次运行时迁移成 servers/ 下的一条。
 DEV="$ZP_DIR/device.json"
 CONF="$ZP_DIR/config.yaml"
 STATE="$ZP_DIR/state"
 
 log() { logger -t zeroproxy-agent "$*"; }
 
-get() { sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$DEV" | head -n1; }
+# ---------------------------------------------------------------- 服务器清单
+
+# 从任意一份凭据文件里取字段 (文件是扁平 JSON, 用 sed 取足够且不依赖 jq)
+field_of() { sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" | head -n1; }
+get() { field_of "$DEV" "$1"; }
+
+server_files() { ls "$SERVERS"/*.json 2>/dev/null; }
+count_servers() { server_files | wc -l | tr -d ' '; }
+first_server() { server_files | head -n1; }
+
+# 面板地址 → provider 键 (合法 YAML 键 + 文件名): https://hkk.i3.pub:8899 → hkk_i3_pub
+key_of() {
+    printf '%s' "$1" | sed -e 's#^https*://##' -e 's/[^A-Za-z0-9]/_/g' | cut -c1-32
+}
+
+# 老版本只写了一份 device.json: 首次运行补成 servers/ 下的一条, 之后统一走多服务器路径
+migrate_servers() {
+    mkdir -p "$SERVERS"
+    [ -s "$DEV" ] || return 0
+    [ -n "$(server_files)" ] && return 0
+    _b="$(get base)"; _i="$(get id)"; _k="$(get secret)"
+    [ -n "$_b" ] && [ -n "$_i" ] && [ -n "$_k" ] || return 0
+    _name="$(get name)"
+    cat > "$SERVERS/$(key_of "$_b").json" <<EOF
+{
+  "base": "$_b",
+  "id": "$_i",
+  "secret": "$_k",
+  "name": "${_name:-$_b}"
+}
+EOF
+    chmod 600 "$SERVERS/$(key_of "$_b").json"
+    log "已把原来的单服务器凭据迁移到 servers/"
+}
+
+# 所有 provider 的键, 逗号分隔 (填进策略组的 use)
+provider_keys() {
+    _out=""
+    for _f in $(server_files); do
+        _k="$(key_of "$(field_of "$_f" base)")"
+        _out="${_out:+$_out, }$_k"
+    done
+    printf '%s' "$_out"
+}
+
+# proxy-providers 段落 (YAML, 缩进两格)
+providers_yaml() {
+    for _f in $(server_files); do
+        _b="$(field_of "$_f" base)"; _i="$(field_of "$_f" id)"; _k="$(field_of "$_f" secret)"
+        _key="$(key_of "$_b")"
+        printf '  %s:\n' "$_key"
+        printf '    type: http\n'
+        printf '    url: "%s/c/sub/%s?k=%s&format=provider"\n' "$_b" "$_i" "$_k"
+        printf '    interval: 3600\n'
+        printf '    path: ./providers/%s.yaml\n' "$_key"
+        printf '    health-check:\n      enable: true\n      url: http://www.gstatic.com/generate_204\n      interval: 300\n'
+    done
+}
+
+# 生成最终配置并打到标准输出。
+#   单服务器: 直接用面板给的整份配置 (已验证的老路径)
+#   多服务器: 取第一台的骨架, 把 providers 与组的 use 填上 (按行替换, 不做 YAML 解析)
+build_config() {
+    migrate_servers
+    _first="$(first_server)"
+    [ -n "$_first" ] || return 1
+    _b="$(field_of "$_first" base)"; _i="$(field_of "$_first" id)"; _k="$(field_of "$_first" secret)"
+    _n="$(count_servers)"
+    if [ "$_n" -le 1 ]; then
+        http_get "$_b/c/sub/$_i?k=$_k&format=clash&rules=smart"
+        return $?
+    fi
+    _skel="$(http_get "$_b/c/sub/$_i?k=$_k&format=skeleton&rules=smart")" || return 1
+    [ -n "$_skel" ] || return 1
+    # provider 段落走临时文件而不是 `awk -v block=...`: -v 的值里带换行时, BSD awk
+    # 直接报 "newline in string", busybox awk 的转义处理也不一致 (本机演练抓到的)。
+    # `getline < file` 是 POSIX, 各版本 awk 都按字面读。
+    _block="$ZP_DIR/.providers.$$.block"
+    providers_yaml > "$_block" || return 1
+    printf '%s\n' "$_skel" | awk -v keys="$(provider_keys)" -v blockfile="$_block" '
+        /^proxy-providers: \{\}[[:space:]]*$/ {
+            print "proxy-providers:"
+            while ((getline line < blockfile) > 0) print line
+            close(blockfile)
+            next
+        }
+        /use: \[\]/ { sub(/use: \[\]/, "use: [" keys "]"); print; next }
+        { print }
+    '
+    _rc=$?
+    rm -f "$_block"
+    return $_rc
+}
 json_get() {
     if command -v jsonfilter >/dev/null 2>&1; then
         printf '%s' "$1" | jsonfilter -e "@.$2" 2>/dev/null | head -n1
@@ -431,26 +543,40 @@ switch_core() {
 
 apply_config() {
     # 原子替换: 新配置先落 .new, 校验通过才替换, 失败保留旧配置继续用。
-    _url="$(get base)/c/sub/$(get id)?k=$(get secret)&format=clash&rules=smart"
-    http_get "$_url" > "$CONF.new" 2>/dev/null || return 1
-    grep -q '^proxies:' "$CONF.new" || { rm -f "$CONF.new"; return 1; }
+    build_config > "$CONF.new" 2>/dev/null || { rm -f "$CONF.new"; return 1; }
+    # 单服务器模式带内联 proxies, 多服务器模式带 proxy-providers —— 唯一共同的锚点是
+    # 策略组, 所以用它判断"这看起来像一份配置"。
+    grep -q '^proxy-groups:' "$CONF.new" || { rm -f "$CONF.new"; return 1; }
     /etc/zeroproxy/mihomo -t -d "$ZP_DIR" -f "$CONF.new" >/dev/null 2>&1 \
         || { rm -f "$CONF.new"; log "新配置校验失败, 保留原配置"; return 1; }
+    mkdir -p "$ZP_DIR/providers"
     mv "$CONF.new" "$CONF"
     /etc/init.d/zeroproxy restart >/dev/null 2>&1 || true
     log "配置已更新并重载"
     return 0
 }
 
+# 命令行模式: agent.sh config 打印一份合并后的配置 (安装脚本与 CLI 都用它);
+# agent.sh once 只跑一轮心跳 (排查用)。默认无参数 = 常驻循环。
+case "${1:-}" in
+    config) migrate_servers; build_config; exit $? ;;
+    once)   RUN_ONCE=1 ;;
+esac
+
 LAST_REV=""
+LAST_PULL=0
 FAILS=0
 while true; do
-    BODY='{"device":"'"$(get id)"'","k":"'"$(get secret)"'","version":"1.0.0"'
+    migrate_servers
+    FIRST="$(first_server)"
+    [ -n "$FIRST" ] || { sleep "$SLEEP"; continue; }
+    BASE="$(field_of "$FIRST" base)"; DID="$(field_of "$FIRST" id)"; DKEY="$(field_of "$FIRST" secret)"
+    BODY='{"device":"'"$DID"'","k":"'"$DKEY"'","version":"1.0.0"'
     if core_up; then BODY="$BODY"',"actual":true'; else BODY="$BODY"',"actual":false'; fi
     [ -n "$LAST_REV" ] && BODY="$BODY"',"rev":"'"$LAST_REV"'"'
     BODY="$BODY"'}'
 
-    RESP="$(http_post "$(get base)/c/report" "$BODY" || true)"
+    RESP="$(http_post "$BASE/c/report" "$BODY" || true)"
     if [ -z "$RESP" ]; then
         FAILS=$((FAILS + 1))
         # 面板不可达时保持现状 (而不是把代理关掉) —— 断网时"维持可用"比"忠于面板"重要
@@ -472,9 +598,13 @@ while true; do
         switch_core off
     fi
 
-    if [ -n "$REV" ] && [ "$REV" != "$LAST_REV" ]; then
-        if apply_config; then LAST_REV="$REV"; fi
+    # 配置版本取自第一台面板; 但多服务器时别的面板改了配置不会反映在这里, 所以
+    # 再补一条"最多 6 小时拉一次"的兜底。
+    _now="$(date +%s)"
+    if { [ -n "$REV" ] && [ "$REV" != "$LAST_REV" ]; } || [ $((_now - LAST_PULL)) -ge 21600 ]; then
+        if apply_config; then LAST_REV="$REV"; LAST_PULL="$_now"; fi
     fi
+    [ -n "${RUN_ONCE:-}" ] && exit 0
     sleep "$SLEEP"
 done
 AGENTEOF
@@ -551,30 +681,127 @@ AGENTINITEOF
 #!/bin/sh
 # ZeroProxy 路由器客户端运维命令
 ZP_DIR=/etc/zeroproxy
-BASE="$(sed -n 's/.*"base"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ZP_DIR/device.json" 2>/dev/null | head -n1)"
+SERVERS="$ZP_DIR/servers"
+FIRST="$(ls "$SERVERS"/*.json 2>/dev/null | head -n1)"
+
+field_of() { sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" | head -n1; }
+key_of() {
+    printf '%s' "$1" | sed -e 's#^https*://##' -e 's/[^A-Za-z0-9]/_/g' | cut -c1-32
+}
+servers() { ls "$SERVERS"/*.json 2>/dev/null; }
 
 running() { /etc/init.d/zeroproxy running >/dev/null 2>&1 && echo yes || echo no; }
 
 case "${1:-status}" in
     status)
         echo "内核:  $( [ "$(running)" = yes ] && echo 运行中 || echo 已停止 )"
-        echo "设备:  $(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ZP_DIR/device.json" 2>/dev/null | head -n1)"
-        echo "面板:  $BASE"
+        echo "服务器 ($(servers | wc -l | tr -d ' ') 台):"
+        for _f in $(servers); do
+            printf '  %-16s %s\n' "$(key_of "$(field_of "$_f" base)")" "$(field_of "$_f" base)"
+        done
         [ -c /dev/net/tun ] && echo "模式:  TUN (全屋透明)" || echo "模式:  tproxy (全屋透明, 本机自身流量除外)"
         if command -v curl >/dev/null 2>&1; then
             curl -fsS -m 8 "http://127.0.0.1:9090/version" 2>/dev/null | head -c 200 && echo
         fi
         ;;
+    servers)
+        echo "服务器清单 ($ZP_DIR/servers):"
+        for _f in $(servers); do
+            printf '  %-16s %s  (设备 %s)\n' "$(key_of "$(field_of "$_f" base)")" \
+                "$(field_of "$_f" base)" "$(field_of "$_f" id)"
+        done
+        ;;
+    add)
+        # 从面板复制一行 (安装命令里的那个 URL), 粘进来即可 —— 不用再走一次完整安装。
+        _url="${2:-}"
+        [ -n "$_url" ] || { echo "用法: zeroproxy add https://面板:8899/c/<配对码>"; exit 2; }
+        case "$_url" in
+            http*://*/c/*) ;;
+            *) echo "这看起来不是一个面板链接。请到面板「客户端」生成安装命令, 复制其中 https://…/c/… 这一段。"; exit 2 ;;
+        esac
+        _base="${_url%/c/*}"
+        _code="${_url##*/c/}"
+        _key="$(key_of "$_base")"
+        mkdir -p "$SERVERS"
+        echo "正在与 $_base 配对…"
+        _body='{"code":"'"$_code"'","kind":"router","model":"router","arch":"'"$(uname -m)"'","os":"OpenWrt","version":"1.0.0"}'
+        if command -v curl >/dev/null 2>&1; then
+            _resp="$(curl -fsSk -m 30 -H 'Content-Type: application/json' --data "$_body" "$_base/c/pair" 2>/dev/null)"
+        else
+            _resp="$(uclient-fetch -q --no-check-certificate -O - --post-data "$_body" "$_base/c/pair" 2>/dev/null)"
+        fi
+        _id="$(printf '%s' "$_resp" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+        _sec="$(printf '%s' "$_resp" | sed -n 's/.*"secret"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+        if [ -z "$_id" ] || [ -z "$_sec" ]; then
+            echo "配对失败: $(printf '%s' "$_resp" | sed -n 's/.*"error"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+            echo "配对码是一次性的, 请回面板重新生成一条安装命令后复制其中的链接。"
+            exit 1
+        fi
+        cat > "$SERVERS/$_key.json" <<EOF
+{
+  "base": "$_base",
+  "id": "$_id",
+  "secret": "$_sec",
+  "name": "$_base"
+}
+EOF
+        chmod 600 "$SERVERS/$_key.json"
+        echo "已接入: $_key ($_base)"
+        # 注意把"重建配置"与"重启内核"分开判断: 重启失败不该把已经写好的配置撤掉
+        # (内核本来就是 procd 常驻的, 它自己会重启)。
+        if "$ZP_DIR/agent.sh" config > "$ZP_DIR/config.yaml.new" 2>/dev/null \
+            && "$ZP_DIR/mihomo" -t -d "$ZP_DIR" -f "$ZP_DIR/config.yaml.new" >/dev/null 2>&1; then
+            mv "$ZP_DIR/config.yaml.new" "$ZP_DIR/config.yaml"
+            /etc/init.d/zeroproxy restart >/dev/null 2>&1 || true
+            echo "配置已更新并重载 (现在共 $(servers | wc -l | tr -d ' ') 台服务器)"
+        else
+            rm -f "$ZP_DIR/config.yaml.new"
+            echo "配置更新失败, 旧配置仍在运行 (看 zeroproxy log)"
+        fi
+        ;;
+    drop)
+        _key="${2:-}"
+        _file="$SERVERS/$_key.json"
+        [ -f "$_file" ] || { echo "没有这台服务器: $_key (用 zeroproxy servers 看清单)"; exit 2; }
+        mv "$_file" "$_file.removed"
+        echo "已移除 $_key, 正在重建配置…"
+        if "$ZP_DIR/agent.sh" config > "$ZP_DIR/config.yaml.new" 2>/dev/null \
+            && "$ZP_DIR/mihomo" -t -d "$ZP_DIR" -f "$ZP_DIR/config.yaml.new" >/dev/null 2>&1; then
+            mv "$ZP_DIR/config.yaml.new" "$ZP_DIR/config.yaml"
+            /etc/init.d/zeroproxy restart >/dev/null 2>&1
+            rm -f "$_file.removed"
+            echo "完成 (剩余 $(servers | wc -l | tr -d ' ') 台服务器)"
+        else
+            mv "$_file.removed" "$_file"
+            rm -f "$ZP_DIR/config.yaml.new"
+            echo "重建失败, 已回滚 —— 这台服务器还在用"
+        fi
+        echo "提示: 面板上的设备记录不会自动删除, 需要的话在那边一并移除。"
+        ;;
+    refresh)
+        echo "重新拉取全部服务器的节点…"
+        if "$ZP_DIR/agent.sh" config > "$ZP_DIR/config.yaml.new" 2>/dev/null \
+            && "$ZP_DIR/mihomo" -t -d "$ZP_DIR" -f "$ZP_DIR/config.yaml.new" >/dev/null 2>&1; then
+            mv "$ZP_DIR/config.yaml.new" "$ZP_DIR/config.yaml"
+            /etc/init.d/zeroproxy restart >/dev/null 2>&1
+            echo "完成"
+        else
+            rm -f "$ZP_DIR/config.yaml.new"
+            echo "拉取失败, 旧配置仍在运行 (看 zeroproxy log)"
+            exit 1
+        fi
+        ;;
     on|off)
         # 本地开关同样以面板为准: 告诉面板改期望状态, agent 下一轮生效
         ON=$([ "$1" = on ] && echo true || echo false)
-        ID="$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ZP_DIR/device.json" | head -n1)"
-        KEY="$(sed -n 's/.*"secret"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ZP_DIR/device.json" | head -n1)"
+        [ -n "$FIRST" ] || { echo "还没有接入任何服务器"; exit 1; }
+        ID="$(field_of "$FIRST" id)"
+        KEY="$(field_of "$FIRST" secret)"
         BODY='{"device":"'"$ID"'","k":"'"$KEY"'","set_desired":'"$ON"'}'
         if command -v curl >/dev/null 2>&1; then
-            curl -fsSk -m 15 -H 'Content-Type: application/json' --data "$BODY" "$BASE/c/report" >/dev/null
+            curl -fsSk -m 15 -H 'Content-Type: application/json' --data "$BODY" "$(field_of "$FIRST" base)/c/report" >/dev/null
         else
-            uclient-fetch -q --no-check-certificate -O - --post-data "$BODY" "$BASE/c/report" >/dev/null
+            uclient-fetch -q --no-check-certificate -O - --post-data "$BODY" "$(field_of "$FIRST" base)/c/report" >/dev/null
         fi
         echo "已请求面板把总开关设为「$1」, 约 15 秒内生效 (zeroproxy status 查看)"
         ;;
@@ -593,10 +820,14 @@ case "${1:-status}" in
         rm -rf "$ZP_DIR" /etc/init.d/zeroproxy /etc/init.d/zeroproxy-agent /usr/bin/zeroproxy
         echo "已卸载。这台设备在面板上仍然存在, 请在面板「客户端」里一并移除。"
         ;;
-    *) echo "用法: zeroproxy [status|on|off|log|uninstall]" ;;
+    *) echo "用法: zeroproxy [status|servers|add <链接>|drop <键>|refresh|on|off|log|uninstall]" ;;
 esac
 CLIEOF
     chmod 755 "$ZP_CLI"
+    # 配置在所有运行文件就位之后才生成 (agent 的 config 模式要用到 agent.sh 自己);
+    # 生成失败时那条自愈路径还能用本次命令里的配对码重新接入。
+    fetch_config "$ZP_CONF" || die "拉取/校验配置失败, 请回面板确认已有可用节点"
+    ok "配置已写入 $ZP_CONF"
     ok "已写入 $ZP_INIT / $ZP_AGENT_INIT / $ZP_DIR/agent.sh / $ZP_CLI"
 }
 

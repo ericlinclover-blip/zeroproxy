@@ -2939,11 +2939,20 @@ def client_pair(payload: DeviceRegisterIn, request: Request):
 
 @router.get("/c/sub/{device_id}")
 def client_subscription(
-    device_id: str, request: Request, k: str = "", format: str = "clash", rules: str = ""
+    device_id: str,
+    request: Request,
+    k: str = "",
+    format: str = "clash",
+    rules: str = "",
+    prefix: str = "",
 ):
-    """设备专属订阅。只出 routers 用的 clash 配置 —— 设备不该拿到主订阅令牌。
+    """设备专属订阅。设备不该拿到主订阅令牌, 所以它走自己的凭据。
 
     单个设备可以用 `?rules=` 覆盖分流模板 (面板上那台设备的设置优先)。
+    三种输出:
+      format=clash     整份路由器配置 (单服务器模式, 内联节点)
+      format=skeleton  骨架 (多服务器模式: providers 与组的 use 留空, 由路由器填)
+      format=provider  只有节点 (给 mihomo 的 proxy-provider 用, 名字带前缀)
     """
     with config.locked():
         state = load_state()
@@ -2954,8 +2963,19 @@ def client_subscription(
             return _err("设备凭据无效", 403)
         # 设备自己的模板覆盖优先于全局设置
         tpl = (device or {}).get("template") or ""
+        fmt = (format or "clash").strip().lower()
+        if fmt not in (
+            "clash", "mihomo", "yaml", "yml",
+            "provider", "nodes", "skeleton", "router-skeleton",
+        ):
+            fmt = "clash"
         body, media_type = share_links.subscription_body(
-            state, "clash", rules or tpl, router=True, device=str(device.get("name") or "")
+            state,
+            fmt,
+            rules or tpl,
+            router=True,
+            device=str(device.get("name") or ""),
+            prefix=(prefix or "").strip()[:40],
         )
         # 拉配置也算一次"设备还活着": 装完立刻在面板上显示在线, 不用等下一轮心跳
         if devices.touch(state, device, {"ip": _client_ip(request), "rev": devices.config_rev(state)}):
