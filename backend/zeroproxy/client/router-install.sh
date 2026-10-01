@@ -571,7 +571,11 @@ apply_config() {
         || { rm -f "$CONF.new"; log "新配置校验失败, 保留原配置"; return 1; }
     mkdir -p "$ZP_DIR/providers"
     mv "$CONF.new" "$CONF"
-    /etc/init.d/zeroproxy restart >/dev/null 2>&1 || true
+    # 只在"该开"的时候重启内核。关闭状态下也重启的话, 内核会被反复拉起来又被下一轮
+    # 心跳关掉 —— 真机日志里就是这样刷屏的 (面板上表现为"同步中"来回跳)。
+    if core_up; then
+        /etc/init.d/zeroproxy restart >/dev/null 2>&1 || true
+    fi
     log "配置已更新并重载"
     return 0
 }
