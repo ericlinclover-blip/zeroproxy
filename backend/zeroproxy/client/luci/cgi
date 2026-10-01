@@ -19,25 +19,6 @@ header() {
 }
 fail() { header; printf '{"ok":false,"error":"%s"}\n' "$1"; exit 0; }
 
-# ---------------------------------------------------------------- 鉴权
-# 先服务"页面本身": 界面也由这个脚本发出 —— GL.iNet 这类固件的 80 端口是
-# nginx + fcgiwrap, 静态目录不一定在浏览器能访问的位置 (真机上 /www/zeroproxy/
-# 直接 403), 而 /cgi-bin/ 一定通 (LuCI 自己就走这条路)。
-# 页面代码不含任何机密, 所以这一段不需要登录。
-QS="${QUERY_STRING:-}"
-want="$(printf '%s' "$QS" | tr '&' '\n' | sed -n 's/^file=//p' | head -n1)"
-if [ "$want" = "app.js" ]; then
-    printf 'Content-Type: text/javascript; charset=utf-8\r\nCache-Control: no-store\r\n\r\n'
-    cat /www/zeroproxy/app.js 2>/dev/null
-    exit 0
-fi
-act="$(printf '%s' "$QS" | tr '&' '\n' | sed -n 's/^a=//p' | head -n1)"
-if [ -z "$act" ] && [ -z "$want" ]; then
-    printf 'Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n\r\n'
-    cat /www/zeroproxy/index.html 2>/dev/null
-    exit 0
-fi
-
 # 鉴权: 满足任意一条即可
 #   ① URL 里带一次性令牌 (?k=…)  —— `zeroproxy ui` 打印的就是它, 顺手种成 cookie
 #   ② 已经种下的令牌 cookie
@@ -60,6 +41,28 @@ if [ -z "$ok" ]; then
         ubus -S "$sid" call session get '{}' 2>/dev/null | grep -q '"ubus_rpc_session"' && ok=1
     fi
 fi
+
+# ---------------------------------------------------------------- 鉴权
+# 先服务"页面本身": 界面也由这个脚本发出 —— GL.iNet 这类固件的 80 端口是
+# nginx + fcgiwrap, 静态目录不一定在浏览器能访问的位置 (真机上 /www/zeroproxy/
+# 直接 403), 而 /cgi-bin/ 一定通 (LuCI 自己就走这条路)。
+# 页面代码不含任何机密, 所以这一段不需要登录。
+QS="${QUERY_STRING:-}"
+want="$(printf '%s' "$QS" | tr '&' '\n' | sed -n 's/^file=//p' | head -n1)"
+if [ "$want" = "app.js" ]; then
+    printf 'Content-Type: text/javascript; charset=utf-8\r\nCache-Control: no-store\r\n\r\n'
+    cat /www/zeroproxy/app.js 2>/dev/null
+    exit 0
+fi
+act="$(printf '%s' "$QS" | tr '&' '\n' | sed -n 's/^a=//p' | head -n1)"
+if [ -z "$act" ] && [ -z "$want" ]; then
+    printf 'Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n\r\n'
+    cat /www/zeroproxy/index.html 2>/dev/null
+    exit 0
+fi
+
+
+# 页面与脚本本身不需要授权; 只有下面的数据接口要。
 [ -n "$ok" ] || fail "未授权 — 在路由器上执行 zeroproxy ui 拿到带令牌的地址"
 
 # ---------------------------------------------------------------- 工具
