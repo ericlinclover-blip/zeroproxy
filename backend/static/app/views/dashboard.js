@@ -13,6 +13,7 @@ import { renderAudit } from "./audit.js";
 import { renderNodes, renderKpis, renderDashboardBanner, runProbe } from "./status.js";
 import { renderTraffic, renderAdvanced, renderSystem } from "./traffic.js";
 import { renderChain } from "./chain.js";
+import { renderClients } from "./clients.js";
 import { loadUpdate, renderUpdate } from "./update.js";
 import { renderPanel } from "./panel.js";
 
@@ -83,6 +84,7 @@ export function renderDash(quiet) {
   renderTraffic(S.dash.traffic);
   renderAdvanced(S.dash);
   renderChain(S.dash);
+  renderClients(S.dash);
   renderSystem(S.dash);
   renderPanel(S.dash);
   renderAudit(S.dash.audit, S.dash.audit_facets, S.dash.audit_stats, S.dash.audit_more);

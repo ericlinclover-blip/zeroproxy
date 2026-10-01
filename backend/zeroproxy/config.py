@@ -24,7 +24,8 @@ except ImportError:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
 #: state.json 结构版本 — 新增字段时 +1, `_merge` 会自动补齐缺失键
-STATE_VERSION = 4
+#: v5: 新增 devices (客户端设备注册表, 见 devices.py)
+STATE_VERSION = 5
 
 DEFAULT_HOME = "/opt/zeroproxy"
 #: 面板对外端口 (nginx 监听, 默认 8899) — 用于生成订阅/面板链接
@@ -192,6 +193,15 @@ DEFAULTS: dict = {
             "hy_sni": "",       # 客户端必须用这个 SNI (本机自签证书的 SAN 就是它)
         },
         "entries": [],
+    },
+    # 客户端设备 (手机 / 电脑 / 路由器)。每台设备一条记录, 由 devices.py 维护:
+    #   items      — 已接入的设备 (设备侧持有 secret, 这里只存 sha256)
+    #   pair_codes — 待使用的一次性配对码 (安装命令里带的就是它, 用完即废)
+    # 设备凭自己的 secret 拉订阅 (/c/sub/{id}?k=…) 并轮询开关状态 (/c/report),
+    # 因此主订阅令牌永远不会落到路由器上, 单台设备也能被单独吊销。
+    "devices": {
+        "items": [],
+        "pair_codes": [],
     },
     "cert": {
         "type": "none",  # none | letsencrypt | selfsigned
@@ -425,6 +435,12 @@ AUDIT_ACTIONS: dict[str, tuple[str, str]] = {
     "chain_warmup": ("预热入口链路", "chain"),
     "chain_warmup_failed": ("链路预热失败", "chain"),
     "chain_transport": ("切换内层传输", "chain"),
+    "device_pair": ("生成客户端配对码", "device"),
+    "device_add": ("客户端接入", "device"),
+    "device_rename": ("重命名客户端", "device"),
+    "device_toggle": ("客户端总开关", "device"),
+    "device_template": ("客户端分流模板", "device"),
+    "device_remove": ("移除客户端", "device"),
     "geodata_update": ("更新 GeoIP 数据", "data"),
     "geodata_update_failed": ("GeoIP 更新失败", "data"),
     "geodata_auto": ("自动更新 GeoIP", "data"),
@@ -440,6 +456,7 @@ AUDIT_CATEGORIES: dict[str, str] = {
     "auth": "安全",
     "config": "配置",
     "chain": "链路",
+    "device": "客户端",
     "data": "数据",
     "system": "程序",
     "other": "其它",
@@ -449,7 +466,10 @@ AUDIT_CATEGORIES: dict[str, str] = {
 AUDIT_FAILING = {"login_failed", "geodata_update_failed"}
 
 #: 不可逆 / 影响面大的动作: 面板上单独标一下, 方便回看"谁动过这一下"。
-AUDIT_RISK = {"setup", "restore", "update", "logout_all", "chain_delete", "audit_clear"}
+#: 设备被移除 = 那台机器上的代理立刻失效 (不能靠"再装一次"恢复), 值得单独标出来。
+AUDIT_RISK = {
+    "setup", "restore", "update", "logout_all", "chain_delete", "audit_clear", "device_remove",
+}
 
 AUDIT_MAX = 500             # state.json 里保留的条数 (再老的滚进 audit.log)
 AUDIT_COALESCE_S = 60       # 同一条记录在这个窗口内重复出现就合并计数

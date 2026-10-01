@@ -31,7 +31,7 @@ import qrcode.constants
 import qrcode.image.pil  # noqa: F401  (PIL 后端需显式导入)
 import qrcode.image.svg
 from fastapi import APIRouter, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 from . import (
@@ -41,7 +41,9 @@ from . import (
     chain_quic,
     config,
     crypto,
+    devices,
     geodata,
+    router_client,
     services,
     share_links,
     update,
@@ -816,6 +818,9 @@ def _dashboard_body(state: dict, request: Request, traffic: dict | None = None) 
         },
         "geodata": geodata.status(state),
         "chain": _chain_view(state),
+        # 客户端设备 (路由器/手机/电脑) + 路由器安装脚本的元信息
+        "devices": devices.view(state),
+        "client": router_client.summary(),
         "xhttp": state.get("xhttp", {}),
         "ports": state.get("ports", {}),
         "traffic": traffic,
@@ -2692,3 +2697,315 @@ def chain_exit_qr(request: Request, size: int = 6, img: str = "png"):
     if not code:
         return _err("本机还没有作为落地端的凭据, 请先生成配对码", 409)
     return _qr_response(code, size, img)
+
+
+# ---------------------------------------------------------------- 客户端设备
+#
+# 两条入口刻意分开:
+#   /api/devices*  面板用 (登录会话) —— 生成配对码 / 看设备 / 总开关 / 移除
+#   /c/*           设备用 (设备 secret) —— 取安装脚本 / 下内核 / 拉配置 / 报状态
+#
+# 设备侧不能依赖面板会话: 路由器上没有浏览器也没有 Cookie。它们的身份是配对时
+# 换来的 device_id + secret (见 devices.py 顶部)。
+
+
+class DevicePairIn(BaseModel):
+    label: str = ""
+
+
+class DevicePatchIn(BaseModel):
+    name: str | None = None
+    template: str | None = None
+    desired: bool | None = None
+
+
+class DeviceProxyIn(BaseModel):
+    on: bool = True
+
+
+class DeviceRegisterIn(BaseModel):
+    """设备侧配对请求 (安装脚本构造)。"""
+
+    code: str = ""
+    kind: str = "router"
+    hostname: str = ""
+    model: str = ""
+    arch: str = ""
+    os: str = ""
+    version: str = ""
+
+
+class DeviceReportIn(BaseModel):
+    """设备心跳 + 状态上报。`set_desired` 让路由器本机的 CLI 也能改总开关。"""
+
+    device: str = ""
+    k: str = ""
+    actual: bool | None = None
+    rev: str = ""
+    version: str = ""
+    arch: str = ""
+    os: str = ""
+    model: str = ""
+    report: dict | None = None
+    set_desired: bool | None = None
+
+
+def _install_command(base: str, code: str) -> str:
+    return f"wget -qO- {base}/c/{code} | sh"
+
+
+@router.post("/api/devices/pair")
+def device_pair(payload: DevicePairIn, request: Request):
+    """生成一次性配对码 + 可直接粘贴的安装命令。"""
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        if not state["configured"]:
+            return _err("面板尚未初始化", 409)
+        entry = devices.create_pair_code(state, payload.label)
+        base = share_links.panel_base_url(request, state)
+        config.audit(state, "device_pair", f"配对码 {entry['code'][:8]}… (30 分钟内有效)")
+        save_state(state)
+        return {
+            "code": entry["code"],
+            "expires_at": entry["expires_at"],
+            "url": f"{base}/c/{entry['code']}",
+            "command": _install_command(base, entry["code"]),
+            "ttl": devices.PAIR_TTL,
+        }
+
+
+@router.get("/api/devices")
+def device_list(request: Request):
+    state = load_state()
+    if not _require_auth(state, request):
+        return _err("未登录", 401)
+    return {"devices": devices.view(state), "client": router_client.summary()}
+
+
+@router.post("/api/devices/{device_id}/proxy")
+def device_proxy(device_id: str, payload: DeviceProxyIn, request: Request):
+    """全屋代理总开关。
+
+    只改"期望状态"并立刻落盘: 设备下一轮心跳 (≤15s) 就会拿到它并执行。
+    面板显示的开关颜色取自设备回报的 actual, 所以这里不假装已经生效 ——
+    前端会把 desired != actual 的那段时间显示成"同步中"。
+    """
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        device = devices.find(state, device_id)
+        if device is None:
+            return _err("设备不存在 (可能已被移除)", 404)
+        device["desired"] = bool(payload.on)
+        config.audit(
+            state, "device_toggle", f"{device['name']} → {'开启' if payload.on else '关闭'}"
+        )
+        save_state(state)
+        return {"device": devices.device_view(device)}
+
+
+@router.post("/api/devices/{device_id}")
+def device_update(device_id: str, payload: DevicePatchIn, request: Request):
+    """改名 / 覆盖分流模板 / 直接设定期望开关。"""
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        device = devices.find(state, device_id)
+        if device is None:
+            return _err("设备不存在 (可能已被移除)", 404)
+        notes: list[str] = []
+        if payload.name is not None:
+            name = payload.name.strip()[:40]
+            if not name:
+                return _err("设备名不能为空", 400)
+            device["name"] = name
+            notes.append(f"改名 {name}")
+        if payload.template is not None:
+            tpl = payload.template.strip().lower()
+            if tpl and tpl not in share_links.TEMPLATES:
+                return _err("未知分流模板", 400)
+            device["template"] = tpl
+            notes.append(f"分流 {tpl or '跟随面板'}")
+        if payload.desired is not None:
+            device["desired"] = bool(payload.desired)
+            notes.append("开启" if payload.desired else "关闭")
+        if notes:
+            action = "device_template" if payload.template is not None else "device_rename"
+            config.audit(state, action, f"{device['name']}: {' / '.join(notes)}")
+        save_state(state)
+        return {"device": devices.device_view(device)}
+
+
+@router.delete("/api/devices/{device_id}")
+def device_delete(device_id: str, request: Request):
+    """移除设备 = 立刻吊销它手里的 secret (那台机器上的代理随即失效)。"""
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        device = devices.find(state, device_id)
+        if device is None:
+            return _err("设备不存在", 404)
+        name = device.get("name", "")
+        devices.remove(state, device_id)
+        config.audit(state, "device_remove", f"{name} ({device_id})")
+        save_state(state)
+        return {"removed": device_id, "devices": devices.view(state)}
+
+
+# ---------------------------------------------------------------- 设备侧接口
+# 下面四个接口走设备凭据, 不校验面板会话 —— 但要求面板已初始化。
+
+
+@router.get("/c/{code}")
+def client_install_script(code: str, request: Request):
+    """安装脚本本体 (`wget -qO- <面板>/c/<配对码> | sh` 拉的就是它)。"""
+    state = load_state()
+    if not state["configured"]:
+        return _err("面板尚未初始化", 409)
+    if not devices.pair_code_live(state, code):
+        return Response(
+            "ZeroProxy: 配对码无效或已过期, 请回面板「客户端」重新生成安装命令。\n",
+            status_code=404,
+            media_type="text/plain; charset=utf-8",
+        )
+    try:
+        body = router_client.render_script(share_links.panel_base_url(request, state), code)
+    except (OSError, ValueError) as exc:
+        return _err(f"安装脚本不可用: {exc}", 500)
+    return Response(
+        body,
+        media_type="text/x-shellscript; charset=utf-8",
+        headers={"cache-control": "no-store"},
+    )
+
+
+@router.get("/c/bin/{arch}")
+def client_core_binary(arch: str, request: Request):
+    """内核二进制。面板侧缓存 —— 路由器只访问面板, 不用自己翻墙去 GitHub。"""
+    state = load_state()
+    if not state["configured"]:
+        return _err("面板尚未初始化", 409)
+    if arch not in router_client.ARCHES:
+        return _err("不支持的架构", 404)
+    ok, detail, path = router_client.fetch_core(arch)
+    if not ok or not path:
+        return _err(f"内核下载失败: {detail}", 502)
+    return FileResponse(
+        path,
+        media_type="application/gzip",
+        headers={"cache-control": "no-store"},
+        filename=os.path.basename(path),
+    )
+
+
+@router.post("/c/pair")
+def client_pair(payload: DeviceRegisterIn, request: Request):
+    """一次性配对码 → 设备凭据 (只在这次响应里出现, 服务端只存 hash)。"""
+    with config.locked():
+        state = load_state()
+        if not state["configured"]:
+            return _err("面板尚未初始化", 409)
+        info = {
+            "code": payload.code,
+            "kind": payload.kind,
+            "hostname": payload.hostname,
+            "model": payload.model,
+            "arch": payload.arch,
+            "os": payload.os,
+            "version": payload.version,
+            "ip": _client_ip(request),
+        }
+        device, secret, error = devices.register(state, info)
+        if device is None:
+            return _err(error, 403)
+        base = share_links.panel_base_url(request, state)
+        config.audit(state, "device_add", f"{device['name']} · {device['arch']} · {device['os']}")
+        save_state(state)
+        return {
+            "id": device["id"],
+            "secret": secret,
+            "name": device["name"],
+            "desired": bool(device["desired"]),
+            "rev": devices.config_rev(state),
+            "sub": f"{base}/c/sub/{device['id']}?k={secret}&format=clash&rules=smart",
+            "report": f"{base}/c/report",
+        }
+
+
+@router.get("/c/sub/{device_id}")
+def client_subscription(
+    device_id: str, request: Request, k: str = "", format: str = "clash", rules: str = ""
+):
+    """设备专属订阅。只出 routers 用的 clash 配置 —— 设备不该拿到主订阅令牌。
+
+    单个设备可以用 `?rules=` 覆盖分流模板 (面板上那台设备的设置优先)。
+    """
+    with config.locked():
+        state = load_state()
+        if not state["configured"]:
+            return _err("面板尚未初始化", 409)
+        device = devices.find(state, device_id)
+        if not devices.check_secret(device, k):
+            return _err("设备凭据无效", 403)
+        # 设备自己的模板覆盖优先于全局设置
+        tpl = (device or {}).get("template") or ""
+        body, media_type = share_links.subscription_body(
+            state, "clash", rules or tpl, router=True, device=str(device.get("name") or "")
+        )
+        # 拉配置也算一次"设备还活着": 装完立刻在面板上显示在线, 不用等下一轮心跳
+        if devices.touch(state, device, {"ip": _client_ip(request), "rev": devices.config_rev(state)}):
+            save_state(state)
+    return Response(
+        body,
+        media_type=media_type,
+        headers={"cache-control": "no-store", "profile-update-interval": "12"},
+    )
+
+
+@router.post("/c/report")
+def client_report(payload: DeviceReportIn, request: Request):
+    """设备心跳: 上报实际状态, 取回期望开关与配置版本。"""
+    with config.locked():
+        state = load_state()
+        if not state["configured"]:
+            return _err("面板尚未初始化", 409)
+        device = devices.find(state, payload.device)
+        if not devices.check_secret(device, payload.k):
+            return _err("设备凭据无效", 403)
+        assert device is not None  # check_secret 已保证
+        changed = False
+        if payload.set_desired is not None and bool(device.get("desired")) != payload.set_desired:
+            # 路由器本机的 `zeroproxy on|off` 走这里 —— 仍然以面板为唯一事实来源
+            device["desired"] = bool(payload.set_desired)
+            config.audit(
+                state,
+                "device_toggle",
+                f"{device['name']} → {'开启' if payload.set_desired else '关闭'} (设备端操作)",
+                actor="device",
+            )
+            changed = True
+        info = {
+            "ip": _client_ip(request),
+            "version": payload.version,
+            "arch": payload.arch,
+            "os": payload.os,
+            "model": payload.model,
+        }
+        if payload.actual is not None:
+            info["actual"] = payload.actual
+        if payload.report:
+            info["report"] = payload.report
+        changed = devices.touch(state, device, info) or changed
+        if changed:
+            save_state(state)
+        return {
+            "desired": bool(device["desired"]),
+            "rev": devices.config_rev(state),
+            "name": device["name"],
+            "template": share_links.template_of(state),
+        }

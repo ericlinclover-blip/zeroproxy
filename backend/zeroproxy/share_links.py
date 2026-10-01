@@ -73,6 +73,92 @@ G_FINAL = "🐟 漏网之鱼"
 G_ADS = "🛑 广告拦截"
 G_DIRECT = "🎯 全球直连"
 
+#: 路由器端配置文件 (profile=router)。手机/电脑端导入订阅就完事, 路由器端不一样:
+#: 它要接管**全屋**流量, 配置里少一个字段就是"某类 App 用不了"的工单。这里逐项说明
+#: 为什么这么写 —— 这些都是"上网体验不受影响"的关键, 不是随手加的调优参数。
+#
+#:   dns + fake-ip        路由器上必须由内核接管 DNS。fake-ip 让域名在连接前就拿到一个
+#:                        可路由的假 IP, 分流规则按域名判定 → 国内站点不会被误判成
+#:                        "未知 IP 走代理"。dnsmasq 完全不用改 (见下面 dns-hijack)。
+#:   nameserver-policy    国内域名用国内 DNS 解析 (拿到最近的 CDN 节点), 国外域名走
+#:                        DoH 且经代理出去 —— 这是"全屋走代理"但不拖慢国内站点的核心。
+#:   proxy-server-nameserver
+#:                        解析节点自己的域名必须直连。若它跟着规则走了代理, 就成了
+#:                        "要先连上代理才能解析代理地址"的死锁, 表现是开机后一直转圈。
+#:   sniffer              有些 App 直接连 IP, 规则只能看到 IP。开 SNI 嗅探后仍按域名
+#:                        分流, 国内直连的准确率明显变好 (尤其是 App 内的 CDN 回源)。
+#:   fake-ip-filter       这些域名必须拿到真实 IP: 局域网设备发现 (mDNS/SSDP)、路由器
+#:                        自己的管理域名、NTP、微信本地回环登录 —— 给成假 IP 会直接
+#:                        让"打印机找不到""智能音箱配不上网""时间同步失败"。
+#:   find-process-mode    路由器上没有进程匹配能力, 关掉省 CPU 和内存。
+#:   tun + auto-route     全屋透明的实现方式。用 tun 而不是自写 nftables 规则, 是因为
+#:                        tun 由内核接管路由且**可逆**: 内核一停, 网络立刻回到原样。
+#:   tun.dns-hijack       dnsmasq 的查询也要进内核, 否则局域网设备拿到的还是真实 IP。
+#:                        有了它就不用改 /etc/config/dhcp, 卸载/关开关都不留残留。
+#:   log-level: warning   路由器闪存写日志是慢性损耗, 正常运行不该刷 info。
+ROUTER_FAKE_IP_FILTER = [
+    "*.lan",
+    "*.local",
+    "*.localdomain",
+    "*.home.arpa",
+    "localhost.ptlogin2.qq.com",
+    "localhost.*.wechat.com",
+    "*.msftconnecttest.com",
+    "*.msftncsi.com",
+    "time.*.com",
+    "time.*.gov",
+    "ntp.*.com",
+    "*.pool.ntp.org",
+    "*.ntp.org.cn",
+    "+.market.xiaomi.com",
+    "*.stun.*",
+    "stun.*",
+    "*.*.stun.*",
+    "*.turn.*",
+    "*.webrtc.*",
+]
+
+#: 路由器端 `dns` 段。国内域名走国内 DNS (快、拿到就近 CDN), 国外域名走 DoH 且经代理
+#: 出口 (不被污染)。DoH 的域名解析走 default-nameserver (纯 IP, 国内), 所以引导期
+#: 不会绕回代理 —— 整条链路上没有死循环。
+ROUTER_DNS = {
+    "enable": True,
+    # 0.0.0.0 而不是 127.0.0.1: tproxy 回退模式下 nft 会把局域网 DNS 重定向到这个
+    # 端口, 只监听回环就收不到。tun 模式下用不到它 (走 dns-hijack)。
+    "listen": "0.0.0.0:7874",
+    "ipv6": False,
+    "enhanced-mode": "fake-ip",
+    "fake-ip-range": "198.18.0.1/16",
+    "fake-ip-filter": ROUTER_FAKE_IP_FILTER,
+    # 只用来解析下面这些 DoH 服务器的主机名 (它们是 IP, 通常用不到, 但要有)
+    "default-nameserver": ["223.5.5.5", "119.29.29.29"],
+    "nameserver": ["223.5.5.5", "119.29.29.29"],
+    "proxy-server-nameserver": ["223.5.5.5", "119.29.29.29"],
+    "direct-nameserver": ["223.5.5.5", "119.29.29.29"],
+    "nameserver-policy": {
+        # 私有域名 / 国内域名: 国内 DNS 直查, 与"国内直连"规则配套
+        "geosite:private,cn": ["223.5.5.5", "119.29.29.29"],
+        # 其余域名: 加密 DNS 且经代理解析, 避免污染与泄漏
+        "geosite:geolocation-!cn": [
+            "https://1.1.1.1/dns-query",
+            "https://dns.google/dns-query",
+        ],
+    },
+}
+
+#: 路由器端 `tun` 段 (全屋透明的实现)。gvisor 栈兼容性最好; mtu 压到 1500 是因为
+#: 部分宽带/光猫对巨帧不友好, 表现为"能连上但大文件卡死"。
+ROUTER_TUN = {
+    "enable": True,
+    "stack": "gvisor",
+    "device": "zp-tun",
+    "auto-route": True,
+    "auto-redirect": True,
+    "auto-detect-interface": True,
+    "mtu": 1500,
+    "dns-hijack": ["any:53"],
+}
+
 
 def template_of(state: dict, override: str | None = None) -> str:
     """生效的分流模板: URL 参数 > 面板设置 > 默认值。"""
@@ -356,7 +442,15 @@ def _clash_proxy(state: dict, node_id: str) -> dict | None:
     return None
 
 
-def clash_profile(state: dict, template: str | None = None) -> str:
+def clash_profile(
+    state: dict, template: str | None = None, router: bool = False, device: str = ""
+) -> str:
+    """Clash / mihomo 配置。
+
+    `router=True` 时输出路由器端专用版本: 多出 tun / dns / 嗅探三段, 由路由器
+    整机接管全屋流量 (见 ROUTER_DNS / ROUTER_TUN 上面的说明)。
+    `device` 只用于注释里标注是哪台设备拉的, 不影响配置内容。
+    """
     proxies: list[dict] = []
     skipped: list[str] = []
     for node_id, _ in enabled_links(state):
@@ -415,32 +509,87 @@ def clash_profile(state: dict, template: str | None = None) -> str:
     else:  # direct: 不依赖任何 geo 数据 (无需下载), 只做广告拦截与手动切换
         rules = [f"MATCH,{G_FINAL}"]
 
-    profile = {
-        "mixed-port": 7890,
-        "allow-lan": False,
-        "mode": "rule",
-        "log-level": "info",
-        # 分流数据库下载地址: mihomo 默认从 GitHub 拉取, 在受限网络下会超时
-        # (实测: 首次拉取失败会导致整个订阅加载失败)。这里改成可用镜像,
-        # 客户端首次导入时仍能自动拿到 geoip/geosite 数据。
-        "geox-url": {
-            "mmdb": GEOX_BASE + "geoip.metadb",
-            "geoip": GEOX_BASE + "geoip.dat",
-            "geosite": GEOX_BASE + "geosite.dat",
-            "asn": GEOX_BASE + "GeoLite2-ASN.mmdb",
-        },
-        "proxies": proxies,
-        "proxy-groups": groups,
-        "rules": rules,
+    # 分流数据库下载地址: mihomo 默认从 GitHub 拉取, 在受限网络下会超时
+    # (实测: 首次拉取失败会导致整个订阅加载失败)。这里改成可用镜像,
+    # 客户端首次导入时仍能自动拿到 geoip/geosite 数据。
+    geox = {
+        "mmdb": GEOX_BASE + "geoip.metadb",
+        "geoip": GEOX_BASE + "geoip.dat",
+        "geosite": GEOX_BASE + "geosite.dat",
+        "asn": GEOX_BASE + "GeoLite2-ASN.mmdb",
     }
-    head = [
-        "# ZeroProxy 订阅 — Clash / mihomo",
-        "# 直接导入 App 或保存为 config.yaml 使用; 订阅内容会随面板配置自动更新",
-        f"# 分流模板: {tpl}"
-        + (" (国内直连 + 广告拦截)" if tpl == "smart" else
-           " (全部走代理)" if tpl == "global" else " (全部直连, 不下载 geo 数据)"),
-        "# 切换模板: 面板「高级设置 → 分流模板」, 或在订阅 URL 后加 ?rules=smart|global|direct",
-    ]
+    if router:
+        # 路由器端: 键的书写顺序 = 运维时 cat 一眼的阅读顺序 (端口 → 内核参数 →
+        # 分流数据 → 节点)。
+        profile = {
+            "mixed-port": 7890,          # 局域网里手动填代理地址时用
+            "redir-port": 7892,          # TCP 透明代理 (tproxy 回退模式)
+            "tproxy-port": 7893,         # TCP/UDP 透明代理 (tproxy 回退模式)
+            "allow-lan": True,
+            "bind-address": "*",
+            "mode": "rule",
+            "log-level": "warning",
+            "ipv6": False,
+            # 并发建连 + 统一延迟: 多设备同时上网时体感差别明显
+            "tcp-concurrent": True,
+            "unified-delay": True,
+            # 路由器没有进程匹配能力, 关掉省 CPU
+            "find-process-mode": "off",
+            "global-client-fingerprint": "chrome",
+            "keep-alive-interval": 30,
+            # 本机控制口: 安装脚本用它做健康检查, 也留作以后"只重载不断连"的入口
+            "external-controller": "127.0.0.1:9090",
+            "profile": {"store-selected": True, "store-fake-ip": True},
+            "sniffer": {
+                "enable": True,
+                "sniff": {
+                    "HTTP": {"ports": [80, "8080-8880"]},
+                    "TLS": {"ports": [443, 8443]},
+                    "QUIC": {"ports": [443, 8443]},
+                },
+                # 这两类域名被嗅探后推送/米家设备的证书校验会出问题, 跳过
+                "skip-domain": ["Mijia Cloud", "+.push.apple.com"],
+            },
+            "dns": ROUTER_DNS,
+            "tun": ROUTER_TUN,
+            "geox-url": geox,
+            "proxies": proxies,
+            "proxy-groups": groups,
+            "rules": rules,
+        }
+    else:
+        profile = {
+            "mixed-port": 7890,
+            "allow-lan": False,
+            "mode": "rule",
+            "log-level": "info",
+            "geox-url": geox,
+            "proxies": proxies,
+            "proxy-groups": groups,
+            "rules": rules,
+        }
+    tpl_note = (
+        " (国内直连 + 广告拦截)" if tpl == "smart"
+        else " (全部走代理)" if tpl == "global"
+        else " (全部直连, 不下载 geo 数据)"
+    )
+    if router:
+        head = [
+            "# ZeroProxy 路由器客户端配置 — mihomo",
+            "# 由面板自动生成, 请勿手改: 节点启停 / 端口变更 / 分流切换都会自动同步",
+            f"# 分流模板: {tpl}{tpl_note}",
+            "# 全屋透明代理由 tun + auto-route 接管, DNS 走 fake-ip + 嗅探;",
+            "# dnsmasq / 防火墙都不需要改动, 停掉内核即完全恢复原状",
+        ]
+        if device:
+            head.append(f"# 设备: {device}")
+    else:
+        head = [
+            "# ZeroProxy 订阅 — Clash / mihomo",
+            "# 直接导入 App 或保存为 config.yaml 使用; 订阅内容会随面板配置自动更新",
+            f"# 分流模板: {tpl}{tpl_note}",
+            "# 切换模板: 面板「高级设置 → 分流模板」, 或在订阅 URL 后加 ?rules=smart|global|direct",
+        ]
     if tpl != "direct":
         head.append("# 分流依赖客户端 geo 数据; 已内置 geox-url 镜像, 首次导入会自动下载")
     if skipped:
@@ -686,12 +835,20 @@ def singbox_profile(state: dict, template: str | None = None, next_gen: bool = F
 # ---------------------------------------------------------------- 订阅出口
 
 def subscription_body(
-    state: dict, fmt: str = "base64", template: str | None = None
+    state: dict,
+    fmt: str = "base64",
+    template: str | None = None,
+    router: bool = False,
+    device: str = "",
 ) -> tuple[str, str]:
-    """返回 (响应体, media_type)。"""
+    """返回 (响应体, media_type)。
+
+    `router=True` 只对 clash 格式有效 (手机/电脑端的 base64 与 sing-box 输出不变):
+    路由器端要的是"整机接管"的配置, 不是一份节点清单。
+    """
     fmt = (fmt or "base64").lower()
     if fmt in ("clash", "mihomo", "yaml", "yml"):
-        return clash_profile(state, template), "text/yaml; charset=utf-8"
+        return clash_profile(state, template, router=router, device=device), "text/yaml; charset=utf-8"
     if fmt in ("singbox-next", "singbox14", "singbox-1.14", "singbox-new"):
         # 面向 sing-box ≥1.14: 用 http_clients 指定下载出口 (无废弃警告)
         return singbox_profile(state, template, next_gen=True), "application/json; charset=utf-8"

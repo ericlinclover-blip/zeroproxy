@@ -76,6 +76,7 @@
         <nav class="nav" id="dash-nav">
           <a href="#sec-nodes" class="on"><span class="ic">◆</span>节点<span class="cnt" id="nav-nodes">—</span></a>
           <a href="#sec-subs"><span class="ic">⌘</span>订阅</a>
+          <a href="#sec-clients"><span class="ic">⇱</span>客户端<span class="cnt" id="nav-clients">—</span></a>
           <a href="#sec-traffic"><span class="ic">▤</span>流量</a>
           <a href="#chain-intro"><span class="ic">⇄</span>链式代理<span class="cnt" id="nav-chain">—</span></a>
           <a href="#sec-adv"><span class="ic">⑃</span>高级 / 分流</a>
@@ -171,6 +172,21 @@
       <div class="note mt-2">
         三个地址指向同一份订阅内容; 节点启停 / 端口变更 / 伪装设置都会自动同步, 客户端无需重新导入。
       </div>
+    </section>
+
+    <section class="card reveal" id="sec-clients">
+      <div class="tile-head">
+        <h2>客户端</h2>
+        <span class="hint">路由器贴一行命令即用 · 全屋设备自动走代理</span>
+        <span class="grow"></span>
+        <span class="muted fs-xs" id="client-count">—</span>
+      </div>
+      <div class="tabs" id="client-tabs">
+        <button class="tab on" data-client-tab="router"><span>📶</span> 路由器</button>
+        <button class="tab" data-client-tab="phone"><span>📱</span> 手机</button>
+        <button class="tab" data-client-tab="desktop"><span>💻</span> 电脑</button>
+      </div>
+      <div id="client-body"></div>
     </section>
 
     <section class="card reveal" id="sec-traffic">
