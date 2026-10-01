@@ -11,6 +11,8 @@ export PATH
 
 ZP_DIR=/etc/zeroproxy
 CLI=/usr/bin/zeroproxy
+#: 查询串要在鉴权之前解析 —— 令牌就是从它里面取的
+QS="${QUERY_STRING:-}"
 
 header() {
     printf 'Content-Type: application/json; charset=utf-8\r\n'
@@ -47,7 +49,6 @@ fi
 # nginx + fcgiwrap, 静态目录不一定在浏览器能访问的位置 (真机上 /www/zeroproxy/
 # 直接 403), 而 /cgi-bin/ 一定通 (LuCI 自己就走这条路)。
 # 页面代码不含任何机密, 所以这一段不需要登录。
-QS="${QUERY_STRING:-}"
 want="$(printf '%s' "$QS" | tr '&' '\n' | sed -n 's/^file=//p' | head -n1)"
 if [ "$want" = "app.js" ]; then
     printf 'Content-Type: text/javascript; charset=utf-8\r\nCache-Control: no-store\r\n\r\n'
