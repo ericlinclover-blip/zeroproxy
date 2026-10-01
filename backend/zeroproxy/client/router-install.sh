@@ -825,6 +825,11 @@ EOF
         fi
         echo "已请求面板把总开关设为「$1」, 约 15 秒内生效 (zeroproxy status 查看)"
         ;;
+    ui)
+        _ip="$(uci get network.lan.ipaddr 2>/dev/null || echo 192.168.1.1)"
+        echo "http://$_ip/cgi-bin/zeroproxy?k=$(cat "$ZP_DIR/ui.token" 2>/dev/null)"
+        echo "(打开一次即可; 之后同一浏览器不用再带令牌)"
+        ;;
     log)        logread -e zeroproxy | tail -n "${2:-40}" ;;
     update)
         echo "重新执行面板上的安装命令即可升级 (配置与凭据会保留)"
@@ -840,7 +845,7 @@ EOF
         rm -rf "$ZP_DIR" /etc/init.d/zeroproxy /etc/init.d/zeroproxy-agent /usr/bin/zeroproxy
         echo "已卸载。这台设备在面板上仍然存在, 请在面板「客户端」里一并移除。"
         ;;
-    *) echo "用法: zeroproxy [status|servers|add <链接>|drop <键>|refresh|on|off|log|uninstall]" ;;
+    *) echo "用法: zeroproxy [status|ui|servers|add <链接>|drop <键>|refresh|on|off|log|uninstall]" ;;
 esac
 CLIEOF
     chmod 755 "$ZP_CLI"
@@ -889,7 +894,15 @@ install_ui() {
         # 本机自检: 页面真能被服务器发出来才算装好。这台固件 80 端口可能是 nginx
         # 而不是 uhttpd, 文档路径不一定是我们以为的 /www —— 与其让用户看到 403,
         # 不如当场说清楚并给出排查命令。
-        _probe="$(http_get "http://127.0.0.1/cgi-bin/zeroproxy" 2>/dev/null | head -c 300)"
+        # 界面令牌: GL.iNet 的后台不是 LuCI, 登录它没有 LuCI 会话可校验, 所以界面还有
+    # 这套自带令牌 (0600)。`zeroproxy ui` 打印带令牌的地址。
+    if [ ! -s "$ZP_DIR/ui.token" ]; then
+        umask 077
+        head -c 16 /dev/urandom | md5sum | cut -c1-32 > "$ZP_DIR/ui.token" 2>/dev/null ||             printf '%s' "$(date +%s)$$" > "$ZP_DIR/ui.token"
+        umask 022
+        chmod 600 "$ZP_DIR/ui.token"
+    fi
+    _probe="$(http_get "http://127.0.0.1/cgi-bin/zeroproxy?k=$(cat "$ZP_DIR/ui.token")" 2>/dev/null | head -c 300)"
         case "$_probe" in
             *ZeroProxy*) ok "本机自检: 页面可访问" ;;
             *) warn "本机自检没通过 —— 浏览器打开 $UI_URL 可能看到 403/404。

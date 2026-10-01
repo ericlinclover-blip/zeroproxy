@@ -38,13 +38,29 @@ if [ -z "$act" ] && [ -z "$want" ]; then
     exit 0
 fi
 
-# LuCI 把会话 id 放在 cookie 里 (sysauth / sysauth_http / sysauth_https 随协议变),
-# 拿它问一次 ubus: 能取回会话对象才算登录。
-sid="$(printf '%s' "${HTTP_COOKIE:-}" | tr ';' '\n' | sed -n 's/^ *sysauth[^=]*=\(.*\)$/\1/p' | head -n1)"
-[ -n "$sid" ] || fail "未登录 LuCI"
-command -v ubus >/dev/null 2>&1 || fail "路由器缺少 ubus, 无法校验会话"
-ubus -S "$sid" call session get '{}' 2>/dev/null | grep -q '"ubus_rpc_session"' \
-    || fail "LuCI 会话已过期, 请重新登录后再操作"
+# 鉴权: 满足任意一条即可
+#   ① URL 里带一次性令牌 (?k=…)  —— `zeroproxy ui` 打印的就是它, 顺手种成 cookie
+#   ② 已经种下的令牌 cookie
+#   ③ 一个有效的 LuCI 会话 (走 LuCI 菜单进来的人)
+# 为什么不能只认 ③: GL.iNet 的后台是它自己的 Vue 界面, **不是 LuCI** —— 登录它不会
+# 产生 LuCI 会话, 而 LuCI 在 /cgi-bin/luci 是另一个入口。只认 LuCI 的话, 这台设备上
+# 页面永远是"未登录"(真机截图就是这么来的)。
+TOKFILE=/etc/zeroproxy/ui.token
+tok="$(cat "$TOKFILE" 2>/dev/null)"
+qk="$(printf '%s' "$QS" | tr '&' '\n' | sed -n 's/^k=//p' | head -n1)"
+ck="$(printf '%s' "${HTTP_COOKIE:-}" | tr ';' '\n' | sed -n 's/^ *zp_ui=\(.*\)$/\1/p' | head -n1)"
+if [ -n "$tok" ] && [ "$qk" = "$tok" ] && [ "$ck" != "$tok" ]; then
+    printf 'Set-Cookie: zp_ui=%s; Path=/; HttpOnly; SameSite=Lax\r\n' "$tok"
+fi
+ok=""
+if [ -n "$tok" ] && { [ "$qk" = "$tok" ] || [ "$ck" = "$tok" ]; }; then ok=1; fi
+if [ -z "$ok" ]; then
+    sid="$(printf '%s' "${HTTP_COOKIE:-}" | tr ';' '\n' | sed -n 's/^ *sysauth[^=]*=\(.*\)$/\1/p' | head -n1)"
+    if [ -n "$sid" ] && command -v ubus >/dev/null 2>&1; then
+        ubus -S "$sid" call session get '{}' 2>/dev/null | grep -q '"ubus_rpc_session"' && ok=1
+    fi
+fi
+[ -n "$ok" ] || fail "未授权 — 在路由器上执行 zeroproxy ui 拿到带令牌的地址"
 
 # ---------------------------------------------------------------- 工具
 BODY="$(cat 2>/dev/null || true)"
