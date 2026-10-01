@@ -47,9 +47,18 @@ function makeMock() {
   };
   return http.createServer((req, res) => {
     const url = new URL(req.url, "http://x");
-    const action = url.pathname.replace(/^\/cgi-bin\/zeroproxy\/?/, "");
+    const action = url.searchParams.get("a") || "";
     const authed = /sysauth/.test(req.headers.cookie || "");
     if (url.pathname.startsWith("/cgi-bin/")) {
+      // 与 cgi 一致: 页面与脚本本身不需要登录, 数据接口才要
+      if (url.searchParams.get("file") === "app.js") {
+        res.writeHead(200, { "Content-Type": "text/javascript; charset=utf-8" });
+        res.end(fs.readFileSync(path.join(LUCi_DIR, "app.js"))); return;
+      }
+      if (!action && url.searchParams.get("file") !== "app.js") {
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+        res.end(fs.readFileSync(path.join(LUCi_DIR, "index.html"))); return;
+      }
       if (!authed) return json(res, { ok: false, error: "未登录 LuCI" });
       let body = "";
       req.on("data", (c) => (body += c));
@@ -80,6 +89,10 @@ function makeMock() {
       return;
     }
     // 目录请求按 uhttpd 的规矩回 index.html
+    if (/^\/cgi-bin\/zeroproxy$/.test(url.pathname) && url.searchParams.get("file") === "app.js") {
+      res.writeHead(200, { "Content-Type": "text/javascript; charset=utf-8" });
+      res.end(fs.readFileSync(path.join(LUCi_DIR, "app.js"))); return;
+    }
     let rel = url.pathname.replace(/^\/zeroproxy\/?/, "");
     if (!rel || rel.endsWith("/")) rel += "index.html";
     if (rel === "favicon.ico") { res.writeHead(204); res.end(); return; }
@@ -97,7 +110,7 @@ async function main() {
   fs.mkdirSync(SHOT_DIR, { recursive: true });
   const server = makeMock();
   await new Promise((r) => server.listen(PORT, "127.0.0.1", r));
-  const base = `http://127.0.0.1:${PORT}/zeroproxy/`;
+  const base = `http://127.0.0.1:${PORT}/cgi-bin/zeroproxy`;
   const { chromium } = require("playwright");
   let browser;
   try {

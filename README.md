@@ -2155,3 +2155,19 @@ MT3000 上重跑安装命令后的三个现象, 各自的原因都不在"安装�
 
 顺带修掉一处自相矛盾: 结尾摘要原来只看 `/dev/net/tun` 存在就写"模式 TUN", 与上面那句
 "TUN 未出现, 改用 tproxy"打架。现在按实际生效的模式报 (verify 里记下来)。
+
+### 8.30 v2.7.8: 界面改从 /cgi-bin/ 发出 —— GL.iNet 是 nginx + fcgiwrap
+
+真机排查结果: 80 端口是 **nginx (1.26.1)**, 而它的 `/cgi-bin/` 走 **fcgiwrap**
+(`fastcgi_pass unix:/var/run/fcgiwrap.socket`) —— LuCI 自己就走这条路, 所以
+`/cgi-bin/` 一定通; 相反 `/www/zeroproxy/` 这种静态目录在这套固件上返回 403
+(nginx 的文档根/规则是厂商私有的, 不该去猜)。
+
+于是界面**由 cgi 脚本自己发出**: 无参数 = 返回页面, `?file=app.js` = 返回脚本,
+两者都不需要登录 (页面代码不含任何机密); 数据接口 (`?a=status|add|drop|toggle|refresh|log`)
+仍然逐次校验 LuCI 会话。接口从 `PATH_INFO` 改成 **query 参数** (`?a=…`) —— fcgiwrap
+不保证把 PATH_INFO 交给脚本, 而 query 一定会到。安装脚本的自检与打印的地址也跟着改成
+`http://<路由器>/cgi-bin/zeroproxy`; LuCI 菜单那一项指向同一地址。
+
+静态文件仍然写到 /www/zeroproxy/ (uhttpd 系的固件本来就能直接用), 只是不再依赖它。
+`scripts/router_ui_check.cjs` 的模拟路由器同步改成同一套契约, 13 项仍全过。

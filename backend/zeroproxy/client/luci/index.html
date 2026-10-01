@@ -128,6 +128,7 @@ details summary:hover{color:var(--accent)}
   </div>
 </div>
 <div id="toast"></div>
-<script src="app.js"></script>
+<!-- 走 cgi 取脚本: nginx+fcgiwrap 的固件上静态目录不一定在浏览器能到的地方 -->
+<script src="/cgi-bin/zeroproxy?file=app.js"></script>
 </body>
 </html>

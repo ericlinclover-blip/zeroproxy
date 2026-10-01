@@ -8,6 +8,8 @@
 'use strict';
 
 const API = '/cgi-bin/zeroproxy';
+/* 接口一律走 query (?a=status): GL.iNet 固件的 80 端口是 nginx + fcgiwrap,
+   PATH_INFO 不保证传给脚本, 而 query 一定会到。 */
 const $ = (id) => document.getElementById(id);
 
 function toast(msg) {
@@ -19,7 +21,7 @@ function toast(msg) {
 }
 
 async function call(path, body) {
-  const res = await fetch(API + '/' + path, body === undefined ? {} : {
+  const res = await fetch(API + '?a=' + path, body === undefined ? {} : {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),

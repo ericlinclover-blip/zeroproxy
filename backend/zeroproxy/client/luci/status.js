@@ -10,7 +10,7 @@
 return view.extend({
 	render: function () {
 		return E('iframe', {
-			src: '/zeroproxy/',
+			src: '/cgi-bin/zeroproxy',
 			style: 'width:100%;height:78vh;border:0;border-radius:10px;background:transparent',
 			title: 'ZeroProxy'
 		});

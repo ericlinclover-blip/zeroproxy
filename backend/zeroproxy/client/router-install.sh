@@ -854,7 +854,9 @@ install_ui() {
     done
     http_get "$ZP_BASE/c/ui/cgi" > /www/cgi-bin/zeroproxy 2>/dev/null || true
     chmod 755 /www/cgi-bin/zeroproxy
-    UI_URL="http://$(uci get network.lan.ipaddr 2>/dev/null || echo 192.168.1.1)/zeroproxy/"
+    # 界面地址走 /cgi-bin/: GL.iNet 这类固件是 nginx + fcgiwrap, 静态目录不一定
+    # 在浏览器能到的地方, 而 /cgi-bin/ 一定通 (LuCI 自己就走它)
+    UI_URL="http://$(uci get network.lan.ipaddr 2>/dev/null || echo 192.168.1.1)/cgi-bin/zeroproxy"
 
     # LuCI 菜单 / 权限 / 承载页 —— 只有装了 LuCI 才写, 否则上面那个地址一样能用
     if [ -d /usr/share/luci/menu.d ]; then
@@ -871,7 +873,7 @@ install_ui() {
         # 本机自检: 页面真能被服务器发出来才算装好。这台固件 80 端口可能是 nginx
         # 而不是 uhttpd, 文档路径不一定是我们以为的 /www —— 与其让用户看到 403,
         # 不如当场说清楚并给出排查命令。
-        _probe="$(http_get "http://127.0.0.1/zeroproxy/" 2>/dev/null | head -c 200)"
+        _probe="$(http_get "http://127.0.0.1/cgi-bin/zeroproxy" 2>/dev/null | head -c 300)"
         case "$_probe" in
             *ZeroProxy*) ok "本机自检: 页面可访问" ;;
             *) warn "本机自检没通过 —— 浏览器打开 $UI_URL 可能看到 403/404。
