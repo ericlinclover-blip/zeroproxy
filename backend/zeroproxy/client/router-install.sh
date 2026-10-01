@@ -588,27 +588,41 @@ LAST_PULL=0
 FAILS=0
 while true; do
     migrate_servers
-    FIRST="$(first_server)"
-    [ -n "$FIRST" ] || { sleep "$SLEEP"; continue; }
-    BASE="$(field_of "$FIRST" base)"; DID="$(field_of "$FIRST" id)"; DKEY="$(field_of "$FIRST" secret)"
-    BODY='{"device":"'"$DID"'","k":"'"$DKEY"'","version":"1.0.0"'
-    if core_up; then BODY="$BODY"',"actual":true'; else BODY="$BODY"',"actual":false'; fi
-    [ -n "$LAST_REV" ] && BODY="$BODY"',"rev":"'"$LAST_REV"'"'
-    BODY="$BODY"'}'
+    # 多服务器: **每一台都要收到心跳**。
+    # 早期版本只向第一台上报, 于是"没被上报的那台"在面板上永远显示离线 —— 用户加完
+    # 第二台服务器, 看到的正是第二台一直是同步中 / 离线 (真机反馈)。
+    #
+    # 总开关取"任一为关则关": 任一面板把它关掉, 全屋就断; 在那台上再打开即恢复。
+    # 新设备默认就是"开", 所以只有"没人碰过"的面板不会干扰。
+    DESIRED_ALL="true"
+    REV=""
+    for _f in $(server_files); do
+        _b="$(field_of "$_f" base)"; _i="$(field_of "$_f" id)"; _k="$(field_of "$_f" secret)"
+        [ -n "$_b" ] || continue
+        BODY='{"device":"'"$_i"'","k":"'"$_k"'","version":"1.0.0"'
+        if core_up; then BODY="$BODY"',"actual":true'; else BODY="$BODY"',"actual":false'; fi
+        [ -n "$LAST_REV" ] && BODY="$BODY"',"rev":"'"$LAST_REV"'"'
+        BODY="$BODY"'}'
+        RESP="$(http_post "$_b/c/report" "$BODY" || true)"
+        if [ -z "$RESP" ]; then
+            FAILS=$((FAILS + 1))
+            continue
+        fi
+        _d="$(json_get_bool "$RESP" desired)"
+        [ -n "$_d" ] || _d=true
+        [ "$_d" = "false" ] && DESIRED_ALL="false"
+        # 配置版本取第一台能应答的 (配置内容各台不同, 用哪台的 rev 都只是"变了就重拉")
+        [ -z "$REV" ] && REV="$(json_get "$RESP" rev)"
+    done
 
-    RESP="$(http_post "$BASE/c/report" "$BODY" || true)"
-    if [ -z "$RESP" ]; then
-        FAILS=$((FAILS + 1))
-        # 面板不可达时保持现状 (而不是把代理关掉) —— 断网时"维持可用"比"忠于面板"重要
+    if [ -z "$REV" ]; then
+        # 一台都没应答: 保持现状而不是把代理关掉 —— 断网时"维持可用"比"忠于面板"重要
         [ $((FAILS % 20)) -eq 1 ] && log "面板不可达 (第 $FAILS 次), 保持当前状态"
         sleep "$SLEEP"
         continue
     fi
     FAILS=0
-
-    DESIRED="$(json_get_bool "$RESP" desired)"
-    REV="$(json_get "$RESP" rev)"
-    [ -n "$DESIRED" ] || DESIRED=true
+    DESIRED="$DESIRED_ALL"
 
     if [ "$DESIRED" = "true" ] && ! core_up; then
         log "面板要求开启, 启动内核"
@@ -618,8 +632,6 @@ while true; do
         switch_core off
     fi
 
-    # 配置版本取自第一台面板; 但多服务器时别的面板改了配置不会反映在这里, 所以
-    # 再补一条"最多 6 小时拉一次"的兜底。
     _now="$(date +%s)"
     if { [ -n "$REV" ] && [ "$REV" != "$LAST_REV" ]; } || [ $((_now - LAST_PULL)) -ge 21600 ]; then
         if apply_config; then LAST_REV="$REV"; LAST_PULL="$_now"; fi
@@ -744,7 +756,9 @@ case "${1:-status}" in
         _key="$(key_of "$_base")"
         mkdir -p "$SERVERS"
         echo "正在与 $_base 配对…"
-        _body='{"code":"'"$_code"'","kind":"router","model":"router","arch":"'"$(uname -m)"'","os":"OpenWrt","version":"1.0.0"}'
+        _model="$(cat /tmp/sysinfo/model 2>/dev/null || uname -m)"; _hn="$(cat /proc/sys/kernel/hostname 2>/dev/null || echo router)"
+        _model="$(printf %s "$_model" | tr -d '"')"
+        _body='{"code":"'"$_code"'","kind":"router","model":"'"$_model"'","hostname":"'"$_hn"'","arch":"'"$(uname -m)"'","os":"OpenWrt","version":"1.0.0"}'
         if command -v curl >/dev/null 2>&1; then
             _resp="$(curl -fsSk -m 30 -H 'Content-Type: application/json' --data "$_body" "$_base/c/pair" 2>/dev/null)"
         else

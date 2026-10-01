@@ -275,6 +275,17 @@ def main() -> int:
         check("组的 use 填上了两个 provider 键", len(auto.get("use", [])) == 2, str(auto.get("use")))
         check("节点不再内联 (交给 provider 拉)", "proxies" not in merged_yaml)
 
+        # agent 要同时喂两台: 只喂第一台的话, 第二台面板上永远显示离线 (真机反馈)
+        proc = subprocess.Popen(["sh", agent_path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        time.sleep(8)
+        proc.kill()
+        for p_, label in ((panels[0], "第一台"), (panels[1], "第二台")):
+            _, body, _ = p_.req("GET", "/api/devices")
+            items = json.loads(body)["devices"]["items"]
+            check(f"两台服务器都收到心跳 ({label})",
+                  bool(items) and items[0]["online"] is True,
+                  f"{len(items)} 台设备")
+
         out = subprocess.run(["sh", cli, "servers"], capture_output=True, text=True)
         check("zeroproxy servers 列出两台", out.stdout.count("127.0.0.") == 2, out.stdout.strip().splitlines()[0] if out.stdout else "")
 
