@@ -35,6 +35,7 @@ ZP_MIXED=7890
 TLS_OPTS=""
 ARCH=""
 DEPENDENCY_NOTE=""
+ACTIVE_MODE=""
 # 设备凭据与配对结果 (set -u 下必须预置: 只有在真的走过那条分支时才会被赋值)
 DEV_ID=""
 DEV_SECRET=""
@@ -264,8 +265,11 @@ install_deps() {
         _pkgs="${_pkgs:+$_pkgs }kmod-nft-tproxy"
         opkg update >/dev/null 2>&1 || warn "opkg update 失败 (软件源可能不可用), 继续尝试安装已缓存的包"
         # shellcheck disable=SC2086
-        opkg install $_pkgs >/dev/null 2>&1 || warn "内核模块安装未全部成功 ($_pkgs)"
+            opkg install $_pkgs >/dev/null 2>&1 || warn "内核模块安装未全部成功 ($_pkgs)"
     fi
+    # /dev/net/tun 这个设备节点存在 ≠ tun 模块已加载: 节点是包安装时创建的, 内核模块
+    # 要 modprobe 才进内核。真机反馈里 "TUN 可用" 但还是没建出 tun 设备, 就是这一步。
+    modprobe tun 2>/dev/null || true
     if [ -c /dev/net/tun ]; then
         ok "TUN 可用 (kmod-tun 已就绪)"
     else
@@ -858,9 +862,23 @@ install_ui() {
         http_get "$ZP_BASE/c/ui/status.js" > /www/luci-static/resources/view/zeroproxy/status.js 2>/dev/null || true
         http_get "$ZP_BASE/c/ui/menu.json" > /usr/share/luci/menu.d/luci-app-zeroproxy.json 2>/dev/null || true
         http_get "$ZP_BASE/c/ui/acl.json" > /usr/share/rpcd/acl.d/luci-app-zeroproxy.json 2>/dev/null || true
-        # rpcd 缓存 ACL, 重载后菜单才会出现
+        # 两道缓存都要清: rpcd 缓存 ACL, LuCI 把菜单索引缓存在 /tmp/luci-indexcache*
+        # (只 reload rpcd 不够 —— 菜单是 LuCI 自己缓存的那份索引, 这是"菜单不出现"
+        # 最常见的原因)
         /etc/init.d/rpcd reload >/dev/null 2>&1 || /etc/init.d/rpcd restart >/dev/null 2>&1 || true
+        rm -f /tmp/luci-indexcache* /tmp/luci-modulecache/* 2>/dev/null || true
         ok "管理界面已装好: $UI_URL (LuCI 菜单: 服务 → ZeroProxy)"
+        # 本机自检: 页面真能被服务器发出来才算装好。这台固件 80 端口可能是 nginx
+        # 而不是 uhttpd, 文档路径不一定是我们以为的 /www —— 与其让用户看到 403,
+        # 不如当场说清楚并给出排查命令。
+        _probe="$(http_get "http://127.0.0.1/zeroproxy/" 2>/dev/null | head -c 200)"
+        case "$_probe" in
+            *ZeroProxy*) ok "本机自检: 页面可访问" ;;
+            *) warn "本机自检没通过 —— 浏览器打开 $UI_URL 可能看到 403/404。
+  这台设备的 Web 服务不是标准的 uhttpd(/www) 时会出现这种情况, 请把下面三行的输出发回:
+    grep -rl 'root ' /etc/nginx/conf.d/ 2>/dev/null | head -3; grep -rn 'root \|cgi' /etc/nginx/conf.d/*.conf 2>/dev/null | head -10
+    ls -ld /www /www/zeroproxy; netstat -lntp 2>/dev/null | grep -E ':(80|443)\\b'" ;;
+        esac
     else
         ok "管理界面已装好: $UI_URL"
     fi
@@ -888,11 +906,13 @@ verify() {
     fi
     ok "内核已启动"
 
+    ACTIVE_MODE="tproxy"
     if [ -c /dev/net/tun ]; then
         if ip link show zp-tun >/dev/null 2>&1; then
+            ACTIVE_MODE="tun"
             ok "TUN 已建立: 全屋设备 (含路由器自身) 透明代理生效"
         else
-            warn "TUN 设备未出现, 改用 tproxy 模式 (全屋设备生效, 路由器自身流量除外)"
+            warn "TUN 设备没有建立 (内核模块/权限问题), 改用 tproxy 模式"
             nft -f "$ZP_DIR/tproxy.nft" 2>/dev/null || true
         fi
     else
@@ -922,7 +942,7 @@ finish() {
     printf '\n%s────────────────────────────────────────────%s\n' "$C_B" "$C_R"
     ok "全屋代理已开启 —— 手机 / 电脑 / 电视连上这台路由器即可用"
     printf '  设备名   %s\n' "$MODEL"
-    printf '  模式     %s\n' "$( [ -c /dev/net/tun ] && echo 'TUN 全屋透明代理' || echo 'tproxy 全屋透明代理' )"
+    printf '  模式     %s\n' "$( [ "${ACTIVE_MODE:-tproxy}" = "tun" ] && echo 'TUN 全屋透明代理' || echo 'tproxy 全屋透明代理 (本机自身流量除外)' )"
     printf '  分流     智能分流 (国内直连 + 广告拦截, 其余走代理)\n'
     printf '  管理     面板「客户端」页可看状态、开关、改分流、移除设备\n'
     printf '  本机命令 zeroproxy status | on | off | log | uninstall\n'

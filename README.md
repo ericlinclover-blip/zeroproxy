@@ -2139,3 +2139,19 @@ zeroproxy refresh                            # 重新拉取全部节点
 `scripts/router_ui_check.cjs` **13 项** —— 用模拟路由器 (按 cgi 同样的 JSON 契约应答) 在真实
 浏览器里验: 未登录时明确提示而不是空白页、状态渲染、开关、添加合法/非法链接、移除、日志,
 截图 `work/browser-check/router-ui.png`。
+
+### 8.29 v2.7.6: 真机三连: TUN 没建起来 / LuCI 菜单不出现 / 界面 403
+
+MT3000 上重跑安装命令后的三个现象, 各自的原因都不在"安装流程"上:
+
+* **`TUN 可用` 但还是没建出 tun 设备** —— `/dev/net/tun` 这个节点是 kmod 包**装的时候**
+  创建的, 内核模块要 `modprobe tun` 才真正进内核。只检查节点存在是不够的 (现在两件事都做);
+* **LuCI 菜单里没有 ZeroProxy** —— 菜单是 LuCI 自己缓存的索引 (`/tmp/luci-indexcache*`),
+  只 `reload rpcd` 不够。装了菜单文件必须清这个缓存 (现在清);
+* **`http://192.168.8.1/zeroproxy/` 403 (nginx/1.26.1)** —— GL.iNet 固件的 80 端口是
+  **nginx**, 不是 OpenWrt 默认的 uhttpd; 界面文件按"uhttpd 的 /www 就是文档根"设计,
+  在这类固件上不一定成立。安装脚本现在会**本机自检**这个页面, 不通过就当场打印排查命令
+  (问 nginx 的 root 在哪、/www 长什么样、谁在听 80), 而不是让用户看到 403 再猜。
+
+顺带修掉一处自相矛盾: 结尾摘要原来只看 `/dev/net/tun` 存在就写"模式 TUN", 与上面那句
+"TUN 未出现, 改用 tproxy"打架。现在按实际生效的模式报 (verify 里记下来)。
