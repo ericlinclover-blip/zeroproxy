@@ -908,11 +908,23 @@ verify() {
 
     ACTIVE_MODE="tproxy"
     if [ -c /dev/net/tun ]; then
+        # 等内核把设备建出来: mihomo 启动到 zp-tun 出现之间有十几秒 —— 只查一次会
+        # 误判成"没建出来", 于是错误地退回 tproxy 并把那套 nft 规则也加上
+        # (真机上就是这么发生的: tun 明明是好的, 却又叠了一层 tproxy)。
+        _wait=0
+        while [ "$_wait" -lt 30 ]; do
+            ip link show zp-tun >/dev/null 2>&1 && break
+            sleep 1
+            _wait=$((_wait + 1))
+        done
         if ip link show zp-tun >/dev/null 2>&1; then
             ACTIVE_MODE="tun"
+            # 清掉可能被误加上的 tproxy 规则 (两者同时生效会互相打架)
+            nft delete table inet zp_router 2>/dev/null || true
             ok "TUN 已建立: 全屋设备 (含路由器自身) 透明代理生效"
         else
-            warn "TUN 设备没有建立 (内核模块/权限问题), 改用 tproxy 模式"
+            warn "等了 30 秒 TUN 设备仍未出现 (内核模块/权限问题), 改用 tproxy 模式"
+            killall -HUP dnsmasq 2>/dev/null || true
             nft -f "$ZP_DIR/tproxy.nft" 2>/dev/null || true
         fi
     else
