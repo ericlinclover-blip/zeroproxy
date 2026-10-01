@@ -67,7 +67,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 223 项 (217 passed + 6 skipped; 带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (155 项) + `scripts/clients_check.cjs` (20 项, 真实浏览器点开关) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 224 项 (218 passed + 6 skipped; 带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (155 项) + `scripts/clients_check.cjs` (20 项, 真实浏览器点开关) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 | **看得懂的界面 (v2.6.0)** | 控制台布局: 左侧锚点导航 (带计数角标 + 滚动高亮) + 顶部指标条 (健康节点 / 落地出口 IP / 平均延迟 + 迷你折线 / 运行时长) + 节点密集表格 (名称 / 地址状态 / **握手延迟条** / **上下行双轨** / 开关与复制) + **流量卡 (双弧圆环 + 实时速率曲线 + 逐节点双色流量条)** + 链式链路拓扑 (你的设备 → 本机入口 → 落地端) + 程序更新闭环; 动效全部走 `transform`/自绘 rAF 并受 `prefers-reduced-motion` 约束 |
 
@@ -1991,3 +1991,39 @@ KPI 顶部渐变线 · 区块入场 stagger (40ms 递增) · 弹窗 `zp-pop`。
 **回归**: `pytest` 221 → **223 项** (新增: 模块入口与样式表必须带版本前缀、裸路径不许
 再出现、两处静态响应都必须 no-cache、首页 ETag 必须含版本号且命中回 304)。
 `browser_check` 155 项与 `clients_check` 20 项在改造后的静态服务下重跑仍全过。
+
+### 8.25 v2.7.2: 第一次真机安装: `od: not found` —— 拿 OpenWrt 没有的工具做饭
+
+2.7.1 上线后第一次在真路由器 (GL-MT3000 / OpenWrt 24.10.4) 上跑安装命令,
+停在下载内核之后:
+
+```
+==> 下载代理内核 (mihomo · arm64)
+sh: od: not found
+安装失败: 内核无法执行 (架构不匹配?), 请把上面这一行反馈给面板
+```
+
+三处问题叠在一起, 一处都不能留:
+
+* **用了路由器上没有的工具**。判断"下载到的是不是 gzip"我写的是
+  `head -c 2 | od -An -tx1` 读魔数, 而 OpenWrt 的 busybox 默认**不带 od**;
+  命令不存在 → 命令替换得到空字符串 → 代码判定"不是压缩包" → 把 20 MB 的 gz
+  原样 `chmod +x` 当内核执行。改用 `gzip -t` (busybox 一定有)。
+* **错误信息把人往错误方向引**。"内核无法执行 (架构不匹配?)" —— 真正的失败是
+  "文件根本不是 ELF"。现在报字节数, 并列出可能原因 (架构/下载不完整/空间/动态库),
+  同时给出一条可复制的反馈内容。
+* **失败会自己粘住**。`install_core` 原来只看 `-x $ZP_BIN` 就跳过下载, 于是上一次
+  留下的坏文件会让每一次重跑都死在同一个地方, 看起来像"修了没用"。现在复用前先
+  真的跑一次 `-v`。
+
+顺带把 `core_up` 改回用 `/etc/init.d/zeroproxy running` 判断内核状态 —— 这在
+8.23 里不能用 (内核与 agent 挤在一个服务里, `running` 会把"只有 agent 活着"也算成
+内核在跑), 拆成两个服务之后它就是最准的判据; 保留一行 `pgrep` 兜底, 且命令不存在
+时只返回非 0, 不会因为 `set -e` 把 agent 打死。
+
+**回归**: `pytest` 223 → **224 项** (新增一条静态审计: 安装脚本的**命令行**里不许
+出现 od / hexdump / xxd / readelf / jq / python3 / perl —— 注释里解释"为什么不能用"
+不受影响; 并盯住 gzip -t 与复用前先跑 -v 这两点)。同时把端到端演练改成用面板侧的
+**压缩假内核**走完整条链路 (下载 → gzip -t 判定 → 解压 → 可执行校验), 而不是预置一个
+能跑的文件把这段跳过去 —— 2.7.0 的坑正好在这段里, 演练必须覆盖它
+(`ZP_CORE_MIN_BYTES` 就是为这个加的开关)。

@@ -243,21 +243,33 @@ install_deps() {
 # ---------------------------------------------------------------- 内核二进制
 install_core() {
     step "下载代理内核 (mihomo · $ARCH)"
-    if [ -x "$ZP_BIN" ]; then
-        ok "内核已存在, 跳过下载"
+    # 复用旧文件前必须确认它真的跑得起来: 上一次失败可能留下一个没解开的 gz
+    # (chmod 是成功的, 只看 -x 会以为装好了, 于是每次重跑都在同一个地方再挂一次)。
+    if [ -x "$ZP_BIN" ] && "$ZP_BIN" -v >/dev/null 2>&1; then
+        ok "内核已存在且可执行, 跳过下载"
         return 0
     fi
+    rm -f "$ZP_BIN"
     _tmp="$ZP_DIR/.mihomo.gz"
     mkdir -p "$ZP_DIR"
     http_get "$ZP_BASE/c/bin/$ARCH" > "$_tmp" || die "下载内核失败 (面板上该架构的二进制没有缓存成功, 请稍后重试)"
     [ -s "$_tmp" ] || die "下载到的内核是空文件"
-    case "$(head -c 2 "$_tmp" | od -An -tx1 | tr -d ' \n')" in
-        1f8b) gzip -dc "$_tmp" > "$ZP_BIN" || die "解压内核失败" ;;
-        *)    mv "$_tmp" "$ZP_BIN" ;;   # 面板直接给了未压缩的二进制
-    esac
+    # 判断"是不是 gzip"只能用 gzip -t, 不能用 `od -An -tx1` 看魔数 ——
+    # OpenWrt 的 busybox 默认不带 od, 命令不存在时那一行会静默失败, 于是 gz 被当成
+    # 二进制直接 chmod +x, 直到"无法执行"才暴露 (2.7.0 上线后的真机反馈)。
+    if gzip -t "$_tmp" >/dev/null 2>&1; then
+        gzip -dc "$_tmp" > "$ZP_BIN" || die "解压内核失败 (下载到的文件可能不完整, 请重试)"
+    else
+        cp "$_tmp" "$ZP_BIN"     # 面板直接给了未压缩的二进制
+    fi
     rm -f "$_tmp"
     chmod 755 "$ZP_BIN"
-    "$ZP_BIN" -v >/dev/null 2>&1 || die "内核无法执行 (架构不匹配?), 请把上面这一行反馈给面板"
+    if ! "$ZP_BIN" -v >/dev/null 2>&1; then
+        _size="$(wc -c < "$ZP_BIN" 2>/dev/null | tr -d ' ')"
+        die "内核无法执行: $ZP_BIN (${_size:-?} 字节)。
+  可能原因: 架构不匹配 ($ARCH) / 下载不完整 / 闪存空间不足 / 缺动态库。
+  请把这一行连同 'uname -m' 的输出一起发回面板。"
+    fi
     ok "内核就绪: $("$ZP_BIN" -v 2>/dev/null | head -n1)"
 }
 
@@ -355,11 +367,15 @@ http_get() {
 }
 
 # 内核是否在跑 —— 这是要上报给面板的 actual。
-# 不能用 `/etc/init.d/zeroproxy running`: 控制 agent 是另一个常驻服务, 用服务名
-# 判断会把"只有 agent 活着"也算成内核在跑, 于是面板永远显示"已连接"。
-# 这里看两件事: 我们的开关意图 (core.up 标记) + 进程真的在。
+# 看两件事: 我们的开关意图 (core.up 标记) + procd 说这个服务在跑。
+# 注意 `/etc/init.d/zeroproxy` 是**只含内核**的服务 (控制 agent 是另一个服务
+# zeroproxy-agent): 两个实例合在一个服务里的时候 `running` 会把"只有 agent 活着"
+# 也算成内核在跑, 面板于是永远显示"已连接" —— 拆开之后这里才能用它。
 core_up() {
     [ -f "$ZP_DIR/core.up" ] || return 1
+    /etc/init.d/zeroproxy running >/dev/null 2>&1 && return 0
+    # 兜底: 老版本 rc.common 没有 running 子命令时看进程 (busybox 不一定有 pgrep,
+    # 命令不存在时这里只是返回非 0, 不会因为 set -e 把 agent 打死)
     pgrep -f "$ZP_DIR/mihomo" >/dev/null 2>&1
 }
 

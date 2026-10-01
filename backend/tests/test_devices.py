@@ -116,6 +116,32 @@ def test_core_binary_endpoint(client, configured, tmp_path, monkeypatch):
     assert res.content == blob.read_bytes()
 
 
+def test_install_script_sticks_to_busybox_tools():
+    """路由器上的可用命令比服务器少得多, 这条测试盯住"用了 OpenWrt 没有的工具"。
+
+    真机事故 (2.7.0): 用 `od -An -tx1` 读文件前两个字节来判断下载到的是不是 gzip。
+    OpenWrt 的 busybox 默认**不带 od**, 那行命令直接 "od: not found" —— 命令替换拿到
+    空字符串, 于是代码判定"不是压缩包", 把 20 MB 的 gz 原样 chmod +x 当成内核执行,
+    报错还写成"内核无法执行 (架构不匹配?)", 把人往错误方向引。
+
+    判断压缩包只用 gzip -t (busybox 一定有), 别再引入任何"服务器上才有"的工具。
+    """
+    import re
+
+    from zeroproxy import router_client
+
+    raw = open(router_client.script_path(), encoding="utf-8").read()
+    # 只看真正的命令行: 注释里当然可以提到 od (解释"为什么不能用它"的那段)
+    text = "\n".join(line for line in raw.splitlines() if not line.lstrip().startswith("#"))
+    for tool in ("od", "hexdump", "xxd", "readelf", "jq", "python3", "perl", "dpkg", "apt"):
+        assert not re.search(rf"(?<![A-Za-z0-9_]){tool}(?![A-Za-z0-9_])", text), (
+            f"安装脚本里不该出现 {tool}: 路由器上不一定有"
+        )
+    assert "gzip -t" in text, "判断 gzip 必须用 gzip -t"
+    # 复用旧内核前要真的跑一次 -v, 否则上一次失败留下的坏文件会让重跑一直挂在原地
+    assert '"$ZP_BIN" -v >/dev/null 2>&1; then' in text
+
+
 # ---------------------------------------------------------------- 配置生成
 
 def test_router_profile_has_router_only_blocks(client, configured):

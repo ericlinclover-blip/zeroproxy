@@ -59,8 +59,10 @@ MIRRORS = (
 )
 
 UA = "zeroproxy-panel"
-#: 低于这个大小一律视为下载失败 (一个正常的 mihomo 压缩包 ≈ 20 MB)
-MIN_BYTES = 4 << 20
+#: 低于这个大小一律视为下载失败 (一个正常的 mihomo 压缩包 ≈ 20 MB)。
+#: 可用 ZP_CORE_MIN_BYTES 调低 —— 自动化演练里用一个几 KB 的假内核就能把
+#: "下载 → 解压 → 可执行校验"这条路整条跑通, 不必真的下 20 MB。
+MIN_BYTES = int(os.environ.get("ZP_CORE_MIN_BYTES", str(4 << 20)))
 
 
 def asset_name(arch: str) -> str:
