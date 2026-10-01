@@ -67,7 +67,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 221 项 (215 passed + 6 skipped; 带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (155 项) + `scripts/clients_check.cjs` (20 项, 真实浏览器点开关) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 223 项 (217 passed + 6 skipped; 带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/browser_check.cjs` (155 项) + `scripts/clients_check.cjs` (20 项, 真实浏览器点开关) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 | **看得懂的界面 (v2.6.0)** | 控制台布局: 左侧锚点导航 (带计数角标 + 滚动高亮) + 顶部指标条 (健康节点 / 落地出口 IP / 平均延迟 + 迷你折线 / 运行时长) + 节点密集表格 (名称 / 地址状态 / **握手延迟条** / **上下行双轨** / 开关与复制) + **流量卡 (双弧圆环 + 实时速率曲线 + 逐节点双色流量条)** + 链式链路拓扑 (你的设备 → 本机入口 → 落地端) + 程序更新闭环; 动效全部走 `transform`/自绘 rAF 并受 `prefers-reduced-motion` 约束 |
 
@@ -1956,3 +1956,38 @@ KPI 顶部渐变线 · 区块入场 stagger (40ms 递增) · 弹窗 `zp-pop`。
 ⚠️ 尚未在真实路由器上跑过 (本机没有 OpenWrt 环境)。第一次真机验证的口径:
 `wget -qO- <面板>/c/<配对码> | sh` 跑完后看终端最后三行, 以及在路由器上执行
 `zeroproxy status` / 面板上点一次开关看卡片是否在一轮心跳内变绿。
+
+### 8.24 v2.7.1: 升级后新卡片是"空壳"—— 静态资源被浏览器缓存住了
+
+上线 2.7.0 后用户截图反馈: 「客户端」卡片**只有标题和三个 tab, 下面什么都没有**,
+而且那三个 tab 是浏览器默认样式的方块。
+
+这不是 JS 报错, 是**缓存**: 页面结构 (index.html) 更新了, 但它的 JS/CSS 没有。
+
+为什么只更新了一半 —— 两边的缓存策略不一样:
+
+* `index.html` 由面板自己的路由送出, 早就带了 `cache-control: no-cache` (这是
+  v2.6.29 修过的一个同类问题), 所以它每次都回源 → 用户拿到的是新版页面;
+* `/static/` 下的资源由 FastAPI 的 `StaticFiles` 直接送, **只带 Last-Modified/ETag,
+  不带 Cache-Control**。浏览器于是按 RFC 的启发式缓存处理 (可缓存"文件年龄的 10%",
+  面版这种装了几天没动的文件就是几个小时), 期间连回源校验都不做 → 模块图与样式表
+  还是上一版。
+
+于是浏览器跑的是旧的 `dashboard.js` (它根本不知道有 clients 这个视图), 也不去请求
+新的 `views/clients.js`; 旧的 `components.css` 里没有 `.tabs` 规则, tab 就退回浏览器
+默认样式。用户看到的就是"新卡片是空壳", 而且他不该被要求知道要按 Ctrl+Shift+R。
+
+修法两道防线, 都不需要用户做任何事:
+
+* **资源地址带版本前缀**: `index.html` 由面板渲染时, 把 `"/static/` 改写成
+  `"/static/v<版本>/`; 同时把静态目录挂到 `/static/v<版本>` 与 `/static` 两处
+  (带版本的先注册, 否则 Starlette 会先命中裸挂载点然后去磁盘找 `v2.7.1/` 目录 → 404)。
+  升级后浏览器面对的是**从没见过的 URL**, 必然回源 —— 旧缓存里那些 URL 再也不会被用到;
+* **整棵静态树 `cache-control: no-cache`**: 同一个 URL 下的改动 (例如没涨版本号的热修)
+  也拿得到; 命中 ETag 就是 304, 代价是每次加载多十来个条件请求。
+
+首页仍然是 `no-cache` + 版本号进 ETag (命中 304), 保留原来的意图。
+
+**回归**: `pytest` 221 → **223 项** (新增: 模块入口与样式表必须带版本前缀、裸路径不许
+再出现、两处静态响应都必须 no-cache、首页 ETag 必须含版本号且命中回 304)。
+`browser_check` 155 项与 `clients_check` 20 项在改造后的静态服务下重跑仍全过。

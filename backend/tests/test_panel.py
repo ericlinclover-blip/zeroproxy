@@ -164,6 +164,48 @@ def test_csp_drops_unsafe_inline_but_whitelists_the_theme_bootstrap(client):
     assert f"'sha256-{digest}'" in script_src, "内联脚本的哈希必须在白名单里, 否则主题会静默失效"
 
 
+def test_static_assets_are_versioned_and_never_heuristically_cached(client):
+    """升级后"新卡片是个空壳、样式也是旧的"的根因, 以及它为什么不会再发生。
+
+    面板的静态资源以前由 StaticFiles 直接送出 —— 只带 Last-Modified/ETag, **没有
+    Cache-Control**, 浏览器于是按启发式缓存处理 (可缓存"文件年龄的 10%")。升级后
+    index.html 会立刻更新 (它自己带 no-cache), 但 /static/ 下的 JS/CSS 可能还是上一版:
+    页面结构是新的、逻辑与样式是旧的 —— 用户看到的就是一个新卡片里什么都没有, 而且
+    他不可能知道要强制刷新。
+
+    两道防线: 资源地址带版本前缀 (升级后是浏览器没见过的 URL, 必然回源) + 整棵静态树
+    no-cache (同 URL 的改动也拿得到, ETag 命中就是 304)。
+    """
+    from zeroproxy import __version__ as ver
+
+    html = client.get("/").text
+    assert f'/static/v{ver}/app/main.js' in html, "模块入口必须带版本前缀"
+    assert f'/static/v{ver}/app/style/components.css' in html, "样式表必须带版本前缀"
+    assert 'src="/static/app/main.js"' not in html, "不该再有裸静态路径"
+
+    versioned = client.get(f"/static/v{ver}/app/main.js")
+    assert versioned.status_code == 200
+    assert versioned.headers["cache-control"] == "no-cache"
+
+    # 裸路径保留可用 (旧书签 / 外部引用), 但同样不许被缓存住
+    bare = client.get("/static/app/main.js")
+    assert bare.status_code == 200
+    assert bare.headers["cache-control"] == "no-cache"
+
+
+def test_index_page_revalidates_with_versioned_etag(client):
+    """首页每次都回源校验, 但命中就只回 304 —— 升级后必须立刻换内容。"""
+    first = client.get("/")
+    etag = first.headers.get("etag", "")
+    assert etag.startswith('W/"'), etag
+    from zeroproxy import __version__ as ver
+
+    assert ver in etag, "版本号要在 ETag 里, 否则升级后可能命中旧缓存"
+    again = client.get("/", headers={"If-None-Match": etag})
+    assert again.status_code == 304
+    assert again.content == b""
+
+
 # ---------------------------------------------------------------- 订阅
 
 def test_subscription_base64_contains_all_enabled_nodes(client, configured):

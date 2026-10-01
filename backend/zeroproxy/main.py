@@ -17,8 +17,8 @@ import sys
 import threading
 
 import uvicorn
-from fastapi import FastAPI
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__, chain_quic, config, geodata, routes, services
@@ -195,6 +195,9 @@ def _static_dir() -> str:
 def create_app() -> FastAPI:
     static_dir = _static_dir()
     headers = security_headers(static_dir)
+    #: 静态资源的版本前缀。资源 URL 里带版本号 = 升级后浏览器面对的是**新地址**,
+    #: 不可能命中上一版的缓存 (下面的 index() 会把 index.html 里的 /static/ 改写掉)。
+    static_prefix = f"/static/v{__version__}"
     app = FastAPI(
         title="ZeroProxy", version=__version__, docs_url=None, redoc_url=None, lifespan=lifespan
     )
@@ -205,25 +208,51 @@ def create_app() -> FastAPI:
         response = await call_next(request)
         for key, value in headers.items():
             response.headers.setdefault(key, value)
+        # 静态资源必须每次回源校验。
+        #
+        # FastAPI 的 StaticFiles 只发 Last-Modified/ETag, 不发 Cache-Control —— 浏览器
+        # 于是按"启发式缓存"处理 (可缓存文件年龄的 10%)。升级后 index.html 会立刻更新
+        # (它自己带 no-cache), 但 /static/ 下的 JS/CSS 可能还在用上一版: 表现就是
+        # **新加的功能卡片在页面上是空壳, 样式也是旧的**, 而用户完全不知道要强制刷新。
+        # 这里给整棵静态树补上 no-cache (命中 ETag 就是 304, 代价极小)。
+        if request.url.path.startswith("/static/"):
+            response.headers.setdefault("cache-control", "no-cache")
         return response
 
     app.include_router(routes.router)
 
     @app.get("/", include_in_schema=False)
-    def index():
+    def index(request: Request):
         target = os.path.join(static_dir, "index.html")
-        if os.path.exists(target):
-            # 前端必须跟随后端一起升级: 只带 Last-Modified/ETag 而没有 Cache-Control 时,
-            # 浏览器会做"启发式缓存" (最长可到文件年龄的 10%), 升级后面板可能还在跑几天
-            # 前那份 index.html —— 界面是旧的, 于是"明明修了按钮还是卡"。这里强制每次
-            # 都用 ETag 回源校验 (命中就是 304, 代价极小)。
+        if not os.path.exists(target):
+            return JSONResponse(
+                {"name": "ZeroProxy", "version": __version__, "hint": "static/index.html 缺失"},
+                status_code=200,
+            )
+        # index.html 每次都由这里渲染, 顺便把静态资源地址改写成带版本前缀的形式。
+        # 只改 `"/static/` 这种带引号的引用 (样式表与模块入口), 注释里的路径不动。
+        try:
+            with open(target, encoding="utf-8") as fh:
+                html = fh.read().replace('"/static/', f'"{static_prefix}/')
+        except OSError:
             return FileResponse(target, headers={"cache-control": "no-cache"})
-        return JSONResponse(
-            {"name": "ZeroProxy", "version": __version__, "hint": "static/index.html 缺失"},
-            status_code=200,
+        # 前端必须跟随后端一起升级: 只带 Last-Modified/ETag 而没有 Cache-Control 时,
+        # 浏览器会做"启发式缓存" (最长可到文件年龄的 10%), 升级后面板可能还在跑几天
+        # 前那份 index.html —— 界面是旧的, 于是"明明修了按钮还是卡"。这里强制每次
+        # 都用 ETag 回源校验 (命中就是 304, 代价极小); 版本号进 ETag, 升级必然失效。
+        etag = f'W/"{__version__}-{int(os.path.getmtime(target))}"'
+        if request.headers.get("if-none-match") == etag:
+            return Response(status_code=304, headers={"etag": etag, "cache-control": "no-cache"})
+        return Response(
+            html,
+            media_type="text/html; charset=utf-8",
+            headers={"etag": etag, "cache-control": "no-cache"},
         )
 
     if os.path.isdir(static_dir):
+        # 先挂带版本号的, 再挂裸 /static: Starlette 按注册顺序匹配, 顺序反了的话
+        # /static/v2.7.1/app/main.js 会先命中裸挂载点, 然后去磁盘上找 v2.7.1 目录 → 404。
+        app.mount(static_prefix, StaticFiles(directory=static_dir), name="static-versioned")
         app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
     @app.get("/api/info", include_in_schema=False)
