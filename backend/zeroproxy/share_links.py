@@ -570,7 +570,11 @@ def clash_profile(
             "keep-alive-interval": 30,
             # 本机控制口: 安装脚本用它做健康检查, 也留作以后"只重载不断连"的入口
             "external-controller": "127.0.0.1:9090",
-            "profile": {"store-selected": True, "store-fake-ip": True},
+            # store-selected 故意关掉: 面板才是开关的唯一出处, 路由器不需要记住
+            # "上次手选了哪个节点"。开着它有个真机踩过的坑 —— 开机瞬间节点还没加载
+            # (provider 还没拉下来) 时 mihomo 会把组落到 DIRECT 并**记住**,
+            # 之后节点回来了也照样直连: 表现就是"全是超时, 页面加载极慢"。
+            "profile": {"store-selected": False, "store-fake-ip": True},
             "sniffer": {
                 "enable": True,
                 "sniff": {
