@@ -977,6 +977,19 @@ verify() {
         nft -f "$ZP_DIR/tproxy.nft" 2>/dev/null || true
     fi
 
+    # 等节点就绪再测: provider 是内核启动后异步拉的, 立刻测一定失败 —— 那句
+    # "出口测试未通过" 于是变成一条误导 (真机反馈里它一直挂着, 让人以为代理坏了)。
+    # 判据是 mihomo 自己说 🚀 节点选择 现在选的是谁: 还是 DIRECT 就再等。
+    if command -v curl >/dev/null 2>&1; then
+        _w=0
+        while [ "$_w" -lt 30 ]; do
+            _now="$(curl -s -m 3 "http://127.0.0.1:9090/proxies/%F0%9F%9A%80%20%E8%8A%82%E7%82%B9%E9%80%89%E6%8B%A9" 2>/dev/null | sed -n 's/.*"now":"\([^"]*\)".*/\1/p')"
+            [ -n "$_now" ] && [ "$_now" != "DIRECT" ] && break
+            sleep 2
+            _w=$((_w + 1))
+        done
+        [ -n "$_now" ] && ok "节点已就绪 (当前选中: $_now)"
+    fi
     # 真实出口测试: 经代理端口请求一次, 只作为信息展示 —— 节点全关时失败是正常的。
     # 用 curl 是因为 busybox 的 wget 不支持 -x (代理), 没有 curl 就跳过这一步。
     if command -v curl >/dev/null 2>&1; then
