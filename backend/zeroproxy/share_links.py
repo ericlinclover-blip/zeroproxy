@@ -157,7 +157,11 @@ ROUTER_DNS = {
 #: 部分宽带/光猫对巨帧不友好, 表现为"能连上但大文件卡死"。
 ROUTER_TUN = {
     "enable": True,
-    "stack": "gvisor",
+    # stack: system —— 用内核的 tun 收发, 而不是 gvisor 的用户态协议栈。
+    # gvisor 兼容性最好但**每一个包都要过用户态**, 在 MT7981 这种双核 A53 上就是
+    # 吞吐天花板 (真机反馈: 比电脑上直接跑代理慢一截)。system 走内核路径, 同样的
+    # 硬件通常能快出成倍。万一某台设备的 system 栈有问题, 把它改回 "gvisor" 即可。
+    "stack": "system",
     "device": "zp-tun",
     "auto-route": True,
     "auto-redirect": True,
