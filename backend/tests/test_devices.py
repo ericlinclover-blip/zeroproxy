@@ -222,6 +222,28 @@ def test_install_script_never_fetches_geo_from_the_internet():
     assert "PANEL_GEO" in text
 
 
+def test_router_reports_its_ui_url_so_the_panel_can_open_it(client, configured):
+    """路由器把"管理界面地址 (带着界面令牌)"随心跳上报 —— 面板上那张卡因此能一键打开。
+
+    少掉的那一步手动操作: 新用户装完不必回终端敲 `zeroproxy ui`、再抄一条带令牌的长地址,
+    在面板「客户端」点一下就走进去 (地址里的令牌只在那台路由器的局域网内有用)。
+    面板只接受 http(s) 且路径里带 zeroproxy 的值 —— 它会进前端 HTML, 不能变成注入面。
+    """
+    _login(client)
+    device = _register(client, _pair_code(client)["code"])
+    ui = "http://192.168.8.1/cgi-bin/zeroproxy?k=" + "a" * 32
+    client.post("/c/report", json={
+        "device": device["id"], "k": device["secret"], "actual": True, "ui": ui,
+    })
+    assert client.get("/api/devices").json()["devices"]["items"][0]["ui"] == ui
+
+    for bad in ("javascript:alert(1)", "http://192.168.8.1/other", "ftp://x/zeroproxy", ""):
+        client.post("/c/report", json={
+            "device": device["id"], "k": device["secret"], "ui": bad,
+        })
+        assert client.get("/api/devices").json()["devices"]["items"][0]["ui"] == ui, bad
+
+
 def test_install_ui_always_makes_a_token_and_prints_it():
     """路由器管理界面的地址必须带令牌, 令牌也必须无条件生成。
 

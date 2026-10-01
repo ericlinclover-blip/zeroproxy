@@ -95,6 +95,12 @@ function deviceCard(d) {
         <span class="tag-chip">${d.actual ? "内核运行中" : "内核已停止"}</span>
         ${d.version ? `<span class="tag-chip">客户端 v${esc(d.version)}</span>` : ""}
       </div>
+      ${d.ui ? `
+      <div class="dev-sub">
+        <a class="btn ghost small" href="${escAttr(d.ui)}" target="_blank" rel="noreferrer"
+           title="只在路由器所在的局域网内可用; 打不开就在路由器上执行 zeroproxy ui">打开路由器管理界面</a>
+        <span class="muted fs-xs">同一局域网内可直接打开 (地址里带着这台路由器的界面令牌)</span>
+      </div>` : ""}
     </div>
     <div class="dev-switch">
       <label class="bigswitch" title="${d.desired ? "点击关闭全屋代理" : "点击开启全屋代理"}">

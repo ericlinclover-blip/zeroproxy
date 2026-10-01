@@ -134,7 +134,12 @@ async function main() {
 
     await api("/c/report", {
       method: "POST",
-      body: JSON.stringify({ device: device.id, k: device.secret, actual: true, version: "1.0.0" }),
+      body: JSON.stringify({
+        device: device.id, k: device.secret, actual: true, version: "1.0.0",
+        // 真机上这份地址由 agent 每轮心跳上报 (带界面令牌) —— 面板据此给一个"点一下就能进"
+        // 的入口, 新用户不必回终端敲 zeroproxy ui 抄一条长地址
+        ui: "http://192.168.8.1/cgi-bin/zeroproxy?k=" + "ab12".repeat(8),
+      }),
     });
     await page.click("#btn-apply");           // 触发一次面板刷新 (等同 20s 轮询)
     await page.waitForSelector(".dev-card", { timeout: 20000 });
@@ -144,6 +149,11 @@ async function main() {
     check("已连接时卡片是绿色状态", await page.locator(".dev-card.on").count() === 1);
     check("状态文案是「已连接」", /已连接/.test(await page.locator(".dev-card .pill").innerText()));
     check("开关处于打开状态", await page.locator(".bigswitch input").isChecked());
+    const uiLink = page.locator('.dev-card a[href*="/cgi-bin/zeroproxy"]');
+    check("设备卡上有「打开路由器管理界面」的入口", await uiLink.count() === 1,
+      await uiLink.getAttribute("href"));
+    check("这个入口是新窗口打开 (不把面板页面顶掉)",
+      (await uiLink.getAttribute("target")) === "_blank");
     const glow = await page.locator(".bigswitch input:checked + .track").count();
     check("开关打开时有发光样式", glow === 1);
     // 真机上这里是"看起来像个按钮"的下拉 —— 用计算样式盯住它 (自绘箭头 + ghost 同款边框)

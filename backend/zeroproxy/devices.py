@@ -25,6 +25,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import time
 
@@ -238,6 +239,10 @@ def touch(state: dict, device: dict, info: dict) -> bool:
     if info.get("rev") and device.get("rev") != str(info["rev"])[:32]:
         device["rev"] = str(info["rev"])[:32]
         changed = True
+    ui = clean_ui_url(info.get("ui"))
+    if ui and device.get("ui") != ui:
+        device["ui"] = ui
+        changed = True
     report = info.get("report")
     if isinstance(report, dict):
         fresh = {
@@ -260,6 +265,19 @@ def remove(state: dict, device_id: str) -> bool:
 
 def online(device: dict, now: int | None = None) -> bool:
     return (_now() if now is None else now) - int(device.get("last_seen") or 0) <= ONLINE_WINDOW
+
+
+#: 设备自己上报的"管理界面地址"(路由器端 LuCI 页 + 界面令牌)。面板只做展示:
+#: 用户在面板上点一下就能进那台路由器的管理界面, 不必回终端敲 `zeroproxy ui`。
+#: 校验从严 —— 这个值会进前端 HTML, 只接受 http(s) 且路径里带 zeroproxy 的短地址。
+_UI_URL_RE = re.compile(r"^https?://[^\s\"'<>]{1,180}$")
+
+
+def clean_ui_url(value: object) -> str:
+    text = str(value or "").strip()
+    if not _UI_URL_RE.match(text) or "/zeroproxy" not in text:
+        return ""
+    return text
 
 
 # ---------------------------------------------------------------- 配置版本
@@ -308,6 +326,9 @@ def device_view(device: dict, *, now: int | None = None) -> dict:
         "connected": desired and actual,
         "template": device.get("template", ""),
         "rev": device.get("rev", ""),
+        # 路由器管理界面地址 (带界面令牌, 只在路由器所在的局域网内可用);
+        # 手机/电脑端没有这个值 —— 前端按有没有它决定要不要显示"打开管理界面"。
+        "ui": device.get("ui", ""),
         "report": device.get("report", {}),
     }
 

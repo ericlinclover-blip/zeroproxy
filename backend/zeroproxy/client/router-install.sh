@@ -578,6 +578,18 @@ providers_yaml() {
 # 分流数据库是否就位 (两份都要): 配置里的 GEOSITE / GEOIP,CN 规则靠它
 geo_ok() { [ -s "$ZP_DIR/geoip.metadb" ] && [ -s "$ZP_DIR/geosite.dat" ]; }
 
+# 管理界面的地址 (带界面令牌)。上报给面板, 用户就能在面板的设备卡上直接点开 ——
+# 不必回终端敲 `zeroproxy ui` (那一步是"这个页面要授权"的唯一门槛)。
+# 令牌文件不在 (极少数固件上没生成) 就返回空, 面板那边自然不显示这个入口。
+ui_url() {
+    _ip="$(uci get network.lan.ipaddr 2>/dev/null || true)"
+    [ -n "$_ip" ] || _ip="$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -n1)"
+    [ -n "$_ip" ] || _ip="192.168.8.1"
+    _tok="$(cat "$ZP_DIR/ui.token" 2>/dev/null)"
+    [ -n "$_tok" ] || return 0
+    printf 'http://%s/cgi-bin/zeroproxy?k=%s' "$_ip" "$_tok"
+}
+
 # 从面板取分流数据库 (参数 force 时即使本地已有也重取)。返回 0 = 两份都齐了。
 # 一份都取不到时返回非 0: 调用方据此输出"不含 geo 规则"的降级配置 —— 能上网, 而且
 # 面板恢复后下一次重建配置会自动换回完整分流。
@@ -757,11 +769,14 @@ while true; do
     # 新设备默认就是"开", 所以只有"没人碰过"的面板不会干扰。
     DESIRED_ALL="true"
     REV=""
+    # 管理界面地址 (带令牌) 只算一次 —— 每台面板都收到同一份, 面板据此给一个可点的入口
+    UI_URL_REPORT="$(ui_url 2>/dev/null || true)"
     for _f in $(server_files); do
         _b="$(field_of "$_f" base)"; _i="$(field_of "$_f" id)"; _k="$(field_of "$_f" secret)"
         [ -n "$_b" ] || continue
         BODY='{"device":"'"$_i"'","k":"'"$_k"'","version":"'"$ZP_VERSION"'"'
         if core_up; then BODY="$BODY"',"actual":true'; else BODY="$BODY"',"actual":false'; fi
+        [ -n "$UI_URL_REPORT" ] && BODY="$BODY"',"ui":"'"$UI_URL_REPORT"'"'
         [ -n "$LAST_REV" ] && BODY="$BODY"',"rev":"'"$LAST_REV"'"'
         BODY="$BODY"'}'
         RESP="$(http_post "$_b/c/report" "$BODY" || true)"
@@ -1040,6 +1055,17 @@ CLIEOF
         sed "s/__ZP_CLIENT_VERSION__/$ZP_CLIENT_VERSION/g" "$_f" > "$_f.ver" \
             && { chmod 755 "$_f.ver"; mv "$_f.ver" "$_f"; } || rm -f "$_f.ver"
     done
+    # 界面令牌 (0600): 数据接口要么认它 (地址里带 ?k=…, 打开一次种成一年期的 cookie),
+    # 要么认一个有效的 LuCI 会话。GL.iNet 的后台不是 LuCI, 所以这个令牌是那类固件上唯一
+    # 能授权的方式 —— 它在**这里**生成而不是在"有没有 LuCI"那个分支里: 令牌属于客户端凭据
+    # (agent 每轮心跳把它报给面板, 用户在面板上就能一键打开), 与有没有网页界面无关。
+    if [ ! -s "$ZP_DIR/ui.token" ]; then
+        umask 077
+        head -c 16 /dev/urandom | md5sum | cut -c1-32 > "$ZP_DIR/ui.token" 2>/dev/null || \
+            printf '%s' "$(date +%s)$$" > "$ZP_DIR/ui.token"
+        umask 022
+        chmod 600 "$ZP_DIR/ui.token"
+    fi
     # 分流数据库要在生成配置**之前**就位: 配置里要不要带 geo 规则, 由本机有没有数据决定。
     install_geo
     # 配置在所有运行文件就位之后才生成 (agent 的 config 模式要用到 agent.sh 自己);
@@ -1072,10 +1098,8 @@ install_ui() {
     # 在浏览器能到的地方, 而 /cgi-bin/ 一定通 (LuCI 自己就走它)
     UI_URL="http://$(uci get network.lan.ipaddr 2>/dev/null || echo 192.168.1.1)/cgi-bin/zeroproxy"
 
-    # 界面令牌: 数据接口要么认这个 (地址里带 ?k=…, 打开一次种成 cookie), 要么认一个有效的
-    # LuCI 会话。GL.iNet 的后台**不是** LuCI, 登录它拿不到 LuCI 会话 —— 所以这个令牌是
-    # 那类固件上唯一能授权的方式, 必须在**任何**固件上都生成, 不能挂在"有没有 LuCI"下面
-    # (否则 `zeroproxy ui` 打印不出令牌, 页面永远停在"未授权", 开关看着就是坏的)。
+    # 界面令牌在 write_files 里就生成好了 (agent 的心跳要拿它上报"管理界面地址")。
+    # 万一被谁删了, 这里补一个 —— 没有令牌的地址等于打不开。
     if [ ! -s "$ZP_DIR/ui.token" ]; then
         umask 077
         head -c 16 /dev/urandom | md5sum | cut -c1-32 > "$ZP_DIR/ui.token" 2>/dev/null || \
@@ -1105,6 +1129,7 @@ install_ui() {
     # 页面 (真机反馈: 用户照着打印的地址打开, 看到开关是关的、点不开, 以为是 bug)。
     ok "浏览器打开: $UI_URL_K"
     ok "  (令牌只用来授权这一个页面, 打开一次即可; 忘了就用 zeroproxy ui 再打印)"
+    ok "  面板「客户端」那张设备卡上也有一键入口 (同一局域网内点它就行)"
     # 本机自检: 页面真能被服务器发出来才算装好。这台固件 80 端口可能是 nginx
     # 而不是 uhttpd, 文档路径不一定是我们以为的 /www —— 与其让用户看到 403,
     # 不如当场说清楚并给出排查命令。

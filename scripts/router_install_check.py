@@ -278,6 +278,11 @@ def main() -> int:
         device = json.loads(body)["devices"]["items"][0]
         check("agent 上报后设备显示在线", device["online"] is True)
         check("总开关默认开启且面板能看到期望状态", device["desired"] is True)
+        # 面板上那张卡能一键打开路由器管理界面 (地址带界面令牌, 由 agent 上报) ——
+        # 新用户因此不用回终端敲 zeroproxy ui 抄一条长地址
+        check("agent 上报的管理界面地址进了面板",
+              device.get("ui", "").startswith("http://") and "/cgi-bin/zeroproxy?k=" in device.get("ui", ""),
+              device.get("ui", "")[:48])
 
         print("\n[2b] 面板给不出分流数据库时自动降级 (不留 geo 规则), 数据回来再自动恢复")
         for name in ("geoip.metadb", "geosite.dat"):

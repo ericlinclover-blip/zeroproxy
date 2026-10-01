@@ -2746,6 +2746,8 @@ class DeviceReportIn(BaseModel):
     arch: str = ""
     os: str = ""
     model: str = ""
+    # 路由器端管理界面的地址 (带界面令牌) —— 面板拿它给用户一个"点一下就能进"的入口
+    ui: str = ""
     report: dict | None = None
     set_desired: bool | None = None
 
@@ -3091,6 +3093,7 @@ def client_report(payload: DeviceReportIn, request: Request):
             "arch": payload.arch,
             "os": payload.os,
             "model": payload.model,
+            "ui": payload.ui,
         }
         if payload.actual is not None:
             info["actual"] = payload.actual

@@ -68,7 +68,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 252 项 (246 passed + 6 skipped; 带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/router_install_check.py` (39 项, **真的用 shell 跑一遍路由器安装脚本**) + `scripts/browser_check.cjs` (155 项) + `scripts/clients_check.cjs` (20 项, 真实浏览器点开关) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 253 项 (247 passed + 6 skipped; 带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/router_install_check.py` (40 项, **真的用 shell 跑一遍路由器安装脚本**) + `scripts/browser_check.cjs` (155 项) + `scripts/clients_check.cjs` (23 项, 真实浏览器点开关) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 | **看得懂的界面 (v2.6.0)** | 控制台布局: 左侧锚点导航 (带计数角标 + 滚动高亮) + 顶部指标条 (健康节点 / 落地出口 IP / 平均延迟 + 迷你折线 / 运行时长) + 节点密集表格 (名称 / 地址状态 / **握手延迟条** / **上下行双轨** / 开关与复制) + **流量卡 (双弧圆环 + 实时速率曲线 + 逐节点双色流量条)** + 链式链路拓扑 (你的设备 → 本机入口 → 落地端) + 程序更新闭环; 动效全部走 `transform`/自绘 rAF 并受 `prefers-reduced-motion` 约束 |
 
@@ -2391,3 +2391,24 @@ agent 上报的客户端版本号一直硬编码 `1.0.0`, 现在跟着 `SCRIPT_V
 页面里必须出现 `zeroproxy ui` 这条可执行的下一步); `pytest` 251 → **252 项** (安装脚本的
 令牌必须在 LuCI 分支之前无条件生成, 且摘要里打印的地址必须带 `?k=`)。界面截图见
 `work/browser-check/router-ui.png`。
+
+### 8.40 v2.9.6: 把"打开路由器控制台"这最后一步手动操作也去掉
+
+上一版把未授权页面改好了 (禁用控件 + 写明命令), 但那仍然要求用户回终端抄一条带令牌的长
+地址 —— 对一个"装完就想用"的东西来说, 这一步是多余的。三处一起改:
+
+* **面板上直接点开**: agent 每 15 秒的心跳里带上这台路由器的管理界面地址 (含界面令牌),
+  面板「客户端」那张设备卡因此多一个「打开路由器管理界面」按钮 —— 刚装完的人在同一局域网
+  点一下就进去, 全程不用回终端。地址只在路由器所在的局域网内可用; 面板只存不解释, 并且
+  只接受 http(s) 且路径里带 zeroproxy 的值 (它会进前端 HTML, 不能变成注入面);
+* **打开一次, 记住一年**: 那条地址种下的 cookie 从会话级改成 `Max-Age` 一年。以前关掉
+  浏览器就忘, 第二天用普通地址进来又是"未授权" —— 看起来像时好时坏;
+* **令牌改到 `write_files` 里生成**: 它属于客户端凭据 (agent 要拿它上报), 与"这台固件有没有
+  网页界面"无关; 挂在 `install_ui` 的 LuCI 分支里是上一版留下的最后一处依赖。
+
+为什么不干脆放开局域网: 家里有访客设备 / 摄像头 / 租户的网段时, 谁都能把全屋代理关掉、
+看到你的面板地址。这道令牌只守住**控制台页面**, 代理本身不受影响 —— "装完即通"一点没变。
+
+**回归**: `scripts/router_install_check.py` 39 → **40 项** (断言 agent 上报的管理界面地址真的
+进了面板); `scripts/clients_check.cjs` 21 → **23 项** (设备卡上有入口 + 新窗口打开, 不把面板
+顶掉); `pytest` 252 → **253 项** (上报地址的校验: `javascript:` / 不相关路径一律丢掉)。

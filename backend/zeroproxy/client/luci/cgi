@@ -33,7 +33,9 @@ tok="$(cat "$TOKFILE" 2>/dev/null)"
 qk="$(printf '%s' "$QS" | tr '&' '\n' | sed -n 's/^k=//p' | head -n1)"
 ck="$(printf '%s' "${HTTP_COOKIE:-}" | tr ';' '\n' | sed -n 's/^ *zp_ui=\(.*\)$/\1/p' | head -n1)"
 if [ -n "$tok" ] && [ "$qk" = "$tok" ] && [ "$ck" != "$tok" ]; then
-    printf 'Set-Cookie: zp_ui=%s; Path=/; HttpOnly; SameSite=Lax\r\n' "$tok"
+    # Max-Age 一年: 这是"打开过一次就再也不用管"的关键 —— 会话 cookie 一关浏览器就没了,
+    # 用户下次打开普通地址又看到"未授权", 只会觉得这东西时好时坏。
+    printf 'Set-Cookie: zp_ui=%s; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax\r\n' "$tok"
 fi
 ok=""
 if [ -n "$tok" ] && { [ "$qk" = "$tok" ] || [ "$ck" = "$tok" ]; }; then ok=1; fi
