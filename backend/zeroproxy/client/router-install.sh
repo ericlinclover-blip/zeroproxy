@@ -185,17 +185,32 @@ detect_env() {
     KERNEL="$(uname -r)"
 }
 
+# 本机是否已经有一个**跑得起来**的内核? 判据要和 install_core 的复用判据一致:
+# 只看 `-x` 会把上一次留下的坏文件 (比如没解开的 gz) 当成已装好, 于是预检这边放行、
+# 那边又去重下一次, 空间算错。
+core_reusable() { [ -x "$ZP_BIN" ] && "$ZP_BIN" -v >/dev/null 2>&1; }
+
 preflight() {
     step "检查环境"
     ok "设备: $MODEL · $ARCH · $OS_NAME (内核 $KERNEL)"
 
-    # 空间: mihomo 解压后约 57 MB。小于 90 MB 剩余空间的机器装到一半会 ENOSPC,
-    # 那是所有失败里最难排查的一种, 所以提前挡。
+    # 空间: 只有"这一轮真的要装内核"时才需要 90 MB (20 MB 的 gz + 解压后约 57 MB);
+    # 内核已经在而且能跑时, 本轮只多写几 MB 的分流数据库 —— 重跑安装命令 (= 升级客户端
+    # / 更新分流数据) 的机器正是这种。拿 90 MB 去卡一台"内核就在那儿"的设备, 只会把用户
+    # 挡在门外: 真机上第一次失败的安装已经把 57 MB 的内核解压在那儿了, 于是重跑时
+    # "需要约 90 MB, 当前只有 89 MB" —— 明明什么都不缺。
+    _need_mb=20
+    core_reusable || _need_mb=90
     _free="$(df -k /overlay 2>/dev/null | awk 'NR==2{print $4}' || true)"
     [ -n "$_free" ] || _free="$(df -k / | awk 'NR==2{print $4}' || true)"
-    if [ -n "$_free" ] && [ "$_free" -lt 92160 ]; then
-        die "可用空间不足: 需要约 90 MB, 当前只有 $((_free / 1024)) MB。
-  请先在路由器后台释放空间 (卸载不用的插件 / 清理 /tmp), 或换一台闪存更大的设备。"
+    if [ -n "$_free" ] && [ "$_free" -lt $((_need_mb * 1024)) ]; then
+        if core_reusable; then
+            die "可用空间不足: 更新分流数据需要约 ${_need_mb} MB, 当前只有 $((_free / 1024)) MB。
+  请先清理 /tmp 或不用的插件 (内核已经在位, 不需要重装)。"
+        fi
+        die "可用空间不足: 首次安装需要约 ${_need_mb} MB (20 MB 内核压缩包 + 解压后约 57 MB),
+  当前只有 $((_free / 1024)) MB。请先在路由器后台释放空间 (卸载不用的插件 / 清理 /tmp),
+  或换一台闪存更大的设备。"
     fi
 
     # 面板可达性 (顺带确定 TLS 策略)
@@ -327,7 +342,8 @@ install_core() {
     rm -f "$ZP_DIR/.mihomo.gz" "$ZP_DIR"/*.new "$ZP_DIR"/.geo-*.part 2>/dev/null || true
     # 复用旧文件前必须确认它真的跑得起来: 上一次失败可能留下一个没解开的 gz
     # (chmod 是成功的, 只看 -x 会以为装好了, 于是每次重跑都在同一个地方再挂一次)。
-    if [ -x "$ZP_BIN" ] && "$ZP_BIN" -v >/dev/null 2>&1; then
+    # (预检那边算空间用的是同一个判据, 见 core_reusable。)
+    if core_reusable; then
         ok "内核已存在且可执行, 跳过下载"
         return 0
     fi

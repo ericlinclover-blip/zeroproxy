@@ -366,6 +366,42 @@ def main() -> int:
         check("旧凭据被拒后自动重新接入", ok and "重新接入" in out, f"旧 {old_id}")
         check("面板上换成一台新设备 (没有卡死在旧凭据)",
               len(items) == 1 and items[0]["id"] != old_id, items[0]["id"] if items else "无")
+
+        print("\n[5] 空间预检: 只有真要装内核时才该卡 90 MB"
+              " (真机: 首次失败的安装留下内核, 重跑时只剩 89 MB 被判空间不足)")
+        # 伪造一个 df: 剩 89 MB (91264 KB), 比首次安装的 90 MB 线低一点 —— 真机就是这个数
+        fake_bin = os.path.join(tmp, "fakebin")
+        os.makedirs(fake_bin, exist_ok=True)
+        with open(os.path.join(fake_bin, "df"), "w") as fh:
+            fh.write(
+                "#!/bin/sh\n"
+                "echo 'Filesystem 1K-blocks Used Available Capacity Mounted on'\n"
+                "echo 'overlay 200000 110000 91264 55% /'\n"
+            )
+        os.chmod(os.path.join(fake_bin, "df"), 0o755)
+
+        def run_low_space(root: str) -> subprocess.CompletedProcess:
+            code_ = panel.pair_code("space")
+            _, script_, _ = http("GET", f"/c/{code_}")
+            path_ = os.path.join(tmp, "space.sh")
+            with open(path_, "w") as fh:
+                fh.write(patch_for_local_run(script_, root))
+            env_ = {**os.environ, "PATH": fake_bin + ":" + os.environ.get("PATH", "")}
+            return subprocess.run(["sh", path_], capture_output=True, text=True, env=env_)
+
+        space_root = os.path.join(tmp, "space-root")
+        fresh = run_low_space(space_root)
+        check("还没有内核时 89 MB 会被挡下, 并说清要多少",
+              fresh.returncode != 0 and "可用空间不足" in fresh.stdout + fresh.stderr)
+        # 真机上 /etc/zeroproxy 是上一次失败的安装留下的 (里面有内核), 这里补上目录与内核
+        os.makedirs(space_root, exist_ok=True)
+        with open(os.path.join(space_root, "mihomo"), "w") as fh:
+            fh.write('#!/bin/sh\n[ "$1" = "-v" ] && echo "stub"\n')
+        os.chmod(os.path.join(space_root, "mihomo"), 0o755)
+        again_space = run_low_space(space_root)
+        check("已经有可用的内核时, 同样的剩余空间直接放行",
+              "可用空间不足" not in again_space.stdout + again_space.stderr,
+              again_space.stdout.splitlines()[-1][:60] if again_space.stdout else "")
     finally:
         logs = []
         for panel in panels:

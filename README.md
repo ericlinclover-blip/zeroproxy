@@ -68,7 +68,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 251 项 (245 passed + 6 skipped; 带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/router_install_check.py` (37 项, **真的用 shell 跑一遍路由器安装脚本**) + `scripts/browser_check.cjs` (155 项) + `scripts/clients_check.cjs` (20 项, 真实浏览器点开关) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 251 项 (245 passed + 6 skipped; 带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/router_install_check.py` (39 项, **真的用 shell 跑一遍路由器安装脚本**) + `scripts/browser_check.cjs` (155 项) + `scripts/clients_check.cjs` (20 项, 真实浏览器点开关) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 | **看得懂的界面 (v2.6.0)** | 控制台布局: 左侧锚点导航 (带计数角标 + 滚动高亮) + 顶部指标条 (健康节点 / 落地出口 IP / 平均延迟 + 迷你折线 / 运行时长) + 节点密集表格 (名称 / 地址状态 / **握手延迟条** / **上下行双轨** / 开关与复制) + **流量卡 (双弧圆环 + 实时速率曲线 + 逐节点双色流量条)** + 链式链路拓扑 (你的设备 → 本机入口 → 落地端) + 程序更新闭环; 动效全部走 `transform`/自绘 rAF 并受 `prefers-reduced-motion` 约束 |
 
@@ -2310,3 +2310,34 @@ agent 上报的客户端版本号一直硬编码 `1.0.0`, 现在跟着 `SCRIPT_V
 另外用**真的 mihomo v1.19.32 + 真的上游分流数据**在本地跑通了整条链路 (下载 → 落盘 →
 `mihomo -t` 通过), 对照实验: 同样一份配置在空目录里就是真机那条
 `can't download MMDB` / `test failed`。
+
+### 8.37 v2.9.3: 真机第四次: 只剩 89 MB —— 预检把"已经有内核"的机器也按首次安装卡
+
+上一版推送后, 用户在路由器上重跑更新命令, 这次停在环境检查:
+
+```
+==> 检查环境
+  ✓ 设备: GL.iNet GL-MT3000 · arm64 · OpenWrt 24.10.4 (内核 6.6.110)
+安装失败: 可用空间不足: 需要约 90 MB, 当前只有 89 MB。
+```
+
+那 89 MB 正是**上一次失败的安装**留下的: 内核 (解压后约 57 MB) 已经在 `/etc/zeroproxy/`
+里躺着了, 这一轮它本来会被原样复用, 根本不需要再下 20 MB —— 可预检只认一个写死的
+"90 MB" (那是"要下内核"时的峰值: 20 MB 压缩包 + 解压后 57 MB), 于是把一台什么都不缺的
+机器挡在门外, 而且差得只有 1 MB, 看上去特别像"路由器真的满了"。
+
+修法: 预检按**这一轮到底要不要装内核**算门槛 ——
+
+* 内核已经在且真的能跑 (复用判据与 `install_core` 完全一致, 见 `core_reusable()`) →
+  本轮只多写几 MB 的分流数据库, 要求 20 MB;
+* 要重新下载 (首次安装, 或上次留下的是个跑不起来的坏文件) → 仍然要求 90 MB, 并说清
+  这 90 MB 花在哪儿 (20 MB 压缩包 + 解压后 57 MB);
+* 两种情况各自的报错文案不同: 前者告诉用户"内核已在位, 清一下 /tmp 就行", 后者才是
+  "释放空间或换设备"。
+
+顺带把面板上的说明改成同一件事: 首次安装 ≥ 90 MB, **已经装过内核的机器**重跑安装命令
+只要十几 MB。
+
+**回归**: `scripts/router_install_check.py` 37 → **39 项** —— 演练里伪造一个 `df`
+(剩 89 MB, 就是真机那个数), 空目录里必须被挡下并说明要多少, 放进一个可执行的内核之后
+同样的剩余空间必须放行。`pytest` 251 项全过。
