@@ -20,7 +20,7 @@ import urllib.request
 from .config import paths
 
 #: 路由器端脚本版本 (会显示在面板的设备卡上; 改了脚本就 +1)
-SCRIPT_VERSION = "1.1.0"
+SCRIPT_VERSION = "1.2.0"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"
@@ -28,30 +28,39 @@ SCRIPT_VERSION = "1.1.0"
 CORE_VERSION = os.environ.get("ZP_CORE_VERSION", "v1.19.32")
 
 #: CPU 架构 → mihomo release 资产后缀。
-#: armv7 兜底 armv6 (mihomo 没有单独的 armv6 构建, armv7 构建在 armv6 上跑不了 ——
-#: 但这类设备 (老款百兆路由) 本来也带不动, 让它在 preflight 就报空间不足更诚实)。
+#: armv6 有独立构建 (mihomo-linux-armv6-*), 老款百兆路由 (bcm27xx / arm1176) 直接用它;
+#: 以前把 armv6 兜到 armv7 上 —— 结果是一台内核能下载、能解压、跑起来就 "Illegal
+#: instruction" 的机器, 比一开始就说清楚难查得多。
+#: mips 大端 / 小端都取 softfloat 构建: OpenWrt 的 mips_24kc / mipsel_24kc 目标
+#: (绝大多数 MIPS 路由) 的 24Kc 核没有 FPU, hardfloat 构建在上面同样跑不了。
 ARCHES: dict[str, str] = {
     "arm64": "arm64",
+    "armv6": "armv6",
     "armv7": "armv7",
     "amd64": "amd64-v1",       # x86-64 v1 基线: 兼容所有 x86_64 机器
     "mips": "mips-softfloat",
     "mipsle": "mipsle-softfloat",
+    "mips64": "mips64",
     "mips64le": "mips64le",
 }
 
 #: 面板上展示用的中文名
 ARCH_LABEL = {
     "arm64": "ARM64 (aarch64)",
+    "armv6": "ARMv6 (arm1176 等老设备)",
     "armv7": "ARMv7 (arm)",
     "amd64": "x86_64",
     "mips": "MIPS (大端)",
     "mipsle": "MIPSel (小端)",
+    "mips64": "MIPS64 (大端)",
     "mips64le": "MIPS64el",
 }
 
 #: 下载镜像。第一个是 GitHub 官方, 后面是国内可用的加速前缀 ——
 #: 这些前缀的可用性会随时间变化, 所以是"挨个试"而不是"选一个最好的"。
-MIRRORS = (
+#: 官方直连只给一次**短**预算 (见 _budget_for): 网络被黑洞掉时 connect 会一直挂到
+#: 超时, 拿 45 秒去等它, 后面真正的反代就没时间了。
+DEFAULT_MIRRORS = (
     "{url}",
     "https://ghfast.top/{url}",
     "https://gh-proxy.com/{url}",
@@ -59,11 +68,42 @@ MIRRORS = (
     "https://hk.gh-proxy.com/{url}",
 )
 
+
+def _mirror_list() -> tuple[str, ...]:
+    """实际使用的镜像表。
+
+    `ZP_CORE_MIRRORS=https://my.mirror/{url},…` 可以整体替换 (自建反代 / 内网缓存的人
+    需要这个: 他们的镜像比任何公共前缀都可靠)。留空就用默认那一串。
+    """
+    raw = os.environ.get("ZP_CORE_MIRRORS", "").strip()
+    if not raw:
+        return DEFAULT_MIRRORS
+    custom = tuple(item.strip() for item in raw.split(",") if item.strip())
+    return custom or DEFAULT_MIRRORS
+
+
+MIRRORS = _mirror_list()
+
 UA = "zeroproxy-panel"
 #: 低于这个大小一律视为下载失败 (一个正常的 mihomo 压缩包 ≈ 20 MB)。
 #: 可用 ZP_CORE_MIN_BYTES 调低 —— 自动化演练里用一个几 KB 的假内核就能把
 #: "下载 → 解压 → 可执行校验"这条路整条跑通, 不必真的下 20 MB。
 MIN_BYTES = int(os.environ.get("ZP_CORE_MIN_BYTES", str(4 << 20)))
+
+#: 单个镜像的连接/读取超时。注意 urllib 的 timeout 是"每次 socket 操作"的上限,
+#: 不是整段传输的上限 —— 一个每秒滴一点数据的镜像可以让它永远不超时 (真机现场:
+#: 安装命令停在"下载代理内核"上不动, 就是这种慢速黑洞)。
+CORE_SOURCE_TIMEOUT = int(os.environ.get("ZP_CORE_SOURCE_TIMEOUT", "60"))
+
+#: 一次取内核的**总**时间上限。超过就如实报错, 让路由器端拿到一句能读懂的话
+#: (以前这里没有上限: 5 个镜像 × 180 秒, 用户看到的就是"卡住", 不是"失败")。
+#: 240 秒是量出来的: 一条 170 KB/s 的镜像线路取 20 MB 要 115 秒, 150 秒会把它
+#: 卡在门口; 而路由器端等的是 CORE_WAIT=360 秒, 比这里长, 所以它总能等到一个
+#: 明确的结果 (ready 或 error), 不会两边一起超时。
+CORE_DEADLINE = int(os.environ.get("ZP_CORE_DEADLINE", "240"))
+
+#: 官方直连那一档的最长等待 (秒)。黑洞掉的直连不值得花掉整个预算。
+CORE_DIRECT_BUDGET = int(os.environ.get("ZP_CORE_DIRECT_BUDGET", "25"))
 
 
 def asset_name(arch: str) -> str:
@@ -110,10 +150,147 @@ def cached_arches() -> list[dict]:
     return out
 
 
-def fetch_core(arch: str, *, timeout: int = 180) -> tuple[bool, str, str]:
+# ---------------------------------------------------------------- 取内核 (带总时限)
+# 真机事故 (GL-MT3600BE / OpenWrt 25.12, 2026-10): 安装命令停在 "下载代理内核" 上,
+# 十分钟后被路由器自己的 curl -m 600 掐断, 用户看到的既不是成功也不是失败, 而是
+# "卡住"。面板侧的原因在这里: 原本**没有总时限** —— 5 个镜像各 180 秒, 而且
+# urllib 的 timeout 只管单次 socket 操作, 一个"能连上、每秒滴几 KB"的镜像可以让它
+# 拖到天荒地老。
+#
+# 现在三道闸门一起上:
+#   1. 每个镜像有自己的连接/读取超时;
+#   2. 官方直连只给 CORE_DIRECT_BUDGET 秒 (被黑洞时 connect 会一直挂着, 不能让它
+#      吃掉整个预算 —— GEO 那边早就踩过: "直连排第一会白吃掉整个时间预算");
+#   3. 读循环里检查总时限 CORE_DEADLINE, 到点就中断并如实报错。
+#
+# 另外, 路由器端**不再同步等**这个下载 (见 ensure_core_async 与 routes 的 503)。
+
+#: 后台预取的状态: arch → {state, detail, bytes, started, done, error}
+CORE_LOCK = threading.Lock()
+CORE_STATE: dict[str, dict] = {}
+#: 一次失败之后的冷静时间: 路由器每几秒问一次, 不能让面板一直捶上游。
+CORE_RETRY_AFTER = int(os.environ.get("ZP_CORE_RETRY_AFTER", "20"))
+
+
+def _budget_for(index: int, remaining: float, timeout: int) -> int:
+    """这一个镜像最多能花多少秒。官方直连 (index 0) 额外收紧。"""
+    cap = min(timeout, CORE_DIRECT_BUDGET) if index == 0 else timeout
+    return max(5, int(min(cap, remaining)))
+
+
+def core_state(arch: str) -> dict:
+    """这一档内核现在的状态。面板 UI 与路由器端轮询都读它。"""
+    if core_ready(arch):
+        try:
+            size = os.path.getsize(core_file(arch))
+        except OSError:
+            size = 0
+        return {
+            "arch": arch,
+            "state": "ready",
+            "detail": "面板已缓存",
+            "bytes": size,
+            "error": "",
+            "updated": int((CORE_STATE.get(arch) or {}).get("done") or 0),
+        }
+    entry = CORE_STATE.get(arch) or {}
+    return {
+        "arch": arch,
+        "state": entry.get("state") or "missing",
+        "detail": entry.get("detail") or "",
+        "bytes": int(entry.get("bytes") or 0),
+        "error": entry.get("error") or "",
+        "updated": int(entry.get("done") or entry.get("started") or 0),
+    }
+
+
+def core_states() -> list[dict]:
+    """全部架构的状态 (面板 UI 用)。"""
+    out = []
+    for arch in ARCHES:
+        st = core_state(arch)
+        st["label"] = ARCH_LABEL.get(arch, arch)
+        out.append(st)
+    return out
+
+
+def core_pending_text(arch: str) -> str:
+    """给路由器端看的一句人话 (它会原样打印出来)。
+
+    路由器端需要知道的是"现在该等还是该重跑", 不是一句 HTTP 状态码。
+    """
+    st = core_state(arch)
+    if st["state"] == "downloading":
+        got = st["bytes"] // (1 << 20)
+        extra = f", 已取 {got} MB" if got else ""
+        return (
+            f"面板正在准备 {arch} 内核 (首次安装时面板要先从上游取约 20 MB{extra})。"
+            f"这不是错误 —— 稍后会自动重试。"
+        )
+    if st["state"] == "error":
+        return f"面板取内核失败: {st['error'] or st['detail']}"
+    return "面板正在准备内核, 稍后会自动重试。"
+
+
+def ensure_core_async(arch: str) -> dict:
+    """确保有一份内核正在下载, **不阻塞**调用方。返回当前状态。
+
+    为什么不在请求里同步下: 这是一段几十秒到两分钟的活, 而路由器那边正在等一个
+    HTTP 响应。把请求挂住的结果就是用户看到的"装到一半卡住"; 改成"立刻回一句能
+    读懂的话 + 后台去取", 同一段时间里路由器还能打印真实进度。
+    """
+    if arch not in ARCHES:
+        return {"arch": arch, "state": "unknown", "detail": f"不支持的架构: {arch}",
+                "bytes": 0, "error": f"不支持的架构: {arch}", "updated": 0}
+    if core_ready(arch):
+        return core_state(arch)
+    with CORE_LOCK:
+        entry = CORE_STATE.setdefault(arch, {})
+        if entry.get("state") == "downloading":
+            return core_state(arch)
+        failed_at = int(entry.get("done") or 0)
+        if entry.get("state") == "error" and time.time() - failed_at < CORE_RETRY_AFTER:
+            return core_state(arch)
+        entry.update({
+            "state": "downloading",
+            "detail": "正在从上游下载",
+            "bytes": 0,
+            "error": "",
+            "started": int(time.time()),
+            "done": 0,
+        })
+    threading.Thread(target=_prefetch, args=(arch,), daemon=True, name=f"zp-core-{arch}").start()
+    return core_state(arch)
+
+
+def _prefetch(arch: str) -> None:
+    def note(size: int) -> None:
+        with CORE_LOCK:
+            CORE_STATE.setdefault(arch, {})["bytes"] = size
+
+    try:
+        ok, detail, _path = fetch_core(arch, progress=note)
+    except Exception as exc:  # 后台线程不能死得无声无息: 那会让状态永远停在"下载中"
+        ok, detail = False, f"取内核时出错了: {exc}"
+    with CORE_LOCK:
+        entry = CORE_STATE.setdefault(arch, {})
+        entry["state"] = "ready" if ok else "error"
+        entry["detail"] = detail
+        entry["error"] = "" if ok else detail
+        entry["done"] = int(time.time())
+
+
+def fetch_core(
+    arch: str,
+    *,
+    timeout: int | None = None,
+    deadline: float | None = None,
+    progress=None,
+) -> tuple[bool, str, str]:
     """按镜像顺序下载内核。返回 (ok, 说明, 本地路径)。
 
     已缓存就直接返回 —— 路由器重装/多台设备复用时不再重复下载。
+    `deadline` 是这一轮的绝对时间上限 (time.time() 口径), 到点就放弃剩余镜像。
     """
     if arch not in ARCHES:
         return False, f"不支持的架构: {arch}", ""
@@ -121,31 +298,48 @@ def fetch_core(arch: str, *, timeout: int = 180) -> tuple[bool, str, str]:
     if core_ready(arch):
         return True, "已缓存", dst
 
+    timeout = timeout or CORE_SOURCE_TIMEOUT
+    if deadline is None:
+        deadline = time.time() + CORE_DEADLINE
     os.makedirs(core_dir(), exist_ok=True)
     tmp = dst + ".part"
     url = release_url(arch)
     errors: list[str] = []
-    for template in MIRRORS:
+    for index, template in enumerate(MIRRORS):
+        left = deadline - time.time()
+        if left <= 2:
+            errors.append(f"总时间超限 ({CORE_DEADLINE}s), 放弃剩余镜像")
+            break
         source = template.format(url=url)
         try:
             request = urllib.request.Request(source, headers={"User-Agent": UA})
-            with urllib.request.urlopen(request, timeout=timeout) as resp:
+            with urllib.request.urlopen(request, timeout=_budget_for(index, left, timeout)) as resp:
                 status = getattr(resp, "status", 200)
                 if status is not None and status != 200:
                     errors.append(f"{source} HTTP {status}")
                     continue
                 size = 0
+                next_note = 1 << 20          # 每 1 MB 回一次进度
                 with open(tmp, "wb") as fh:
                     while True:
+                        # 关键的一行: urllib 的 timeout 管不住"一直有数据但极慢"的
+                        # 连接, 只有墙钟管得住。
+                        if time.time() > deadline:
+                            raise TimeoutError(f"总时间超限 ({CORE_DEADLINE}s)")
                         chunk = resp.read(1 << 18)
                         if not chunk:
                             break
                         fh.write(chunk)
                         size += len(chunk)
+                        if progress is not None and size >= next_note:
+                            progress(size)
+                            next_note = size + (1 << 20)
             if size < MIN_BYTES:
                 errors.append(f"{source} 体积异常 ({size} 字节)")
                 continue
             os.replace(tmp, dst)
+            if progress is not None:
+                progress(size)
             return True, f"已下载 {size // 1024 // 1024} MB", dst
         except (urllib.error.URLError, OSError, TimeoutError) as exc:
             errors.append(f"{source} {exc}")
@@ -385,6 +579,9 @@ def summary() -> dict:
         "core_version": CORE_VERSION,
         "arches": [{"id": a, "label": ARCH_LABEL.get(a, a)} for a in ARCHES],
         "cached": cached_arches(),
+        # 每一档内核现在的状态 (missing / downloading / ready / error):
+        # 面板上那张卡片要能回答"现在发这条安装命令, 会不会卡在下载内核上"。
+        "cores": core_states(),
         "geo": cached_geo(),
         "geo_names": list(GEO_FILES),
         "cached_at": int(time.time()),

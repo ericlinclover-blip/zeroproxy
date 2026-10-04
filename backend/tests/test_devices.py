@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
 import yaml
@@ -113,10 +114,151 @@ def test_core_binary_endpoint(client, configured, tmp_path, monkeypatch):
 
     blob = tmp_path / "mihomo-arm64.gz"
     blob.write_bytes(b"\x1f\x8b" + b"0" * 64)
-    monkeypatch.setattr(router_client, "fetch_core", lambda arch, **kw: (True, "已缓存", str(blob)))
+    # 面板已经缓存好这一档内核时, 直接把它发出去 (缓存判据与 install_core 一致)
+    monkeypatch.setattr(router_client, "core_ready", lambda arch: arch == "arm64")
+    monkeypatch.setattr(router_client, "core_file", lambda arch: str(blob))
     res = client.get("/c/bin/arm64")
     assert res.status_code == 200
     assert res.content == blob.read_bytes()
+
+
+def test_core_binary_answers_instead_of_hanging(client, configured, monkeypatch):
+    """内核还没缓存时, /c/bin 必须**立刻**回一句人话, 不能把请求挂在那里。
+
+    真机事故 (GL-MT3600BE / OpenWrt 25.12.5, 2026-10): 安装命令停在
+    "==> 下载代理内核 (mihomo · arm64)" 上再也不动, 十分钟后被路由器自己的
+    curl -m 600 掐断。原因是面板在这个请求里同步去上游拉 20 MB, 而且没有总时限
+    (5 个镜像 × 180 秒, urllib 的超时又只管单次 socket 操作)。
+    现在: 立刻 503 + Retry-After + 一句"面板正在准备内核", 同时后台开取。
+    """
+    from zeroproxy import router_client
+
+    monkeypatch.setattr(router_client, "CORE_DEADLINE", 60)
+    # 上游换成一个"只握手、几乎不发货"的本地服务器: 没有总时限时这里会挂到天荒地老
+    srv = _trickle_server()
+    try:
+        monkeypatch.setattr(router_client, "MIRRORS", (srv.url,))
+        started = time.time()
+        res = client.get("/c/bin/arm64")
+        elapsed = time.time() - started
+    finally:
+        srv.close()
+    assert res.status_code == 503, res.text
+    assert res.headers.get("retry-after") == "5", "路由器端要知道多久后来重试"
+    assert "面板正在准备" in res.text or "面板取内核失败" in res.text, res.text
+    assert elapsed < 5, f"请求被上游挂住了 ({elapsed:.1f}s)"
+    # 后台确实开始取了 (不是回一句就走)
+    assert router_client.core_state("arm64")["state"] in ("downloading", "error", "ready")
+
+
+def test_core_status_tells_the_router_what_to_fetch_directly(client, configured, monkeypatch):
+    """状态接口要把版本号与资产名给出来 —— 路由器端直连兜底时按它拼 URL。
+
+    客户端里不重复写一份版本号 (改一处漏一处), 所以这个接口是兜底那条路的前提。
+    """
+    from zeroproxy import router_client
+
+    res = client.get("/c/core/status?arch=arm64")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["core_version"] == router_client.CORE_VERSION
+    assert data["asset"] == f"mihomo-linux-arm64-{router_client.CORE_VERSION}.gz"
+    assert data["state"] in ("missing", "downloading", "ready", "error")
+    assert isinstance(data["bytes"], int)
+    # 没指定架构时不透露资产名 (那是按架构拼的), 但列表要在
+    assert client.get("/c/core/status").json()["asset"] == ""
+    assert len(client.get("/c/core/status").json()["cores"]) == len(router_client.ARCHES)
+
+
+def test_preparing_a_core_is_explicit_and_idempotent(client, configured, monkeypatch):
+    """面板上能"先把内核准备好"再发安装命令 —— 幂等, 且不会重复下第二遍。"""
+    from zeroproxy import router_client
+
+    client.post("/api/logout")
+    assert client.post("/api/devices/cores/arm64/prepare").status_code == 401
+    _login(client)
+    assert client.post("/api/devices/cores/pdp11/prepare").status_code == 404
+
+    calls = []
+
+    def fake_fetch(arch, **kw):
+        calls.append(arch)
+        return True, "已下载 20 MB", router_client.core_file(arch)
+
+    monkeypatch.setattr(router_client, "fetch_core", fake_fetch)
+    first = client.post("/api/devices/cores/arm64/prepare")
+    assert first.status_code == 200
+    assert first.json()["core"]["state"] in ("downloading", "ready")
+    # 已经在下 / 已经下好时再点一次, 不该再起一个任务
+    for _ in range(3):
+        client.post("/api/devices/cores/arm64/prepare")
+    deadline = time.time() + 10
+    while time.time() < deadline and router_client.core_state("arm64")["state"] == "downloading":
+        time.sleep(0.05)
+    assert len(calls) <= 1, f"重复触发了下载: {calls}"
+    assert "arm64" in [c["arch"] for c in client.get("/api/devices/cores").json()["cores"]]
+
+
+class _Trickle:
+    """一个"能连上、每秒滴一点"的假上游 —— 没有总时限就会永远不返回。"""
+
+    def __init__(self) -> None:
+        import http.server
+        import socketserver
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Length", str(64 << 20))
+                self.end_headers()
+                try:
+                    while True:
+                        self.wfile.write(b"x" * 512)
+                        self.wfile.flush()
+                        time.sleep(0.2)
+                except OSError:
+                    pass
+
+            def log_message(self, *args):  # pragma: no cover - 别刷屏
+                pass
+
+        self.httpd = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+        self.httpd.daemon_threads = True
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/{{url}}"
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def _trickle_server() -> _Trickle:
+    return _Trickle()
+
+
+def test_core_fetch_gives_up_at_the_deadline(configured, monkeypatch):
+    """取内核必须有**总**时限 —— 慢速黑洞不算"正在下载", 要按时认输。
+
+    真机事故 (GL-MT3600BE / OpenWrt 25.12.5): 安装停在"下载代理内核"上。面板侧
+    urllib 的 timeout 只管单次 socket 操作, 一个不断滴数据的镜像可以让它永远不返回。
+    这道测试用同样手法的本地服务器复现那一刻, 断言到点就返回并如实说明原因。
+    """
+    from zeroproxy import router_client
+
+    monkeypatch.setattr(router_client, "MIN_BYTES", 1024)
+    srv = _trickle_server()
+    try:
+        monkeypatch.setattr(router_client, "MIRRORS", (srv.url,))
+        started = time.time()
+        ok, detail, path = router_client.fetch_core("arm64", deadline=time.time() + 2)
+        elapsed = time.time() - started
+    finally:
+        srv.close()
+    assert not ok and path == ""
+    assert elapsed < 8, f"没有按总时限放弃 ({elapsed:.1f}s)"
+    assert "超时" in detail or "总时间超限" in detail, detail
 
 
 def test_geo_files_are_served_and_name_whitelisted(client, configured, tmp_path, monkeypatch):
@@ -335,6 +477,47 @@ def test_install_script_self_heals_rejected_credentials():
     assert "重新接入失败" in text and "重新生成一条安装命令" in text, "重接也失败时要给出可执行的下一步"
     # 换面板 (stored base ≠ 本次 base) 必须能识别出来, 而不是继续用旧凭据撞 403
     assert "_old_base" in text and "本次改用" in text
+
+
+def test_install_script_handles_openwrt_25_and_never_hangs_on_the_core():
+    """客户端侧的两条硬约束 (真机: GL-MT3600BE / OpenWrt 25.12.5 / 内核 6.12.94)。
+
+    一、25.12 起 OpenWrt 的包管理器从 opkg 换成了 apk —— 只认 opkg 的写法在那类固件上
+        是**静默跳过**: kmod-tun 与 kmod-nft-tproxy 一个都没装, 安装过程全绿, 而 TUN
+        建不出来、tproxy 回退也没有规则, 全屋代理名存实亡。两代都要认。
+    二、同一台机器上安装停在 "下载代理内核" 上不动 (面板侧没有总时限)。客户端这一侧
+        必须: 下载有进度、等面板有上限、失败给下一步 —— 而不是一行输出不动地等下去。
+    """
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+    code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+
+    # 一、两代包管理器
+    assert "apk add" in code, "OpenWrt 25.12 起是 apk, 不认它就等于不装内核模块"
+    assert "opkg install" in code, "24.10 及更早还是 opkg, 不能只留 apk"
+
+    # 二、取内核那一步: 进度 + 上限 + 人话 + 下一步
+    assert "core_download" in code and "start_progress" in code, "下载期间要有进度输出"
+    assert "CORE_WAIT" in code, "等面板要有上限 (面板取不到时不能无限等)"
+    assert "面板正在取内核" in code, "等待期间要把面板的真实进度说出来"
+    assert "/c/core/status" in code, "要从面板的状态接口读进度"
+    assert "data/client/cores" in text, "失败时要告诉用户内核压缩包该放哪"
+
+    # 架构表: mihomo 有 armv6 / mips64 的构建, 别把它们兜到别的架构上
+    # (兜错的后果是"下载解压都成功, 一执行 Illegal instruction")
+    assert "armv6" in code and "mips64)" in code, "armv6 / mips64 要有自己的分支"
+    from zeroproxy import router_client as rc
+    assert rc.ARCHES["armv6"] == "armv6" and rc.ARCHES["mips64"] == "mips64"
+
+    # bash / 某些 ash 会把变量名后面紧跟的高字节算进名字里 —— `$ZP_BASE。` 在
+    # set -u 下会变成 "ZP_BASE?: unbound variable", 而它偏偏只在"真的连不上面板"
+    # 时才执行 (这条由演练抓到: 面板地址不可达 → 报错信息自己炸了)。
+    import re
+    for line in code.splitlines():
+        assert not re.search(r"\$[A-Za-z_][A-Za-z0-9_]*[^\x00-\x7f]", line), (
+            f"变量名后面紧跟非 ASCII 字符要写成 ${{VAR}}: {line.strip()[:60]}"
+        )
 
 
 @pytest.mark.parametrize("name", ["index.html", "app.js", "cgi", "menu.json", "acl.json", "status.js"])

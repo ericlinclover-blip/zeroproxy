@@ -17,6 +17,7 @@ let tab = "router";
 let pairInfo = null;      // 刚生成的配对码 (含命令与有效期)
 let busy = false;         // 生成命令 / 切换开关期间禁用按钮
 let syncTimers = {};      // device_id -> 轮询定时器
+let coreTimer = null;     // "准备内核"期间的轮询定时器
 
 const KIND_LABEL = { router: "路由器", phone: "手机", desktop: "电脑" };
 const TPL_LABEL = { "": "跟随面板", smart: "智能分流", global: "全局代理", direct: "全部直连" };
@@ -50,6 +51,65 @@ function statusPill(d) {
   if (d.syncing) return `<span class="pill warn"><i class="dot warn"></i>同步中…</span>`;
   if (d.connected) return `<span class="pill ok"><i class="dot running"></i>已连接</span>`;
   return `<span class="pill other"><i class="dot other"></i>已关闭</span>`;
+}
+
+/** 内核缓存这一行 —— 回答"现在发这条安装命令, 会不会卡在下载内核上"。
+ *
+ *  真机反馈 (GL-MT3600BE / OpenWrt 25.12.5): 安装停在「下载代理内核」上不动。
+ *  根因在面板侧 (没有缓存 + 没有总时限), 但用户看到的只有路由器终端里那行不动的
+ *  输出。所以面板这里要**提前**说清楚: 面板有没有这一档内核、正在取还是取失败了,
+ *  并且给一个"先把内核取回来"的按钮 —— 取一次, 之后所有路由器都复用。
+ */
+function coreRow(dash) {
+  const client = (dash && dash.client) || {};
+  const cores = client.cores || [];
+  if (!cores.length) return "";
+  const ver = client.core_version ? `mihomo ${esc(client.core_version)}` : "mihomo";
+  const main = cores.find((c) => c.arch === "arm64") || cores[0];
+  if (main.state === "ready") {
+    return `<div class="client-hint">
+      内核已就绪 (${ver} · ${esc(main.label || main.arch)}) —— 安装命令跑到下载那一步
+      是面板直传, 不会卡在"面板去上游取"上。
+      ${restArches(cores)}
+    </div>`;
+  }
+  if (main.state === "downloading") {
+    const mb = Math.round((main.bytes || 0) / 1048576);
+    return `<div class="client-hint">
+      面板正在取内核 (${ver} · ${esc(main.label || main.arch)})${mb ? `, 已取 ${mb} MB` : ""}…
+      <span class="muted fs-xs">取好后所有路由器复用同一份</span>
+      <button class="btn ghost small" data-core-refresh>刷新状态</button>
+    </div>`;
+  }
+  const bad = main.state === "error";
+  return `<div class="client-hint">
+    <b>面板还没有 ${esc(main.label || main.arch)} 这一档内核</b> (${ver})。
+    先让面板取回来, 安装命令就不会卡在"下载代理内核"那一步 (取一次, 之后所有路由器复用):
+    <button class="btn small" data-core-prepare="${escAttr(main.arch)}">准备内核</button>
+    ${bad && main.error ? `<div class="muted fs-xs mt-1">上次失败: ${esc(main.error)}</div>` : ""}
+    <div class="muted fs-xs mt-1">
+      面板自己取不到时 (到上游的线路不通), 可以把压缩包手动放进面板的
+      <code class="mono">data/client/cores/</code> 目录, 文件名:
+      <code class="mono">mihomo-${esc(main.arch)}-${esc(client.core_version || "")}.gz</code>
+    </div>
+    ${restArches(cores)}
+  </div>`;
+}
+
+/** 其它架构 (MIPS / x86 / 老 ARM): 折叠起来, 但让用小众设备的人也能自己准备。 */
+function restArches(cores) {
+  const rest = cores.filter((c) => c.arch !== "arm64" && c.arch !== "armv7");
+  if (!rest.length) return "";
+  const ready = rest.filter((c) => c.state === "ready").map((c) => c.label || c.arch);
+  const todo = rest.filter((c) => c.state !== "ready");
+  return `<details class="client-help">
+    <summary>其它 CPU 架构的小设备 (${ready.length ? `已就绪 ${ready.length} 种` : "都没准备"})</summary>
+    <div class="muted fs-xs mt-2">
+      ${todo.map((c) => `<span class="tag-chip">${esc(c.label || c.arch)}</span>
+        <button class="btn ghost small" data-core-prepare="${escAttr(c.arch)}">准备</button>`).join(" ")}
+      ${todo.length ? "" : `<span class="tag-chip">全都准备好了</span>`}
+    </div>
+  </details>`;
 }
 
 function ago(ts) {
@@ -134,7 +194,8 @@ function installCard(dash) {
       </div>
     </div>
   </div>
-  ${pairInfo ? pairCard() : `
+  ${pairInfo ? "" : coreRow(dash)}
+  ${pairInfo ? pairCard(dash) : `
   <div class="client-actions">
     <button class="btn primary" id="btn-pair">生成安装命令</button>
     <span class="muted fs-xs">命令里带一个一次性的配对码 (30 分钟内有效, 用过即废)。</span>
@@ -157,7 +218,7 @@ function installCard(dash) {
   </details>`;
 }
 
-function pairCard() {
+function pairCard(dash) {
   const left = Math.max(0, Math.floor((pairInfo.expires_at - Date.now() / 1000) / 60));
   return `
   <div class="cmd-card">
@@ -169,6 +230,7 @@ function pairCard() {
       <code class="mono">${esc(pairInfo.command)}</code>
       <button class="btn small" id="btn-copy-cmd">复制</button>
     </div>
+    ${coreRow(dash)}
     <div class="muted fs-xs mt-2">
       安装过程约 1 分钟 (含 20 MB 内核 + 4 MB 分流数据下载); 结束后终端会告诉你是 TUN
       还是 tproxy 模式, 以及分流是否已就绪。刷新本页即可看到设备卡片。
@@ -216,6 +278,11 @@ function bind(dash, routers) {
   if (copy) copy.onclick = () => copyText(pairInfo.command);
   const add = $("#btn-add-device");
   if (add) add.onclick = makePairCode;
+  document.querySelectorAll("[data-core-prepare]").forEach((el) => {
+    el.onclick = () => prepareCore(el.dataset.corePrepare);
+  });
+  const coreRefresh = $("[data-core-refresh]");
+  if (coreRefresh) coreRefresh.onclick = () => { refreshDevices().catch(() => {}); };
 
   document.querySelectorAll("[data-sub-copy]").forEach((el) => {
     el.onclick = () => copyText(el.dataset.subCopy);
@@ -278,6 +345,39 @@ async function makePairCode() {
   } finally {
     busy = false;
   }
+}
+
+/** 让面板现在就去把这一档内核取回来 (取一次, 之后所有路由器复用)。
+ *
+ *  为什么要这一步: 面板没缓存时, 第一次安装要等面板从上游拉 20 MB —— 那段时间
+ *  路由器那边只是在等 (真机上表现为"卡在下载代理内核上不动")。提前取好, 安装就是
+ *  纯局域网传输。
+ */
+async function prepareCore(arch) {
+  try {
+    await api(`/api/devices/cores/${encodeURIComponent(arch)}/prepare`, { method: "POST" });
+  } catch (e) {
+    toast(e.message || "无法开始下载");
+    return;
+  }
+  toast("面板开始取内核 (约 1 分钟), 取好后所有路由器复用同一份");
+  await refreshDevices().catch(() => {});
+  clearInterval(coreTimer);
+  let tries = 0;
+  coreTimer = setInterval(async () => {
+    tries += 1;
+    try {
+      await refreshDevices();
+    } catch (e) {
+      return;
+    }
+    const st = ((S.dash.client || {}).cores || []).find((c) => c.arch === arch) || {};
+    if (st.state === "downloading" && tries < 40) return;
+    clearInterval(coreTimer);
+    coreTimer = null;
+    if (st.state === "ready") toast("内核已就绪 —— 现在发安装命令不会卡在下载那一步");
+    else if (st.state === "error") toast(`面板没取到内核: ${st.error || "未知原因"}`);
+  }, 3000);
 }
 
 async function refreshDevices() {

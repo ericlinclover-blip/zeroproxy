@@ -2786,6 +2786,38 @@ def device_list(request: Request):
     return {"devices": devices.view(state), "client": router_client.summary()}
 
 
+@router.get("/api/devices/cores")
+def device_core_states(request: Request):
+    """内核缓存状态 (面板 UI 用: 发安装命令之前先看它准备好没有)。"""
+    state = load_state()
+    if not _require_auth(state, request):
+        return _err("未登录", 401)
+    return {"cores": router_client.core_states(), "version": router_client.CORE_VERSION}
+
+
+@router.post("/api/devices/cores/{arch}/prepare")
+def device_core_prepare(arch: str, request: Request):
+    """让面板现在就去把某一档内核取回来。
+
+    这是给"我马上要装一台 arm64 路由器"的人准备的一步: 面板先把 20 MB 从上游取好,
+    安装命令跑起来的时候就是纯局域网传输, 不会在"下载代理内核"那一行上等。
+    """
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        if not state["configured"]:
+            return _err("面板尚未初始化", 409)
+        if arch not in router_client.ARCHES:
+            return _err("不支持的架构", 404)
+        before = router_client.core_state(arch)["state"]
+        st = router_client.ensure_core_async(arch)
+        if before != "downloading" and st.get("state") == "downloading":
+            config.audit(state, "client_core", f"开始缓存内核 {arch}")
+        save_state(state)
+        return {"core": st, "cores": router_client.core_states()}
+
+
 @router.post("/api/devices/{device_id}/proxy")
 def device_proxy(device_id: str, payload: DeviceProxyIn, request: Request):
     """全屋代理总开关。
@@ -2910,21 +2942,62 @@ def client_install_script(code: str, request: Request):
 
 @router.get("/c/bin/{arch}")
 def client_core_binary(arch: str, request: Request):
-    """内核二进制。面板侧缓存 —— 路由器只访问面板, 不用自己翻墙去 GitHub。"""
+    """内核二进制。面板侧缓存 —— 路由器只访问面板, 不用自己翻墙去 GitHub。
+
+    没缓存时**不能把请求挂在这里等** (以前就是这样: 面板同步去上游拉, 最长几分钟,
+    路由器端看到的是"下载代理内核"这一行不动 —— 装机的用户分不清是慢还是死)。
+    现在立刻回一句能读懂的话 + 503, 同时后台开始取; 路由器端按 Retry-After 重试,
+    并可以把真实进度打出来 (见 /c/core/status)。
+    """
     state = load_state()
     if not state["configured"]:
         return _err("面板尚未初始化", 409)
     if arch not in router_client.ARCHES:
         return _err("不支持的架构", 404)
-    ok, detail, path = router_client.fetch_core(arch)
-    if not ok or not path:
-        return _err(f"内核下载失败: {detail}", 502)
-    return FileResponse(
-        path,
-        media_type="application/gzip",
-        headers={"cache-control": "no-store"},
-        filename=os.path.basename(path),
+    if router_client.core_ready(arch):
+        path = router_client.core_file(arch)
+        return FileResponse(
+            path,
+            media_type="application/gzip",
+            headers={"cache-control": "no-store"},
+            filename=os.path.basename(path),
+        )
+    router_client.ensure_core_async(arch)
+    return Response(
+        router_client.core_pending_text(arch) + "\n",
+        status_code=503,
+        media_type="text/plain; charset=utf-8",
+        headers={"retry-after": "5", "cache-control": "no-store"},
     )
+
+
+@router.get("/c/core/status")
+def client_core_status(request: Request):
+    """内核缓存状态 (`?arch=arm64` 只看一档)。
+
+    路由器端在等内核时轮询它, 于是那句 "正在下载" 后面能跟上真实进度; 内容不含
+    任何凭据, 所以和 /c/bin 一样匿名可达。
+    """
+    state = load_state()
+    if not state["configured"]:
+        return _err("面板尚未初始化", 409)
+    want = (request.query_params.get("arch") or "").strip()
+    payload = {
+        "core_version": router_client.CORE_VERSION,
+        "asset": router_client.asset_name(want) if want in router_client.ARCHES else "",
+        "cores": router_client.core_states(),
+    }
+    # 指定了架构时再把这一档的字段摊平在顶层: 路由器端只做浅层解析 (没有 jq),
+    # 嵌套在数组里的 bytes/state 它取不到。
+    if want in router_client.ARCHES:
+        st = router_client.core_state(want)
+        payload.update({
+            "state": st["state"],
+            "bytes": st["bytes"],
+            "detail": st["detail"],
+            "ready": st["state"] == "ready",
+        })
+    return payload
 
 
 @router.get("/c/geo/{name}")
@@ -2992,6 +3065,10 @@ def client_pair(payload: DeviceRegisterIn, request: Request):
         if device is None:
             return _err(error, 403)
         base = share_links.panel_base_url(request, state)
+        # 这台设备马上就会来取内核。面板现在就开始取 —— 等它来的时候多半已经好了,
+        # 于是"首次安装卡在下载代理内核"这件事在装机前就消掉了 (取不到也不影响这次
+        # 配对: 路由器端会看到 503 + 一句人话, 并按进度重试)。
+        router_client.ensure_core_async(str(payload.arch or "").strip())
         config.audit(state, "device_add", f"{device['name']} · {device['arch']} · {device['os']}")
         save_state(state)
         return {
@@ -3004,6 +3081,9 @@ def client_pair(payload: DeviceRegisterIn, request: Request):
             # 拿到的配置却带 geo 规则 —— 路由器只能去 GitHub 拉并超时, 所以客户端
             # 需要在装机时就发现这一点并当场说清楚 (见 router-install.sh 的 install_geo)。
             "geo": True,
+            # 配对这一刻面板上这一档内核是否已经就绪 (信息位, 便于事后核对;
+            # 路由器端真正依据的是 /c/bin 回 200 还是 503)。
+            "core_ready": router_client.core_ready(device["arch"]),
             "sub": f"{base}/c/sub/{device['id']}?k={secret}&format=clash&rules=smart",
             "report": f"{base}/c/report",
         }

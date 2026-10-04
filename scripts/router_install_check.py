@@ -34,6 +34,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -91,10 +92,34 @@ def patch_for_local_run(script: str, root: str) -> str:
     return out
 
 
+class StallUpstream:
+    """一个"能连上、永远不说话"的假上游。
+
+    用它复现真机那一刻: 面板去上游取内核时被挂在"正在下载"上 (urllib 的超时只管
+    单次 socket 操作, 只要对面不关连接就得靠面板自己的总时限兜底)。
+    """
+
+    def __init__(self) -> None:
+        import socketserver
+
+        class Handler(socketserver.BaseRequestHandler):
+            def handle(self):  # pragma: no cover - 只负责把连接挂住
+                time.sleep(120)
+
+        self.srv = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+        self.srv.daemon_threads = True
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
 class Panel:
     """一台演练用的面板 (真起 uvicorn, 真注册设备)。"""
 
-    def __init__(self, port: int, home: str, name: str):
+    def __init__(self, port: int, home: str, name: str, extra_env: dict | None = None):
         self.port, self.home, self.name = port, home, name
         self.base = f"http://127.0.0.1:{port}"
         os.makedirs(os.path.join(home, "data"), exist_ok=True)
@@ -113,6 +138,7 @@ class Panel:
             "ZP_CORE_MIN_BYTES": "16",   # 假内核只有几百字节
             "ZP_GEO_MIN_BYTES": "16",    # 分流数据库同理 (演练不下载真的 4 MB)
         }
+        self.env.update(extra_env or {})
         self.proc = subprocess.Popen(
             [PYTHON, "-m", "zeroproxy.main"], cwd=BACKEND, env=self.env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -151,6 +177,17 @@ class Panel:
     def pair_code(self, label: str) -> str:
         _, body, _ = self.req("POST", "/api/devices/pair", {"label": label})
         return json.loads(body)["code"]
+
+    def req_raw(self, method: str, path: str):
+        """同 req(), 但不把 4xx/5xx 当异常 —— 要看的就是 503 的正文与头。"""
+        req = urllib.request.Request(self.base + path, method=method)
+        if self.cookie:
+            req.add_header("Cookie", self.cookie)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.status, resp.read().decode(), resp.headers
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode(), exc.headers
 
     def stop(self) -> None:
         self.proc.send_signal(signal.SIGTERM)
@@ -204,21 +241,29 @@ def main() -> int:
                 with open(os.path.join(geo_cache, name), "wb") as fh:
                     fh.write(f"fake-geo-{panel_.name}-{name}".encode())
 
-        def run_script(script: str, label: str) -> tuple[bool, str]:
+        def run_script(script: str, label: str, root: str | None = None,
+                       extra: dict | None = None) -> tuple[bool, str]:
+            target = root or fake_root
             path = os.path.join(tmp, f"install-{label}.sh")
             with open(path, "w") as fh:
-                fh.write(patch_for_local_run(script, fake_root))
-            proc = subprocess.run(["sh", path], capture_output=True, text=True)
+                fh.write(patch_for_local_run(script, target))
+            # ZP_CORE_MIN_BYTES 与面板侧同名: 演练里那个假内核只有几百字节, 真机上
+            # 65536 的下限是用来挡"面板返回的是一句话"的 (见 install_core)。
+            env = {**os.environ, "ZP_CORE_MIN_BYTES": "16", **(extra or {})}
+            proc = subprocess.run(["sh", path], capture_output=True, text=True, env=env)
             print(f"---- 安装输出 ({label}) ----")
             print(proc.stdout.strip())
             if proc.returncode:
                 print(proc.stderr[-800:])
-            return proc.returncode == 0, proc.stdout
+            # stdout + stderr: die/warn 的话都走 stderr, 断言要看得到
+            return proc.returncode == 0, proc.stdout + proc.stderr
 
-        def run_install(label: str) -> tuple[bool, str]:
-            code = panel.pair_code(label)
-            _, script, _ = http("GET", f"/c/{code}")
-            return run_script(script, label)
+        def run_install(label: str, panel_=None, root: str | None = None,
+                        extra: dict | None = None) -> tuple[bool, str]:
+            panel_ = panel if panel_ is None else panel_
+            code = panel_.pair_code(label)
+            _, script, _ = panel_.req("GET", f"/c/{code}")
+            return run_script(script, label, root=root, extra=extra)
 
         print("\n[1] 首次安装")
         ok, out = run_install("first")
@@ -407,6 +452,62 @@ def main() -> int:
         check("已经有可用的内核时, 同样的剩余空间直接放行",
               "可用空间不足" not in again_space.stdout + again_space.stderr,
               again_space.stdout.splitlines()[-1][:60] if again_space.stdout else "")
+
+        # [6] 面板还没准备好内核 —— 真机上这一步的表现就是"卡在下载代理内核上不动"
+        print("\n[6] 面板还没准备好内核 (真机: 卡在 '下载代理内核' 上不动)")
+        stall = StallUpstream()
+        slow = Panel(PORT + 2, os.path.join(tmp, "home-c"), "C", extra_env={
+            # 一台"到上游不通"的面板: 镜像指向一个只握手、不说话的本地上游, 面板的
+            # 后台取内核会一直停在"正在下载"上直到总时限 —— 正是真机那台面板的处境。
+            "ZP_CORE_MIRRORS": f"http://127.0.0.1:{stall.port}/{{url}}",
+            "ZP_CORE_SOURCE_TIMEOUT": "10",
+            "ZP_CORE_DEADLINE": "6",
+        })
+        panels.append(slow)
+        try:
+            if not slow.wait():
+                print(f"面板 C 没起来:\n" + slow.log[-2000:])
+                return 1
+            # 域名用 127.0.0.1: 面板只绑回环, 生成出来的基址必须是它真能连上的那个
+            slow.configure("127.0.0.1")
+            # 分流数据也预置好: 这一节要是让面板真去 GitHub 取 4 MB, 演练就不再是
+            # 离线可跑的了 (而且慢)。
+            geo_cache = os.path.join(slow.home, "data", "client", "geo")
+            os.makedirs(geo_cache, exist_ok=True)
+            for name in ("geoip.metadb", "geosite.dat"):
+                with open(os.path.join(geo_cache, name), "wb") as fh:
+                    fh.write(f"fake-geo-C-{name}".encode())
+
+            started = time.time()
+            status, body, headers = slow.req_raw("GET", "/c/bin/arm64")
+            elapsed = time.time() - started
+            check("内核没缓存时 /c/bin 立刻回话, 不再把请求挂住", elapsed < 3,
+                  f"{elapsed:.2f}s")
+            check("回的是 503 + Retry-After (路由器据此重试)",
+                  status == 503 and headers.get("retry-after") == "5", f"HTTP {status}")
+            check("正文是一句人话, 不是空响应或 HTML", "面板" in body, body.strip()[:40])
+            st = json.loads(slow.req_raw("GET", "/c/core/status?arch=arm64")[1])
+            check("面板同时在后台取 (状态可见, 不是回一句就走)", st["state"] == "downloading",
+                  st["state"])
+
+            # 路由器端: 面板取不到时要有界地失败, 而不是让用户对着一行不动的输出猜
+            fresh_root = os.path.join(tmp, "fresh-root")
+            ok_slow, slow_out = run_install("no-core", panel_=slow, root=fresh_root,
+                                            extra={"ZP_CORE_WAIT": "9"})
+            check("面板取不到上游时, 安装命令有界地失败 (不是卡死)",
+                  (not ok_slow) and "内核下载失败" in slow_out)
+            check("等待期间打的是面板的真实进度", "面板正在取内核" in slow_out)
+            check("失败时给出可执行的下一步",
+                  "准备内核" in slow_out and "data/client/cores" in slow_out)
+
+            # 面板把内核准备好之后, 同一条安装命令一次装完 (先准备再发命令那条路)
+            with gzip.open(os.path.join(slow.home, "data", "client", "cores",
+                                        f"mihomo-arm64-{router_client.CORE_VERSION}.gz"), "wb") as fh:
+                fh.write(stub.encode())
+            ok_ready, ready_out = run_install("core-ready", panel_=slow, root=fresh_root)
+            check("面板准备好内核后, 同一条命令装完", ok_ready and "内核就绪" in ready_out)
+        finally:
+            stall.close()
     finally:
         logs = []
         for panel in panels:

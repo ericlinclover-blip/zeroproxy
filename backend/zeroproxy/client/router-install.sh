@@ -34,6 +34,8 @@ ZP_MIXED=7890
 
 TLS_OPTS=""
 ARCH=""
+#: 最近一次带状态码的请求结果 (http_fetch_to 会写它)
+HTTP_CODE=""
 DEPENDENCY_NOTE=""
 ACTIVE_MODE=""
 # 面板是否提供分流数据库接口 (/c/geo)。空 = 没问过 (更新模式), true = 有
@@ -92,19 +94,6 @@ http_get() {
     esac
 }
 
-# 大文件下载 (内核 20 MB / 分流数据库 4 MB)。30 秒的通用超时是给接口用的: 4 Mbps 的
-# 线路上光内核就要 40 秒, 卡在这里会变成"下载内核失败"这种看不懂的报错。
-http_get_file() {
-    case "$HTTP" in
-        curl)
-            if [ "$TLS_OPTS" = "insecure" ]; then curl -fsSk -m 600 "$1"
-            else curl -fsS -m 600 "$1"; fi ;;
-        *)
-            if [ "$TLS_OPTS" = "insecure" ]; then "$HTTP" -q --no-check-certificate -T 600 -O - "$1"
-            else "$HTTP" -q -T 600 -O - "$1"; fi ;;
-    esac
-}
-
 http_post() {
     _url="$1"; _body="$2"
     case "$HTTP" in
@@ -121,6 +110,76 @@ http_post() {
                 "$HTTP" -q -O - --post-data "$_body" "$_url"
             fi ;;
     esac
+}
+
+# 把下载结果存进文件, 并且**尽量**带回 HTTP 状态码 (放进 HTTP_CODE)。
+#
+# 内核这一步必须分得清三件事, 它们的下一步完全不同:
+#   200 → 拿到二进制, 继续装;
+#   503 → 面板还没准备好 (正在从上游取), 该等 + 轮询进度;
+#   502 → 面板自己取不到上游, 该换条路或明确报错。
+# curl 有 -w 能直接给出状态码; uclient-fetch / wget 没有这个能力, 那里只能退化成
+# "拿到的东西像不像一个内核" —— 所以下面还留了一条按内容识别的兜底。
+http_fetch_to() {
+    _url="$1"; _dest="$2"; _tmo="${3:-900}"
+    HTTP_CODE=""
+    case "$HTTP" in
+        curl)
+            if [ "$TLS_OPTS" = "insecure" ]; then
+                HTTP_CODE="$(curl -sSk -m "$_tmo" -o "$_dest" -w '%{http_code}' "$_url" 2>/dev/null || true)"
+            else
+                HTTP_CODE="$(curl -sS -m "$_tmo" -o "$_dest" -w '%{http_code}' "$_url" 2>/dev/null || true)"
+            fi
+            [ -n "$HTTP_CODE" ] || HTTP_CODE="000"
+            [ "$HTTP_CODE" = "200" ]
+            ;;
+        *)
+            rm -f "$_dest"
+            if [ "$TLS_OPTS" = "insecure" ]; then
+                "$HTTP" -q --no-check-certificate -T "$_tmo" -O "$_dest" "$_url" >/dev/null 2>&1
+            else
+                "$HTTP" -q -T "$_tmo" -O "$_dest" "$_url" >/dev/null 2>&1
+            fi
+            ;;
+    esac
+}
+
+# 下载失败时把面板那句话原样带出来 —— 面板的 503/502 正文就是写给用户看的中文,
+# 藏在文件里不给任何人看就等于没有。只对"小文件"这么做: 内核是 20 MB, 不可能是话。
+show_body() {
+    _f="$1"
+    [ -s "$_f" ] || return 0
+    _size="$(wc -c < "$_f" 2>/dev/null | tr -d ' ' || true)"
+    [ "${_size:-0}" -lt 4096 ] || return 0
+    sed -n '1,4p' "$_f" 2>/dev/null | sed 's/^/      /' >&2 || true
+}
+
+# 下载进度: 路由器上没有任何工具会替你打这个 (uclient-fetch 全程静默), 而 20 MB 在
+# 4 Mbps 的线路上要 40 秒。中间一行输出都没有, 用户就会以为卡死了 —— 真机反馈里
+# "一直卡在下载代理内核"就是这么来的。后台小循环每 5 秒读一次文件大小, 有增长才报。
+PROGRESS_PID=""
+start_progress() {
+    _file="$1"; _label="${2:-下载中}"
+    stop_progress
+    (
+        _last=0
+        while :; do
+            _now="$(wc -c < "$_file" 2>/dev/null | tr -d ' ' || true)"
+            [ -n "$_now" ] || _now=0
+            if [ "$_now" -gt "$_last" ]; then
+                _last="$_now"
+                printf '  … %s %s KB\n' "$_label" "$((_now / 1024))"
+            fi
+            sleep 5
+        done
+    ) &
+    PROGRESS_PID=$!
+}
+stop_progress() {
+    [ -n "$PROGRESS_PID" ] || return 0
+    kill "$PROGRESS_PID" 2>/dev/null || true
+    wait "$PROGRESS_PID" 2>/dev/null || true
+    PROGRESS_PID=""
 }
 
 json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\r\n'; }
@@ -140,6 +199,12 @@ json_get() {
     fi
 }
 
+# 数字字段 (bytes / 进度这类): 上面的 json_get 只认带引号的值。
+json_get_num() {
+    _json="$1"; _key="$2"
+    printf '%s' "$_json" | sed -n 's/.*"'"$_key"'"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1
+}
+
 json_get_bool() {
     _json="$1"; _key="$2"
     if command -v jsonfilter >/dev/null 2>&1; then
@@ -157,6 +222,26 @@ json_get_bool() {
 }
 
 # ---------------------------------------------------------------- 环境探测
+# OpenWrt 自己的架构名 (/etc/openwrt_release 的 DISTRIB_ARCH) → 内核资产架构。
+# 它是权威的: uname -m 在个别固件上会给模棱两可的值 (32 位用户态 / 厂商改过的串),
+# 而 DISTRIB_ARCH 是这份固件真正编译出来的目标 (aarch64_cortex-a53 / mipsel_24kc /
+# arm_cortex-a7_neon-vfpv4 / x86_64 …)。
+arch_from_openwrt() {
+    _da="$(sed -n "s/^DISTRIB_ARCH=['\"]\(.*\)['\"].*/\1/p" /etc/openwrt_release 2>/dev/null | head -n1 || true)"
+    [ -n "$_da" ] || return 1
+    case "$_da" in
+        aarch64*)              printf 'arm64\n' ;;
+        arm_arm1176*|arm_arm11*) printf 'armv6\n' ;;
+        arm*)                  printf 'armv7\n' ;;
+        mips64el*)             printf 'mips64le\n' ;;
+        mips64*)               printf 'mips64\n' ;;
+        mipsel*|mipsle*)       printf 'mipsle\n' ;;
+        mips*)                 printf 'mips\n' ;;
+        x86_64*|i386*)         printf 'amd64\n' ;;
+        *) return 1 ;;
+    esac
+}
+
 detect_env() {
     [ "$(id -u)" = "0" ] || die "需要 root 权限, 请用 root 账户执行 (OpenWrt 默认就是 root)"
     [ -r /etc/openwrt_release ] || die "没有检测到 OpenWrt (/etc/openwrt_release 不存在)。
@@ -166,13 +251,21 @@ detect_env() {
     case "$(uname -m)" in
         aarch64|arm64)     ARCH=arm64 ;;
         armv7l|armv7)      ARCH=armv7 ;;
-        armv6l)            ARCH=armv7 ;;
+        armv6l)            ARCH=armv6 ;;
         x86_64|amd64)      ARCH=amd64 ;;
         mips64el)          ARCH=mips64le ;;
+        mips64)            ARCH=mips64 ;;
         mipsel|mipsle)     ARCH=mipsle ;;
         mips)              ARCH=mips ;;
-        *) die "暂不支持的 CPU 架构: $(uname -m) (可到面板把该设备标记为不支持, 或反馈这个架构)" ;;
+        # uname -m 认不出来时用 OpenWrt 自己的目标名兜底 (两者都没有才报错)
+        *)                 ARCH="$(arch_from_openwrt 2>/dev/null || true)"
+                           [ -n "$ARCH" ] || die "暂不支持的 CPU 架构: $(uname -m) (可到面板把该设备标记为不支持, 或反馈这个架构)" ;;
     esac
+    # armv7l 也可能是 arm1176 (ARMv6) 的固件报出来的: OpenWrt 的目标名更可信。
+    if [ "$ARCH" = "armv7" ]; then
+        _da_arch="$(arch_from_openwrt 2>/dev/null || true)"
+        if [ "$_da_arch" = "armv6" ]; then ARCH=armv6; fi
+    fi
 
     MODEL="$(cat /tmp/sysinfo/model 2>/dev/null || true)"
     [ -n "$MODEL" ] || MODEL="$(cat /proc/device-tree/model 2>/dev/null | tr -d '\0' || true)"
@@ -214,7 +307,10 @@ preflight() {
     fi
 
     # 面板可达性 (顺带确定 TLS 策略)
-    http_probe "$ZP_BASE/api/status" || die "连不上面板 $ZP_BASE。
+    # `${ZP_BASE}` 的花括号不能省: 后面紧跟一个中文字符时, 有的 shell (bash/某些
+    # ash 构建) 会把高字节也算进变量名, 于是这句本该说"连不上面板"的话变成
+    # "ZP_BASE?: unbound variable" —— 偏偏只在**真的连不上**的时候才触发。
+    http_probe "$ZP_BASE/api/status" || die "连不上面板 ${ZP_BASE}。
   请确认路由器能上网, 且面板地址可以从外网访问。"
     if [ "$TLS_OPTS" = "insecure" ]; then
         warn "面板证书校验未通过, 已改用不校验模式继续 (面板可能还在自签证书阶段)"
@@ -308,18 +404,38 @@ EOF
 
 # ---------------------------------------------------------------- 依赖
 # TUN 模式只需要 kmod-tun; tproxy 回退需要 kmod-nft-tproxy。
-# opkg 源不可用 (改过源的机器很常见) 不算致命 —— 内核模块可能已经装好了。
+# 软件源不可用 (改过源的机器很常见) 不算致命 —— 内核模块可能已经装好了。
+#
+# OpenWrt 25.12 起包管理器从 opkg 换成了 apk (Alpine 那套)。只认 opkg 的写法在这类
+# 固件上是**静默跳过**: 两个 kmod 一个都没装, 安装过程看着全绿, 实际上 TUN 建不出来、
+# tproxy 回退也没有 nft 规则 —— 全屋代理名存实亡。所以两套都试, 并且把"手动补一条"
+# 的命令原样打出来。
 install_deps() {
     step "准备网络内核模块"
-    if command -v opkg >/dev/null 2>&1; then
-        # kmod-nft-tproxy 是 mihomo auto-redirect / tproxy 回退的前提;
-        # kmod-tun 是主方案 (TUN 全屋透明代理) 的前提。两个都小, 一起装。
-        _pkgs=""
-        [ -c /dev/net/tun ] || _pkgs="kmod-tun"
-        _pkgs="${_pkgs:+$_pkgs }kmod-nft-tproxy"
+    # kmod-nft-tproxy 是 mihomo auto-redirect / tproxy 回退的前提;
+    # kmod-tun 是主方案 (TUN 全屋透明代理) 的前提。两个都小, 一起装。
+    _pkgs=""
+    [ -c /dev/net/tun ] || _pkgs="kmod-tun"
+    _pkgs="${_pkgs:+$_pkgs }kmod-nft-tproxy"
+    if command -v apk >/dev/null 2>&1; then
+        apk update >/dev/null 2>&1 || warn "apk update 失败 (软件源可能不可用), 继续尝试安装已缓存的包"
+        # shellcheck disable=SC2086
+        if apk add $_pkgs >/dev/null 2>&1; then
+            ok "内核模块已装 (apk)"
+        else
+            warn "内核模块安装未全部成功 ($_pkgs) —— 手动补:  apk add $_pkgs"
+        fi
+    elif command -v opkg >/dev/null 2>&1; then
         opkg update >/dev/null 2>&1 || warn "opkg update 失败 (软件源可能不可用), 继续尝试安装已缓存的包"
         # shellcheck disable=SC2086
-            opkg install $_pkgs >/dev/null 2>&1 || warn "内核模块安装未全部成功 ($_pkgs)"
+        if opkg install $_pkgs >/dev/null 2>&1; then
+            ok "内核模块已装 (opkg)"
+        else
+            warn "内核模块安装未全部成功 ($_pkgs) —— 手动补:  opkg install $_pkgs"
+        fi
+    else
+        warn "这台设备上没有 apk 也没有 opkg, 跳过内核模块安装
+  若稍后 TUN 不可用, 请手动安装 kmod-tun 与 kmod-nft-tproxy 后重跑本命令"
     fi
     # /dev/net/tun 这个设备节点存在 ≠ tun 模块已加载: 节点是包安装时创建的, 内核模块
     # 要 modprobe 才进内核。真机反馈里 "TUN 可用" 但还是没建出 tun 设备, 就是这一步。
@@ -335,6 +451,39 @@ install_deps() {
 }
 
 # ---------------------------------------------------------------- 内核二进制
+#: 面板说"还没准备好内核"时最多等多久 (秒)。面板侧取内核的总时限是 240 秒
+#: (ZP_CORE_DEADLINE) —— 这里必须比它长, 否则两边一起超时、谁都不知道到底怎么了;
+#: 但不无限等: 到点就把话说清楚, 而不是让用户对着一行不动的输出猜。
+CORE_WAIT="${ZP_CORE_WAIT:-360}"
+#: 小于这个大小的一律不当内核 —— 面板的 502/503 正文只有几十到几百字节, 而一个
+#: 正常的 mihomo 压缩包 ≈ 20 MB。(自检演练里用几 KB 的假内核, 那时调小这个值。)
+CORE_MIN_BYTES="${ZP_CORE_MIN_BYTES:-65536}"
+
+# 下载一份文件到 $2, 带进度。成功返回 0。
+core_download() {
+    rm -f "$2"
+    start_progress "$2" "已下载"
+    if http_fetch_to "$1" "$2" 900; then
+        stop_progress
+        return 0
+    fi
+    stop_progress
+    return 1
+}
+
+# 等面板把内核取回来时, 拿面板的真实进度说一句人话 (而不是干等)。
+core_wait_note() {
+    _json="$(http_get "$ZP_BASE/c/core/status?arch=$ARCH" 2>/dev/null || true)"
+    _b="$(json_get_num "$_json" bytes)"
+    [ -n "$_b" ] || _b=0
+    _mb=$((_b / 1048576))
+    if [ "$_mb" -gt 0 ]; then
+        printf '\r  面板正在取内核… 已取 %s MB   ' "$_mb"
+    else
+        printf '\r  面板正在取内核…            '
+    fi
+}
+
 install_core() {
     step "下载代理内核 (mihomo · $ARCH)"
     # 清掉上一次中断留下的半截下载: 路由器闪存很小, 20 MB 的临时文件不该长期躺着
@@ -350,7 +499,58 @@ install_core() {
     rm -f "$ZP_BIN"
     _tmp="$ZP_DIR/.mihomo.gz"
     mkdir -p "$ZP_DIR"
-    http_get_file "$ZP_BASE/c/bin/$ARCH" > "$_tmp" || die "下载内核失败 (面板上该架构的二进制没有缓存成功, 请稍后重试)"
+
+    # 取内核: 面板**不再**让请求挂在那里等它去上游下载 (那正是"卡在下载代理内核"
+    # 的来源)。它立刻回一句"正在准备" + 503, 这里带着真实进度等它把话说完。
+    _waited=0
+    while :; do
+        _ok=0
+        if core_download "$ZP_BASE/c/bin/$ARCH" "$_tmp"; then
+            _size="$(wc -c < "$_tmp" 2>/dev/null | tr -d ' ' || true)"
+            if [ "${_size:-0}" -ge "$CORE_MIN_BYTES" ]; then
+                _ok=1
+            fi
+        fi
+        if [ "$_ok" = "1" ]; then
+            break
+        fi
+        # 走到这里 = 面板给的不是内核。它多半给了一句话 (503 正在准备 / 502 取不到),
+        # 把那句话原样念出来 —— 用户看得懂"面板正在准备", 看不懂 "HTTP 503"。
+        _body="$(cat "$_tmp" 2>/dev/null || true)"
+        if [ -n "$_body" ]; then
+            show_body "$_tmp"
+        fi
+        case "$_body" in
+            *取内核失败*)
+                die "内核下载失败: 面板自己取不到这份内核 (它到上游的线路不通)。
+  这不是路由器的问题, 也不该在路由器上再试一次 —— 装机时这台机器还没有代理可用,
+  自己去找上游只会变成第二次超时 (2.9.2 那条真机教训)。下一步任选一条:
+    1) 到面板「客户端」页面点一次「准备内核」, 它会给出失败原因 (面板可以直接
+       换镜像: 在面板上设 ZP_CORE_MIRRORS=https://你的镜像/{url} 后重启面板);
+    2) 把内核压缩包手动放进面板的 data/client/cores/ (文件名在该页面写着);
+    3) 过几分钟重跑这条安装命令 —— 面板取到一次就会一直缓存, 之后所有路由器复用。" ;;
+        esac
+        # 每 30 秒报一次"还在重试", 免得网络层面的失败看起来又是一片安静
+        if [ $((_waited % 30)) -eq 0 ]; then
+            warn "这一次没拿到内核 (HTTP ${HTTP_CODE:-?}), 继续重试…"
+        fi
+        _waited=$((_waited + 5))
+        if [ "$_waited" -gt "$CORE_WAIT" ]; then
+            printf '\n' >&2
+            show_body "$_tmp"
+            warn "等了 ${CORE_WAIT} 秒, 面板还是没把内核准备好"
+            die "内核下载失败: 面板在 ${CORE_WAIT} 秒内没能从上游取到内核。
+  这不是路由器的问题 —— 面板自己到上游的线路不通。下一步任选一条:
+    1) 到面板「客户端」页面点一次「准备内核」, 看它给出的失败原因;
+    2) 或把内核压缩包手动放到面板的 data/client/cores/ 目录下 (文件名见该页提示);
+    3) 然后再重跑这条安装命令。"
+        fi
+        core_wait_note
+        sleep 5
+    done
+    if [ "$_waited" -gt 0 ]; then
+        printf '\n' >&2
+    fi
     [ -s "$_tmp" ] || die "下载到的内核是空文件"
     # 判断"是不是 gzip"只能用 gzip -t, 不能用 `od -An -tx1` 看魔数 ——
     # OpenWrt 的 busybox 默认不带 od, 命令不存在时那一行会静默失败, 于是 gz 被当成

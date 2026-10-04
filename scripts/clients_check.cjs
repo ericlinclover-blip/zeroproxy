@@ -56,6 +56,16 @@ async function main() {
   fs.writeFileSync(path.join(home, "data", "bootstrap_token"), TOKEN + "\n", { mode: 0o600 });
   fs.mkdirSync(SHOT_DIR, { recursive: true });
 
+  // 一个"只握手、不说话"的假上游: 面板去取内核时会停在"正在取"上。测试里点
+  // 「准备内核」只会碰到它 —— 不会真的去 GitHub 下 20 MB (也不能让测试依赖外网)。
+  const stallSockets = new Set();
+  const stall = net.createServer((sock) => {
+    stallSockets.add(sock);
+    sock.on("error", () => {});
+    sock.on("close", () => stallSockets.delete(sock));
+  });
+  await new Promise((r) => stall.listen(0, "127.0.0.1", r));
+
   const server = spawn(PYTHON, ["-m", "zeroproxy.main"], {
     cwd: path.join(ROOT, "backend"),
     env: {
@@ -68,6 +78,9 @@ async function main() {
       ZP_GEODATA_AUTO: "0",
       ZP_PUBLIC_IP: "0",
       ZP_APPLY_ASYNC: "0",
+      ZP_CORE_MIRRORS: `http://127.0.0.1:${stall.address().port}/{url}`,
+      ZP_CORE_SOURCE_TIMEOUT: "30",
+      ZP_CORE_DEADLINE: "60",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -105,6 +118,19 @@ async function main() {
     check("侧栏出现「客户端」入口", (await page.locator('#dash-nav a[href="#sec-clients"]').count()) === 1);
     check("客户端卡片默认停在路由器 tab", await page.locator('#client-tabs .tab.on[data-client-tab="router"]').count() === 1);
     check("空状态先介绍价值" , /全屋|每台设备/.test(await page.locator("#client-body").innerText()));
+
+    // 内核缓存这一行: 真机 (GL-MT3600BE / OpenWrt 25.12.5) 那次"卡在下载代理内核上
+    // 不动"——面板必须把"内核准备好了没有"摆在发命令的地方, 并且能一键先取回来。
+    check("还没缓存内核时, 把「准备内核」这一步摆在卡片上",
+      /准备内核/.test(await page.locator("#client-body").innerText()));
+    await page.click("[data-core-prepare]");
+    await page.waitForFunction(
+      () => /正在取内核/.test(document.querySelector("#client-body").innerText),
+      { timeout: 15000 });
+    check("点「准备内核」后能看到面板正在取 (有进度可看, 不用猜)",
+      /正在取内核/.test(await page.locator("#client-body").innerText()));
+    check("取内核期间不假装已就绪",
+      !/内核已就绪/.test(await page.locator("#client-body").innerText()));
 
     await page.click("#btn-pair");
     await page.waitForSelector(".cmd-box code", { timeout: 10000 });
@@ -212,6 +238,10 @@ async function main() {
     check("无 console / page 错误", consoleErrors.length === 0, consoleErrors.slice(0, 2).join(" | "));
   } finally {
     if (browser) await browser.close();
+    // 面板那边可能还挂着一条"正在取内核"的连接: 先掐掉它, 否则 close() 会一直等
+    for (const sock of stallSockets) sock.destroy();
+    stall.close();
+    stall.unref();
     server.kill("SIGTERM");
     await new Promise((r) => server.once("exit", r));
   }
