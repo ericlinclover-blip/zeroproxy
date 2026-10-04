@@ -116,6 +116,103 @@ class StallUpstream:
         self.srv.server_close()
 
 
+class FakeMirror:
+    """一个本地的"直连镜像": 不管请求什么路径, 都返回那份假内核。
+
+    真机上这里是 github.i3.pub / gh-proxy 这类反代 —— 演练里用本地服务器替代,
+    于是"面板直传太慢 → 改走直连镜像"这条路可以离线跑、也不会真去下 20 MB。
+    """
+
+    def __init__(self, blob: bytes) -> None:
+        import http.server
+
+        payload = blob
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Type", "application/gzip")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):  # pragma: no cover - 别刷屏
+                pass
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.httpd.server_address[1]
+        self.base = f"http://127.0.0.1:{self.port}/{{url}}"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+class Throttle:
+    """把面板"包"在一根慢管子后面: 转发一切, 但 /c/bin 的正文按块慢慢吐。
+
+    用它复现真机那一幕: 面板自己有内核, 但用户家宽到海外面板只有几十 KB/s ——
+    20 MB 要十几分钟。安装脚本应该发现"这条路太慢"并改走直连镜像。
+    """
+
+    def __init__(self, upstream: str, *, chunk: int = 8192, delay: float = 0.25) -> None:
+        import http.server
+        import urllib.request as _req
+
+        self.chunk, self.delay = chunk, delay
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def _proxy(self):
+                body = None
+                if "Content-Length" in self.headers:
+                    body = self.rfile.read(int(self.headers["Content-Length"]))
+                request = _req.Request(upstream + self.path, data=body, method=self.command)
+                for key in ("Content-Type", "Cookie", "Authorization"):
+                    if key in self.headers:
+                        request.add_header(key, self.headers[key])
+                try:
+                    with _req.urlopen(request, timeout=30) as resp:
+                        data = resp.read()
+                        code, headers = resp.status, dict(resp.headers)
+                except Exception as exc:  # pragma: no cover - 演练里不该走到
+                    self.send_error(502, str(exc))
+                    return
+                self.send_response(code)
+                for key, value in headers.items():
+                    if key.lower() in ("content-length", "transfer-encoding", "connection"):
+                        continue
+                    self.send_header(key, value)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                if "/c/bin/" in self.path:
+                    for start in range(0, len(data), outer.chunk):
+                        self.wfile.write(data[start:start + outer.chunk])
+                        self.wfile.flush()
+                        time.sleep(outer.delay)       # 慢管子
+                else:
+                    self.wfile.write(data)
+
+            do_GET = _proxy
+            do_POST = _proxy
+
+            def log_message(self, *args):  # pragma: no cover - 别刷屏
+                pass
+
+        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.httpd.daemon_threads = True
+        self.port = self.httpd.server_address[1]
+        self.base = f"http://127.0.0.1:{self.port}"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
 class Panel:
     """一台演练用的面板 (真起 uvicorn, 真注册设备)。"""
 
@@ -242,11 +339,18 @@ def main() -> int:
                     fh.write(f"fake-geo-{panel_.name}-{name}".encode())
 
         def run_script(script: str, label: str, root: str | None = None,
-                       extra: dict | None = None) -> tuple[bool, str]:
+                       extra: dict | None = None,
+                       base: str | None = None) -> tuple[bool, str]:
             target = root or fake_root
             path = os.path.join(tmp, f"install-{label}.sh")
+            text = patch_for_local_run(script, target)
+            if base:
+                # 把脚本里的"面板地址"换成本机的一个慢管子 —— 复现"家宽到海外面板
+                # 只有几十 KB/s"那条路 (见 Throttle)
+                text = re.sub(r'^ZP_BASE="[^"]*"', f'ZP_BASE="{base}"', text,
+                              count=1, flags=re.M)
             with open(path, "w") as fh:
-                fh.write(patch_for_local_run(script, target))
+                fh.write(text)
             # ZP_CORE_MIN_BYTES 与面板侧同名: 演练里那个假内核只有几百字节, 真机上
             # 65536 的下限是用来挡"面板返回的是一句话"的 (见 install_core)。
             env = {**os.environ, "ZP_CORE_MIN_BYTES": "16", **(extra or {})}
@@ -259,11 +363,12 @@ def main() -> int:
             return proc.returncode == 0, proc.stdout + proc.stderr
 
         def run_install(label: str, panel_=None, root: str | None = None,
-                        extra: dict | None = None) -> tuple[bool, str]:
+                        extra: dict | None = None,
+                        base: str | None = None) -> tuple[bool, str]:
             panel_ = panel if panel_ is None else panel_
             code = panel_.pair_code(label)
             _, script, _ = panel_.req("GET", f"/c/{code}")
-            return run_script(script, label, root=root, extra=extra)
+            return run_script(script, label, root=root, extra=extra, base=base)
 
         print("\n[1] 首次安装")
         ok, out = run_install("first")
@@ -493,7 +598,8 @@ def main() -> int:
             # 路由器端: 面板取不到时要有界地失败, 而不是让用户对着一行不动的输出猜
             fresh_root = os.path.join(tmp, "fresh-root")
             ok_slow, slow_out = run_install("no-core", panel_=slow, root=fresh_root,
-                                            extra={"ZP_CORE_WAIT": "9"})
+                                            extra={"ZP_CORE_WAIT": "9",
+                                                   "ZP_CORE_MIRROR_BUDGET": "5"})
             check("面板取不到上游时, 安装命令有界地失败 (不是卡死)",
                   (not ok_slow) and "内核下载失败" in slow_out)
             check("等待期间打的是面板的真实进度", "面板正在取内核" in slow_out)
@@ -508,6 +614,62 @@ def main() -> int:
             check("面板准备好内核后, 同一条命令装完", ok_ready and "内核就绪" in ready_out)
         finally:
             stall.close()
+
+        # [7] 面板直传太慢 → 自动改走直连镜像 (真机: 国内家宽到海外面板只有几十 KB/s)
+        print("\n[7] 面板直传太慢时改走直连镜像")
+        # 一份"压不小"的假内核: 脚本本体照旧 (解压后真的能跑), 后面缀一大段随机 hex
+        # 注释 —— 于是 gzip 之后仍有上百 KB, "慢管子"才真的慢。全是 x 的话只压出几百
+        # 字节, 一节就传完, 根本测不到"太慢就换路"这条逻辑。
+        big_stub = stub + "# " + os.urandom(160000).hex() + "\n"
+        blob = gzip.compress(big_stub.encode())
+        mirror = FakeMirror(blob)
+        slow_panel = Panel(PORT + 3, os.path.join(tmp, "home-d"), "D", extra_env={
+            # 面板自己从**本地镜像**取 (快) —— 于是它有缓存可以直传;
+            # 直传那一段会被下面的慢管子拖成十几 KB/s。
+            "ZP_CORE_MIRRORS": mirror.base,
+        })
+        panels.append(slow_panel)
+        throttle = None
+        try:
+            if not slow_panel.wait():
+                print(f"面板 D 没起来:\n" + slow_panel.log[-2000:])
+                return 1
+            slow_panel.configure("127.0.0.1")
+            geo_cache = os.path.join(slow_panel.home, "data", "client", "geo")
+            os.makedirs(geo_cache, exist_ok=True)
+            for name in ("geoip.metadb", "geosite.dat"):
+                with open(os.path.join(geo_cache, name), "wb") as fh:
+                    fh.write(f"fake-geo-D-{name}".encode())
+            # 先让面板把自己那份取好 (真机上就是「准备内核」那一步)
+            slow_panel.req_raw("GET", "/c/bin/arm64")      # 触发面板后台取 (这次是 503)
+            ready = False
+            for _ in range(60):
+                payload = json.loads(slow_panel.req_raw("GET", "/c/core/status?arch=arm64")[1])
+                if payload["state"] == "ready":
+                    ready = True
+                    break
+                time.sleep(0.5)
+            check("面板能先把自己那份内核准备好", ready,
+                  f"{(payload or {}).get('state')} / {(payload or {}).get('size')} 字节")
+
+            # 慢管子: 4 KB / 0.3 秒 ≈ 13 KB/s —— 200 KB 要十几秒
+            throttle = Throttle(slow_panel.base, chunk=4096, delay=0.3)
+            ok_slow, out_slow = run_install(
+                "slow-panel", panel_=slow_panel, root=os.path.join(tmp, "slow-root"),
+                base=throttle.base,
+                extra={"ZP_CORE_PANEL_BUDGET": "3", "ZP_CORE_MIRROR_BUDGET": "60",
+                       "ZP_CORE_TOTAL_BUDGET": "300"},
+            )
+            check("面板直传太慢时, 安装脚本自己换到直连镜像", ok_slow,
+                  out_slow.strip().splitlines()[-1][:60] if out_slow.strip() else "")
+            check("换路时说清了原因与实测速率",
+                  "面板直传没能在" in out_slow and "KB/s" in out_slow)
+            check("下载过程一直有速率可看 (不再是一行不动的输出)", out_slow.count("KB/s") >= 2)
+            check("用的是面板给的那张镜像表", "直连镜像完成" in out_slow)
+        finally:
+            if throttle is not None:
+                throttle.close()
+            mirror.close()
     finally:
         logs = []
         for panel in panels:

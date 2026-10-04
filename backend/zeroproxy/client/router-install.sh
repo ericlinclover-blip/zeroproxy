@@ -123,14 +123,22 @@ http_post() {
 http_fetch_to() {
     _url="$1"; _dest="$2"; _tmo="${3:-900}"
     HTTP_CODE=""
+    # -L 不能少: GitHub 官方直链会 302 到 objects.githubusercontent.com, 有的反代也会跳。
+    # 不跟随重定向的话, 拿到的只是那几十字节的跳转页 —— 大小闸门会把它当"面板的一句话"。
     case "$HTTP" in
         curl)
             if [ "$TLS_OPTS" = "insecure" ]; then
-                HTTP_CODE="$(curl -sSk -m "$_tmo" -o "$_dest" -w '%{http_code}' "$_url" 2>/dev/null || true)"
+                if HTTP_CODE="$(curl -sSkL -m "$_tmo" -o "$_dest" -w '%{http_code}' "$_url" 2>/dev/null)"; then _rc=0; else _rc=1; fi
             else
-                HTTP_CODE="$(curl -sS -m "$_tmo" -o "$_dest" -w '%{http_code}' "$_url" 2>/dev/null || true)"
+                if HTTP_CODE="$(curl -sSL -m "$_tmo" -o "$_dest" -w '%{http_code}' "$_url" 2>/dev/null)"; then _rc=0; else _rc=1; fi
             fi
             [ -n "$HTTP_CODE" ] || HTTP_CODE="000"
+            # curl 自己的退出码也要认: `-m` 到点被掐断时它**照样会打出 200** (响应头早
+            # 就收到了), 只看状态码会把"下了一半"当成"下完了", 然后拿半个文件去比
+            # sha256 —— 报出来就是"镜像不干净", 完全指错方向 (演练抓到过)。
+            if [ "$_rc" != "0" ]; then
+                return 1
+            fi
             [ "$HTTP_CODE" = "200" ]
             ;;
         *)
@@ -162,14 +170,22 @@ start_progress() {
     _file="$1"; _label="${2:-下载中}"
     stop_progress
     (
-        _last=0
+        _ticks=0
         while :; do
-            _now="$(wc -c < "$_file" 2>/dev/null | tr -d ' ' || true)"
-            [ -n "$_now" ] || _now=0
-            if [ "$_now" -gt "$_last" ]; then
-                _last="$_now"
-                printf '  … %s %s KB\n' "$_label" "$((_now / 1024))"
+            # 文件可能还没被 curl 创建 (或者上一次下载刚被删掉): 直接 `wc -c < 不存在的`
+            # 是**重定向**失败, 那句 "No such file or directory" 由 shell 自己打到 stderr,
+            # `2>/dev/null` 挡不住它 —— 装机会莫名其妙多出几行这种噪音。先判断存在性。
+            if [ -f "$_file" ]; then
+                _now="$(wc -c < "$_file" 2>/dev/null | tr -d ' ' || true)"
+            else
+                _now=0
             fi
+            [ -n "$_now" ] || _now=0
+            _ticks=$((_ticks + 1))
+            _kbps=$((_now / 1024 / (_ticks * 5)))
+            # 每 5 秒无条件报一次: 速率掉下来 (或一直是 0) 也看得见 —— 这正是
+            # "卡住"与"慢"的区别所在。
+            printf '  … %s %s KB (%s KB/s)\n' "$_label" "$((_now / 1024))" "$_kbps"
             sleep 5
         done
     ) &
@@ -458,23 +474,101 @@ CORE_WAIT="${ZP_CORE_WAIT:-360}"
 #: 小于这个大小的一律不当内核 —— 面板的 502/503 正文只有几十到几百字节, 而一个
 #: 正常的 mihomo 压缩包 ≈ 20 MB。(自检演练里用几 KB 的假内核, 那时调小这个值。)
 CORE_MIN_BYTES="${ZP_CORE_MIN_BYTES:-65536}"
+#: 面板直传的观察窗口 (秒)。国内家宽到海外面板常常只有几十 KB/s —— 20 MB 要十几分钟,
+#: 而面板会把**它自己那张镜像表 + 官方直链**一起给出来 (见 /c/core/status), 直连往往
+#: 快得多。超过这个窗口还没下完, 就让位给直连镜像。设 0 = 不看这个窗口, 一直等面板。
+CORE_PANEL_BUDGET="${ZP_CORE_PANEL_BUDGET:-90}"
+#: 每条直连镜像最多花多久 (秒)。
+CORE_MIRROR_BUDGET="${ZP_CORE_MIRROR_BUDGET:-240}"
+#: 整轮取内核的总上限 (秒): 面板 + 全部镜像加起来, 到点就报清楚。
+CORE_TOTAL_BUDGET="${ZP_CORE_TOTAL_BUDGET:-900}"
 
-# 下载一份文件到 $2, 带进度。成功返回 0。
+#: 面板给来的这一档内核的元信息 (core_read_panel 填)
+PANEL_DIRECT=""
+PANEL_MIRRORS=""
+PANEL_SHA=""
+PANEL_SIZE=""
+PANEL_PREFER="panel"
+#: 面板最近一次状态回执的原文 (进度显示用)
+PANEL_STATUS_JSON=""
+#: 最近一次下载的实测结果 (core_download 填)
+DL_BYTES=0
+DL_KBPS=0
+DL_SECONDS=1
+#: 这一轮取内核的开始时间 (总预算用)
+CORE_STARTED=0
+
+# 整轮取内核还剩多少秒 (面板 + 全部镜像共用这一个预算)。
+core_budget_left() {
+    _now="$(date +%s 2>/dev/null || echo "$CORE_STARTED")"
+    _left=$((CORE_TOTAL_BUDGET - (_now - CORE_STARTED)))
+    if [ "$_left" -lt 0 ]; then _left=0; fi
+    printf '%s\n' "$_left"
+}
+
+# 下载一份文件到 $2, 最多花 $3 秒, 带进度与实测速率 (DL_BYTES / DL_KBPS)。
+# 成功返回 0。速率是给"这条线值不值得等"用的 —— 以前这里只有一行不动的输出,
+# 用户分不出"慢"和"死"。
 core_download() {
     rm -f "$2"
+    DL_START="$(date +%s 2>/dev/null || echo 0)"
     start_progress "$2" "已下载"
-    if http_fetch_to "$1" "$2" 900; then
-        stop_progress
-        return 0
+    if http_fetch_to "$1" "$2" "${3:-900}"; then
+        _rc=0
+    else
+        _rc=1
     fi
     stop_progress
-    return 1
+    DL_SECONDS=$(( $(date +%s 2>/dev/null || echo 0) - DL_START ))
+    [ "$DL_SECONDS" -gt 0 ] 2>/dev/null || DL_SECONDS=1
+    DL_BYTES="$(wc -c < "$2" 2>/dev/null | tr -d ' ' || true)"
+    [ -n "$DL_BYTES" ] || DL_BYTES=0
+    DL_KBPS=$((DL_BYTES / 1024 / DL_SECONDS))
+    return "$_rc"
+}
+
+# 问面板要这一档内核的元信息: 官方直链 / 面板同款镜像表 / 期望大小 / sha256 / 建议顺序。
+# 旧面板没有这些字段 —— 那就退回"只有面板直传"的老路, 不影响安装。
+core_read_panel() {
+    PANEL_STATUS_JSON="$(http_get "$ZP_BASE/c/core/status?arch=$ARCH" 2>/dev/null || true)"
+    _json="$PANEL_STATUS_JSON"
+    PANEL_DIRECT="$(json_get "$_json" direct)"
+    PANEL_MIRRORS="$(json_get "$_json" mirror_urls)"
+    PANEL_SHA="$(json_get "$_json" sha256)"
+    PANEL_SIZE="$(json_get_num "$_json" size)"
+    PANEL_PREFER="$(json_get "$_json" prefer)"
+    [ -n "$PANEL_PREFER" ] || PANEL_PREFER="panel"
+}
+
+# 落盘前的校验: 大小像内核, 且 (面板给了摘要时) sha256 对得上。
+# 为什么还要哈希: 直连镜像是第三方 —— 它们中间任何一跳都可能给你别的东西。
+core_verify() {
+    _size="$(wc -c < "$_tmp" 2>/dev/null | tr -d ' ' || true)"
+    if [ "${_size:-0}" -lt "$CORE_MIN_BYTES" ]; then
+        return 1
+    fi
+    # 面板知道这份文件多大时先比大小: 传了一半的正文过不了这一关, 而且这句
+    # "期望多少 / 拿到多少"比一句 sha256 对不上好懂得多 (busybox 上也不一定
+    # 有 sha256sum)。
+    if [ -n "$PANEL_SIZE" ] && [ "$PANEL_SIZE" -gt 0 ] && [ "${_size:-0}" -ne "$PANEL_SIZE" ]; then
+        warn "下载到的文件大小不对: 期望 ${PANEL_SIZE} 字节, 拿到 ${_size} 字节 (丢弃重来)"
+        rm -f "$_tmp"
+        return 1
+    fi
+    if [ -n "$PANEL_SHA" ] && command -v sha256sum >/dev/null 2>&1; then
+        _sum="$(sha256sum "$_tmp" 2>/dev/null | cut -d' ' -f1)"
+        if [ "$_sum" != "$PANEL_SHA" ]; then
+            warn "下载到的文件 sha256 与面板给的不一致 (镜像这一跳不干净?), 丢弃重来"
+            rm -f "$_tmp"
+            return 1
+        fi
+    fi
+    return 0
 }
 
 # 等面板把内核取回来时, 拿面板的真实进度说一句人话 (而不是干等)。
 core_wait_note() {
-    _json="$(http_get "$ZP_BASE/c/core/status?arch=$ARCH" 2>/dev/null || true)"
-    _b="$(json_get_num "$_json" bytes)"
+    _b="$(json_get_num "$PANEL_STATUS_JSON" bytes)"
     [ -n "$_b" ] || _b=0
     _mb=$((_b / 1048576))
     if [ "$_mb" -gt 0 ]; then
@@ -482,6 +576,77 @@ core_wait_note() {
     else
         printf '\r  面板正在取内核…            '
     fi
+}
+
+# 面板直传。面板没缓存时它会回 503 + 一句人话 (它自己去上游取), 这里带着进度等;
+# 拿到 200 之后如果传得太慢 (预算内没下完), 让位给直连镜像。
+core_from_panel() {
+    _waited=0
+    while [ "$_waited" -lt "$CORE_WAIT" ]; do
+        if core_download "$ZP_BASE/c/bin/$ARCH" "$_tmp" "$CORE_PANEL_BUDGET"; then
+            if core_verify; then
+                ok "面板直传完成 ($((DL_BYTES / 1048576)) MB, ${DL_KBPS} KB/s)"
+                return 0
+            fi
+            # 下完了但校验没过 (原因 core_verify 已经说过): 换条路
+            warn "面板给的这份没通过校验, 换条路再试"
+            return 1
+        fi
+        _size="$(wc -c < "$_tmp" 2>/dev/null | tr -d ' ' || true)"
+        [ -n "$_size" ] || _size=0
+        # 200 = 拿到了正文却没下完 (线太慢或中途断) → 换条路;
+        # 503/502/000 = 面板给的是一句话 → 按那句话处理 (等待或报错)。
+        # uclient-fetch 拿不到状态码, 那时才用"文件大小像不像内核"兜底。
+        if [ "$HTTP_CODE" = "200" ] || [ "$_size" -ge 262144 ]; then
+            # 下了一半就断了/被预算掐断: 面板这条线要么慢、要么不稳, 换条路
+            warn "面板直传没能在 ${CORE_PANEL_BUDGET} 秒内完成 (已下 $((_size / 1024)) KB, ${DL_KBPS} KB/s)"
+            return 1
+        fi
+        # 不是内核 = 面板给了一句话 (503 正在准备 / 502 取不到)
+        _body="$(cat "$_tmp" 2>/dev/null || true)"
+        if [ -n "$_body" ]; then
+            show_body "$_tmp"
+        fi
+        case "$_body" in
+            *取内核失败*)
+                warn "面板自己取不到这份内核 (它到上游的线路不通)"
+                return 1 ;;
+        esac
+        _waited=$((_waited + 5))
+        if [ "$_waited" -ge "$CORE_WAIT" ]; then
+            warn "等了 ${CORE_WAIT} 秒, 面板还是没把内核准备好"
+            return 1
+        fi
+        core_read_panel            # 刷新进度与摘要 (面板可能刚好取好了)
+        core_wait_note
+        sleep 5
+    done
+    return 1
+}
+
+# 直连镜像 (面板把整张表 + 官方直链一起给出来)。只在面板那条路太慢或走不通时才用。
+core_from_mirrors() {
+    if [ -z "$PANEL_MIRRORS" ] && [ -z "$PANEL_DIRECT" ]; then
+        warn "面板没有给出直连镜像 (面板版本较旧?), 只能走面板直传"
+        return 1
+    fi
+    warn "改走直连镜像 (与面板同一份文件, 校验方式不变)"
+    for _url in $(printf '%s' "$PANEL_MIRRORS" | tr ',' ' '); do
+        [ -n "$_url" ] || continue
+        _left="$(core_budget_left)"
+        if [ "$_left" -le 5 ]; then
+            warn "总时间预算用完了 (${CORE_TOTAL_BUDGET} 秒), 不再试剩下的镜像"
+            break
+        fi
+        _tmo="$CORE_MIRROR_BUDGET"
+        [ "$_left" -lt "$_tmo" ] && _tmo="$_left"
+        if core_download "$_url" "$_tmp" "$_tmo" && core_verify; then
+            ok "直连镜像完成 ($((DL_BYTES / 1048576)) MB, ${DL_KBPS} KB/s)"
+            return 0
+        fi
+        warn "这个镜像没成: $(printf '%s' "$_url" | sed -e 's#^[a-z]*://##' -e 's#/.*##') (${DL_KBPS} KB/s)"
+    done
+    return 1
 }
 
 install_core() {
@@ -500,56 +665,35 @@ install_core() {
     _tmp="$ZP_DIR/.mihomo.gz"
     mkdir -p "$ZP_DIR"
 
-    # 取内核: 面板**不再**让请求挂在那里等它去上游下载 (那正是"卡在下载代理内核"
-    # 的来源)。它立刻回一句"正在准备" + 503, 这里带着真实进度等它把话说完。
-    _waited=0
-    while :; do
-        _ok=0
-        if core_download "$ZP_BASE/c/bin/$ARCH" "$_tmp"; then
-            _size="$(wc -c < "$_tmp" 2>/dev/null | tr -d ' ' || true)"
-            if [ "${_size:-0}" -ge "$CORE_MIN_BYTES" ]; then
-                _ok=1
-            fi
+    # 取内核两条路: ① 面板直传 (面板把内核缓存好再给, 只访问一个地址);
+    #              ② 直连镜像 (面板把它自己那张镜像表 + 官方直链一起给出来)。
+    # 默认先走 ① —— 但国内家宽到面板可能只有几十 KB/s, 而直连镜像往往快得多,
+    # 所以 ① 有一个观察窗口 (CORE_PANEL_BUDGET), 太慢就让位给 ②。
+    # 面板说 prefer=mirror (ZP_ROUTER_SOURCE) 时顺序反过来。
+    CORE_STARTED="$(date +%s 2>/dev/null || echo 0)"
+    core_read_panel
+    _ok=0
+    if [ "$PANEL_PREFER" = "mirror" ]; then
+        warn "面板建议先走直连镜像 (ZP_ROUTER_SOURCE=mirror)"
+        if core_from_mirrors; then _ok=1; fi
+        if [ "$_ok" = "0" ]; then
+            step "改回面板直传"
+            if core_from_panel; then _ok=1; fi
         fi
-        if [ "$_ok" = "1" ]; then
-            break
+    else
+        if core_from_panel; then
+            _ok=1
+        else
+            if core_from_mirrors; then _ok=1; fi
         fi
-        # 走到这里 = 面板给的不是内核。它多半给了一句话 (503 正在准备 / 502 取不到),
-        # 把那句话原样念出来 —— 用户看得懂"面板正在准备", 看不懂 "HTTP 503"。
-        _body="$(cat "$_tmp" 2>/dev/null || true)"
-        if [ -n "$_body" ]; then
-            show_body "$_tmp"
-        fi
-        case "$_body" in
-            *取内核失败*)
-                die "内核下载失败: 面板自己取不到这份内核 (它到上游的线路不通)。
-  这不是路由器的问题, 也不该在路由器上再试一次 —— 装机时这台机器还没有代理可用,
-  自己去找上游只会变成第二次超时 (2.9.2 那条真机教训)。下一步任选一条:
-    1) 到面板「客户端」页面点一次「准备内核」, 它会给出失败原因 (面板可以直接
-       换镜像: 在面板上设 ZP_CORE_MIRRORS=https://你的镜像/{url} 后重启面板);
-    2) 把内核压缩包手动放进面板的 data/client/cores/ (文件名在该页面写着);
-    3) 过几分钟重跑这条安装命令 —— 面板取到一次就会一直缓存, 之后所有路由器复用。" ;;
-        esac
-        # 每 30 秒报一次"还在重试", 免得网络层面的失败看起来又是一片安静
-        if [ $((_waited % 30)) -eq 0 ]; then
-            warn "这一次没拿到内核 (HTTP ${HTTP_CODE:-?}), 继续重试…"
-        fi
-        _waited=$((_waited + 5))
-        if [ "$_waited" -gt "$CORE_WAIT" ]; then
-            printf '\n' >&2
-            show_body "$_tmp"
-            warn "等了 ${CORE_WAIT} 秒, 面板还是没把内核准备好"
-            die "内核下载失败: 面板在 ${CORE_WAIT} 秒内没能从上游取到内核。
-  这不是路由器的问题 —— 面板自己到上游的线路不通。下一步任选一条:
-    1) 到面板「客户端」页面点一次「准备内核」, 看它给出的失败原因;
-    2) 或把内核压缩包手动放到面板的 data/client/cores/ 目录下 (文件名见该页提示);
-    3) 然后再重跑这条安装命令。"
-        fi
-        core_wait_note
-        sleep 5
-    done
-    if [ "$_waited" -gt 0 ]; then
-        printf '\n' >&2
+    fi
+    if [ "$_ok" = "0" ]; then
+        die "内核下载失败: 面板直传与直连镜像都没成 (共用了 $(core_budget_left) 秒的预算)。
+  下一步任选一条:
+    1) 到面板「客户端」页面点一次「准备内核」, 看它给出的失败原因 (面板侧可以换镜像:
+       ZP_CORE_MIRRORS=https://你的镜像/{url} 后重启面板);
+    2) 或把内核压缩包手动放进面板的 data/client/cores/ (文件名在该页面写着);
+    3) 过几分钟重跑这条安装命令 —— 面板取到一次就会一直缓存, 之后所有路由器复用。"
     fi
     [ -s "$_tmp" ] || die "下载到的内核是空文件"
     # 判断"是不是 gzip"只能用 gzip -t, 不能用 `od -An -tx1` 看魔数 ——

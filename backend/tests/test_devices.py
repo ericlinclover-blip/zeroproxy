@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 
@@ -202,7 +203,7 @@ def test_preparing_a_core_is_explicit_and_idempotent(client, configured, monkeyp
 class _Trickle:
     """一个"能连上、每秒滴一点"的假上游 —— 没有总时限就会永远不返回。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, chunk: int = 512, delay: float = 0.2, length: int = 64 << 20) -> None:
         import http.server
         import socketserver
         import threading
@@ -210,13 +211,13 @@ class _Trickle:
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_GET(self):  # noqa: N802
                 self.send_response(200)
-                self.send_header("Content-Length", str(64 << 20))
+                self.send_header("Content-Length", str(length))
                 self.end_headers()
                 try:
                     while True:
-                        self.wfile.write(b"x" * 512)
+                        self.wfile.write(b"x" * chunk)
                         self.wfile.flush()
-                        time.sleep(0.2)
+                        time.sleep(delay)
                 except OSError:
                     pass
 
@@ -236,6 +237,36 @@ class _Trickle:
 
 def _trickle_server() -> _Trickle:
     return _Trickle()
+
+
+class _Static:
+    """一个"一次给完"的假镜像 (按顺序排在慢镜像后面)。"""
+
+    def __init__(self, body: bytes) -> None:
+        import http.server
+        import socketserver
+        import threading
+
+        payload = body
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):  # pragma: no cover - 别刷屏
+                pass
+
+        self.httpd = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+        self.httpd.daemon_threads = True
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/{{url}}"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
 
 
 def test_core_fetch_gives_up_at_the_deadline(configured, monkeypatch):
@@ -259,6 +290,63 @@ def test_core_fetch_gives_up_at_the_deadline(configured, monkeypatch):
     assert not ok and path == ""
     assert elapsed < 8, f"没有按总时限放弃 ({elapsed:.1f}s)"
     assert "超时" in detail or "总时间超限" in detail, detail
+
+
+def test_a_slow_mirror_is_dropped_for_the_next_one(configured, monkeypatch):
+    """能连上但极慢的镜像不该吃掉整个预算 —— 换下一个。
+
+    真机现场: 面板取 20 MB, 某个公共反代只有一两百 KB/s (20 MB 要十几分钟), 而排在
+    它后面的镜像可能一秒就通。速率闸门的判据是"按当前速率跑不完这份文件"; 没有
+    Content-Length 时才退回 ZP_CORE_MIN_RATE_KB 这个兜底值。
+    """
+    from zeroproxy import router_client
+
+    monkeypatch.setattr(router_client, "MIN_BYTES", 4096)
+    monkeypatch.setattr(router_client, "CORE_RATE_GRACE", 1)
+    monkeypatch.setattr(router_client, "CORE_MIN_RATE_KB", 500)      # 低于 500 KB/s 就换
+    slow = _Trickle(chunk=262144, delay=1.3, length=64 << 20)         # ≈200 KB/s
+    fast = _Static(b"f" * 8192)
+    try:
+        monkeypatch.setattr(router_client, "MIRRORS", (slow.url, fast.url))
+        started = time.time()
+        ok, detail, path = router_client.fetch_core(
+            "arm64", timeout=20, deadline=time.time() + 30
+        )
+        elapsed = time.time() - started
+    finally:
+        slow.close()
+        fast.close()
+    assert ok, detail
+    assert os.path.getsize(path) == 8192, "拿到的应该是第二个镜像那份完整的文件"
+    assert elapsed < 20, f"没有及时放弃慢镜像 ({elapsed:.1f}s)"
+
+
+def test_core_status_hands_the_router_a_usable_mirror_table(client, configured, monkeypatch):
+    """状态接口要给路由器**可用的完整地址**, 而且第一个是运营方自建的镜像。
+
+    路由器端不拼模板 (它只有 sha/busybox 那一套工具): 面板给什么它就试什么。
+    自建镜像排第一是因为它在国内线路上最稳 —— 公共前缀会被大量用户挤。
+    """
+    from zeroproxy import router_client
+
+    res = client.get("/c/core/status?arch=arm64").json()
+    urls = [u for u in res["mirror_urls"].split(",") if u]
+    assert urls, res
+    assert urls[0].startswith("https://github.i3.pub/"), "自建镜像应该排第一"
+    assert all(u.endswith(router_client.asset_name("arm64")) for u in urls), urls
+    assert res["direct"].endswith("/mihomo-linux-arm64-v1.19.32.gz")
+    assert res["prefer"] in ("panel", "mirror", "auto")
+    # 没缓存时不谎报大小/摘要; 缓存之后两个都要给 (路由器据此校验镜像)
+    assert "sha256" not in res and "size" not in res
+    blob = b"z" * 32
+    dst = router_client.core_file("arm64")
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    with open(dst, "wb") as fh:
+        fh.write(blob)
+    monkeypatch.setattr(router_client, "MIN_BYTES", 16)
+    ready = client.get("/c/core/status?arch=arm64").json()
+    assert ready["state"] == "ready" and ready["size"] == 32
+    assert ready["sha256"] == hashlib.sha256(blob).hexdigest()
 
 
 def test_geo_files_are_served_and_name_whitelisted(client, configured, tmp_path, monkeypatch):

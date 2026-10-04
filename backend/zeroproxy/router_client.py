@@ -12,6 +12,7 @@ release 域名经常不可达, 用户看到的是"装到一半卡住"。所以�
 from __future__ import annotations
 
 import os
+import hashlib
 import threading
 import time
 import urllib.error
@@ -20,7 +21,7 @@ import urllib.request
 from .config import paths
 
 #: 路由器端脚本版本 (会显示在面板的设备卡上; 改了脚本就 +1)
-SCRIPT_VERSION = "1.2.0"
+SCRIPT_VERSION = "1.2.1"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"
@@ -56,16 +57,21 @@ ARCH_LABEL = {
     "mips64le": "MIPS64el",
 }
 
-#: 下载镜像。第一个是 GitHub 官方, 后面是国内可用的加速前缀 ——
-#: 这些前缀的可用性会随时间变化, 所以是"挨个试"而不是"选一个最好的"。
-#: 官方直连只给一次**短**预算 (见 _budget_for): 网络被黑洞掉时 connect 会一直挂到
-#: 超时, 拿 45 秒去等它, 后面真正的反代就没时间了。
+#: 下载镜像。顺序 = "谁最可能在国内线路上跑得快"。
+#: 第一个是**运营方自建的 GitHub 反代** (github.i3.pub, 写法同 gh-proxy: 把原始地址
+#: 整个拼在后面, 支持 Range), 它比公共前缀稳; 后面是几个公共前缀; 官方直连排最后 ——
+#: 面板自己也在国内时, 直连 GitHub 基本是"挂到超时", 排前面只会白吃掉整个时间预算
+#: (2.6.23 那条教训)。
+#: 前缀的可用性会随时间变化, 所以是"挨个试"; 试的过程中有速率闸门 (见 fetch_core):
+#: 慢到"按这个速率跑不完"就立刻换下一个, 而不是把预算耗在一个数学上不可能完成的源上。
+#: 想换掉整张表: ZP_CORE_MIRRORS=https://自己的镜像/{url},…
 DEFAULT_MIRRORS = (
-    "{url}",
-    "https://ghfast.top/{url}",
+    "https://github.i3.pub/{url}",
     "https://gh-proxy.com/{url}",
-    "https://ghproxy.net/{url}",
     "https://hk.gh-proxy.com/{url}",
+    "https://ghfast.top/{url}",
+    "https://ghproxy.net/{url}",
+    "{url}",
 )
 
 
@@ -104,6 +110,20 @@ CORE_DEADLINE = int(os.environ.get("ZP_CORE_DEADLINE", "240"))
 
 #: 官方直连那一档的最长等待 (秒)。黑洞掉的直连不值得花掉整个预算。
 CORE_DIRECT_BUDGET = int(os.environ.get("ZP_CORE_DIRECT_BUDGET", "25"))
+
+#: 速率闸门: 观察期过后, 若某个镜像的实测速率低于这个值, 就认定它**按当前速率
+#: 跑不完这 20 MB**, 立刻换下一个镜像。
+#: 为什么需要它: 一个"能连上、但在国内线路上只有 30 KB/s"的镜像会把整个 CORE_DEADLINE
+#: 吃掉却什么也拿不到 (20 MB / 30 KB/s = 11 分钟), 而排在后面的镜像可能一秒就通了。
+#: 有 Content-Length 时用"剩余字节 / 剩余时间"精确判断, 没有时才用这个兜底值。
+CORE_MIN_RATE_KB = int(os.environ.get("ZP_CORE_MIN_RATE_KB", "32"))
+
+#: 速率闸门的观察期 (秒): 前几秒的抖动不做数。
+CORE_RATE_GRACE = int(os.environ.get("ZP_CORE_RATE_GRACE", "8"))
+
+#: 路由器端的取内核顺序: panel (默认, 面板直传) / mirror (先直连镜像) / auto (同 panel)。
+#: 面板自建镜像的人可以用它做 A/B: 哪条快就固定哪条。
+ROUTER_SOURCE = os.environ.get("ZP_ROUTER_SOURCE", "panel").strip().lower()
 
 
 def asset_name(arch: str) -> str:
@@ -172,9 +192,13 @@ CORE_STATE: dict[str, dict] = {}
 CORE_RETRY_AFTER = int(os.environ.get("ZP_CORE_RETRY_AFTER", "20"))
 
 
-def _budget_for(index: int, remaining: float, timeout: int) -> int:
-    """这一个镜像最多能花多少秒。官方直连 (index 0) 额外收紧。"""
-    cap = min(timeout, CORE_DIRECT_BUDGET) if index == 0 else timeout
+#: "官方直连"那一档的写法 —— 只有它需要短预算 (被墙时 connect 会一直挂着)。
+DIRECT_TEMPLATE = "{url}"
+
+
+def _budget_for(template: str, remaining: float, timeout: int) -> int:
+    """这一个镜像最多能花多少秒。"""
+    cap = min(timeout, CORE_DIRECT_BUDGET) if template == DIRECT_TEMPLATE else timeout
     return max(5, int(min(cap, remaining)))
 
 
@@ -212,6 +236,42 @@ def core_states() -> list[dict]:
         st["label"] = ARCH_LABEL.get(arch, arch)
         out.append(st)
     return out
+
+
+#: 缓存文件的 sha256 记忆 (path, mtime, size) → 摘要。20 MB 每次请求重算太浪费。
+_SHA_CACHE: dict[tuple, str] = {}
+
+
+def core_sha256(path: str) -> str:
+    """缓存内核的 sha256。路由器端拿到直连镜像时会用它校验 —— 镜像再多一层也不怕。"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return ""
+    key = (path, int(st.st_mtime), st.st_size)
+    hit = _SHA_CACHE.get(key)
+    if hit:
+        return hit
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+    except OSError:
+        return ""
+    value = digest.hexdigest()
+    _SHA_CACHE.clear()
+    _SHA_CACHE[key] = value
+    return value
+
+
+def mirror_urls(arch: str) -> list[str]:
+    """这一档内核的全部镜像地址 (完整 URL, 路由器端直接拿去用)。
+
+    下载地址只有这一份实现: 路由器不需要自己拼模板, 换镜像表时两边不会走偏。
+    """
+    url = release_url(arch)
+    return [template.format(url=url) for template in MIRRORS]
 
 
 def core_pending_text(arch: str) -> str:
@@ -305,7 +365,7 @@ def fetch_core(
     tmp = dst + ".part"
     url = release_url(arch)
     errors: list[str] = []
-    for index, template in enumerate(MIRRORS):
+    for template in MIRRORS:
         left = deadline - time.time()
         if left <= 2:
             errors.append(f"总时间超限 ({CORE_DEADLINE}s), 放弃剩余镜像")
@@ -313,12 +373,17 @@ def fetch_core(
         source = template.format(url=url)
         try:
             request = urllib.request.Request(source, headers={"User-Agent": UA})
-            with urllib.request.urlopen(request, timeout=_budget_for(index, left, timeout)) as resp:
+            with urllib.request.urlopen(request, timeout=_budget_for(template, left, timeout)) as resp:
                 status = getattr(resp, "status", 200)
                 if status is not None and status != 200:
                     errors.append(f"{source} HTTP {status}")
                     continue
                 size = 0
+                started = time.time()
+                try:
+                    total = int(resp.headers.get("content-length") or 0)
+                except (TypeError, ValueError):
+                    total = 0
                 next_note = 1 << 20          # 每 1 MB 回一次进度
                 with open(tmp, "wb") as fh:
                     while True:
@@ -331,9 +396,25 @@ def fetch_core(
                             break
                         fh.write(chunk)
                         size += len(chunk)
-                        if progress is not None and size >= next_note:
-                            progress(size)
+                        if size >= next_note:
                             next_note = size + (1 << 20)
+                            if progress is not None:
+                                progress(size)
+                            # 速率闸门: 慢到"按当前速率跑不完"就换下一个镜像。20 MB 的
+                            # 文件上, 这不只是优化 —— 一个 30 KB/s 的镜像能把整个预算
+                            # 吃掉却什么都给不了, 而排在后面的镜像可能一秒就通了。
+                            elapsed = time.time() - started
+                            if elapsed >= CORE_RATE_GRACE:
+                                rate = size / elapsed
+                                left_now = deadline - time.time()
+                                if total > size and left_now > 0:
+                                    needed = (total - size) / left_now
+                                else:
+                                    needed = rate
+                                if rate < needed or rate < CORE_MIN_RATE_KB * 1024:
+                                    raise TimeoutError(
+                                        f"太慢: {rate / 1024:.0f} KB/s (换下一个镜像)"
+                                    )
             if size < MIN_BYTES:
                 errors.append(f"{source} 体积异常 ({size} 字节)")
                 continue
@@ -390,15 +471,16 @@ GEO_TTL = int(os.environ.get("ZP_GEO_TTL", str(7 * 86400)))
 #: 单个镜像的超时 (4 MB 的文件, 90 秒足够; 与 mihomo 自己的下载超时同量级)。
 GEO_SOURCE_TIMEOUT = 90
 
-#: 分流数据库的镜像顺序: 与内核不同, 把国内可用的反代放前面。GitHub 直连在受限出口上
-#: 是"卡满超时再失败", 排第一会白吃掉整个时间预算 (真机网络就是这样: 直连与 ghfast
-#: 都超时, 只有 gh-proxy 通)。
+#: 分流数据库的镜像顺序: 与内核同一套思路 —— 运营方自建的镜像第一, 公共反代随后,
+#: GitHub 直连最后。直连在受限出口上是"卡满超时再失败", 排第一会白吃掉整个预算
+#: (真机网络就是这样: 直连与 ghfast 都超时, 只有 gh-proxy 通)。
 GEO_MIRRORS = (
+    "https://github.i3.pub/{url}",
     "https://gh-proxy.com/{url}",
     "https://hk.gh-proxy.com/{url}",
-    "{url}",
     "https://ghfast.top/{url}",
     "https://ghproxy.net/{url}",
+    "{url}",
 )
 
 #: 一次下载的总时间上限。5 个镜像各 90 秒最坏是 7 分钟, 而路由器正在**同步等**这份
@@ -496,13 +578,29 @@ def fetch_geo(
                         errors.append(f"{source} HTTP {status}")
                         continue
                     size = 0
+                    started = time.time()
                     with open(tmp, "wb") as fh:
                         while True:
+                            if time.time() > deadline:
+                                raise TimeoutError(f"总时间超限 ({GEO_DEADLINE}s)")
                             chunk = resp.read(1 << 18)
                             if not chunk:
                                 break
                             fh.write(chunk)
                             size += len(chunk)
+                            # 与内核那条一样: 慢到跑不完就换下一个镜像, 别把预算全吃掉
+                            # (4 MB 在 45 KB/s 上要 90 秒 —— 排在后面的镜像可能几秒就完)。
+                            # 判据用"还要多快才来得及", 而不是一个拍出来的固定值:
+                            # 慢但能在时限内跑完的镜像不该被踢掉。
+                            elapsed = time.time() - started
+                            if elapsed >= CORE_RATE_GRACE and size >= (1 << 18):
+                                rate = size / elapsed
+                                left_now = deadline - time.time()
+                                needed = rate if left_now <= 0 else (minimum - size) / left_now
+                                if rate < needed:
+                                    raise TimeoutError(
+                                        f"太慢: {rate / 1024:.0f} KB/s (换下一个镜像)"
+                                    )
                 if size < minimum:
                     errors.append(f"{source} 体积异常 ({size} 字节)")
                     continue

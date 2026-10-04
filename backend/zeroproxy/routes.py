@@ -2986,6 +2986,11 @@ def client_core_status(request: Request):
         "core_version": router_client.CORE_VERSION,
         "asset": router_client.asset_name(want) if want in router_client.ARCHES else "",
         "cores": router_client.core_states(),
+        # 路由器端只在"面板直传太慢"时才会用这些 (见 router-install.sh):
+        #   direct       —— 上游官方地址 (日志/排查用)
+        #   mirror_urls  —— 面板同款镜像的**完整地址**, 逗号分隔 (客户端不拼模板)
+        #   prefer       —— 面板建议先走哪条: panel / mirror (ZP_ROUTER_SOURCE 可改)
+        "prefer": router_client.ROUTER_SOURCE,
     }
     # 指定了架构时再把这一档的字段摊平在顶层: 路由器端只做浅层解析 (没有 jq),
     # 嵌套在数组里的 bytes/state 它取不到。
@@ -2996,7 +3001,13 @@ def client_core_status(request: Request):
             "bytes": st["bytes"],
             "detail": st["detail"],
             "ready": st["state"] == "ready",
+            "direct": router_client.release_url(want),
+            "mirror_urls": ",".join(router_client.mirror_urls(want)),
         })
+        if st["state"] == "ready":
+            path = router_client.core_file(want)
+            payload["size"] = st["bytes"]
+            payload["sha256"] = router_client.core_sha256(path)
     return payload
 
 
