@@ -57,7 +57,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **客户端 (路由器全自动)** | 面板「客户端」页生成一行命令, 在路由器终端粘一次: 自动配对 → 装 mihomo 静态内核 → 落 tun/dns/嗅探配置 → 起服 → 自检。此后这台路由器下的**所有设备** (手机/电脑/电视) 自动走分流代理, 不用每台各装客户端; 面板上一个总开关控制全屋, 开关颜色取自**设备回报的真实状态** (不是前端点一下就变绿); 每台设备独立凭据, 可单独改名 / 换分流模板 / 吊销。**内核与分流数据库 (GeoIP/GeoSite) 都由面板分发** —— 装机时路由器还没有代理可用, 整条链路只访问面板一个地址, 不需要它能连 GitHub |
 | **路由器聚合多台面板** | 同一台路由器可以接多台服务器: 在第二台面板「客户端」页生成一条链接, 在路由器上 `zeroproxy add <链接>` 即可接入 (**不用重跑安装**)。节点由 mihomo 以 `proxy-providers` 聚合, 一台挂了自动走另一台; 各面板互不认识 (凭据不跨服务器流转), 节点名自动带面板域名前缀以免同名冲突 |
 | **3 种订阅格式** | 同一订阅地址 `?format=` 切换: Base64 通用 / Clash(mihomo) YAML / sing-box JSON |
-| **3 档分流模板** | 智能分流 (国内直连+广告拦截) / 全局代理 / 全部直连; 面板一键切换或 `?rules=` 单客户端覆盖, 切换不重启服务 |
+| **3 档分流模板** | 智能分流 (国内 App/域名/IP 直连 + 广告拦截, 含微信/支付宝/公众号/小程序) / 全局代理 / 全部直连; 面板一键切换或 `?rules=` 单客户端覆盖, 切换不重启服务; 国内 App 那一层是**不依赖分流数据库**的显式域名规则, 降级时也生效 |
 | **引导令牌保护** | 初始化必须带 `?token=`, 公网暴露时别人抢不走你的面板; 初始化成功即作废 |
 | **一键自检自愈** | `/api/diagnose` 检查 8 项 (服务、配置、入站一致性、GeoIP 一致性、证书、端口、伪装目标可达性) + `/api/repair` 重新生成并重启 |
 | **节点测速** | `/api/probe` 对每个节点做**真实握手** (Reality / Trojan 走完整 TLS, 失败即说明配置不对), 并测服务器到伪装目标的出口延迟 |
@@ -68,7 +68,7 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` 260 项 (254 passed + 6 skipped; 带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (77 项, 含**两台机器真跑一条链**) + `scripts/router_install_check.py` (53 项, **真的用 shell 跑一遍路由器安装脚本**) + `scripts/browser_check.cjs` (155 项) + `scripts/clients_check.cjs` (26 项, 真实浏览器点开关) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` 262 项 (256 passed + 6 skipped; 带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (97 项, 含**两台机器真跑一条链**) + `scripts/router_install_check.py` (54 项, **真的用 shell 跑一遍路由器安装脚本**) + `scripts/browser_check.cjs` (155 项) + `scripts/clients_check.cjs` (26 项, 真实浏览器点开关) + `scripts/router_ui_check.cjs` (16 项) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 | **看得懂的界面 (v2.6.0)** | 控制台布局: 左侧锚点导航 (带计数角标 + 滚动高亮) + 顶部指标条 (健康节点 / 落地出口 IP / 平均延迟 + 迷你折线 / 运行时长) + 节点密集表格 (名称 / 地址状态 / **握手延迟条** / **上下行双轨** / 开关与复制) + **流量卡 (双弧圆环 + 实时速率曲线 + 逐节点双色流量条)** + 链式链路拓扑 (你的设备 → 本机入口 → 落地端) + 程序更新闭环; 动效全部走 `transform`/自绘 rAF 并受 `prefers-reduced-motion` 约束 |
 
@@ -230,12 +230,22 @@ POST /c/report                     → 心跳: 上报实际状态, 取回期望�
 
 | 模板 | 规则 | 适用 |
 |---|---|---|
-| `smart` (默认) | 广告拦截 + 国内域名/IP 直连 + 私有地址直连, 其余走节点 | 日常: 国内网站直连, 国外走代理 |
+| `smart` (默认) | 广告拦截 + **国内 App 直连层** (微信/支付宝/银联/抖音/淘宝…, 纯域名规则, 不依赖 geo 数据) + 国内域名/IP 直连 + 私有地址直连, 其余走节点 | 日常: 国内网站与 App 直连, 国外走代理 |
 | `global` | 只拦广告, 其余全部走节点 | 需要全部流量走代理 |
 | `direct` | 全部直连 (策略组手动选节点) | 排障 / 不需要分流, **零 geo 下载** |
 
 两端的策略组是一套语义: `♻️ 自动选择` / `🚀 节点选择` / `🎯 全球直连` / `🛑 广告拦截` / `🐟 漏网之鱼`。
 切换模板只影响订阅输出, **不重载任何服务** (前端即时生效)。
+
+**为什么单有一层"国内 App 直连"**: 微信 / 支付宝 / 公众号 / 小程序 这类流量一旦走节点就会
+"能连上但用不了"(公众号空白、小程序报网络错误、支付转圈)。两层原因导致它必须独立存在 ——
+①**降级路径**: 路由器拿不到分流数据库时, 面板给的是不含任何 geo 规则的配置, 那一份以前
+**一条国内直连规则都没有**, 全屋流量全部走节点; ②**覆盖缺口**: `geosite:cn`(实测 11.1 万条)
+并不包含 `alipay.cn` / `alipay.com.cn` / `cup62.cn` / `alipaylog.com` / `baidu.cn` 这些国内域名。
+所以这一层是**显式域名规则, 不依赖任何数据库**, 降级时也照发; 另有
+`geosite:geolocation-cn` + `tencent`/`alibaba`/`aliyun`/`bytedance`/`baidu`/`unionpay` 六个分类
+在有数据时补齐覆盖面。分类名拼错会让整份配置加载失败 (实测), 因此只在白名单里挑选,
+并有回归测试钉死。
 
 - 三种格式**内容一致、地址恒定**; 客户端按 `profile-update-interval: 12` 自动刷新, 节点启停 /
   端口变更 / 伪装设置变化自动同步, 用户侧零操作。
@@ -2549,3 +2559,65 @@ v2.9.7 之后用户在新装时的新反馈: 不再卡死, 但**下载阶段非�
 "直传太慢"、说清速率、改走直连镜像并装完)。两个假镜像 / 慢管子都是本机假服务器, 这几条
 断言离线可跑, 也不会真去下 20 MB。`clients_check.cjs` 26 项、`browser_check.cjs` 155 项
 重跑仍全过。
+
+### 8.43 v2.10.0: 微信 / 支付宝 / 公众号 / 小程序 —— 国内直连不该依赖分流数据库
+
+用户反馈: "分流规则对国内一些热门软件的兼容还是缺失, 比如微信和支付宝, 国内的网站、
+公众号、小程序都没法准确走国内直链, 导致访问有问题。"
+
+先把问题拆成两半, 一半是缺规则, 一半是**规则在降级时整个消失** —— 后者才是真凶:
+
+* **真凶 (可复现)**: 路由器拿不到分流数据库时, 面板给的是"降级配置"。那一份里
+  `GEOSITE` / `GEOIP` 全被去掉 (这是对的 —— 缺数据不是跳过规则而是**整份配置加载失败**,
+  见 8.36), 但它**连一条国内直连规则都没留**: 规则只剩 `GEOIP,LAN → 直连` 与
+  `MATCH → 漏网之鱼(节点)`。也就是说数据一取不到, **全屋流量 (含微信 / 支付宝 / 小程序)
+  就全部走节点** —— 正是用户描述的现象。用真 mihomo 复现过: 降级配置里
+  `mp.weixin.qq.com` 命中 `MATCH → 🐟 漏网之鱼`。
+* **覆盖缺口 (实测)**: 把 MetaCubeX 的实际 `geosite.dat` 逐条比对后确认, `geosite:cn`
+  (11.1 万条) **不是全部** —— `alipay.cn` / `alipay.com.cn` / `alipaylog.com` / `aliapp.org`
+  / `cup62.cn` / `chinaunionpay.com.cn` / `baidu.cn` / `duapp.com` / `mmstat.com` /
+  `snssdk.com` 这些确定的国内域名都不在 `cn` 分类里 (它们大多落在公司分类
+  `tencent` / `alibaba` / `bytedance` / `baidu` / `unionpay` 里)。
+* **上游硬约束 (这次实测出来的)**: mihomo v1.19.32 遇到数据里不存在的分类, 不是
+  "跳过这条规则", 而是 `list … not found in geosite.dat` → `configuration file test failed`
+  —— **整份订阅加载失败**。所以补分类不是"多加几条"那么随意: 只能从两份上游数据里都
+  核对过的分类里挑, 并且要有测试钉死白名单。
+
+改法 (三端同时生效, 顺序即优先级):
+
+1. 新增**国内 App 直连层** `CN_DIRECT_DOMAINS` —— 约 200 条显式 `DOMAIN-SUFFIX`, 按生态
+   分组: 微信 (含公众号 `qq.com` 之下、小程序运行环境 `servicewechat.com`、图片 CDN
+   `qpic.cn`/`qlogo.cn`/`gtimg.cn`、支付 `tenpay.com`)、支付宝 (含 `alipayobjects.com`
+   与上面那些不在 `cn` 里的自有域名)、银联 (`cup62.cn` 云闪付)、阿里 / 字节 / 百度 /
+   腾讯 / 美团 / 滴滴 / 携程 / 京东 / 拼多多 / B站 / 网易 / 小红书 / 小米 / 华为 /
+   三家运营商 / 银行 / 快递 / 教育 / 政务…
+   它是**纯域名规则, 不需要数据库** —— 所以降级配置里原样保留。
+2. 有数据时再加分类: `geosite:geolocation-cn` (补 `cn` 漏掉的那 1300 多条) +
+   `tencent` / `alibaba` / `aliyun` / `bytedance` / `baidu` / `unionpay`。
+   Clash 侧走 `GEOSITE,`, sing-box 侧走对应的 `sing-geosite` rule-set。
+3. **顺序**: 广告拦截 → 落地 (AI/流媒体) → 国内 App 直连 → geo 通用直连 → 漏网之鱼。
+   显式域名早于分类匹配; 落地必须早于国内直连 (否则 ChatGPT 会被 `cn` 规则抢先放行)。
+4. **顺手补上一个"三端一致"的缺口**: sing-box 侧以前**完全没有落地组与落地规则**
+   (只有 Clash 有), 同一个订阅在手机上打开 ChatGPT 会走最快的直连节点而不是落地节点。
+   现在 sing-box 也有 `🌍 落地节点` 选择组 + 内联落地域名 + `netflix/disney/hbo/…`
+   rule-set, 顺序与 Clash 一致。
+
+顺带修掉测试套件里一个**只在"网络快"的机器上才发作的假红**: 面板"预取内核"的后台线程
+由 `/c/pair` 触发, 而 `paths()` 每次调用都读当前 `$ZP_HOME` —— 线程活过用例时, 它把
+20 MB 内核写进了**下一条用例**的目录, 于是那条"什么都还没缓存"的断言莫名其妙地红
+(开发机上到镜像站几秒就下完)。修法: `conftest` 里把镜像表默认换成本地死地址
+(测试不再真的下 20 MB), 并在每个用例前清掉模块级的 `CORE_STATE`。
+
+**回归**: `pytest` 254 → **256 项** 全过 (新增: 国内 App 直连层在**有/无** geo 数据时都在、
+且排在通用分类之前; 配置里出现的 `GEOSITE` 分类必须在白名单里 —— 拼错会让客户端
+起不来)。`scripts/verify.py` 95 → **97 项** 全过 (真实 Xray / Hysteria 2 / mihomo /
+sing-box 1.14.2): 新增"国内 App 直连那几条确实在订阅里""分类都在白名单内""降级配置
+保留国内 App 直连且不含任何 geo 规则", 并让 sing-box 实跑按**配置里实际引用的
+rule-set** 生成测试数据 (以前写死三个, 加了分类就会把"配置没问题"误报成"实跑失败")。
+`router_install_check.py` 53 → **54 项** (演练里断言降级后的路由器配置仍带
+`DOMAIN-SUFFIX,qq.com` / `alipay.com` 直连)。
+
+真机语义也用真实 mihomo v1.19.32 验过: 同一份 `smart` 订阅下,
+`mp.weixin.qq.com` → `DomainSuffix(qq.com)` → `🎯 全球直连[DIRECT]`,
+`servicewechat.com` / `mmbiz.qpic.cn` / `alipay.com` / `alipayobjects.com` 同理;
+`www.google.com` → `MATCH` → `🐟 漏网之鱼`。**降级配置**下同样如此 (这正是本版的重点)。

@@ -364,15 +364,76 @@ def test_clash_templates(client, configured):
     assert direct["proxy-groups"][-1]["proxies"][0] == "DIRECT"
 
 
+def test_cn_app_direct_layer_survives_without_geo_data(client, configured):
+    """国内热门 App (微信 / 支付宝 / 银联 …) 的直连规则**不依赖分流数据库**。
+
+    两件事一起守:
+      * 有数据库时, 它们在 geo 规则之前 —— 显式域名优先于分类匹配;
+      * 没有数据库时 (路由器降级路径) 它们**必须还在**。这一条是真机踩出来的:
+        降级配置以前一条国内直连规则都没有, 全屋流量 (含微信 / 支付宝 / 小程序)
+        都被丢进节点, 表现成"国内网站、公众号、小程序都打不开或很慢"。
+    """
+    from zeroproxy import share_links
+
+    yaml = pytest.importorskip("yaml")
+    must = (
+        "qq.com", "servicewechat.com", "qpic.cn",
+        "alipay.com", "alipayobjects.com", "cup62.cn",
+    )
+
+    smart = yaml.safe_load(_sub(client, configured).text)
+    rules = "\n".join(smart["rules"])
+    for d in must:
+        assert f"DOMAIN-SUFFIX,{d},🎯 全球直连" in rules, d
+    # 显式域名必须排在通用分类之前: geosite:cn 里没有 alipay.cn / cup62.cn 这类域名
+    assert rules.index("DOMAIN-SUFFIX,alipay.com,") < rules.index("GEOSITE,cn,")
+    assert rules.index("DOMAIN-SUFFIX,qq.com,") < rules.index("GEOIP,CN,")
+
+    # 降级 (拿不到数据库) 时: 一条 geo 规则都不许有, 但国内 App 直连层必须原样保留
+    degraded = share_links.clash_profile(config.load_state(), "smart", geo=False)
+    assert "GEOSITE," not in degraded and "GEOIP,CN" not in degraded
+    for d in must:
+        assert f"DOMAIN-SUFFIX,{d},🎯 全球直连" in degraded, d
+    assert degraded.rstrip().endswith("MATCH,🐟 漏网之鱼")
+
+
+def test_only_known_geosite_categories_are_emitted(client, configured):
+    """配置里出现的 GEOSITE 分类必须都在白名单里。
+
+    这条不是形式主义: 实测 mihomo v1.19.32 遇到数据里不存在的分类, 不是"跳过这条
+    规则", 而是**整份配置加载失败** (`list … not found in geosite.dat` →
+    `configuration file test failed`)。分类名拼错 = 客户端直接起不来, 比"分流不准"
+    严重得多, 所以在这里把它钉死。
+    """
+    from zeroproxy import share_links
+
+    yaml = pytest.importorskip("yaml")
+    known = (
+        {"category-ads-all", "private"}
+        | set(share_links.CN_DIRECT_GEOSITES)
+        | set(share_links.LANDING_GEOSITES)
+    )
+    # 白名单本身不能退化成空集合 (否则断言变成永真)
+    assert {"cn", "tencent", "netflix"} <= known
+    smart = yaml.safe_load(_sub(client, configured).text)
+    used = {r.split(",")[1] for r in smart["rules"] if r.startswith("GEOSITE,")}
+    assert used and used <= known, used - known
+
+
 def test_singbox_templates_download_rule_set_directly(client, configured):
     """远程 rule-set 必须直连下载 —— 否则节点不可达时 sing-box 直接起不来。
 
     实测 (见 docs/RESEARCH.md): 不指定 download_detour 时 sing-box 会拿默认出站
     (也就是节点) 去下载 rule-set, 节点不通就 FATAL。
     """
+    from zeroproxy import share_links
+
     profile = json.loads(_sub(client, configured, fmt="singbox").text)
     route = profile["route"]
-    assert {rs["tag"] for rs in route["rule_set"]} == {"ads", "cn", "cn-ip"}
+    assert {rs["tag"] for rs in route["rule_set"]} == {
+        tag for tag, _ in share_links.smart_rule_sets()
+    }
+    assert {rs["tag"] for rs in route["rule_set"]} >= {"ads", "cn", "cn-ip"}
     assert all(rs["download_detour"] == "direct" for rs in route["rule_set"])
     assert all(rs["url"].startswith("https://") for rs in route["rule_set"])
     assert profile["experimental"]["cache_file"]["enabled"] is True
@@ -380,6 +441,16 @@ def test_singbox_templates_download_rule_set_directly(client, configured):
     assert "http_clients" not in profile and "default_http_client" not in route
     assert route["final"] == "🚀 节点选择"
     assert {o["tag"] for o in profile["outbounds"]} >= {"direct", "♻️ 自动选择", "🚀 节点选择"}
+
+    # 与 Clash 侧同一套语义: 落地组存在且兜底到"节点选择"; 落地规则早于国内直连;
+    # 国内 App 直连那批是**内联域名**, 不依赖 rule-set (拿不到数据也生效)。
+    landing = [o for o in profile["outbounds"] if o["tag"] == "🌍 落地节点"]
+    assert landing and landing[0]["outbounds"][-1] == "🚀 节点选择"
+    order = json.dumps(route["rules"], ensure_ascii=False)
+    assert order.index("chatgpt.com") < order.index("qq.com")
+    cn_rule = [r for r in route["rules"] if r.get("domain_suffix") == list(share_links.CN_DIRECT_DOMAINS)]
+    assert cn_rule and cn_rule[0]["outbound"] == "🎯 全球直连"
+    assert any("cn-ip" in r.get("rule_set", []) for r in route["rules"])
 
     glob = json.loads(_sub(client, configured, fmt="singbox", extra="&rules=global").text)
     assert [rs["tag"] for rs in glob["route"]["rule_set"]] == ["ads"]

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import time
 
@@ -184,9 +185,18 @@ def test_preparing_a_core_is_explicit_and_idempotent(client, configured, monkeyp
 
     def fake_fetch(arch, **kw):
         calls.append(arch)
-        return True, "已下载 20 MB", router_client.core_file(arch)
+        # 真的 fetch_core 下完一定把文件落盘 —— 假的也必须落, 否则 core_ready() 一直
+        # 为假, "已经下好就不再下" 这条幂等性就无从谈起 (它以前是靠上一条用例留下的
+        # 全局状态"恰好"成立的)。
+        path = router_client.core_file(arch)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(b"c" * 4096)
+        return True, "已下载 20 MB", path
 
     monkeypatch.setattr(router_client, "fetch_core", fake_fetch)
+    # 体积下限调小: 假文件只有几 KB, 而 core_ready() 要求 >= MIN_BYTES
+    monkeypatch.setattr(router_client, "MIN_BYTES", 4096)
     first = client.post("/api/devices/cores/arm64/prepare")
     assert first.status_code == 200
     assert first.json()["core"]["state"] in ("downloading", "ready")
@@ -329,6 +339,9 @@ def test_core_status_hands_the_router_a_usable_mirror_table(client, configured, 
     """
     from zeroproxy import router_client
 
+    # conftest 里把镜像表默认换成了死地址 (免得后台预取真去下 20 MB); 这一条要的
+    # 正是"真实的镜像表", 所以先切回来。
+    monkeypatch.setattr(router_client, "MIRRORS", router_client.DEFAULT_MIRRORS)
     res = client.get("/c/core/status?arch=arm64").json()
     urls = [u for u in res["mirror_urls"].split(",") if u]
     assert urls, res
@@ -426,11 +439,17 @@ def test_router_profile_degrades_when_panel_has_no_geo_data(client, configured):
     assert "GEOIP,CN" not in rules
     assert "GEOIP,LAN," in rules
     assert profile["rules"][-1] == "MATCH,🐟 漏网之鱼"
+    # 降级 ≠ 没有国内直连: 国内 App 那一层是纯域名规则 (不需要数据库), 必须原样保留。
+    # 少了它, 全屋流量 (微信 / 支付宝 / 公众号 / 小程序) 全部走节点 —— 真机反馈的原话
+    # 就是"国内网站、公众号、小程序都打不开或很慢"。
+    assert "DOMAIN-SUFFIX,qq.com,🎯 全球直连" in rules
+    assert "DOMAIN-SUFFIX,alipay.com,🎯 全球直连" in rules
     assert "nameserver-policy" not in profile["dns"]   # 它的键也是 geosite:… , 要数据库
     assert profile["tun"]["enable"] is True
     # 多服务器模式 (骨架) 同样要能降级
     skeleton = yaml.safe_load(client.get(sub + "&format=skeleton&geo=0").text)
     assert "GEOSITE," not in "\n".join(skeleton["rules"])
+    assert "DOMAIN-SUFFIX,qq.com,🎯 全球直连" in "\n".join(skeleton["rules"])
 
 
 def test_install_script_never_fetches_geo_from_the_internet():
@@ -842,6 +861,16 @@ def test_landing_rules_route_hard_region_sites(client, configured):
         assert landing[0]["proxies"][-1] == "🚀 节点选择", "没有链式节点时要兜底到节点选择"
         # 落地规则必须在国内直连之前, 否则会被 cn 规则抢先放行
         assert rules.index("chatgpt.com") < rules.index("GEOIP,CN"), "落地规则要排在直连规则之前"
+
+    # sing-box 侧以前漏了这一层 (同一个订阅在手机上打开 ChatGPT 会走最快的直连节点,
+    # 而不是落地节点) —— 现在两端语义必须一致。
+    sb = json.loads(
+        client.get(configured["subscription_url"].split("testserver")[-1] + "?format=singbox").text
+    )
+    assert any(o["tag"] == "🌍 落地节点" for o in sb["outbounds"]), "sing-box 缺落地出站组"
+    sb_rules = json.dumps(sb["route"]["rules"], ensure_ascii=False)
+    assert "chatgpt.com" in sb_rules and "netflix" in sb_rules
+    assert sb_rules.index("chatgpt.com") < sb_rules.index("qq.com"), "落地规则要早于国内直连"
 
 
 def test_skeleton_landing_group_filters_chain_nodes(client, configured):

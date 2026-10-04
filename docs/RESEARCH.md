@@ -101,6 +101,9 @@
 | 16 | 写 `detour: "direct"` 的 HTTP 客户端会被拒绝: `detour to an empty direct outbound makes no sense`; **留空 detour 才是直连** | 1.14.2 实测 (http_clients 写法) | 生成 `http_clients` 时不能画蛇添足地写 `detour` |
 | 17 | 证书文件"生成后消失"同样会让 Xray 拒绝启动 (`failed to parse certificate > open …: no such file or directory`) | 隔离二进制 + 指向不存在证书的 Trojan 入站 → `xray -test` exit 23 | 与 geo 数据同一个漏洞面, 启动前自检应一并兜底 |
 | 18 | 远程 rule-set 的下载结果会被 `experimental.cache_file` 缓存, 第二次启动零下载 | 1.13.21 实测: 4 次启动只发出 3 次 GET (首轮各 3 次, 第二轮 0 次), 断网也能用上次数据启动 | 订阅应默认开启缓存, 启动速度和离线可用性都受益 |
+| 19 | mihomo 引用 `geosite.dat` 里**不存在**的分类时, 不是"跳过这条规则", 而是**整份配置加载失败**: `rules[0] [GEOSITE,this-category-does-not-exist,…] error: load GeoSite data error, failed to decode geodata file: geosite.dat, base error: list … not found in geosite.dat` → `configuration file test failed` | mihomo v1.19.32 实测 (本机 `mihomo -t`, 数据取 MetaCubeX `geosite.dat`); 与证据 #9/#10 的 Xray 行为同一类 | 订阅里**不能出现拼错的分类名**; 新增分类只能从两份上游数据里核对过的分类里挑, 并要有白名单回归测试守着 |
+| 20 | `geosite:cn` **不是国内域名的全集**: MetaCubeX `geosite.dat` 的 `cn` 有 111224 条, 但 `alipay.cn` / `alipay.com.cn` / `alipaylog.com` / `aliapp.org` / `cup62.cn` / `chinaunionpay.com.cn` / `baidu.cn` / `baidu.com.cn` / `duapp.com` / `duapps.com` / `mmstat.com` / `snssdk.com` / `alimama.com` / `amap.net` / `quyaoya.com` 这些确定的国内域名都不在 `cn` 里 | 把 `geosite.dat` 按 protobuf 解出各分类后逐条核对 (本机脚本); 它们落在公司分类里: `tencent` 683 / `alibaba` 463 / `aliyun` 88 / `bytedance` 955 / `baidu` 132 / `unionpay` 14 / `geolocation-cn` 5388 条 | 只写 `geosite:cn` 会漏直连; 补齐方式是"显式域名兜底 + 多选几个公司/地理分类" |
+| 21 | 微信 / 支付宝生态的关键域名分别由谁覆盖: 公众号与登录长连接在 `qq.com` 之下 (`mp.weixin.qq.com` 等), 小程序运行环境是 `servicewechat.com`, 公众号图片是 `qpic.cn` / `qlogo.cn`, 支付是 `tenpay.com` / `wechatpay.com`; 支付宝小程序资源是 `alipayobjects.com`, 云闪付是 `cup62.cn` | 对 `geosite.dat` 的分类做后缀匹配核对 (同 #20 的脚本) | "国内 App 一定直连"必须按**生态**列显式域名, 而且要独立于分流数据库 (路由器降级时数据库是空的) |
 
 ### 3.1 一个反直觉的口令陷阱
 
@@ -183,6 +186,7 @@ Xray 的 VLESS/Trojan 用 `user:pass@` 是 **HTTP Basic 风格的 URI 语法糖*
 | 无备份/恢复 | `GET /api/backup` / `POST /api/restore`, 带 SHA-256 校验和与三重校验 |
 | 订阅只有一条硬编码规则 | 三档**客户端分流模板** (智能分流 / 全局代理 / 全部直连), 面板切换或 `?rules=` 覆盖; Clash 侧带 5 个策略组, sing-box 侧带 selector/urltest 出站组 |
 | 启动期可能被 geo 数据卡死 | `systemd ExecStartPre` 调用 `python -m zeroproxy.geodata guard`: 数据缺失或配置自检不过就按当前状态重新生成, 保证核心先起来 (证书丢失同路径兜底) |
+| 国内热门 App (微信/支付宝/公众号/小程序) 直连 | **不依赖分流数据库**的显式域名层 (约 200 条, 按生态分组) + 有数据时补 `geolocation-cn` 与六个公司分类; 降级配置里也保留 —— 见 README 8.43 与上面的证据 #19~#21 |
 
 ---
 

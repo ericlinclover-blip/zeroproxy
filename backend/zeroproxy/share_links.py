@@ -58,9 +58,12 @@ SRS_BASE = "https://fastly.jsdelivr.net/gh/SagerNet/"
 #: 因此默认格式统一写成 `download_detour: "direct"` (1.13.21 / 1.14.2 实测均可用,
 #: 且在 1.13 上无需任何额外字段), 另有 `?format=singbox-next` 给 1.14+ 客户端
 #: 生成零废弃警告的 http_clients 写法。
+
+#: smart 模板的"基础"rule-set: 广告拦截 + 国内 IP 段。
+#: 国内**域名**那几类由 CN_RULE_SETS 提供, "必须走落地"那几类由 LANDING_RULE_SETS
+#: 提供 —— 三者合起来才是完整的 smart 规则集 (见 smart_rule_sets())。
 SMART_RULE_SETS = (
     ("ads", "sing-geosite@rule-set/geosite-category-ads-all.srs"),
-    ("cn", "sing-geosite@rule-set/geosite-cn.srs"),
     ("cn-ip", "sing-geoip@rule-set/geoip-cn.srs"),
 )
 ADS_RULE_SET = ("ads", "sing-geosite@rule-set/geosite-category-ads-all.srs")
@@ -119,6 +122,148 @@ def _landing_rules(geo: bool = True) -> list[str]:
     if geo:
         rules += [f"GEOSITE,{g},{G_LANDING}" for g in LANDING_GEOSITES]
     return rules
+
+
+#: 「必须走直连」的国内应用生态域名 —— **纯域名规则, 不依赖分流数据库**。
+#:
+#: 为什么单列一层, 而不是只靠 `geosite:cn` —— 两条独立理由, 都不是锦上添花:
+#:
+#:   1. **降级路径 (真机踩过)**: 路由器拿不到分流数据库时, 面板给的是一份不含任何
+#:      geo 规则的配置 (见 share_links.clash_profile 的 `geo` 参数)。那一份里原本
+#:      **一条国内直连规则都没有** —— 全屋流量, 包括微信 / 支付宝 / 公众号 / 小程序,
+#:      全部走节点。真机上的表现正是"国内网站、公众号、小程序都打不开或者很慢"。
+#:      这一层是域名规则, 不需要数据库, 所以降级配置里也照发。
+#:   2. **覆盖缺口 (实测)**: `geosite:cn` 有 11.1 万条, 覆盖了绝大多数国内域名, 但
+#:      **不是全部**。拿 MetaCubeX 的实际 geosite.dat 逐条核对后, 下面这些确定的国内
+#:      域名并不在 `cn` 分类里 (见 docs/RESEARCH.md #19):
+#:        alipaylog.com · aliapp.org · mmstat.com · alimama.com · amap.net ·
+#:        snssdk.com · baidustatic.com · hao222.com · duapp.com · duapps.com ·
+#:        quyaoya.com · cup62.cn · chinaunionpay.com.cn · alipay.cn · alipay.com.cn
+#:      对"必须能通"的服务用显式域名兜底 —— 与落地组 (LANDING_DOMAINS) 是同一种做法。
+#:
+#: 顺序: 放在广告拦截与落地组之后、geo 直连之前 —— 显式域名优先于分类匹配。
+#: 生态分组只是给人看的, 匹配语义与顺序无关 (mihomo 对 DOMAIN-SUFFIX 用域名树)。
+CN_DIRECT_DOMAINS = (
+    # ---- 微信 / Weixin (公众号 mp.weixin.qq.com、小程序运行环境 servicewechat.com、
+    #      图片与静态资源 qpic/qlogo/gtimg、登录与长连接全在 qq.com 之下、支付 tenpay) ----
+    "qq.com", "qq.com.cn", "weixin.com", "weixinbridge.com", "weixinsxy.com",
+    "wechat.com", "wechatpay.com", "servicewechat.com",
+    "tenpay.com", "globaltenpay.com",
+    "qpic.cn", "qlogo.cn", "gtimg.cn", "gtimg.com", "gtimg.com.cn",
+    "qcloud.com", "myqcloud.com", "tencent.com", "tencent-cloud.net",
+    "tencentcloudapi.com", "tencentcos.cn", "wegame.com",
+    # ---- 支付宝 / 阿里 (含支付宝小程序 alipayobjects、云闪付之外的自有域名) ----
+    "alipay.com", "alipay.cn", "alipay.com.cn", "alipayobjects.com", "alipaydev.com",
+    "alipaylog.com", "alipaydns.com", "alipay-eco.com", "aliapp.org", "mybank.cn",
+    "antgroup.com", "antfin.com", "antgroup-inc.cn",
+    "alibaba.com", "alibaba-inc.com", "alibabacloud.com", "alibabacorp.com",
+    "alicdn.com", "aliyun.com", "aliyuncs.com", "aliyun-inc.com",
+    "taobao.com", "tmall.com", "tbcdn.cn", "tbcache.com", "mmstat.com", "taobaocdn.com",
+    "1688.com", "alimama.com", "alimama.cn",
+    "amap.com", "amap.net", "gaode.com", "autonavi.com",
+    "dingtalk.com", "dingtalk.cn", "ele.me", "elemecdn.com",
+    "uc.cn", "ucweb.com", "quark.cn", "sm.cn", "youku.com",
+    # ---- 字节 (抖音 / 头条 / 飞书) ----
+    "bytedance.com", "bytedance.cn", "byteimg.com", "bytednsdoc.com", "bytecdn.cn",
+    "douyin.com", "douyinpic.com", "douyinstatic.com", "douyinvod.com",
+    "feishu.cn", "larkoffice.com", "snssdk.com", "toutiao.com",
+    "ixigua.com", "ixiguavideo.com", "volces.com", "volcengine.com", "zijieapi.com",
+    # ---- 百度 (含 .com 短域名, 这几个都不在 geosite:cn 里) ----
+    "baidu.com", "baidu.cn", "baidu.com.cn", "baidustatic.com", "bdstatic.com", "bdimg.com",
+    "bcebos.com", "baidubce.com", "bce-cdn.cn", "bdycdn.cn", "bdydns.cn", "baiduyuncdn.cn",
+    "hao123.com", "hao222.com", "duapp.com", "duapps.com", "duurl.cn", "dwz.cn",
+    "quyaoya.com", "jomocdn.cn", "jomodns.cn",
+    # ---- 支付 / 银联 / 银行 (银联的国内域名几乎都不在 cn 分类里) ----
+    "unionpay.com", "unionpayintl.cn", "unionpaysecure.com", "chinaunionpay.com.cn",
+    "cup.com.cn", "cup62.cn", "95516.com",
+    "icbc.com.cn", "ccb.com", "abchina.com", "boc.cn", "bankofchina.com", "bankcomm.com",
+    "cmbchina.com", "cmbchina.cn", "spdb.com.cn", "citicbank.com", "cebbank.com",
+    "cgbchina.com.cn", "pingan.com", "pingancdn.com", "psbc.com",
+    # ---- 电商 / 生活服务 / 出行 ----
+    "jd.com", "360buyimg.com", "pinduoduo.com", "yangkeduo.com", "pddpic.com",
+    "meituan.com", "meituan.net", "dianping.com", "sankuai.com",
+    "xiaojukeji.com", "didichuxing.com", "didistatic.com",
+    "ctrip.com", "qunar.com", "ly.com", "hellobike.com", "mobike.com",
+    # ---- 社交 / 内容 / 视频 / 音乐 ----
+    "weibo.com", "weibo.cn", "sina.com.cn", "sinaimg.cn", "sinajs.cn",
+    "zhihu.com", "zhimg.com", "xiaohongshu.com", "xhscdn.com",
+    "douban.com", "doubanio.com",
+    "bilibili.com", "hdslb.com", "acfun.cn", "kuaishou.com",
+    "douyu.com", "huya.com", "yystatic.com",
+    "163.com", "126.net", "127.net", "netease.com",
+    "kugou.com", "kglink.cn", "kuwo.cn",
+    "iqiyi.com", "qiyi.com", "iqiyipic.com", "mgtv.com", "hunantv.com",
+    "sohu.com", "letv.com", "le.com", "ximalaya.com", "xmcdn.com",
+    # ---- 办公 / 开发 ----
+    "wps.cn", "wps.com", "kingsoft.com", "kdocs.cn", "yuque.com",
+    "coding.net", "gitee.com", "oschina.net", "csdn.net", "cnblogs.com",
+    "juejin.cn", "teambition.com",
+    # ---- 手机 / 硬件 / 家电 ----
+    "mi.com", "miui.com", "xiaomi.com", "mijia.tech", "xiaomiyoupin.com",
+    "huawei.com", "hicloud.com", "huaweicloud.com",
+    "oppo.com", "vivo.com", "heytap.com", "coloros.com", "meizu.com", "tcl.com",
+    # ---- 安全 / 搜索 / 教育 / 快递 / 游戏 / 运营商 ----
+    "360.cn", "360.com", "360safe.com", "qihoo.com", "qhimg.com", "qhimgs.com",
+    "sogou.com", "sogoucdn.com", "liebao.cn",
+    "xueersi.com", "zybang.com", "17zuoye.com", "chaoxing.com", "kaikeba.com",
+    "sf-express.com", "yundaex.com",
+    "mihoyo.com", "yuanshen.com",
+    "chinatelecom.com.cn", "chinamobile.com", "chinaunicom.com.cn", "10010.com",
+)
+
+#: 「国内直连」的分类 geo 规则 (需要分流数据库, 因此只在 `geo=True` 时下发)。
+#:
+#: 全部来自客户端实际下载的 MetaCubeX geosite.dat —— **分类名拼错会让整个配置加载失败**
+#: (实测 v1.19.32: `GEOSITE,不存在的分类` → `list … not found in geosite.dat` →
+#: `configuration file test failed`), 所以这张表只收已经在两份上游数据里都核对过的分类,
+#: 并由 tests/test_panel.py 的白名单断言守着。
+#:
+#:   cn              国内主表 (11.1 万条, 含 .cn TLD)
+#:   geolocation-cn  v2fly 的"中国地理位置"表 —— 补 cn 没收的那 1300 多条
+#:   tencent/alibaba/aliyun/bytedance/baidu/unionpay
+#:                   公司级分类; 实测这些分类里各有几十~几百条域名不在 cn 里
+#:                   (其中不少是各自 App 的 App 内接口, 正是"App 用不了"的来源)
+CN_DIRECT_GEOSITES = (
+    "cn",
+    "geolocation-cn",
+    "tencent",
+    "alibaba",
+    "aliyun",
+    "bytedance",
+    "baidu",
+    "unionpay",
+)
+
+
+def _cn_direct_rules(geo: bool = True) -> list[str]:
+    """"必须走直连"的国内规则 (放在 geo 通用直连之前)。
+
+    域名那批**永远在** (降级配置里也留) —— 这是"国内 App 一定直连"的保证;
+    分类规则需要数据库, 只在 `geo=True` 时追加。
+    """
+    rules = [f"DOMAIN-SUFFIX,{d},{G_DIRECT}" for d in CN_DIRECT_DOMAINS]
+    if geo:
+        rules += [f"GEOSITE,{g},{G_DIRECT}" for g in CN_DIRECT_GEOSITES]
+    return rules
+
+
+#: sing-box 侧的远程 rule-set —— 与 Clash 侧的两层规则一一对应:
+#:   LANDING_RULE_SETS  ← LANDING_GEOSITES
+#:   CN_RULE_SETS       ← CN_DIRECT_GEOSITES
+#: 名字都在 SagerNet/sing-geosite 的 rule-set 分支里 (实测可直接下载)。
+LANDING_RULE_SETS = tuple(
+    (g, f"sing-geosite@rule-set/geosite-{g}.srs") for g in LANDING_GEOSITES
+)
+CN_RULE_SETS = tuple((g, f"sing-geosite@rule-set/geosite-{g}.srs") for g in CN_DIRECT_GEOSITES)
+
+
+def smart_rule_sets() -> tuple[tuple[str, str], ...]:
+    """smart 模板的全部远程 rule-set。
+
+    tag 唯一是硬要求 —— sing-box 对重复的 rule-set tag 直接拒绝启动。三个来源的
+    tag 集合互不相交 (ads / cn-ip / cn / geolocation-cn / 各公司分类 / 各落地分类)。
+    """
+    return tuple(SMART_RULE_SETS + CN_RULE_SETS + LANDING_RULE_SETS)
 
 
 #: 健康检查目标 (url-test 用它判断哪个节点/哪台服务器可用)
@@ -608,14 +753,17 @@ def clash_profile(
         groups = _groups_for(names, tpl)
 
     if tpl == "smart":
-        # 国内 / 私有地址直连, 广告拦截, 其余走"漏网之鱼"。
-        # 落地规则放在最前面: 这些站点必须用落地 IP, 不能等到国内规则把它们放过去。
+        # 顺序即优先级: 广告拦截 → 落地 → 国内 App 直连 → 国内通用直连 → 漏网之鱼。
+        # 落地规则必须早于国内直连 (这些站点要用落地 IP, 不能被 cn 规则抢先放行);
+        # 国内 App 直连层早于通用 geo 规则, 而且**不依赖数据库** —— 降级配置里它是
+        # 唯一的国内直连来源 (见 CN_DIRECT_DOMAINS 的说明)。
         rules = []
         if geo:
             rules.append(f"GEOSITE,category-ads-all,{G_ADS}")
         rules += _landing_rules(geo)
+        rules += _cn_direct_rules(geo)
         if geo:
-            rules += [f"GEOSITE,private,{G_DIRECT}", f"GEOSITE,cn,{G_DIRECT}"]
+            rules.append(f"GEOSITE,private,{G_DIRECT}")
         # GEOIP,LAN 是内建判断 (私有地址), 不需要数据库 —— 降级时也留着
         rules.append(f"GEOIP,LAN,{G_DIRECT},no-resolve")
         if geo:
@@ -917,6 +1065,18 @@ def singbox_profile(state: dict, template: str | None = None, next_gen: bool = F
             "default": "direct",
         }
     )
+    # 落地组: 成员是链式节点 (名字里带"链式"), 没有时兜底到"节点选择"。
+    # 与 Clash 侧同义 —— 之前 sing-box 侧漏了这一组, 结果同一个订阅在手机上
+    # 打开 ChatGPT 会走最快的直连节点 (不是落地), 属于"三端一致"的缺口。
+    landing_tags = [t for t in tags if "链式" in t]
+    outbounds.append(
+        {
+            "type": "selector",
+            "tag": G_LANDING,
+            "outbounds": landing_tags + [G_SELECT],
+            "default": landing_tags[0] if landing_tags else G_SELECT,
+        }
+    )
     outbounds.append(
         {
             "type": "selector",
@@ -933,9 +1093,30 @@ def singbox_profile(state: dict, template: str | None = None, next_gen: bool = F
         {"ip_is_private": True, "action": "route", "outbound": G_DIRECT},
     ]
     if tpl == "smart":
-        rule_set = [_singbox_rule_set(tag, name, next_gen) for tag, name in SMART_RULE_SETS]
+        rule_set = [_singbox_rule_set(tag, name, next_gen) for tag, name in smart_rule_sets()]
         rules.append({"rule_set": ["ads"], "action": "reject"})
-        rules.append({"rule_set": ["cn", "cn-ip"], "action": "route", "outbound": G_DIRECT})
+        # 落地优先于国内直连 (与 Clash 侧同一顺序), 否则 AI / 流媒体会被 cn 规则放行
+        rules.append(
+            {"domain_suffix": list(LANDING_DOMAINS), "action": "route", "outbound": G_LANDING}
+        )
+        rules.append(
+            {
+                "rule_set": [tag for tag, _ in LANDING_RULE_SETS],
+                "action": "route",
+                "outbound": G_LANDING,
+            }
+        )
+        # 国内 App 直连: 域名那批**不依赖 rule-set**, 所以没有网络也能生效
+        rules.append(
+            {"domain_suffix": list(CN_DIRECT_DOMAINS), "action": "route", "outbound": G_DIRECT}
+        )
+        rules.append(
+            {
+                "rule_set": [tag for tag, _ in CN_RULE_SETS] + ["cn-ip"],
+                "action": "route",
+                "outbound": G_DIRECT,
+            }
+        )
         final = G_SELECT
     elif tpl == "global":
         rule_set = [_singbox_rule_set(*ADS_RULE_SET, next_gen)]

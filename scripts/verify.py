@@ -118,12 +118,18 @@ def _live_singbox(binary: str, client, sub_path: str, home: Path) -> None:
 
     fixtures = home / "rule-set"
     fixtures.mkdir(exist_ok=True)
-    sources = {
-        "ads": {"version": 1, "rules": [{"domain_suffix": ["ads.example"]}]},
-        "cn": {"version": 1, "rules": [{"domain_suffix": ["example.cn"]}]},
-        "cn-ip": {"version": 1, "rules": [{"ip_cidr": ["10.0.0.0/8"]}]},
-    }
-    for tag, body in sources.items():
+    # 要编译哪些 rule-set 由**配置自己**说了算: 直接读三个模板里出现的 tag。
+    # 不然以后新增一个分类 (geolocation-cn / tencent / …), 演练这边会少编译一个,
+    # 于是"配置没问题"被误报成"实跑失败"。
+    tags: set[str] = set()
+    for tpl in ("smart", "global", "direct"):
+        body = json.loads(client.get(f"{sub_path}?format=singbox&rules={tpl}").text)
+        tags |= {rs["tag"] for rs in body["route"].get("rule_set", [])}
+    if not tags:
+        record("编译测试用 rule-set", False, "三个模板都没有引用任何 rule-set")
+        return
+    for tag in sorted(tags):
+        body = {"version": 1, "rules": [{"domain_suffix": [f"{tag}.example"]}]}
         src = fixtures / f"{tag}.json"
         src.write_text(json.dumps(body), encoding="utf-8")
         proc = subprocess.run(
@@ -133,7 +139,7 @@ def _live_singbox(binary: str, client, sub_path: str, home: Path) -> None:
             timeout=60,
         )
         if proc.returncode != 0:
-            record("编译测试用 rule-set", False, last_line(proc.stdout + proc.stderr))
+            record(f"编译测试用 rule-set {tag}", False, last_line(proc.stdout + proc.stderr))
             return
 
     port = free_port()
@@ -289,6 +295,30 @@ def main() -> int:
                 rs.get("download_detour") == "direct" for rs in rule_sets
             )
         record(f"singbox 模板 {tpl} (rule-set 直连下载)", ok, f"{len(rule_sets)} 条 rule-set")
+
+    print("\n[2c-2] 国内 App 直连层 (微信 / 支付宝 / 银联 …) 与 geosite 分类白名单")
+    from zeroproxy import share_links
+
+    smart_clash = client.get(f"{sub_path}?format=clash&rules=smart").text
+    for probe in ("qq.com", "servicewechat.com", "qpic.cn", "alipay.com",
+                  "alipayobjects.com", "cup62.cn"):
+        record(f"国内 App 直连 {probe}", f"DOMAIN-SUFFIX,{probe}," in smart_clash)
+    # 分类名拼错 = 整份配置加载失败 (实测 mihomo: list … not found in geosite.dat),
+    # 所以只允许白名单里的分类出现在订阅里。
+    allowed = (
+        {"category-ads-all", "private"}
+        | set(share_links.CN_DIRECT_GEOSITES)
+        | set(share_links.LANDING_GEOSITES)
+    )
+    used = {chunk.split(",")[0] for chunk in smart_clash.split("GEOSITE,")[1:]}
+    record("GEOSITE 分类都在白名单内", bool(used) and used <= allowed,
+           f"{len(used)} 个分类" + (f", 越界: {sorted(used - allowed)}" if used - allowed else ""))
+    # 降级 (拿不到分流数据库) 时国内 App 那一层必须还在 —— 真机反馈的
+    # "国内网站 / 公众号 / 小程序都走代理" 就是这一层缺失造成的。
+    degraded = share_links.clash_profile(config.load_state(), "smart", geo=False)
+    ok = ("GEOSITE," not in degraded and "GEOIP,CN" not in degraded
+          and "DOMAIN-SUFFIX,qq.com," in degraded and "DOMAIN-SUFFIX,alipay.com," in degraded)
+    record("降级配置保留国内 App 直连 (不含任何 geo 规则)", ok)
 
     if singbox_bin:
         print("\n[2d] 用真实 sing-box 实跑订阅 (节点不可达也必须起得来)")

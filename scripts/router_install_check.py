@@ -441,6 +441,11 @@ def main() -> int:
         check("没有数据库时不再要 geo 规则",
               degraded.returncode == 0 and "GEOIP,CN" not in degraded.stdout
               and "GEOSITE," not in degraded.stdout)
+        # 降级 ≠ 没有国内直连: 国内 App 那一层是纯域名规则, 不依赖数据库, 必须原样保留。
+        # 少了它, 全屋流量 (微信 / 支付宝 / 公众号 / 小程序) 全部走节点。
+        check("降级后仍保留国内 App 直连 (微信 / 支付宝 …)",
+              "DOMAIN-SUFFIX,qq.com,🎯 全球直连" in degraded.stdout
+              and "DOMAIN-SUFFIX,alipay.com,🎯 全球直连" in degraded.stdout)
         check("降级配置仍是完整的路由器配置 (tun + 策略组)",
               "tun:" in degraded.stdout and "proxy-groups:" in degraded.stdout)
         again = subprocess.run(["sh", agent_path, "geo"], capture_output=True, text=True)

@@ -804,7 +804,11 @@ def _dashboard_body(state: dict, request: Request, traffic: dict | None = None) 
         "routing": {
             "template": share_links.template_of(state),
             "templates": [
-                {"id": "smart", "name": "智能分流", "desc": "国内直连 + 广告拦截, 其余走代理"},
+                {
+                    "id": "smart",
+                    "name": "智能分流",
+                    "desc": "国内直连 (含微信/支付宝等 App) + 广告拦截, 其余走代理",
+                },
                 {"id": "global", "name": "全局代理", "desc": "除局域网外全部走代理"},
                 {"id": "direct", "name": "全部直连", "desc": "不下载 geo 数据, 全部直连 (手动切组)"},
             ],
