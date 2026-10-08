@@ -657,6 +657,31 @@ def test_doctor_answers_whether_traffic_actually_flows():
     assert "局域网 DNS 已进内核" in text
 
 
+def test_panel_version_is_bumped_when_the_readme_says_so():
+    """README 最后一段标着的版本号必须等于面板的 `__version__`。
+
+    为什么值得一条测试 —— 这是一个**只有用户会碰到**的失败: 改了面板代码却没动
+    `__version__`, 面板的「检查更新」就会一直显示"已是最新"、按钮也不去拉代码 (升级检查
+    读的是远端仓库里那一行, 和本地比较)。开发者本地怎么测都是好的, 用户却卡住。
+
+    把"README 里写的最新版本"和"代码里的版本"绑在一起: 写完一段新的变更记录却忘了改版本号,
+    这里就会红。
+    """
+    import re
+
+    from zeroproxy import __version__
+    from zeroproxy import router_client
+
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(router_client.__file__))))
+    readme = open(os.path.join(repo, "README.md"), encoding="utf-8").read()
+    sections = re.findall(r"^### 8\.\d+ v([0-9][0-9.]*)[^\n]*$", readme, re.M)
+    assert sections, "README 的变更记录里应当带版本号"
+    assert sections[-1] == __version__, (
+        f"README 最后一段写的是 v{sections[-1]}, 而 __version__ 是 {__version__} —— "
+        "改了面板代码就要动版本号, 否则用户点「检查更新」永远显示已是最新"
+    )
+
+
 def test_local_override_lets_the_router_be_switched_without_the_panel():
     """家里网出问题时, 面板往往正好不可达 —— 而那时**最需要**能关掉代理。
 
