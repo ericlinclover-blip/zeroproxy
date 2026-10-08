@@ -670,6 +670,33 @@ def test_zpcore_version_number_has_exactly_one_source():
     assert "-X main.agentVersion=$VERSION" in build, "构建时必须把版本号注入进去"
 
 
+def test_heredoc_scripts_define_every_variable_they_use():
+    """heredoc 里写出来的脚本是**独立文件**, 作用域与安装脚本完全无关。
+
+    安装脚本顶部定义的变量 (ZP_API / ZP_MIXED / ZP_DIR …) 在 CLI / agent 里必须**自己再
+    定义一次**, 否则运行时就是一个空串 —— 而且不会报错, 只会静默走错分支。
+
+    真机上就是这么栽的第二次 (`ZP_MIXED` 那次我记得加, `ZP_API` 忘了): doctor 的"按域名
+    分流"查的是 `$ZP_API/connections`, 而 ZP_API 只在安装脚本里定义过 —— CLI 里它是空的,
+    URL 变成 `http:///connections`, curl 必然失败, 于是**在任何机器上**都显示
+    "暂时没有被嗅探出域名的连接"。看起来像"设备还没开始用网", 其实是它问错了地址。
+    """
+    import re
+
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+    for marker in ("CLIEOF", "AGENTEOF"):
+        got = re.search(rf"<<'{marker}'\n(.*?)\n{marker}\n", text, re.S)
+        assert got, f"安装脚本里应当有 {marker} 这一段"
+        body = got.group(1)
+        # 这一段里自己赋值过的大写变量 (含大小写混排的自定义变量)
+        assigned = set(re.findall(r"^\s*([A-Za-z_][A-Za-z0-9_]*)=", body, re.M))
+        used = set(re.findall(r"\$\{?(ZP_[A-Za-z0-9_]+)", body))
+        missing = sorted(v for v in used if v not in assigned)
+        assert not missing, f"{marker} 里用了但没定义的变量: {missing} (跨文件作用域不共享)"
+
+
 def test_local_control_plane_source_and_build_script_ship_with_the_repo():
     """zpcore 的源码与构建脚本要跟着仓库走 —— 它没有上游可以下载 (内核是从 GitHub 取的,
     它不行)。构建脚本还要覆盖全部架构: 漏一个, 那一档路由器就静默退回旧路径。"""

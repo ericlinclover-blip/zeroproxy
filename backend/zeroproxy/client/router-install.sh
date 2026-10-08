@@ -1987,8 +1987,11 @@ AGENTINITEOF
 # ZeroProxy 路由器客户端运维命令
 ZP_DIR=/etc/zeroproxy
 ZP_VERSION="__ZP_CLIENT_VERSION__"
-# 本机代理端口 (config.yaml 的 mixed-port) —— doctor 的出口测试用它
+# 本机代理端口与内核控制口 —— doctor 用它们做出口测试与"按域名分流"检查。
+# 注意这两个必须在**这里**定义: CLI 是独立的文件, 与安装脚本不共享作用域 (漏掉一个的
+# 症状是变量为空、URL 变成 http:///connections、然后静默显示"没有连接")。
 ZP_MIXED=7890
+ZP_API=127.0.0.1:9090
 SERVERS="$ZP_DIR/servers"
 FIRST="$(ls "$SERVERS"/*.json 2>/dev/null | head -n1)"
 
@@ -2098,8 +2101,13 @@ doctor() {
     _sniffed="$(sniffed_hosts 2>/dev/null || true)"
     if [ -n "$_sniffed" ] && [ "${_sniffed:-0}" -gt 0 ] 2>/dev/null; then
         printf '  ✓ 按域名分流在工作：%s 条连接被嗅探出域名\n' "$_sniffed"
+    elif [ "${_pkts:-0}" -gt 0 ] 2>/dev/null; then
+        # 有流量经过却一条域名都没嗅探出来 —— 这才可疑: 分流会退化成"按 IP 判断",
+        # 国内/国外那套规则基本失效 (TLS 之外还有一大半流量是靠 SNI 认出来的)。
+        printf '  ! 有流量经过, 但一条都没嗅探出域名 —— 分流在按 IP 判断\n'
+        printf '      看一下 /etc/zeroproxy/config.yaml 里 sniffer.enable 是不是 true\n'
     else
-        printf '  · 暂时没有"被嗅探出域名"的连接（设备还没开始用网?）\n'
+        printf '  · 这一刻没有活跃的"被嗅探出域名"的连接（刚开机 / 刚好空闲 / 设备还没开始用网）\n'
     fi
     if [ "$(running)" = yes ] && [ "${_dnspkts:-0}" -gt 0 ] 2>/dev/null; then
         printf '  · 另有 %s 个查询是设备直接查外部 DNS 的，已被内核接管\n' "$_dnspkts"
