@@ -2032,17 +2032,23 @@ datapath_packets() {
     esac
 }
 
-# 有多少条连接被**嗅探出了域名** —— 这是"按域名分流真的在工作"的证据, 三种数据面都成立。
+# 有多少条连接**已经被识别出域名** —— 这是"按域名分流真的在工作"的证据, 三种数据面都成立。
 #
-# 为什么不拿 DNS 计数器当判据: 局域网设备通常查**路由器自己的 dnsmasq**, 那是本机服务 ——
-# 既不进 tun, 也不会命中 nft/iptables 里那条"53 重定向"(它只拦发往外部 DNS 的查询)。
-# 所以"DNS 计数为 0"是正常状态, 不是故障。第一版 doctor 把它写成"设备可能没把路由器当
-# DNS", 方向正好反了 (真机上 DNS 那一行打着"!", 而代理其实一切正常)。
+# 域名从哪来, 两条路都有:
+#   * 设备的 DNS 走到内核 (查运营商 DNS 的查询会被 dns-hijack 接住, 给出 fake-ip) →
+#     mihomo 手里有 fake-ip → 域名 的映射, 连接一进来就知道域名;
+#   * DNS 没进内核 (设备查的是路由器自己的 dnsmasq, 那是本机服务) → 连接是真实 IP, 靠
+#     **嗅探**从 TLS SNI / HTTP Host 里把域名认回来。
+# 所以"host 或 sniffHost 任一非空"才算数 —— 只数 host 会漏掉纯嗅探的那一半。
+#
+# 为什么不拿 DNS 计数器当判据: 它只统计"设备直接查外部 DNS"的那一部分, 为 0 是正常状态。
+# 第一版 doctor 把它写成"设备可能没把路由器当 DNS", 方向正好反了 (真机上那一行打着"!",
+# 而代理其实一切正常)。
 sniffed_hosts() {
     command -v curl >/dev/null 2>&1 || return 1
     _conn="$(curl -s -m 5 "http://$ZP_API/connections" 2>/dev/null || true)"
     [ -n "$_conn" ] || return 1
-    printf '%s' "$_conn" | grep -o '"host"[ ]*:[ ]*"[^"]\{1,\}"' | wc -l | tr -d ' '
+    printf '%s' "$_conn" | grep -oE '"(host|sniffHost)"[ ]*:[ ]*"[^"]{1,}"' | wc -l | tr -d ' '
 }
 
 # 真机体检。它问的每一句都是"到底行不行", 每一条都给证据 —— 装机之后、出问题时第一个
@@ -2100,20 +2106,21 @@ doctor() {
     # 局域网设备查的是路由器自己的 dnsmasq (本机服务), DNS 计数为 0 是正常的。
     _sniffed="$(sniffed_hosts 2>/dev/null || true)"
     if [ -n "$_sniffed" ] && [ "${_sniffed:-0}" -gt 0 ] 2>/dev/null; then
-        printf '  ✓ 按域名分流在工作：%s 条连接被嗅探出域名\n' "$_sniffed"
+        printf '  ✓ 按域名分流在工作：%s 条连接已经识别出域名\n' "$_sniffed"
     elif [ "${_pkts:-0}" -gt 0 ] 2>/dev/null; then
         # 有流量经过却一条域名都没嗅探出来 —— 这才可疑: 分流会退化成"按 IP 判断",
         # 国内/国外那套规则基本失效 (TLS 之外还有一大半流量是靠 SNI 认出来的)。
         printf '  ! 有流量经过, 但一条都没嗅探出域名 —— 分流在按 IP 判断\n'
         printf '      看一下 /etc/zeroproxy/config.yaml 里 sniffer.enable 是不是 true\n'
     else
-        printf '  · 这一刻没有活跃的"被嗅探出域名"的连接（刚开机 / 刚好空闲 / 设备还没开始用网）\n'
+        printf '  · 这一刻没有活跃的"已知域名"的连接（刚开机 / 刚好空闲 / 设备还没开始用网）\n'
     fi
     if [ "$(running)" = yes ] && [ "${_dnspkts:-0}" -gt 0 ] 2>/dev/null; then
         printf '  · 另有 %s 个查询是设备直接查外部 DNS 的，已被内核接管\n' "$_dnspkts"
     fi
-    printf '    局域网设备通常查路由器自己的 dnsmasq —— 那是本机服务，不进 tun 也不命中 53 重定向，\n'
-    printf '    所以"DNS 计数为 0"是正常的；要证明的是上面那条（按域名分流）。\n'
+    printf '    设备的 DNS 有两条路: 查路由器自己的 dnsmasq（本机服务, 不进内核, 于是连接靠嗅探认出域名），\n'
+    printf '    或查运营商 DNS（IPv6 上很常见, 它会进内核并被 dns-hijack 成 fake-ip）—— 两条路都按域名分流。\n'
+    printf '    所以"DNS 计数为 0"只说明这一刻没人直接查外部 DNS, 不是故障; 要证明的是上面那条。\n'
 
     echo
     echo "IPv6"

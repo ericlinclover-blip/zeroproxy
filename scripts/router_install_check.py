@@ -850,7 +850,7 @@ def main() -> int:
         # DNS 那一行**不许**再写成"设备可能没把路由器当 DNS": 局域网设备查的是路由器自己的
         # dnsmasq (本机服务), 计数为 0 本来就正常 —— 真机上它打着"!" 而代理一切正常。
         check("doctor: DNS 那一行不再把'计数为 0'当成故障",
-              "按域名分流" in doctor and "是正常的" in doctor
+              "按域名分流" in doctor and "不是故障" in doctor
               and "设备可能没把路由器当 DNS" not in doctor,
               [ln.strip() for ln in doctor.splitlines() if "DNS" in ln or "域名分流" in ln][:2])
 

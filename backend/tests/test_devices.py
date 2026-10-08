@@ -748,9 +748,13 @@ def test_doctor_answers_whether_traffic_actually_flows():
     # DNS 那一行不能拿计数器当判据: 局域网设备查的是**路由器自己的 dnsmasq**(本机服务),
     # 既不进 tun 也不命中 53 重定向 —— 计数为 0 本来就正常。第一版把它写成"设备可能没把
     # 路由器当 DNS", 方向正好反了 (真机上它打着"!" 而代理一切正常)。
-    assert "sniffed_hosts() {" in text, "要按'嗅探出域名的连接数'判断分流是否在工作"
-    assert "按域名分流在工作" in text
-    assert "设备可能没把路由器当 DNS" not in text, "那句是错的, 方向反了"
+    assert "sniffed_hosts() {" in text, "要按'已识别出域名的连接数'判断分流是否在工作"
+    assert "按域名分流在工作" in text and "已经识别出域名" in text
+    # fake-ip 路线只填 host、纯嗅探路线只填 sniffHost —— 只数一个会漏掉另一半
+    assert '"(host|sniffHost)"' in text
+    # 只查**真正的输出**: 注释里解释"那句以前是错的"是可以的
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    assert "设备可能没把路由器当 DNS" not in code, "那句是错的, 方向反了"
     assert "是正常的" in text and "nft" in text  # 解释里要讲清为什么 0 是正常的
 
 
