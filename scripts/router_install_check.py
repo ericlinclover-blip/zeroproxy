@@ -668,7 +668,7 @@ def main() -> int:
             check("面板直传太慢时, 安装脚本自己换到直连镜像", ok_slow,
                   out_slow.strip().splitlines()[-1][:60] if out_slow.strip() else "")
             check("换路时说清了原因与实测速率",
-                  "面板直传没能在" in out_slow and "KB/s" in out_slow)
+                  "面板直传太慢" in out_slow and "KB/s" in out_slow)
             check("下载过程一直有速率可看 (不再是一行不动的输出)", out_slow.count("KB/s") >= 2)
             check("用的是面板给的那张镜像表", "直连镜像完成" in out_slow)
         finally:

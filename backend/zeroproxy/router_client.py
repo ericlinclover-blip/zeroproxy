@@ -21,7 +21,7 @@ import urllib.request
 from .config import paths
 
 #: 路由器端脚本版本 (会显示在面板的设备卡上; 改了脚本就 +1)
-SCRIPT_VERSION = "1.2.1"
+SCRIPT_VERSION = "1.2.2"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"

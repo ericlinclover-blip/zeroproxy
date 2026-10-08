@@ -512,7 +512,216 @@ def test_install_ui_always_makes_a_token_and_prints_it():
     assert 'UI_URL_K="$UI_URL?k=$(cat "$ZP_DIR/ui.token"' in text, "要拼出带令牌的地址"
     assert 'ok "浏览器打开: $UI_URL_K"' in text, "安装摘要要打印带令牌的地址"
     # CLI 的 `zeroproxy ui` 一直就是打印带令牌的地址 —— 别把它改成裸地址
-    assert 'echo "http://$_ip/cgi-bin/zeroproxy?k=$(cat "$ZP_DIR/ui.token"' in text
+    # (端口要带上: 固件自己的 Web 服务发不出页面时, 界面在自带 httpd 的那个端口上)
+    assert 'echo "http://$_ip$_port/cgi-bin/zeroproxy?k=$(cat "$ZP_DIR/ui.token"' in text
+
+
+def test_install_ui_verifies_and_falls_back_to_its_own_httpd():
+    """装完必须**真的取一次**页面, 取不到就换自己的 httpd —— 而不是打印一条死地址。
+
+    真机 (GL-MT3600BE · arm64 · GL.iNet 原厂 OpenWrt 21.02-SNAPSHOT / 内核 5.4.281,
+    没有 LuCI): 界面文件写进了 /www, 但原厂 nginx 没有把 /cgi-bin/ 交给脚本 ——
+    于是自检那一句 "本机自检没通过" 挂在那儿, 用户看到 URL 打不开。
+
+    现在的口径: 落盘之后依次走两条路, 每条都要看到**页面内容**才算通 ——
+      ① 固件自己的 Web 服务 (80 端口, 不开新端口);
+      ② 自带的 busybox httpd (只在 ① 不通时起, 只绑局域网地址, 照旧只认界面令牌)。
+    判据必须看内容: 200 也可能是把 cgi 脚本当静态文件发出来, 那种情况"页面"是一坨 shell。
+    """
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+
+    # 判据是页面里的 <title> —— cgi 脚本里没有它, 所以"脚本被当文件下载"不会误判成通过
+    assert "UI_MARK='<title>ZeroProxy'" in text, "自检要看页面内容, 不能只看状态码"
+    assert 'ui_probe "http://127.0.0.1/cgi-bin/zeroproxy"' in text, "先试固件自己的 Web 服务"
+    assert "ui_start_local_httpd" in text, "发不出来要有自带 httpd 的兜底"
+
+    # 兜底服务的两条硬约束: 只绑局域网地址 (绝不 0.0.0.0), 且与固件 Web 服务走同一个
+    # 脚本 (/cgi-bin/zeroproxy 仍然是唯一入口, 令牌校验照旧在 cgi 里)
+    assert 'httpd -f -p "$_ip:$UI_PORT" -h "$ZP_DIR/www"' in text, "自带 httpd 只绑 LAN 地址"
+    # 找不到 LAN 地址就不启动 —— 绝不退化成"绑所有接口" (那等于把界面挂到 WAN 上)
+    assert '[ -n "$_ip" ] || return 0' in text, "兜底服务不能绑到所有接口"
+    assert "/cgi-bin/zeroproxy" in text
+
+    # 端口写进 ui.port, 界面地址由它算出来 (LAN 地址换了也算得对); agent 与 CLI 都认它
+    assert 'printf \'%s\' "$UI_PORT" > "$ZP_DIR/ui.port"' in text
+    assert 'cat "$ZP_DIR/ui.port"' in text
+    # 两条路都不通时要把兜底服务收拾干净, 不留一个跑不起来的开机服务
+    assert "ui_stop_local_httpd" in text
+    assert "zeroproxy-ui disable" in text
+
+
+def test_router_ui_cgi_serves_the_page_from_wherever_it_was_installed(tmp_path):
+    """cgi 要能自己找到页面文件 —— 它现在有两个可能的家 (见安装脚本的 install_ui)。
+
+    走固件 Web 服务的固件, 页面在 /www/zeroproxy; 原厂固件那条路 (没有 /cgi-bin/) 用
+    自带的 busybox httpd, 文档根是 /etc/zeroproxy/www —— 页面在 /etc/zeroproxy/www/zeroproxy。
+    所以脚本不能写死一个路径: SCRIPT_FILENAME 有的服务器给、有的不给 (busybox httpd 给,
+    fcgiwrap 看配置), 那就"给就用它推, 不给就按顺序找"。
+
+    这里真的把那份 cgi 当 cgi 跑一遍 (macOS/BSD 的 sh 就够), 只看它能不能把**页面**
+    发出来 —— 数据接口那部分要 /etc/zeroproxy 下的凭据, 本机没有, 也不该在测试里去碰。
+    """
+    import subprocess
+
+    from zeroproxy import router_client
+
+    cgi, _media, _name = router_client.ui_file("cgi")
+    page, _m, _n = router_client.ui_file("index.html")
+
+    # 自带 httpd 的布局: <root>/cgi-bin/zeroproxy + <root>/zeroproxy/index.html
+    root = tmp_path / "www"
+    (root / "cgi-bin").mkdir(parents=True)
+    (root / "zeroproxy").mkdir()
+    (root / "cgi-bin" / "zeroproxy").write_text(cgi, encoding="utf-8")
+    (root / "zeroproxy" / "index.html").write_text(page, encoding="utf-8")
+
+    env = {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "REQUEST_METHOD": "GET",
+        "QUERY_STRING": "",
+        "SCRIPT_FILENAME": str(root / "cgi-bin" / "zeroproxy"),
+    }
+    out = subprocess.run(["sh", str(root / "cgi-bin" / "zeroproxy")],
+                         capture_output=True, text=True, env=env)
+    assert out.returncode == 0, out.stderr
+    assert "<title>ZeroProxy" in out.stdout, "cgi 要从 SCRIPT_FILENAME 推出页面目录"
+    assert out.stdout.startswith("Content-Type: text/html"), "页面要带自己的响应头"
+
+    # 页面不在推出来的那个目录时 (老的 uhttpd 布局), 也要能找到 /www/zeroproxy 那份
+    assert "for _d in" in cgi, "要按顺序找, 而不是认死一个路径"
+
+
+def test_ui_probe_checks_content_not_just_the_status_code(tmp_path):
+    """自检的判据必须是**页面内容**, 不能是状态码。
+
+    这台真机 (GL.iNet 原厂 21.02-SNAPSHOT, 没有 LuCI) 的现象: 原厂 nginx 没有把
+    /cgi-bin/ 交给脚本, 于是 /www/cgi-bin/zeroproxy 被当成**静态文件**发出来 —— HTTP 200,
+    正文是那份 shell 源码。只看状态码的自检在这里会判"通过", 然后用户打开的是一坨脚本。
+
+    所以这里起两个本地服务器: 一个按原厂那条路发**脚本源码**, 一个发**页面**。把安装
+    脚本里的 ui_probe 原样抠出来跑一遍, 它必须只认后者。
+    """
+    import http.server
+    import re
+    import subprocess
+    import threading
+
+    from zeroproxy import router_client
+
+    cgi_src, _m, _n = router_client.ui_file("cgi")
+    page_src, _m, _n = router_client.ui_file("index.html")
+
+    def serve(payload: str) -> tuple[http.server.ThreadingHTTPServer, str]:
+        body = payload.encode()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):  # pragma: no cover - 别刷屏
+                pass
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv, f"http://127.0.0.1:{srv.server_address[1]}/cgi-bin/zeroproxy"
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+    fn = re.search(r"ui_probe\(\) \{.*?\n\}", text, re.S)
+    assert fn, "安装脚本里应当有 ui_probe"
+    mark = re.search(r"UI_MARK='([^']*)'", text)
+    assert mark and "<title>" in mark.group(1), "自检标记要落在页面的 <title> 上"
+    (tmp_path / "ui.token").write_text("token-for-test\n", encoding="utf-8")
+    probe = (
+        'HTTP=curl; TLS_OPTS="";\n'
+        'http_get() { curl -fsS -m 5 "$1"; }\n'
+        f'ZP_DIR="{tmp_path}";\n'
+        f"UI_MARK='{mark.group(1)}';\n"
+        + fn.group(0) +
+        '\nui_probe "$1"\n'
+    )
+
+    static_srv, static_url = serve(cgi_src)
+    page_srv, page_url = serve(page_src)
+    try:
+        bad = subprocess.run(["sh", "-c", probe, "sh", static_url],
+                             capture_output=True, text=True)
+        assert bad.returncode != 0, "把脚本当静态文件发出来 (200) 不能算通过"
+        good = subprocess.run(["sh", "-c", probe, "sh", page_url],
+                              capture_output=True, text=True)
+        assert good.returncode == 0, "真的发出页面才算通过"
+    finally:
+        static_srv.shutdown()
+        page_srv.shutdown()
+
+
+def test_local_httpd_init_script_only_binds_the_lan_address(tmp_path):
+    """兜底 httpd 的 procd 服务: 在本机把那个 init 脚本真的跑一遍, 看它拼出什么命令。
+
+    本机没有 busybox httpd 可跑 (macOS 也没有 procd), 所以这里给几个桩函数 —— 验的是
+    最容易犯的两个错: 绑成所有接口 (等于把管理界面挂到 WAN 上), 或者把 httpd 的文档根
+    指错 (指错就是 404, 白装一个服务)。
+    """
+    import os
+    import re
+    import subprocess
+
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+    got = re.search(r"cat > \"\$ZP_INIT_UI\" <<'UIINITEOF'\n(.*?)\nUIINITEOF\n", text, re.S)
+    assert got, "安装脚本里应当有兜底 httpd 的 init 脚本"
+    init_body = (got.group(1)
+                 .replace("__ZP_UI_PORT__", "8399")
+                 .replace("__ZP_BUSYBOX__", "/bin/busybox"))
+
+    root = tmp_path / "zp"
+    (root / "www" / "cgi-bin").mkdir(parents=True)
+    page = root / "www" / "cgi-bin" / "zeroproxy"
+    page.write_text("#!/bin/sh\n", encoding="utf-8")
+    page.chmod(0o755)
+    init = (tmp_path / "initd-ui")
+    init.write_text(init_body.replace("/etc/zeroproxy", str(root)), encoding="utf-8")
+
+    # uci 是桩 (本机没有): 它给出局域网地址。写不出地址的那一次要"不启动"。
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    uci = bindir / "uci"
+    uci.write_text("#!/bin/sh\n", encoding="utf-8")
+    uci.chmod(0o755)
+    # ip 也桩掉 (Linux 上真有一堆非回环地址, 不桩的话"写不出地址"那一趟会碰巧成功)
+    ip_stub = bindir / "ip"
+    ip_stub.write_text("#!/bin/sh\n", encoding="utf-8")
+    ip_stub.chmod(0o755)
+
+    def run(start: bool) -> str:
+        uci.write_text("#!/bin/sh\n" + ("printf 192.168.8.1\n" if start else "true\n"),
+                       encoding="utf-8")
+        harness = tmp_path / "harness.sh"
+        harness.write_text(
+            "procd_open_instance() { echo OPEN; }\n"
+            "procd_set_param() { echo \"PARAM $*\"; }\n"
+            "procd_close_instance() { echo CLOSE; }\n"
+            f'. "{init}"\n'
+            "start_service\n",
+            encoding="utf-8",
+        )
+        out = subprocess.run(["sh", str(harness)], capture_output=True, text=True,
+                             env={"PATH": f"{bindir}:{os.environ.get('PATH', '')}"})
+        assert out.returncode == 0, out.stderr
+        return out.stdout
+
+    served = run(True)
+    assert "PARAM command /bin/busybox httpd -f -p 192.168.8.1:8399 -h " in served
+    assert str(root / "www") in served, "文档根要指向页面真正落盘的那个目录"
+
+    stopped = run(False)
+    assert "OPEN" not in stopped, "找不到 LAN 地址就不能启动 (绝不绑所有接口)"
 
 
 def test_install_script_parses_booleans_on_any_sed():

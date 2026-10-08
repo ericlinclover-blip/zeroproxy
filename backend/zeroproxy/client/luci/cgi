@@ -1,9 +1,9 @@
 #!/bin/sh
-# ZeroProxy 路由器管理界面的数据接口 (uhttpd 在 /cgi-bin/zeroproxy 执行)。
+# ZeroProxy 路由器管理界面的页面 + 数据接口 (在 /cgi-bin/zeroproxy 执行)。
 #
-# 为什么不自己起一个监听端口: 路由器上的每一个监听端口都是一个可能被扫的入口。
-# 这里复用 uhttpd, 并且**逐次校验 LuCI 会话** —— 只有已登录 LuCI 的浏览器才能
-# 拿到数据, 也不需要再发明一套登录。
+# 为什么由这个脚本自己发页面, 而不靠静态目录: 固件之间的文档根/Web 服务差别太大 ——
+# uhttpd 的 /www 能用, nginx+fcgiwrap 的固件上静态目录返回 403, 而原厂 nginx (没有
+# LuCI) 干脆没有 /cgi-bin/ 这条 location。脚本由 cgi 环节发出, 这几条路都能走。
 #
 # 输出一律是 JSON: {"ok":true,...} / {"ok":false,"error":"..."}
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
@@ -13,6 +13,24 @@ ZP_DIR=/etc/zeroproxy
 CLI=/usr/bin/zeroproxy
 #: 查询串要在鉴权之前解析 —— 令牌就是从它里面取的
 QS="${QUERY_STRING:-}"
+
+# 页面文件在哪: 默认是固件的文档根 (/www/zeroproxy), 兜底 httpd 那条路放在
+# /etc/zeroproxy/www/zeroproxy。判据是"文件在不在" —— SCRIPT_FILENAME 有的服务器
+# (busybox httpd / fcgiwrap / uhttpd) 给、有的不给, 指望它不如自己找一遍。
+ui_page_dir() {
+    _derived=""
+    if [ -n "${SCRIPT_FILENAME:-}" ]; then
+        _derived="$(dirname "$(dirname "$SCRIPT_FILENAME")")/zeroproxy"
+    fi
+    for _d in "${ZP_PAGE_DIR:-}" "$_derived" /www/zeroproxy "$ZP_DIR/www/zeroproxy"; do
+        if [ -n "$_d" ] && [ -f "$_d/index.html" ]; then
+            printf '%s' "$_d"
+            return 0
+        fi
+    done
+    printf '/www/zeroproxy'
+}
+PAGE_DIR="$(ui_page_dir)"
 
 header() {
     printf 'Content-Type: application/json; charset=utf-8\r\n'
@@ -54,13 +72,13 @@ fi
 want="$(printf '%s' "$QS" | tr '&' '\n' | sed -n 's/^file=//p' | head -n1)"
 if [ "$want" = "app.js" ]; then
     printf 'Content-Type: text/javascript; charset=utf-8\r\nCache-Control: no-store\r\n\r\n'
-    cat /www/zeroproxy/app.js 2>/dev/null
+    cat "$PAGE_DIR/app.js" 2>/dev/null
     exit 0
 fi
 act="$(printf '%s' "$QS" | tr '&' '\n' | sed -n 's/^a=//p' | head -n1)"
 if [ -z "$act" ] && [ -z "$want" ]; then
     printf 'Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n\r\n'
-    cat /www/zeroproxy/index.html 2>/dev/null
+    cat "$PAGE_DIR/index.html" 2>/dev/null
     exit 0
 fi
 

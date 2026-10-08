@@ -24,6 +24,8 @@ ZP_DEV="$ZP_DIR/device.json"
 ZP_BIN="$ZP_DIR/mihomo"
 ZP_INIT=/etc/init.d/zeroproxy
 ZP_AGENT_INIT=/etc/init.d/zeroproxy-agent
+# 固件自己的 Web 服务发不出页面时用的兜底 httpd (见 install_ui)
+ZP_INIT_UI=/etc/init.d/zeroproxy-ui
 ZP_CLI=/usr/bin/zeroproxy
 ZP_SVC=zeroproxy
 
@@ -60,6 +62,10 @@ fi
 step() { printf '%s==>%s %s\n' "$C_B" "$C_R" "$*"; }
 ok()   { printf '%s  ✓%s %s\n' "$C_G" "$C_R" "$*"; }
 warn() { printf '%s  !%s %s\n' "$C_Y" "$C_R" "$*" >&2; }
+# 说明性的一行 (既不是成功, 也不是警告)。什么时候用它: 某条**用不到**的回退路径不可用时
+# —— 例如有 TUN 的机器上 tproxy 模块装不上。那件事是真的, 但把它写成 "!" 会让人以为
+# 安装出了问题 (真机反馈里就是这么被读的)。
+note() { printf '  · %s\n' "$*"; }
 die()  { printf '\n%s安装失败:%s %s\n' "$C_E" "$C_R" "$*" >&2; exit 1; }
 
 # ---------------------------------------------------------------- HTTP
@@ -120,17 +126,29 @@ http_post() {
 #   502 → 面板自己取不到上游, 该换条路或明确报错。
 # curl 有 -w 能直接给出状态码; uclient-fetch / wget 没有这个能力, 那里只能退化成
 # "拿到的东西像不像一个内核" —— 所以下面还留了一条按内容识别的兜底。
+#
+# 第 4/5 个参数是"速率闸门" (KB/s, 观察窗口秒数): curl 在这条线上**平均速率**低于它
+# 超过窗口时间就自己掐断。这不是优化, 是"这条路根本跑不完"的判定 —— 真机上面板直传
+# 63 KB/s, 20 MB 要五分钟, 而我们只给它 CORE_PANEL_BUDGET 秒: 与其把那 90 秒耗完,
+# 不如 20 秒就认清、让位给直连镜像 (那次镜像 931 KB/s)。uclient-fetch / wget 没有
+# 这个能力, 那边只能靠 -T 到点失败。
 http_fetch_to() {
-    _url="$1"; _dest="$2"; _tmo="${3:-900}"
+    _url="$1"; _dest="$2"; _tmo="${3:-900}"; _min_kbps="${4:-0}"; _win="${5:-25}"
     HTTP_CODE=""
+    _speed=""
+    if [ "${_min_kbps:-0}" -gt 0 ] 2>/dev/null; then
+        _speed="--speed-limit $((_min_kbps * 1024)) --speed-time $_win"
+    fi
     # -L 不能少: GitHub 官方直链会 302 到 objects.githubusercontent.com, 有的反代也会跳。
     # 不跟随重定向的话, 拿到的只是那几十字节的跳转页 —— 大小闸门会把它当"面板的一句话"。
     case "$HTTP" in
         curl)
             if [ "$TLS_OPTS" = "insecure" ]; then
-                if HTTP_CODE="$(curl -sSkL -m "$_tmo" -o "$_dest" -w '%{http_code}' "$_url" 2>/dev/null)"; then _rc=0; else _rc=1; fi
+                # shellcheck disable=SC2086
+                if HTTP_CODE="$(curl -sSkL -m "$_tmo" $_speed -o "$_dest" -w '%{http_code}' "$_url" 2>/dev/null)"; then _rc=0; else _rc=1; fi
             else
-                if HTTP_CODE="$(curl -sSL -m "$_tmo" -o "$_dest" -w '%{http_code}' "$_url" 2>/dev/null)"; then _rc=0; else _rc=1; fi
+                # shellcheck disable=SC2086
+                if HTTP_CODE="$(curl -sSL -m "$_tmo" $_speed -o "$_dest" -w '%{http_code}' "$_url" 2>/dev/null)"; then _rc=0; else _rc=1; fi
             fi
             [ -n "$HTTP_CODE" ] || HTTP_CODE="000"
             # curl 自己的退出码也要认: `-m` 到点被掐断时它**照样会打出 200** (响应头早
@@ -299,6 +317,17 @@ detect_env() {
 # 那边又去重下一次, 空间算错。
 core_reusable() { [ -x "$ZP_BIN" ] && "$ZP_BIN" -v >/dev/null 2>&1; }
 
+# 局域网地址。三处要用它 (安装摘要 / 自带 httpd / agent 上报), 而且**不能**拿它当
+# "随便一个本机地址": 兜底 httpd 只绑这个地址, 猜错就绑不上, 猜成 0.0.0.0 则等于把
+# 管理界面挂到 WAN 上。所以先问 uci (权威), 再从接口地址里取第一个非回环 IPv4。
+lan_ip() {
+    _lan="$(uci get network.lan.ipaddr 2>/dev/null || true)"
+    [ -n "$_lan" ] || _lan="$(ip -4 addr show 2>/dev/null \
+        | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | grep -v '^127\.' | head -n1 || true)"
+    [ -n "$_lan" ] || _lan="192.168.1.1"
+    printf '%s' "$_lan"
+}
+
 preflight() {
     step "检查环境"
     ok "设备: $MODEL · $ARCH · $OS_NAME (内核 $KERNEL)"
@@ -419,51 +448,92 @@ EOF
 }
 
 # ---------------------------------------------------------------- 依赖
-# TUN 模式只需要 kmod-tun; tproxy 回退需要 kmod-nft-tproxy。
-# 软件源不可用 (改过源的机器很常见) 不算致命 —— 内核模块可能已经装好了。
+# 主方案是 TUN (kmod-tun), tproxy (kmod-nft-tproxy) 只是"没有 TUN 时"的回退。
 #
-# OpenWrt 25.12 起包管理器从 opkg 换成了 apk (Alpine 那套)。只认 opkg 的写法在这类
-# 固件上是**静默跳过**: 两个 kmod 一个都没装, 安装过程看着全绿, 实际上 TUN 建不出来、
-# tproxy 回退也没有 nft 规则 —— 全屋代理名存实亡。所以两套都试, 并且把"手动补一条"
-# 的命令原样打出来。
+# 两台真机把这段代码的坑都踩出来了:
+#   * OpenWrt 25.12 起包管理器从 opkg 换成了 apk (Alpine 那套)。只认 opkg 的写法在这类
+#     固件上是**静默跳过**: 两个 kmod 一个都没装, 安装过程看着全绿, 而 TUN 建不出来、
+#     tproxy 回退也没有 nft 规则 —— 全屋代理名存实亡。所以两套都认。
+#   * 原厂固件 (GL.iNet 21.02-SNAPSHOT / 内核 5.4.281) 的软件源和它自己那个内核**对不上**,
+#     `opkg install kmod-nft-tproxy` 必然失败。但这台机器有 TUN, 那个模块一次都用不到 ——
+#     把它写成 "内核模块安装未全部成功" 的警告, 用户读到的就是"安装坏了"。
+#
+# 所以判据不是"安装命令成没成功", 而是**能力到底在不在**: 两个都试着装 (装不上就算了),
+# 各自验证一次, 再按"这件事到底重要不重要"决定用什么口气说话。
+pkg_install() {
+    if command -v apk >/dev/null 2>&1; then
+        apk add "$1" >/dev/null 2>&1
+    elif command -v opkg >/dev/null 2>&1; then
+        opkg install "$1" >/dev/null 2>&1
+    else
+        return 127
+    fi
+}
+pkg_update() {
+    if command -v apk >/dev/null 2>&1; then
+        apk update >/dev/null 2>&1
+    elif command -v opkg >/dev/null 2>&1; then
+        opkg update >/dev/null 2>&1
+    else
+        return 127
+    fi
+}
+
+# tproxy 到底能不能用 —— 不看包装没装上, 直接问内核: 加一条 tproxy 规则成不成。
+# 为什么不用"模块在不在": tproxy 有可能被编进内核 (那时 /sys/module 里没有它), 而
+# `nft` 会把模块按需加载 —— 真加一条规则才是这件事的最终判据。探针用完就撤掉。
+tproxy_ok() {
+    # 模块已经在 (内核里编进去的用前两个都查不到, 但那极少见) —— 这条路直接算有。
+    [ -d /sys/module/nft_tproxy ] && return 0
+    grep -q '^nft_tproxy ' /proc/modules 2>/dev/null && return 0
+    command -v nft >/dev/null 2>&1 || return 1
+    nft add table inet zp_probe 2>/dev/null || return 1
+    if ! nft add chain inet zp_probe c '{ type filter hook prerouting priority -150; policy accept; }' 2>/dev/null; then
+        nft delete table inet zp_probe 2>/dev/null || true
+        return 1
+    fi
+    if nft add rule inet zp_probe c meta l4proto tcp tproxy to :1 2>/dev/null; then
+        nft delete table inet zp_probe 2>/dev/null || true
+        return 0
+    fi
+    nft delete table inet zp_probe 2>/dev/null || true
+    return 1
+}
+
 install_deps() {
     step "准备网络内核模块"
-    # kmod-nft-tproxy 是 mihomo auto-redirect / tproxy 回退的前提;
-    # kmod-tun 是主方案 (TUN 全屋透明代理) 的前提。两个都小, 一起装。
-    _pkgs=""
-    [ -c /dev/net/tun ] || _pkgs="kmod-tun"
-    _pkgs="${_pkgs:+$_pkgs }kmod-nft-tproxy"
-    if command -v apk >/dev/null 2>&1; then
-        apk update >/dev/null 2>&1 || warn "apk update 失败 (软件源可能不可用), 继续尝试安装已缓存的包"
-        # shellcheck disable=SC2086
-        if apk add $_pkgs >/dev/null 2>&1; then
-            ok "内核模块已装 (apk)"
-        else
-            warn "内核模块安装未全部成功 ($_pkgs) —— 手动补:  apk add $_pkgs"
-        fi
-    elif command -v opkg >/dev/null 2>&1; then
-        opkg update >/dev/null 2>&1 || warn "opkg update 失败 (软件源可能不可用), 继续尝试安装已缓存的包"
-        # shellcheck disable=SC2086
-        if opkg install $_pkgs >/dev/null 2>&1; then
-            ok "内核模块已装 (opkg)"
-        else
-            warn "内核模块安装未全部成功 ($_pkgs) —— 手动补:  opkg install $_pkgs"
-        fi
-    else
-        warn "这台设备上没有 apk 也没有 opkg, 跳过内核模块安装
-  若稍后 TUN 不可用, 请手动安装 kmod-tun 与 kmod-nft-tproxy 后重跑本命令"
-    fi
-    # /dev/net/tun 这个设备节点存在 ≠ tun 模块已加载: 节点是包安装时创建的, 内核模块
-    # 要 modprobe 才进内核。真机反馈里 "TUN 可用" 但还是没建出 tun 设备, 就是这一步。
+    # 软件源不可用 / 源对不上内核, 在路由器上都很常见, 不算致命 —— 模块可能本来就在。
+    pkg_update || true
+    pkg_install kmod-tun || true
     modprobe tun 2>/dev/null || true
-    if [ -c /dev/net/tun ]; then
-        ok "TUN 可用 (kmod-tun 已就绪)"
-    else
-        warn "TUN 不可用, 稍后会自动改用 tproxy 模式 (全屋主要设备仍然覆盖)"
-        DEPENDENCY_NOTE="tun-missing"
+    _tun=0
+    if [ -c /dev/net/tun ]; then _tun=1; fi
+
+    _tproxy=0
+    if tproxy_ok; then _tproxy=1; fi
+    if [ "$_tproxy" = "0" ]; then
+        pkg_install kmod-nft-tproxy || true
+        modprobe nft_tproxy 2>/dev/null || true
+        if tproxy_ok; then _tproxy=1; fi
     fi
     # nft 是 tproxy 回退与 auto-redirect 的前提 (fw4 自带, 这里只确认)
     command -v nft >/dev/null 2>&1 || warn "没有 nft 命令: 若 TUN 也不可用, 透明代理将无法生效"
+
+    if [ "$_tun" = "1" ]; then
+        ok "TUN 可用 (kmod-tun 已就绪)"
+        # 有 TUN 就不需要 tproxy。装不上只是"少了一条用不到的回退", 说清楚即可。
+        [ "$_tproxy" = "1" ] || note "tproxy 回退不可用 (这台固件的内核 / 软件源里没有 nft_tproxy) —— TUN 模式下用不到它, 不影响任何功能"
+        return 0
+    fi
+    # 没有 TUN: tproxy 就是唯一的路, 它不可用才是真问题。
+    DEPENDENCY_NOTE="tun-missing"
+    if [ "$_tproxy" = "1" ]; then
+        warn "本机没有 TUN 设备, 稍后改用 tproxy 模式 (全屋设备生效, 路由器自身流量除外)"
+    else
+        warn "TUN 与 tproxy 都不可用 —— 透明代理可能无法生效
+  手动补一次: kmod 这两个包 (apk add kmod-tun kmod-nft-tproxy; 24.10 及更早用 opkg install)"
+        DEPENDENCY_NOTE="tun-tproxy-missing"
+    fi
 }
 
 # ---------------------------------------------------------------- 内核二进制
@@ -506,14 +576,33 @@ core_budget_left() {
     printf '%s\n' "$_left"
 }
 
-# 下载一份文件到 $2, 最多花 $3 秒, 带进度与实测速率 (DL_BYTES / DL_KBPS)。
+#: 速率闸门的观察窗口 (秒): 低于闸门持续这么久才掐断, 免得被几秒钟的抖动误伤。
+CORE_RATE_WINDOW="${ZP_CORE_RATE_WINDOW:-25}"
+
+# 这一条路"能不能在预算内跑完"的最低速率 (KB/s)。面板知道文件多大时, 它就是
+# 大小/预算 —— 低于它意味着**数学上跑不完**, 那就不该把整段预算耗在这条路上
+# (真机: 面板直传 63 KB/s, 预算 90 秒 → 20 MB 需要 5 分钟, 90 秒纯属白等, 而直连
+# 镜像 931 KB/s)。不知道大小时退回一个保守值: 20 MB 在这个速度下也要七分钟, 同样跑不完。
+core_min_rate() {
+    _sec="${1:-240}"
+    [ "$_sec" -gt 0 ] 2>/dev/null || _sec=1
+    if [ -n "$PANEL_SIZE" ] && [ "$PANEL_SIZE" -gt 0 ] 2>/dev/null; then
+        _r=$((PANEL_SIZE / 1024 / _sec))
+        [ "$_r" -ge 8 ] || _r=8
+        printf '%s\n' "$_r"
+    else
+        printf '48\n'
+    fi
+}
+
+# 下载一份文件到 $2, 最多花 $3 秒 (可选的 $4 = 最低速率 KB/s), 带进度与实测速率。
 # 成功返回 0。速率是给"这条线值不值得等"用的 —— 以前这里只有一行不动的输出,
 # 用户分不出"慢"和"死"。
 core_download() {
     rm -f "$2"
     DL_START="$(date +%s 2>/dev/null || echo 0)"
     start_progress "$2" "已下载"
-    if http_fetch_to "$1" "$2" "${3:-900}"; then
+    if http_fetch_to "$1" "$2" "${3:-900}" "${4:-0}" "$CORE_RATE_WINDOW"; then
         _rc=0
     else
         _rc=1
@@ -583,7 +672,8 @@ core_wait_note() {
 core_from_panel() {
     _waited=0
     while [ "$_waited" -lt "$CORE_WAIT" ]; do
-        if core_download "$ZP_BASE/c/bin/$ARCH" "$_tmp" "$CORE_PANEL_BUDGET"; then
+        _min="$(core_min_rate "$CORE_PANEL_BUDGET")"
+        if core_download "$ZP_BASE/c/bin/$ARCH" "$_tmp" "$CORE_PANEL_BUDGET" "$_min"; then
             if core_verify; then
                 ok "面板直传完成 ($((DL_BYTES / 1048576)) MB, ${DL_KBPS} KB/s)"
                 return 0
@@ -598,8 +688,9 @@ core_from_panel() {
         # 503/502/000 = 面板给的是一句话 → 按那句话处理 (等待或报错)。
         # uclient-fetch 拿不到状态码, 那时才用"文件大小像不像内核"兜底。
         if [ "$HTTP_CODE" = "200" ] || [ "$_size" -ge 262144 ]; then
-            # 下了一半就断了/被预算掐断: 面板这条线要么慢、要么不稳, 换条路
-            warn "面板直传没能在 ${CORE_PANEL_BUDGET} 秒内完成 (已下 $((_size / 1024)) KB, ${DL_KBPS} KB/s)"
+            # 下了一半就断了 / 太慢被掐断 / 到预算: 面板这条线要么慢、要么不稳, 换条路。
+            # 说"用了多久"而不是"没能在 N 秒内完成" —— 被速率闸门掐断时那句会自相矛盾。
+            warn "面板直传太慢 (${DL_SECONDS} 秒只下到 $((_size / 1024)) KB, ${DL_KBPS} KB/s) —— 换直连镜像"
             return 1
         fi
         # 不是内核 = 面板给了一句话 (503 正在准备 / 502 取不到)
@@ -640,7 +731,8 @@ core_from_mirrors() {
         fi
         _tmo="$CORE_MIRROR_BUDGET"
         [ "$_left" -lt "$_tmo" ] && _tmo="$_left"
-        if core_download "$_url" "$_tmp" "$_tmo" && core_verify; then
+        _min="$(core_min_rate "$_tmo")"
+        if core_download "$_url" "$_tmp" "$_tmo" "$_min" && core_verify; then
             ok "直连镜像完成 ($((DL_BYTES / 1048576)) MB, ${DL_KBPS} KB/s)"
             return 0
         fi
@@ -925,13 +1017,18 @@ geo_ok() { [ -s "$ZP_DIR/geoip.metadb" ] && [ -s "$ZP_DIR/geosite.dat" ]; }
 # 管理界面的地址 (带界面令牌)。上报给面板, 用户就能在面板的设备卡上直接点开 ——
 # 不必回终端敲 `zeroproxy ui` (那一步是"这个页面要授权"的唯一门槛)。
 # 令牌文件不在 (极少数固件上没生成) 就返回空, 面板那边自然不显示这个入口。
+#
+# 端口从 ui.port 读 (安装时写下的): 空 = 走固件自己的 Web 服务 (80), 有值 = 界面由
+# 自带的 httpd 在那个端口发。存端口而不是整个 URL, 是为了 LAN 地址换了之后还算得对。
 ui_url() {
+    _port="$(cat "$ZP_DIR/ui.port" 2>/dev/null || true)"
+    [ -n "$_port" ] && _port=":$_port"
     _ip="$(uci get network.lan.ipaddr 2>/dev/null || true)"
-    [ -n "$_ip" ] || _ip="$(ip -4 addr show br-lan 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -n1)"
+    [ -n "$_ip" ] || _ip="$(ip -4 addr show 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | grep -v '^127\.' | head -n1)"
     [ -n "$_ip" ] || _ip="192.168.8.1"
     _tok="$(cat "$ZP_DIR/ui.token" 2>/dev/null)"
     [ -n "$_tok" ] || return 0
-    printf 'http://%s/cgi-bin/zeroproxy?k=%s' "$_ip" "$_tok"
+    printf 'http://%s%s/cgi-bin/zeroproxy?k=%s' "$_ip" "$_port" "$_tok"
 }
 
 # 从面板取分流数据库 (参数 force 时即使本地已有也重取)。返回 0 = 两份都齐了。
@@ -1361,8 +1458,11 @@ EOF
         echo "已请求面板把总开关设为「$1」, 约 15 秒内生效 (zeroproxy status 查看)"
         ;;
     ui)
+        # 端口在 ui.port 里 (安装时定下的): 空 = 固件自己的 Web 服务, 有值 = 自带 httpd。
+        _port="$(cat "$ZP_DIR/ui.port" 2>/dev/null)"
+        [ -n "$_port" ] && _port=":$_port"
         _ip="$(uci get network.lan.ipaddr 2>/dev/null || echo 192.168.1.1)"
-        echo "http://$_ip/cgi-bin/zeroproxy?k=$(cat "$ZP_DIR/ui.token" 2>/dev/null)"
+        echo "http://$_ip$_port/cgi-bin/zeroproxy?k=$(cat "$ZP_DIR/ui.token" 2>/dev/null)"
         [ -s "$ZP_DIR/ui.token" ] || echo "(令牌文件不见了 —— 重跑一次安装命令会重新生成)"
         echo "(打开一次即可; 之后同一浏览器不用再带令牌)"
         ;;
@@ -1379,11 +1479,13 @@ EOF
         # 先停 agent 再停内核: 反过来的话 agent 会在内核停掉后立刻把它拉起来
         /etc/init.d/zeroproxy-agent stop >/dev/null 2>&1 || true
         /etc/init.d/zeroproxy-agent disable >/dev/null 2>&1 || true
+        /etc/init.d/zeroproxy-ui stop >/dev/null 2>&1 || true
+        /etc/init.d/zeroproxy-ui disable >/dev/null 2>&1 || true
         /etc/init.d/zeroproxy stop >/dev/null 2>&1 || true
         /etc/init.d/zeroproxy disable >/dev/null 2>&1 || true
         nft delete table inet zp_router 2>/dev/null || true
         killall -HUP dnsmasq 2>/dev/null || true
-        rm -rf "$ZP_DIR" /etc/init.d/zeroproxy /etc/init.d/zeroproxy-agent /usr/bin/zeroproxy
+        rm -rf "$ZP_DIR" /etc/init.d/zeroproxy /etc/init.d/zeroproxy-agent /etc/init.d/zeroproxy-ui /usr/bin/zeroproxy
         echo "已卸载。这台设备在面板上仍然存在, 请在面板「客户端」里一并移除。"
         ;;
     *) echo "用法: zeroproxy [status|ui|servers|add <链接>|drop <键>|refresh|geo|on|off|log|uninstall]" ;;
@@ -1419,29 +1521,118 @@ CLIEOF
     ok "已写入 $ZP_INIT / $ZP_AGENT_INIT / $ZP_DIR/agent.sh / $ZP_CLI"
 }
 
-# ---------------------------------------------------------------- 启动与自检
-# 网页管理界面 (LuCI 菜单 + /www/zeroproxy/ 页面 + /cgi-bin 数据接口)。
-# 失败不致命: 命令行 (zeroproxy) 一直是可用的兜底。
+# ---------------------------------------------------------------- 网页界面
+# 界面文件 (一个页面 + 一个 cgi) 落盘只是第一步; 第二步 —— "让本机的 Web 服务真的把它
+# 发出去" —— 在固件之间差别很大, 真机踩过三种:
+#   * uhttpd (OpenWrt 默认): 文档根 /www, /cgi-bin/ 会执行脚本 —— 落盘即通;
+#   * nginx + fcgiwrap (GL.iNet 部分固件): /www 是文档根, /cgi-bin/ 走 fcgiwrap (LuCI
+#     自己就走它), 也通;
+#   * nginx 原厂界面 (GL.iNet 21.02-SNAPSHOT 原厂, 没有 LuCI): /www 照发静态文件, 但
+#     /cgi-bin/ 没有对应的 location —— 我们那个脚本会被当成**文本文件**发出去 (浏览器
+#     打开是一坨 shell 源码), 数据接口全废。
+# 所以落盘之后必须真的取一次, 而且**判据要看内容**: 200 也可能是把脚本当静态文件发了。
+# 页面里有 <title>, 那个 cgi 脚本里没有 —— 用它区分"页面被发出来了"和"脚本被下载了"。
+#
+# 两条路都不通也不影响代理: 命令行 (zeroproxy) 一直是可用的兜底。
+UI_MARK='<title>ZeroProxy'
+#: 兜底 httpd 的端口 (只在固件自己的 Web 服务发不出页面时才用, 且只绑局域网地址)。
+UI_PORT="${ZP_UI_PORT:-8399}"
+
+# 这个基地址能不能把**页面**发出来 (返回 0 = 能)。
+ui_probe() {
+    _t="$(cat "$ZP_DIR/ui.token" 2>/dev/null)"
+    _body="$(http_get "$1?k=$_t" 2>/dev/null | head -c 600)"
+    case "$_body" in *"$UI_MARK"*) return 0 ;; esac
+    return 1
+}
+
+# 界面基地址 (不带令牌)。端口写在 ui.port 里: 空 = 固件自己的 Web 服务 (80),
+# 有值 = 界面由自带的 httpd 发。存端口而不是整个 URL —— LAN 地址换了也得算得对。
+ui_base() {
+    _port="$(cat "$ZP_DIR/ui.port" 2>/dev/null || true)"
+    [ -n "$_port" ] && _port=":$_port"
+    printf 'http://%s%s/cgi-bin/zeroproxy' "$(lan_ip)" "$_port"
+}
+
+ui_busybox() {
+    # 返回**绝对路径**: 这个值会被写进 procd 的服务定义, 那里不保证有 PATH。
+    _c="$(command -v busybox 2>/dev/null || true)"
+    if [ -n "$_c" ]; then printf '%s' "$_c"; return 0; fi
+    for _c in /bin/busybox /usr/bin/busybox; do
+        if [ -x "$_c" ]; then printf '%s' "$_c"; return 0; fi
+    done
+    return 1
+}
+
+ui_stop_local_httpd() {
+    /etc/init.d/zeroproxy-ui stop >/dev/null 2>&1 || true
+    /etc/init.d/zeroproxy-ui disable >/dev/null 2>&1 || true
+    rm -f "$ZP_INIT_UI"
+}
+
+# 固件的 Web 服务发不出页面时的兜底: 自带的 busybox httpd —— 它的约定很简单
+# ("url 以 /cgi-bin/ 开头就当 cgi 执行"), 与固件自己那套 nginx/uhttpd 无关, 所以在哪台
+# 机器上都一样。只绑**局域网地址**: 每多一个监听口都是事实, 所以绝不退化成 0.0.0.0
+# (那等于把管理界面挂到 WAN 上)。授权照旧只认界面令牌, 与走固件 Web 服务时同一条路。
+ui_start_local_httpd() {
+    _bb="$(ui_busybox 2>/dev/null || true)"
+    [ -n "$_bb" ] || return 1
+    # --list 不是所有 busybox 都给; 给的话就顺手确认 httpd 这个 applet 编进去了。
+    if "$_bb" --list >/dev/null 2>&1; then
+        "$_bb" --list | grep -qx httpd || return 1
+    fi
+    _root="$ZP_DIR/www"
+    [ -s "$_root/cgi-bin/zeroproxy" ] || return 1
+    cat > "$ZP_INIT_UI" <<'UIINITEOF'
+#!/bin/sh /etc/rc.common
+# ZeroProxy 网页管理界面 (固件没有把 /cgi-bin/ 交给脚本时用的兜底 httpd)。
+# 只绑局域网地址: 找不到 LAN 地址就不启动, 绝不退化成 0.0.0.0。
+START=98
+USE_PROCD=1
+
+ZP_DIR=/etc/zeroproxy
+UI_PORT=__ZP_UI_PORT__
+BB=__ZP_BUSYBOX__
+
+lan_ip() {
+    _ip="$(uci get network.lan.ipaddr 2>/dev/null || true)"
+    [ -n "$_ip" ] || _ip="$(ip -4 addr show 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | grep -v '^127\.' | head -n1)"
+    printf '%s' "$_ip"
+}
+
+start_service() {
+    [ -x "$ZP_DIR/www/cgi-bin/zeroproxy" ] || return 0
+    _ip="$(lan_ip)"
+    [ -n "$_ip" ] || return 0
+    procd_open_instance
+    procd_set_param command "$BB" httpd -f -p "$_ip:$UI_PORT" -h "$ZP_DIR/www"
+    procd_set_param respawn 3600 5 5
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
+
+service_triggers() { procd_add_reload_interface_trigger lan; }
+UIINITEOF
+    # 端口与 busybox 路径用占位符写 (带引号的 heredoc 不做变量替换), 落盘后再替一次 ——
+    # 与 agent/CLI 的版本号同一个手法。chmod 要在 mv 之后: 新文件是默认权限。
+    sed -e "s#__ZP_UI_PORT__#$UI_PORT#" -e "s#__ZP_BUSYBOX__#$_bb#" "$ZP_INIT_UI" > "$ZP_INIT_UI.ver" \
+        && { chmod 755 "$ZP_INIT_UI.ver"; mv "$ZP_INIT_UI.ver" "$ZP_INIT_UI"; } || rm -f "$ZP_INIT_UI.ver"
+    /etc/init.d/zeroproxy-ui enable >/dev/null 2>&1 || true
+    /etc/init.d/zeroproxy-ui restart >/dev/null 2>&1 || true
+    _w=0
+    while [ "$_w" -lt 12 ]; do
+        sleep 1
+        ui_probe "http://$(lan_ip):$UI_PORT/cgi-bin/zeroproxy" && return 0
+        _w=$((_w + 1))
+    done
+    # 起不来说明这台设备上没有可用的 busybox httpd —— 收干净, 不留一个跑不起来的服务。
+    ui_stop_local_httpd
+    return 1
+}
+
 install_ui() {
     step "安装网页管理界面"
-    if [ ! -d /www ]; then
-        warn "这台设备没有 uhttpd/LuCI, 跳过网页界面 (命令行仍然可用: zeroproxy status)"
-        return 0
-    fi
-    mkdir -p /www/zeroproxy /www/cgi-bin
-    for f in index.html app.js; do
-        http_get "$ZP_BASE/c/ui/$f" > "/www/zeroproxy/$f" 2>/dev/null || {
-            warn "面板没有提供界面文件 (面板版本较旧?), 跳过网页界面"
-            rm -rf /www/zeroproxy
-            return 0
-        }
-    done
-    http_get "$ZP_BASE/c/ui/cgi" > /www/cgi-bin/zeroproxy 2>/dev/null || true
-    chmod 755 /www/cgi-bin/zeroproxy
-    # 界面地址走 /cgi-bin/: GL.iNet 这类固件是 nginx + fcgiwrap, 静态目录不一定
-    # 在浏览器能到的地方, 而 /cgi-bin/ 一定通 (LuCI 自己就走它)
-    UI_URL="http://$(uci get network.lan.ipaddr 2>/dev/null || echo 192.168.1.1)/cgi-bin/zeroproxy"
-
     # 界面令牌在 write_files 里就生成好了 (agent 的心跳要拿它上报"管理界面地址")。
     # 万一被谁删了, 这里补一个 —— 没有令牌的地址等于打不开。
     if [ ! -s "$ZP_DIR/ui.token" ]; then
@@ -1451,10 +1642,36 @@ install_ui() {
         umask 022
         chmod 600 "$ZP_DIR/ui.token"
     fi
-    UI_URL_K="$UI_URL?k=$(cat "$ZP_DIR/ui.token" 2>/dev/null)"
+
+    # 界面文件先落到 /etc/zeroproxy/www (兜底 httpd 的文档根就是它), 再复制一份到 /www
+    # —— 固件自己的 Web 服务那条路走的是 /www, 而"能用它就不开新端口"是首选。
+    _stage="$ZP_DIR/www"
+    mkdir -p "$_stage/zeroproxy" "$_stage/cgi-bin"
+    for f in index.html app.js; do
+        if ! http_get "$ZP_BASE/c/ui/$f" > "$_stage/zeroproxy/$f" 2>/dev/null; then
+            warn "面板没有提供界面文件 (面板版本较旧?), 跳过网页界面"
+            rm -rf "$_stage"
+            return 0
+        fi
+    done
+    http_get "$ZP_BASE/c/ui/cgi" > "$_stage/cgi-bin/zeroproxy" 2>/dev/null || true
+    chmod 755 "$_stage/cgi-bin/zeroproxy"
+    if [ ! -s "$_stage/zeroproxy/index.html" ]; then
+        warn "面板没有提供界面文件 (面板版本较旧?), 跳过网页界面"
+        rm -rf "$_stage"
+        return 0
+    fi
+    if [ -d /www ]; then
+        mkdir -p /www/zeroproxy /www/cgi-bin 2>/dev/null || true
+        cp "$_stage/zeroproxy/index.html" "$_stage/zeroproxy/app.js" /www/zeroproxy/ 2>/dev/null || true
+        cp "$_stage/cgi-bin/zeroproxy" /www/cgi-bin/zeroproxy 2>/dev/null || true
+        chmod 755 /www/cgi-bin/zeroproxy 2>/dev/null || true
+    fi
 
     # LuCI 菜单 / 权限 / 承载页 —— 只有装了 LuCI 才写, 否则上面那个地址一样能用
+    _luci=0
     if [ -d /usr/share/luci/menu.d ]; then
+        _luci=1
         mkdir -p /www/luci-static/resources/view/zeroproxy /usr/share/rpcd/acl.d
         http_get "$ZP_BASE/c/ui/status.js" > /www/luci-static/resources/view/zeroproxy/status.js 2>/dev/null || true
         http_get "$ZP_BASE/c/ui/menu.json" > /usr/share/luci/menu.d/luci-app-zeroproxy.json 2>/dev/null || true
@@ -1464,29 +1681,46 @@ install_ui() {
         # 最常见的原因)
         /etc/init.d/rpcd reload >/dev/null 2>&1 || /etc/init.d/rpcd restart >/dev/null 2>&1 || true
         rm -f /tmp/luci-indexcache* /tmp/luci-modulecache/* 2>/dev/null || true
-        ok "管理界面已装好 (LuCI 菜单: 服务 → ZeroProxy)"
-    else
-        ok "管理界面已装好"
     fi
 
+    # 谁把页面发出去? 先试固件自己的 Web 服务 (80 端口, 不开新端口), 发不出来再起自带
+    # 的 httpd。两条路都要**当场验过**才算数。
+    : > "$ZP_DIR/ui.port"
+    if [ -d /www ] && { ui_probe "http://127.0.0.1/cgi-bin/zeroproxy" || ui_probe "http://$(lan_ip)/cgi-bin/zeroproxy"; }; then
+        if [ "$_luci" = "1" ]; then
+            ok "管理界面已装好 (LuCI 菜单: 服务 → ZeroProxy)"
+        else
+            ok "管理界面已装好"
+        fi
+        # 上一次可能是靠自带 httpd 发的 (固件升级后 /cgi-bin/ 又能用了): 收掉它,
+        # 不留一个多余的监听口。
+        if [ -f "$ZP_INIT_UI" ]; then
+            ui_stop_local_httpd
+        fi
+    elif ui_start_local_httpd; then
+        printf '%s' "$UI_PORT" > "$ZP_DIR/ui.port"
+        ok "管理界面已装好 (这台固件没有把 /cgi-bin/ 交给脚本, 已用自带 httpd 在 $UI_PORT 端口发出)"
+    else
+        rm -f "$ZP_DIR/ui.port"
+        warn "本机自检没通过 —— 浏览器打开下面的地址可能看到 403/404。
+  这台设备的 Web 服务 (nginx?) 没把 /cgi-bin/ 交给脚本, 自带的 busybox httpd 也没能起来。
+  请把下面四行的输出发回, 就能给这台固件补上对应的一条:
+    pidof nginx uhttpd; nginx -v 2>&1; uci -q get uhttpd.main.home
+    grep -rn 'root \|cgi\|fastcgi' /etc/nginx/conf.d/*.conf 2>/dev/null | head -10
+    ls -ld /www /www/zeroproxy /www/cgi-bin 2>/dev/null
+    busybox --list 2>/dev/null | grep -c httpd"
+    fi
+
+    UI_URL="$(ui_base)"
+    UI_URL_K="$UI_URL?k=$(cat "$ZP_DIR/ui.token" 2>/dev/null)"
     # 打印出来的一定是**带令牌**的那条: 不带令牌打开就是一个"读不到状态、开关也点不动"的
     # 页面 (真机反馈: 用户照着打印的地址打开, 看到开关是关的、点不开, 以为是 bug)。
     ok "浏览器打开: $UI_URL_K"
     ok "  (令牌只用来授权这一个页面, 打开一次即可; 忘了就用 zeroproxy ui 再打印)"
     ok "  面板「客户端」那张设备卡上也有一键入口 (同一局域网内点它就行)"
-    # 本机自检: 页面真能被服务器发出来才算装好。这台固件 80 端口可能是 nginx
-    # 而不是 uhttpd, 文档路径不一定是我们以为的 /www —— 与其让用户看到 403,
-    # 不如当场说清楚并给出排查命令。
-    _probe="$(http_get "http://127.0.0.1/cgi-bin/zeroproxy?k=$(cat "$ZP_DIR/ui.token")" 2>/dev/null | head -c 300)"
-    case "$_probe" in
-        *ZeroProxy*) ok "本机自检: 页面可访问" ;;
-        *) warn "本机自检没通过 —— 浏览器打开上面的地址可能看到 403/404。
-  这台设备的 Web 服务不是标准的 uhttpd(/www) 时会出现这种情况, 请把下面三行的输出发回:
-    grep -rl 'root ' /etc/nginx/conf.d/ 2>/dev/null | head -3; grep -rn 'root \|cgi' /etc/nginx/conf.d/*.conf 2>/dev/null | head -10
-    ls -ld /www /www/zeroproxy; netstat -lntp 2>/dev/null | grep -E ':(80|443)\\b'" ;;
-    esac
 }
 
+# ---------------------------------------------------------------- 启动与自检
 verify() {
     step "启动并自检"
     /etc/init.d/zeroproxy enable >/dev/null 2>&1 || true
