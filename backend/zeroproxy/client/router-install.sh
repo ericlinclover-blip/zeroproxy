@@ -44,6 +44,8 @@ ACTIVE_MODE=""
 PANEL_GEO=""
 # 非空 = 这次只能装降级配置 (面板暂时给不出分流数据库), 结尾要如实说明
 DEGRADED=""
+# 非空 = 这次靠自愈才把 TUN 建起来 (值说明改了哪一项), 结尾要告诉用户
+TUN_HEALED=""
 # 设备凭据与配对结果 (set -u 下必须预置: 只有在真的走过那条分支时才会被赋值)
 DEV_ID=""
 DEV_SECRET=""
@@ -479,14 +481,29 @@ pkg_update() {
     fi
 }
 
-# tproxy 到底能不能用 —— 不看包装没装上, 直接问内核: 加一条 tproxy 规则成不成。
+# 三项网络能力, 装机时各探一次。结论有三处要用, 必须是同一份:
+#   * 安装输出怎么说话;
+#   * 写进 /etc/zeroproxy/caps —— agent 重建配置时把 tproxy 能力带给面板 (?tproxy=0/1),
+#     面板据此不写 auto-redirect (那一项在不支持它的固件上会让整个 tun 建不起来);
+#   * verify 判断"退回 tproxy"到底退成功了没有。
+NET_TUN=0
+NET_NFT=0
+NET_TPROXY=0
+
+# nft 能不能真的下规则。有 nft 命令 ≠ 内核里有 nf_tables —— 原厂精简固件上见过
+# "命令在、规则下不去"的组合, 而那一项正是 auto-redirect 依赖的东西。
+nft_ok() {
+    command -v nft >/dev/null 2>&1 || return 1
+    nft add table inet zp_probe 2>/dev/null || return 1
+    nft delete table inet zp_probe 2>/dev/null || true
+    return 0
+}
+
+# tproxy 能不能用 —— 不看包装没装上, 直接问内核: 加一条 tproxy 规则成不成。
 # 为什么不用"模块在不在": tproxy 有可能被编进内核 (那时 /sys/module 里没有它), 而
 # `nft` 会把模块按需加载 —— 真加一条规则才是这件事的最终判据。探针用完就撤掉。
 tproxy_ok() {
-    # 模块已经在 (内核里编进去的用前两个都查不到, 但那极少见) —— 这条路直接算有。
-    [ -d /sys/module/nft_tproxy ] && return 0
-    grep -q '^nft_tproxy ' /proc/modules 2>/dev/null && return 0
-    command -v nft >/dev/null 2>&1 || return 1
+    nft_ok || return 1
     nft add table inet zp_probe 2>/dev/null || return 1
     if ! nft add chain inet zp_probe c '{ type filter hook prerouting priority -150; policy accept; }' 2>/dev/null; then
         nft delete table inet zp_probe 2>/dev/null || true
@@ -500,37 +517,82 @@ tproxy_ok() {
     return 1
 }
 
+# TUN 能不能真的建出设备。**节点存在 ≠ 能建**: /dev/net/tun 是装包时创建的, 而模块
+# 可能没编进这个内核、或者加载失败 —— 原厂 5.4.281 那台就是"节点在, 建不出来", 于是
+# mihomo 起 tun 失败、脚本却一直以为 TUN 没问题。判据: 真建一个再删掉; `ip` 不带
+# tuntap 子命令时, 退化成"模块在不在"。
+tun_ok() {
+    [ -c /dev/net/tun ] || return 1
+    if ip tuntap add dev zp0probe mode tun 2>/dev/null; then
+        ip link del zp0probe 2>/dev/null || ip tuntap del dev zp0probe mode tun 2>/dev/null || true
+        return 0
+    fi
+    [ -d /sys/module/tun ] && return 0
+    grep -q '^tun ' /proc/modules 2>/dev/null && return 0
+    return 1
+}
+
+# 能力落盘 (agent 读它决定给面板报 ?tproxy=)。格式极简: 一行一个 key=value,
+# 用 sed 取就够 —— 路由器上没有 jq。
+#
+# `autoredirect` 是**学出来的**, 不是探出来的: 面板配置里的 auto-redirect 会让某些
+# 固件上的 tun 整个起不来 (见 tun_retry_without_redirect)。那次自愈成功后把它记成 0,
+# 于是以后每轮重建配置都不再要它。想重新试一次: 删掉 /etc/zeroproxy/caps 或把这一行
+# 改成 1, 再重跑安装命令。
+write_caps() {
+    _ar="$(sed -n 's/^autoredirect=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    case "$_ar" in 0) ;; *) _ar=1 ;; esac
+    caps_write "$_ar"
+}
+
+# 落一份 caps。自愈那一步要单独改 autoredirect, 所以单独抽出来。
+caps_write() {
+    {
+        printf 'tun=%s\n' "$NET_TUN"
+        printf 'nft=%s\n' "$NET_NFT"
+        printf 'tproxy=%s\n' "$NET_TPROXY"
+        printf 'autoredirect=%s\n' "$1"
+    } > "$ZP_DIR/caps"
+}
+
 install_deps() {
     step "准备网络内核模块"
     # 软件源不可用 / 源对不上内核, 在路由器上都很常见, 不算致命 —— 模块可能本来就在。
     pkg_update || true
     pkg_install kmod-tun || true
     modprobe tun 2>/dev/null || true
-    _tun=0
-    if [ -c /dev/net/tun ]; then _tun=1; fi
+    if tun_ok; then NET_TUN=1; fi
+    if nft_ok; then NET_NFT=1; fi
 
-    _tproxy=0
-    if tproxy_ok; then _tproxy=1; fi
-    if [ "$_tproxy" = "0" ]; then
-        pkg_install kmod-nft-tproxy || true
-        modprobe nft_tproxy 2>/dev/null || true
-        if tproxy_ok; then _tproxy=1; fi
+    if [ "$NET_NFT" = "1" ]; then
+        if tproxy_ok; then NET_TPROXY=1; fi
+        if [ "$NET_TPROXY" = "0" ]; then
+            pkg_install kmod-nft-tproxy || true
+            modprobe nft_tproxy 2>/dev/null || true
+            if tproxy_ok; then NET_TPROXY=1; fi
+        fi
     fi
-    # nft 是 tproxy 回退与 auto-redirect 的前提 (fw4 自带, 这里只确认)
-    command -v nft >/dev/null 2>&1 || warn "没有 nft 命令: 若 TUN 也不可用, 透明代理将无法生效"
+    write_caps
 
-    if [ "$_tun" = "1" ]; then
+    if [ "$NET_TUN" = "1" ]; then
         ok "TUN 可用 (kmod-tun 已就绪)"
-        # 有 TUN 就不需要 tproxy。装不上只是"少了一条用不到的回退", 说清楚即可。
-        [ "$_tproxy" = "1" ] || note "tproxy 回退不可用 (这台固件的内核 / 软件源里没有 nft_tproxy) —— TUN 模式下用不到它, 不影响任何功能"
+        # 有 TUN 就用不到 tproxy —— 装不上只是"少一条用不到的回退", 说清楚即可。
+        if [ "$NET_TPROXY" = "0" ]; then
+            if [ "$NET_NFT" = "0" ]; then
+                note "tproxy 回退不可用 (内核里没有 nf_tables, nft 下的规则不生效) —— TUN 模式下用不到它"
+            else
+                note "tproxy 回退不可用 (内核 / 软件源里没有 nft_tproxy) —— TUN 模式下用不到它, 不影响任何功能"
+            fi
+        fi
         return 0
     fi
     # 没有 TUN: tproxy 就是唯一的路, 它不可用才是真问题。
     DEPENDENCY_NOTE="tun-missing"
-    if [ "$_tproxy" = "1" ]; then
-        warn "本机没有 TUN 设备, 稍后改用 tproxy 模式 (全屋设备生效, 路由器自身流量除外)"
+    warn "本机建不出 TUN 设备 (/dev/net/tun 在, 但内核里没有可用的 tun)"
+    if [ "$NET_TPROXY" = "1" ]; then
+        warn "稍后改用 tproxy 模式 (全屋设备生效, 路由器自身流量除外)"
     else
-        warn "TUN 与 tproxy 都不可用 —— 透明代理可能无法生效
+        warn "TUN 与 tproxy 都不可用 —— 全屋透明代理这次不会生效。
   手动补一次: kmod 这两个包 (apk add kmod-tun kmod-nft-tproxy; 24.10 及更早用 opkg install)"
         DEPENDENCY_NOTE="tun-tproxy-missing"
     fi
@@ -1063,6 +1125,17 @@ ensure_geo() {
 # 生成最终配置并打到标准输出。
 #   单服务器: 直接用面板给的整份配置 (已验证的老路径)
 #   多服务器: 取第一台的骨架, 把 providers 与组的 use 填上 (按行替换, 不做 YAML 解析)
+caps_flag() {
+    # 面板配置里能不能写 auto-redirect。装机时默认 1 (与面板默认一致), 只有**真的因为
+    # 它起不来 tun** 时才会被学成 0 (见安装脚本的 tun_retry_without_redirect)。
+    # 文件不在 = 老版本升级上来的, 按 1 报 —— 行为不变。
+    _v="$(sed -n 's/^autoredirect=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    case "$_v" in
+        0|1) printf '%s' "$_v" ;;
+        *)   printf '1' ;;
+    esac
+}
+
 build_config() {
     migrate_servers
     _first="$(first_server)"
@@ -1072,11 +1145,15 @@ build_config() {
     # 没有分流数据库就不能要 geo 规则 (面板知道这件事, 会给一份降级规则)。判据必须是
     # 本机文件: 数据库在路由器上, 面板看不到它。
     _geo="1"; geo_ok || _geo="0"
+    # 本机没有 nft / tproxy 时别让面板写 auto-redirect: 那一项会让整个 tun 建不起来
+    # (真机现象: 装完 zp-tun 一直不出现, 脚本退回 tproxy, 而那台机器的 tproxy 也是
+    # 同一个原因不可用 —— 全屋透明代理名存实亡)。判据同样只能是本机。
+    _tp="$(caps_flag)"
     if [ "$_n" -le 1 ]; then
-        http_get "$_b/c/sub/$_i?k=$_k&format=clash&rules=smart&geo=$_geo"
+        http_get "$_b/c/sub/$_i?k=$_k&format=clash&rules=smart&geo=$_geo&tproxy=$_tp"
         return $?
     fi
-    _skel="$(http_get "$_b/c/sub/$_i?k=$_k&format=skeleton&rules=smart&geo=$_geo")" || return 1
+    _skel="$(http_get "$_b/c/sub/$_i?k=$_k&format=skeleton&rules=smart&geo=$_geo&tproxy=$_tp")" || return 1
     [ -n "$_skel" ] || return 1
     # provider 段落走临时文件而不是 `awk -v block=...`: -v 的值里带换行时, BSD awk
     # 直接报 "newline in string", busybox awk 的转义处理也不一致 (本机演练抓到的)。
@@ -1277,11 +1354,19 @@ start_service() {
     [ -f "$CONF" ] || return 0
 
     # TUN 模式: 由内核接管路由与 DNS, 不需要动防火墙。
-    # 若机器没有 /dev/net/tun, agent 会自动切到 tproxy 规则 (见 tproxy.nft)。
-    if [ -c /dev/net/tun ]; then
-        nft delete table inet zp_router 2>/dev/null || true
-    else
+    # 走 TUN 还是 tproxy, 按**装机时探出来的能力**决定 (caps), 而不是"节点在不在":
+    # 原厂固件上 /dev/net/tun 存在但内核建不出设备, 那时该走 tproxy 而不是空转。
+    # caps 不在 (从老版本升上来的) 就退回原来的节点判断。
+    _mode=tun
+    if [ -f "$ZP_DIR/caps" ]; then
+        grep -q '^tun=1' "$ZP_DIR/caps" 2>/dev/null || _mode=tproxy
+    elif [ ! -c /dev/net/tun ]; then
+        _mode=tproxy
+    fi
+    if [ "$_mode" = "tproxy" ]; then
         nft -f "$ZP_DIR/tproxy.nft" 2>/dev/null || true
+    else
+        nft delete table inet zp_router 2>/dev/null || true
     fi
     killall -HUP dnsmasq 2>/dev/null || true
 
@@ -1349,7 +1434,21 @@ case "${1:-status}" in
         for _f in $(servers); do
             printf '  %-16s %s\n' "$(key_of "$(field_of "$_f" base)")" "$(field_of "$_f" base)"
         done
-        [ -c /dev/net/tun ] && echo "模式:  TUN (全屋透明)" || echo "模式:  tproxy (全屋透明, 本机自身流量除外)"
+        # 模式按"现在到底是什么在生效"报, 不看 /dev/net/tun 这个节点 —— 它在某些固件上
+        # 存在但建不出设备 (真机: 原厂 5.4.281), 那时报 TUN 就是骗人。能力是装机时探的。
+        if ip link show zp-tun >/dev/null 2>&1; then
+            echo "模式:  TUN (全屋透明, 含路由器自身)"
+        elif nft list table inet zp_router >/dev/null 2>&1; then
+            echo "模式:  tproxy (全屋透明, 本机自身流量除外)"
+        else
+            echo "模式:  未生效 (只有本机代理端口可用)"
+        fi
+        if [ -f "$ZP_DIR/caps" ]; then
+            printf '能力:  tun=%s nft=%s tproxy=%s (装机时探测)\n' \
+                "$(sed -n 's/^tun=//p' "$ZP_DIR/caps" | head -n1)" \
+                "$(sed -n 's/^nft=//p' "$ZP_DIR/caps" | head -n1)" \
+                "$(sed -n 's/^tproxy=//p' "$ZP_DIR/caps" | head -n1)"
+        fi
         if command -v curl >/dev/null 2>&1; then
             curl -fsS -m 8 "http://127.0.0.1:9090/version" 2>/dev/null | head -c 200 && echo
         fi
@@ -1721,6 +1820,83 @@ install_ui() {
 }
 
 # ---------------------------------------------------------------- 启动与自检
+# tproxy 回退: **只有规则真的装进去了才算生效**。以前这里是 `nft -f ... || true`, 于是
+# "规则没装上"和"装上了"在输出里长得一模一样, 结尾还照样报"tproxy 全屋生效" —— 真机上
+# 就出现过这种"看着全绿、其实全屋没有代理"的状态 (原厂固件没有 nft/tproxy)。
+tproxy_fallback() {
+    killall -HUP dnsmasq 2>/dev/null || true
+    nft -f "$ZP_DIR/tproxy.nft" 2>/dev/null || true
+    if nft list table inet zp_router >/dev/null 2>&1; then
+        ACTIVE_MODE="tproxy"
+        # 兜一下"能力探测判错"这种可能: 探测说建不出 TUN, 而内核其实建出来了 —— 那时
+        # 两套同时生效会互相打架 (真机踩过: tun 明明是好的, 却又叠了一层 tproxy 规则)。
+        _w=0
+        while [ "$_w" -lt 3 ]; do
+            if ip link show zp-tun >/dev/null 2>&1; then
+                nft delete table inet zp_router 2>/dev/null || true
+                ACTIVE_MODE="tun"
+                ok "TUN 已建立: 全屋设备 (含路由器自身) 透明代理生效"
+                return 0
+            fi
+            sleep 1
+            _w=$((_w + 1))
+        done
+        ok "已启用 tproxy 模式 (全屋设备生效, 路由器自身流量除外)"
+    else
+        ACTIVE_MODE="none"
+        warn "tproxy 规则也没能装上 —— 这次全屋透明代理**没有**生效"
+    fi
+}
+
+# TUN 起不来时的一次自愈 —— 只在真的失败过之后才做, 能跑的机器一个字节都不动。
+#
+# 怀疑对象是 auto-redirect: 它是 sing-tun 往内核里写 nftables 规则的开关 (OpenWrt 上
+# 还要往 /etc/nftables.d/ 写文件再 `fw4 reload`), 某些固件上那一步会失败 —— 而那是
+# **致命**的: 整个 tun 都起不来, 现象就是"zp-tun 一直不出现"。全屋的本体是 auto-route
+# (ip rule + 独立路由表接管全部流量, 含局域网转发), 少了 auto-redirect 功能不受影响。
+#
+# 做法是让面板给一份不带 auto-redirect 的配置再试一次 (?tproxy=0 那条路)。跑通就把
+# 这个结论记进 caps (以后每轮重建配置都不再要它); 跑不通就原样回滚, 免得留一个没用的
+# 改动在人家机器上。
+tun_retry_without_redirect() {
+    [ -x "$ZP_DIR/agent.sh" ] || return 1
+    [ -f "$ZP_CONF" ] || return 1
+    _ar="$(sed -n 's/^autoredirect=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    case "$_ar" in 1) ;; *) return 1 ;; esac
+    cp "$ZP_CONF" "$ZP_CONF.ar.bak" 2>/dev/null || return 1
+    caps_write 0
+    if ! "$ZP_DIR/agent.sh" config > "$ZP_CONF.new" 2>/dev/null; then
+        rm -f "$ZP_CONF.new"
+        caps_write 1
+        return 1
+    fi
+    # 与 fetch_config 同一道闸门: 拿到的必须像一份配置, 而且要能被内核自己校验通过
+    if ! grep -q '^proxy-groups:' "$ZP_CONF.new" 2>/dev/null \
+        || ! "$ZP_BIN" -t -d "$ZP_DIR" -f "$ZP_CONF.new" >/dev/null 2>&1; then
+        rm -f "$ZP_CONF.new"
+        caps_write 1
+        return 1
+    fi
+    mv "$ZP_CONF.new" "$ZP_CONF"
+    /etc/init.d/zeroproxy restart >/dev/null 2>&1 || true
+    _w=0
+    while [ "$_w" -lt 20 ]; do
+        if ip link show zp-tun >/dev/null 2>&1; then
+            rm -f "$ZP_CONF.ar.bak"
+            TUN_HEALED="no-auto-redirect"
+            return 0
+        fi
+        sleep 1
+        _w=$((_w + 1))
+    done
+    # 还是不行: 配置与 caps 都退回原样 (这两件事必须一起回, 否则下次重建配置又会
+    # 拿一份不一样的配置去覆盖)
+    mv "$ZP_CONF.ar.bak" "$ZP_CONF" 2>/dev/null || true
+    caps_write 1
+    /etc/init.d/zeroproxy restart >/dev/null 2>&1 || true
+    return 1
+}
+
 verify() {
     step "启动并自检"
     /etc/init.d/zeroproxy enable >/dev/null 2>&1 || true
@@ -1744,7 +1920,7 @@ verify() {
     ok "内核已启动"
 
     ACTIVE_MODE="tproxy"
-    if [ -c /dev/net/tun ]; then
+    if [ "$NET_TUN" = "1" ]; then
         # 等内核把设备建出来: mihomo 启动到 zp-tun 出现之间有十几秒 —— 只查一次会
         # 误判成"没建出来", 于是错误地退回 tproxy 并把那套 nft 规则也加上
         # (真机上就是这么发生的: tun 明明是好的, 却又叠了一层 tproxy)。
@@ -1760,13 +1936,25 @@ verify() {
             nft delete table inet zp_router 2>/dev/null || true
             ok "TUN 已建立: 全屋设备 (含路由器自身) 透明代理生效"
         else
-            warn "等了 30 秒 TUN 设备仍未出现 (内核模块/权限问题), 改用 tproxy 模式"
-            killall -HUP dnsmasq 2>/dev/null || true
-            nft -f "$ZP_DIR/tproxy.nft" 2>/dev/null || true
+            # 这里必须把**内核自己说的原因**打出来: 一台设备一种原因 (没有 tun 模块 /
+            # nft 不支持 auto-redirect / 权限), 光看"没建出来"没法定位 —— 上一版就是
+            # 只有一句警告, 于是只能靠用户截图猜。
+            warn "等了 30 秒 TUN 设备仍未出现, 与 tun 有关的内核日志:"
+            logread -e zeroproxy 2>/dev/null \
+                | grep -iE 'tun|tproxy|nft|permission|denied|not permitted|no such|error' \
+                | tail -n 6 >&2 || true
+            # 再试一次: 去掉 auto-redirect 重建配置 (只在失败后做, 见 tun_retry_without_redirect)
+            if tun_retry_without_redirect && ip link show zp-tun >/dev/null 2>&1; then
+                ACTIVE_MODE="tun"
+                nft delete table inet zp_router 2>/dev/null || true
+                ok "TUN 已建立 (已按这台固件去掉 auto-redirect): 全屋透明代理生效"
+            else
+                tproxy_fallback
+            fi
         fi
     else
-        warn "本机没有 TUN, 使用 tproxy 模式 (全屋设备生效, 路由器自身流量除外)"
-        nft -f "$ZP_DIR/tproxy.nft" 2>/dev/null || true
+        warn "本机建不出 TUN 设备 (见上面的能力探测), 改用 tproxy 模式"
+        tproxy_fallback
     fi
 
     # 等节点就绪再测: provider 是内核启动后异步拉的, 立刻测一定失败 —— 那句
@@ -1802,9 +1990,30 @@ report_up() {
 
 finish() {
     printf '\n%s────────────────────────────────────────────%s\n' "$C_B" "$C_R"
-    ok "全屋代理已开启 —— 手机 / 电脑 / 电视连上这台路由器即可用"
+    if [ "${ACTIVE_MODE:-tproxy}" = "none" ]; then
+        # 之前这里是无条件报"全屋代理已开启" —— 而 TUN 建不出来、tproxy 也装不上时,
+        # 局域网里其实一台设备都没被接管。宁可说难看的话, 也不能让人以为好了。
+        printf '%s透明代理未生效%s —— 这台设备上 TUN 与 tproxy 都用不了\n' "$C_E" "$C_R"
+        printf '  原因: TUN 设备没建出来 (内核没有可用的 tun), 而 tproxy 需要的\n'
+        printf '        nf_tables / nft_tproxy 这台固件也没有。\n'
+        printf '  下一步任选一条:\n'
+        printf '    1) 补内核模块后重跑这条安装命令:\n'
+        printf '         opkg install kmod-tun kmod-nft-tproxy    (OpenWrt 25.12 及更新: apk add ...)\n'
+        printf '    2) 换成带 TUN / nftables 支持的固件 (原厂精简固件常常两个都缺)\n'
+        printf '  路由器本机的代理端口一直可用 (http://%s:%s), 只是没有接管局域网设备。\n' "$(lan_ip)" "$ZP_MIXED"
+    else
+        ok "全屋代理已开启 —— 手机 / 电脑 / 电视连上这台路由器即可用"
+    fi
     printf '  设备名   %s\n' "$MODEL"
-    printf '  模式     %s\n' "$( [ "${ACTIVE_MODE:-tproxy}" = "tun" ] && echo 'TUN 全屋透明代理' || echo 'tproxy 全屋透明代理 (本机自身流量除外)' )"
+    case "${ACTIVE_MODE:-tproxy}" in
+        tun)    printf '  模式     TUN 全屋透明代理 (含路由器自身)\n' ;;
+        tproxy) printf '  模式     tproxy 全屋透明代理 (本机自身流量除外)\n' ;;
+        *)      printf '  模式     未生效 (只有本机代理端口可用)\n' ;;
+    esac
+    if [ -n "$TUN_HEALED" ]; then
+        printf '  调整     这台固件上 auto-redirect 会让 tun 起不来, 已自动去掉 (功能不受影响)\n'
+        printf '           %s\n' "要重新试它: 把 /etc/zeroproxy/caps 里的 autoredirect 改成 1 后重跑安装命令"
+    fi
     if [ -n "$DEGRADED" ]; then
         printf '  分流     降级模式 (未拿到 GeoIP/GeoSite 数据): 全部流量走节点\n'
         printf '           %s\n' "面板恢复后会自动切回「智能分流」(国内直连 + 广告拦截)"

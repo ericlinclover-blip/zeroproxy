@@ -3113,12 +3113,16 @@ def client_subscription(
     rules: str = "",
     prefix: str = "",
     geo: int = 1,
+    tproxy: int = 1,
 ):
     """设备专属订阅。设备不该拿到主订阅令牌, 所以它走自己的凭据。
 
     单个设备可以用 `?rules=` 覆盖分流模板 (面板上那台设备的设置优先)。
     `?geo=0` 表示这台设备现在拿不到分流数据库 (面板暂时取不到, 或路由器上还没有):
     这时不给它任何 geo 规则 —— mihomo 缺数据库不是"跳过规则"而是整份配置加载失败。
+    `?tproxy=0` 是设备侧的 nft / tproxy 能力 (路由器装机时自己探出来的): 面板据此
+    不写 `auto-redirect` —— 那一项在不支持它固件上会让整个 tun 建不起来 (见
+    share_links.router_tun)。默认 1, 老客户端行为不变。
     三种输出:
       format=clash     整份路由器配置 (单服务器模式, 内联节点)
       format=skeleton  骨架 (多服务器模式: providers 与组的 use 留空, 由路由器填)
@@ -3147,6 +3151,7 @@ def client_subscription(
             device=str(device.get("name") or ""),
             prefix=(prefix or "").strip()[:40],
             geo=bool(geo),
+            tproxy=bool(tproxy),
             # 分流数据库的下载地址指向面板自己 (路由器只需要能访问面板)
             base=share_links.panel_base_url(request, state),
         )

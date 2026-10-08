@@ -364,6 +364,26 @@ ROUTER_TUN = {
 }
 
 
+def router_tun(tproxy: bool = True) -> dict:
+    """路由器端的 `tun` 段 (按设备的实际能力裁剪)。
+
+    `auto-redirect` 会往内核里写 nftables 规则 (sing-tun 在 OpenWrt 上还会写
+    `/etc/nftables.d/0-*-auto-redirect.nft` 再 `fw4 reload`) —— 设备不支持时, **tun 会
+    因为这一步失败而建不出来**: 现象是装完之后 `zp-tun` 一直不出现, 于是脚本退回
+    tproxy, 而那台设备的 tproxy 往往是同一个原因不可用, 最后"全屋透明代理"名存实亡
+    (真机: GL.iNet 原厂 OpenWrt 21.02-SNAPSHOT / 内核 5.4.281, 见 README 8.45)。
+
+    "全屋"的本体是 `auto-route` (它用 ip rule + 独立路由表接管所有流量, 含局域网转发),
+    所以去掉 auto-redirect 不影响功能。设备在装机时探一次自己有没有 nft/tproxy, 用
+    `?tproxy=0` 告诉面板 —— 有就用, 没有就别写, 别让它把 tun 拖垮。
+    """
+    if tproxy:
+        return dict(ROUTER_TUN)
+    trimmed = dict(ROUTER_TUN)
+    trimmed.pop("auto-redirect", None)
+    return trimmed
+
+
 #: 路由器端 `dns` 段在**没有**分流数据库时的样子: nameserver-policy 的键是
 #: `geosite:private,cn`, 它自己也要 geosite.dat 才成立 (mihomo 会为它去加载数据库)。
 #: 数据库实在取不到时, 宁可少一条"国内域名走国内 DNS"的优化, 也不能让配置加载失败。
@@ -695,6 +715,7 @@ def clash_profile(
     skeleton: bool = False,
     geo: bool = True,
     base: str = "",
+    tproxy: bool = True,
 ) -> str:
     """Clash / mihomo 配置。
 
@@ -706,6 +727,8 @@ def clash_profile(
     而不是让路由器自己翻墙去 GitHub —— 装机时它还没有任何代理可用。
     `geo=False` 是**降级**: 面板暂时给不出数据库时, 输出一份不引用 geo 的规则
     (少一层国内直连与广告拦截, 但能跑起来), 等数据到位后 agent 会自己换回来。
+    `tproxy=False` 同理, 是设备侧的能力: 那台路由器没有 nft/tproxy 时不要写
+    `auto-redirect` (它会让 tun 建不起来), 见 router_tun。
     """
     proxies: list[dict] = []
     skipped: list[str] = []
@@ -828,7 +851,7 @@ def clash_profile(
                 "skip-domain": ["Mijia Cloud", "+.push.apple.com"],
             },
             "dns": router_dns(geo),
-            "tun": ROUTER_TUN,
+            "tun": router_tun(tproxy),
             "geox-url": geox,
             # 多服务器模式: 节点由路由器挂成 proxy-providers, 这里留一个空 map 当锚点
             **({"proxy-providers": {}} if skeleton else {"proxies": proxies}),
@@ -1182,7 +1205,12 @@ def provider_profile(state: dict, prefix: str = "") -> str:
 
 
 def router_skeleton(
-    state: dict, template: str | None = None, device: str = "", geo: bool = True, base: str = ""
+    state: dict,
+    template: str | None = None,
+    device: str = "",
+    geo: bool = True,
+    base: str = "",
+    tproxy: bool = True,
 ) -> str:
     """路由器端多服务器模式的骨架 (`?format=skeleton`)。
 
@@ -1190,7 +1218,8 @@ def router_skeleton(
     `use` 是空列表 —— 路由器按行填进它自己那几台服务器的 provider 定义。
     """
     return clash_profile(
-        state, template, router=True, device=device, skeleton=True, geo=geo, base=base
+        state, template, router=True, device=device, skeleton=True, geo=geo, base=base,
+        tproxy=tproxy,
     )
 
 
@@ -1203,6 +1232,7 @@ def subscription_body(
     prefix: str = "",
     geo: bool = True,
     base: str = "",
+    tproxy: bool = True,
 ) -> tuple[str, str]:
     """返回 (响应体, media_type)。
 
@@ -1213,10 +1243,12 @@ def subscription_body(
     if fmt in ("provider", "nodes"):
         return provider_profile(state, prefix=prefix), "text/yaml; charset=utf-8"
     if fmt in ("skeleton", "router-skeleton"):
-        return router_skeleton(state, template, device=device, geo=geo, base=base), "text/yaml; charset=utf-8"
+        return router_skeleton(
+            state, template, device=device, geo=geo, base=base, tproxy=tproxy
+        ), "text/yaml; charset=utf-8"
     if fmt in ("clash", "mihomo", "yaml", "yml"):
         return clash_profile(
-            state, template, router=router, device=device, geo=geo, base=base
+            state, template, router=router, device=device, geo=geo, base=base, tproxy=tproxy
         ), "text/yaml; charset=utf-8"
     if fmt in ("singbox-next", "singbox14", "singbox-1.14", "singbox-new"):
         # 面向 sing-box ≥1.14: 用 http_clients 指定下载出口 (无废弃警告)

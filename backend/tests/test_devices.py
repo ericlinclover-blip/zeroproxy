@@ -452,6 +452,46 @@ def test_router_profile_degrades_when_panel_has_no_geo_data(client, configured):
     assert "DOMAIN-SUFFIX,qq.com,🎯 全球直连" in "\n".join(skeleton["rules"])
 
 
+def test_install_script_probes_capabilities_and_reports_honestly():
+    """TUN 这件事上的三条硬要求: 探得起、说得出、失败别报成功。
+
+    真机 (GL-MT3600BE · 原厂 OpenWrt 21.02-SNAPSHOT / 内核 5.4.281) 的教训:
+    `/dev/net/tun` 这个**节点在**, 但内核建不出设备 —— 老代码据此报"TUN 可用", 于是
+    mihomo 起 tun 失败、脚本退回 tproxy, 而 tproxy 也不可用, 结尾却仍然写着
+    "全屋代理已开启"。三件事都要改:
+      ① 探能力要真建一个设备 (节点存在 ≠ 能建), nft / tproxy 也要真下一条规则;
+      ② TUN 起不来时把**内核自己说的原因**打出来, 而不是只报一句"未出现";
+      ③ 都没生效就不能说"已开启" —— 宁可难看, 也不能让人以为好了。
+    探出来的结论写进 /etc/zeroproxy/caps, agent 重建配置时带给面板 (?tproxy=)。
+    """
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+
+    # ① 能力探测: 都往内核里真做一次
+    assert "ip tuntap add dev zp0probe mode tun" in text, "TUN 要真建一个设备再删掉"
+    assert "nft add rule inet zp_probe c meta l4proto tcp tproxy to :1" in text, "tproxy 要真下一条规则"
+    assert "nft add table inet zp_probe" in text, "nft 本身能不能下规则也要探 (命令在 ≠ 内核支持)"
+    assert "write_caps" in text and "autoredirect=" in text, "结论要落盘给 agent 用"
+
+    # ② 失败时把内核日志打出来
+    assert "与 tun 有关的内核日志" in text
+    assert "logread -e zeroproxy" in text
+
+    # ③ 诚实: 没生效时不许说"全屋代理已开启"; 有自愈, 而且只在失败之后才跑
+    assert "透明代理未生效" in text, "TUN 与 tproxy 都不行时要说实话"
+    assert "tproxy 规则也没能装上" in text, "tproxy 回退要真的验一下规则装上了没有"
+    fail_at = text.index("等了 30 秒 TUN 设备仍未出现")
+    heal_at = text.index("if tun_retry_without_redirect &&")
+    assert fail_at < heal_at, "自愈只能发生在真的失败之后 (能跑的机器一个字节都不动)"
+    # 而且它排在"把内核日志打出来"之后 —— 先让人看见原因, 再动手改配置
+    assert text.index("与 tun 有关的内核日志") < heal_at
+    assert 'mv "$ZP_CONF.ar.bak" "$ZP_CONF"' in text, "自愈没成要把配置退回原样"
+
+    # agent 重建配置时把能力带给面板 (单服务器与多服务器骨架两条路都要带)
+    assert text.count("&tproxy=$_tp") == 2
+
+
 def test_install_script_never_fetches_geo_from_the_internet():
     """安装脚本不许自己去找 GitHub / jsDelivr: 装机时路由器还没有代理可用,
     那条路就是真机上的超时。数据只能来自面板 (/c/geo), 而且要在生成配置之前就位。
@@ -884,6 +924,36 @@ def test_router_profile_has_router_only_blocks(client, configured):
     client_yaml = client.get(path + "?format=clash").text
     assert "tun:" not in client_yaml
     assert "fake-ip" not in client_yaml
+
+
+def test_router_config_can_drop_auto_redirect_for_devices_that_cannot_use_it(client, configured):
+    """`auto-redirect` 要往内核里写 nftables 规则 —— 不支持的固件上会让**整个 tun 起不来**。
+
+    真机 (GL-MT3600BE · arm64 · 原厂 OpenWrt 21.02-SNAPSHOT / 内核 5.4.281): 装完
+    `zp-tun` 一直不出现, 脚本按老逻辑退回 tproxy, 而那台机器的 tproxy 也是同一个原因
+    不可用 —— 结果是"看着全绿、全屋其实没有代理"。
+
+    设备在装机时自己探一次, 用 `?tproxy=0` 告诉面板; 面板据此**不写那一项**。
+    全屋的本体是 `auto-route` (ip rule + 独立路由表, 含局域网转发), 少了 auto-redirect
+    功能不受影响 —— 所以这条只删一项, 不能连 auto-route 一起删。
+    """
+    _login(client)
+    device = _register(client, _pair_code(client)["code"])
+    sub = f"/c/sub/{device['id']}?k={device['secret']}"
+
+    # 默认 (老客户端 / 支持的设备) 一个字节都不变
+    with_ar = yaml.safe_load(client.get(sub).text)
+    assert with_ar["tun"]["auto-redirect"] is True
+    assert with_ar["tun"]["auto-route"] is True
+
+    without = yaml.safe_load(client.get(sub + "&tproxy=0").text)
+    assert "auto-redirect" not in without["tun"], "设备说用不了就别写"
+    assert without["tun"]["auto-route"] is True, "只去掉 auto-redirect, 全屋的本体不能动"
+    assert without["tun"]["device"] == "zp-tun"
+
+    # 多服务器模式的骨架走同一条路
+    skeleton = yaml.safe_load(client.get(sub + "&format=skeleton&tproxy=0").text)
+    assert "auto-redirect" not in skeleton["tun"]
 
 
 def test_device_subscription_requires_secret(client, configured):
