@@ -25,12 +25,15 @@ type serverEntry struct {
 // 一个字节都不用改。多出来的 mode / covered / why 是老字段的细化: 原来只有 mode,
 // 而且那个 mode 是按 "/dev/net/tun 在不在" 报的 (原厂 5.4 上就是这么骗人的)。
 type statusResp struct {
-	OK      bool          `json:"ok"`
-	Core    string        `json:"core"`
-	Mode    string        `json:"mode"`
-	Covered string        `json:"covered"`
-	Why     string        `json:"why"`
-	IPv6    string        `json:"ipv6"`
+	OK      bool   `json:"ok"`
+	Core    string `json:"core"`
+	Mode    string `json:"mode"`
+	Covered string `json:"covered"`
+	Why     string `json:"why"`
+	IPv6    string `json:"ipv6"`
+	//: 数据面上真的过了多少包。规则在但 0 包 = 没人被接管 (多半是接口名不对),
+	//: 这个数字是界面上唯一能一眼看出来的"真的接管了"的证据。
+	Packets int           `json:"packets"`
 	Client  string        `json:"client"`
 	Servers []serverEntry `json:"servers"`
 }
@@ -255,6 +258,7 @@ func currentStatus(cfg serveConfig) statusResp {
 		Why:     why,
 		// IPv6 是泄漏面: 探不到就必须显示出来 (目标网站会看到真实的 v6 地址)
 		IPv6:    caps["ipv6"],
+		Packets: datapathPackets(mode),
 		Client:  readTrimmed(filepath.Join(cfg.dir, "version")),
 		Servers: readServers(cfg.dir),
 	}

@@ -27,7 +27,8 @@ from .config import paths
 #:        面板与路由器界面显示的都是"真的接管到哪", 不再出现"报成功其实没接管"。
 #: 1.4.0: 本机覆盖 (面板不可达时也能开关) + `revert` 逐条比对装机前快照 +
 #:        IPv6 能力探测 (能接管才给双栈配置, 接不了就在面板上写"IPv6 未接管")。
-SCRIPT_VERSION = "1.4.0"
+#: 1.4.1: `zeroproxy doctor` 真机体检 + 规则计数器 (规则存在 ≠ 有流量经过)。
+SCRIPT_VERSION = "1.4.1"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"
@@ -708,7 +709,7 @@ def summary() -> dict:
 # 与内核唯一的区别: zpcore 是我们自己的东西, 没有上游可下载, 所以产物跟着**仓库**走
 # (scripts/build-agent.sh 生成到 client/agent/dist/), 不是 data/ 缓存。它是可选件 ——
 # 面板没准备某一档时, 那台路由器自动退回原来的界面路径, 装机不会失败。
-AGENT_VERSION = os.environ.get("ZP_AGENT_VERSION", "1.0.0")
+AGENT_VERSION = os.environ.get("ZP_AGENT_VERSION", "1.1.0")
 
 #: 小于这个大小的一律不当二进制 (一份正常的 zpcore.gz 约 2.5 MB)。演练里可以用
 #: ZP_AGENT_MIN_BYTES 调低。

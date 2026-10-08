@@ -780,9 +780,20 @@ def main() -> int:
         # ip: 建不出 tun 设备 (原厂 5.4 那台的表现)
         _tool("ip", 'case "$1 $2" in\n'
                     '  "tuntap add") echo "ip: ioctl(TUNSETIFF): Operation not supported" >&2; exit 1 ;;\n'
+                    '  "link show") exit 1 ;;\n'
                     "esac\nexit 0\n")
-        # iptables: 能建链、能加 REDIRECT 规则
-        _tool("iptables", "exit 0\n")
+        # iptables: 能建链、能加 REDIRECT 规则; 并且**带一份真实的计数器表** ——
+        # `zeroproxy doctor` 的"规则上真的有流量吗"就是解析它 (接口名写错时规则照样装得上,
+        # 却一个包都不命中, 这是唯一能证明"真的接管了"的现场证据)。
+        _tool("iptables", 'case "$*" in\n'
+                          '  *"-L zp_router -v -n"*)\n'
+                          "    echo 'Chain zp_router (1 references)'\n"
+                          "    echo ' pkts bytes target     prot opt in     out     source               destination'\n"
+                          "    echo '   12   720 RETURN     all  --  *      *       0.0.0.0/8            0.0.0.0/0'\n"
+                          "    echo '    3   180 REDIRECT   udp  --  *      *       0.0.0.0/0            0.0.0.0/0  udp dpt:53 redir ports 7874'\n"
+                          "    echo '   40  2400 REDIRECT   tcp  --  *      *       0.0.0.0/0            0.0.0.0/0  redir ports 7892'\n"
+                          "    exit 0 ;;\n"
+                          "esac\nexit 0\n")
 
         r_root = os.path.join(tmp, "redirect-root")
         ok_r, out_r = run_install(
@@ -816,6 +827,22 @@ def main() -> int:
               [ln for ln in r_caps.splitlines() if ln.startswith("why.ipv6=")][:1])
         check("IPv6 未接管时不给双栈配置 (不给内核管不了的东西)",
               r_cfg["ipv6"] is False and r_cfg["dns"]["ipv6"] is False)
+
+        # 真机体检: `zeroproxy doctor` 必须在真机上给出可核对的证据, 而这里验它的判据
+        r_cli = os.path.join(r_root, "cli-doctor.sh")
+        with open(r_cli, "w") as fh:
+            fh.write(open(os.path.join(r_root, "cli"), encoding="utf-8").read()
+                     .replace("/etc/init.d/zeroproxy", "true"))
+        doctor = subprocess.run(
+            ["sh", r_cli, "doctor"], capture_output=True, text=True,
+            env={**os.environ, "PATH": fake_tools + os.pathsep + os.environ.get("PATH", "")},
+        ).stdout
+        check("doctor: 现场与 caps 一致时说'数据面真的在'",
+              "数据面真的在（redirect）" in doctor,
+              [ln.strip() for ln in doctor.splitlines() if "现场" in ln][:1])
+        check("doctor: 从规则计数器算出真的有多少包经过 (54 + DNS 3)",
+              "55 个包经过" in doctor and "3 个查询被劫持" in doctor,
+              [ln.strip() for ln in doctor.splitlines() if "包经过" in ln or "劫持" in ln][:2])
 
         # [9] 健康机器: tun / nft 都在的普通 OpenWrt → 阶梯应当仍然选 L1
         print("\n[9] 健康机器 (tun + nftables 都在): 阶梯选 tun, 行为与以前一致")
@@ -851,6 +878,19 @@ def main() -> int:
               and g_cfg["dns"]["enhanced-mode"] == "fake-ip")
         check("能接管 v6 时配置是双栈 (顶层 ipv6 + dns.ipv6 同时开)",
               g_cfg["ipv6"] is True and g_cfg["dns"]["ipv6"] is True)
+        # 同一份 doctor 在 tun 机器上: 现场一致, 但本机没有流量 (演练机没有局域网) ——
+        # 这时**不能**说"已接管并正常工作", 只能说"规则在, 还没有流量经过"。
+        g_cli = os.path.join(g_root, "cli-doctor.sh")
+        with open(g_cli, "w") as fh:
+            fh.write(open(os.path.join(g_root, "cli"), encoding="utf-8").read()
+                     .replace("/etc/init.d/zeroproxy", "true"))
+        g_doctor = subprocess.run(
+            ["sh", g_cli, "doctor"], capture_output=True, text=True,
+            env={**os.environ, "PATH": good + os.pathsep + os.environ.get("PATH", "")},
+        ).stdout
+        check("doctor: 没有流量时说'还没有', 不谎报已正常工作",
+              "数据面真的在（tun）" in g_doctor and "还没有流量经过" in g_doctor,
+              [ln.strip() for ln in g_doctor.splitlines() if "流量" in ln][:1])
 
         # [10] 本地控制面 (zpcore): 自带的界面服务 —— "界面能不能打开"从此与固件无关
         if go:

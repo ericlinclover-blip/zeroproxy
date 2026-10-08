@@ -1289,15 +1289,20 @@ table inet zp_router {
         ip6 daddr @local6 return
         meta mark 0x1ff return
         meta l4proto { tcp, udp } th dport { 22, 53, 7890, 7874, 9092, 9090 } return
-        meta l4proto tcp meta mark set 0x1ff tproxy to :7893 accept
-        meta l4proto udp meta mark set 0x1ff tproxy to :7893 accept
+        # counter 不是可有可无的装饰: **规则存在 ≠ 有流量经过**。接口名写错时规则照样
+        # "装上", 却一个包都不命中 —— 这个计数是唯一能证明"真的接管了"的现场证据,
+        # `zeroproxy doctor` 读的就是它。
+        meta l4proto tcp counter meta mark set 0x1ff tproxy to :7893 accept
+        meta l4proto udp counter meta mark set 0x1ff tproxy to :7893 accept
     }
     chain dns {
         type nat hook prerouting priority -105; policy accept;
         ip daddr @local4 return
         ip6 daddr @local6 return
-        udp dport 53 redirect to :7874
-        tcp dport 53 redirect to :7874
+        # DNS 单独计数: "局域网设备真的把 DNS 发给了路由器吗"这个问题只有它能回答
+        # (dnsmasq 我们一个字节都没改, 所以这件事必须验, 不能假设)。
+        udp dport 53 counter redirect to :7874
+        tcp dport 53 counter redirect to :7874
     }
 }
 NFTEOF
@@ -1939,6 +1944,8 @@ AGENTINITEOF
 # ZeroProxy 路由器客户端运维命令
 ZP_DIR=/etc/zeroproxy
 ZP_VERSION="__ZP_CLIENT_VERSION__"
+# 本机代理端口 (config.yaml 的 mixed-port) —— doctor 的出口测试用它
+ZP_MIXED=7890
 SERVERS="$ZP_DIR/servers"
 FIRST="$(ls "$SERVERS"/*.json 2>/dev/null | head -n1)"
 
@@ -1949,6 +1956,137 @@ key_of() {
 servers() { ls "$SERVERS"/*.json 2>/dev/null; }
 
 running() { /etc/init.d/zeroproxy running >/dev/null 2>&1 && echo yes || echo no; }
+
+# 数据面上真的有流量经过吗 —— **规则存在 ≠ 有流量**。接口名写错 (L3 那一档最容易) 时
+# 规则照样"装得上", 却一个包都不命中; 而这是唯一能证明"真的接管了"的现场证据。
+# 输出两个数字: "总包数 DNS包数" (拿不到就给 0 0)。
+datapath_packets() {
+    _mode="$(sed -n 's/^chosen=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    case "$_mode" in
+        tun)
+            _rx="$(cat /sys/class/net/zp-tun/statistics/rx_packets 2>/dev/null | head -n1)"
+            printf '%s 0\n' "${_rx:-0}"
+            ;;
+        tproxy)
+            _dump="$(nft list table inet zp_router 2>/dev/null || true)"
+            _tot="$(printf '%s\n' "$_dump" | sed -n 's/.*counter packets \([0-9][0-9]*\).*/\1/p' \
+                | awk '{s+=$1} END{print s+0}')"
+            _dns="$(printf '%s\n' "$_dump" | grep 'dport 53' \
+                | sed -n 's/.*counter packets \([0-9][0-9]*\).*/\1/p' \
+                | awk '{s+=$1} END{print s+0}')"
+            printf '%s %s\n' "${_tot:-0}" "${_dns:-0}"
+            ;;
+        redirect)
+            _dump="$(iptables -t nat -L zp_router -v -n 2>/dev/null || true)"
+            _tot="$(printf '%s\n' "$_dump" | awk 'NR>2 {s+=$1} END{print s+0}')"
+            _dns="$(printf '%s\n' "$_dump" | awk '$0 ~ /dpt:53/ {s+=$1} END{print s+0}')"
+            printf '%s %s\n' "${_tot:-0}" "${_dns:-0}"
+            ;;
+        *) printf '0 0\n' ;;
+    esac
+}
+
+# 真机体检。它问的每一句都是"到底行不行", 每一条都给证据 —— 装机之后、出问题时第一个
+# 应该跑的命令。设计上它只能在真机上给出完整答案 (本机没有"局域网侧"这回事), 所以
+# 演练只验它的判据与输出格式。
+doctor() {
+    echo "ZeroProxy 路由器端体检"
+    echo "────────────────────────────────────────────"
+    echo
+    echo "内核"
+    if [ "$(running)" = yes ]; then
+        printf '  ✓ 服务在跑：%s\n' "$("$ZP_DIR/mihomo" -v 2>/dev/null | head -n1)"
+    else
+        printf '  ✗ 服务没在跑 — 面板上打开总开关，或本机执行 zeroproxy on\n'
+    fi
+
+    echo
+    echo "数据面"
+    _chosen="$(sed -n 's/^chosen=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    _covered="$(sed -n 's/^covered=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    printf '  选择：%s（覆盖 %s）\n' "${_chosen:-未知}" "${_covered:-未知}"
+    # 现场 vs 意图: caps 里的是"我们打算用什么", 这里问的是"现在真的在不在"
+    if [ "$(running)" = yes ]; then
+        _live="none"
+        if ip link show zp-tun >/dev/null 2>&1; then _live="tun"
+        elif nft list table inet zp_router >/dev/null 2>&1; then _live="tproxy"
+        elif iptables -t nat -L zp_router >/dev/null 2>&1; then _live="redirect"
+        fi
+        if [ "$_live" = "$_chosen" ] && [ "$_live" != "none" ]; then
+            printf '  ✓ 现场一致：数据面真的在（%s）\n' "$_live"
+        elif [ "$_live" = "none" ]; then
+            printf '  ✗ 数据面没有生效 — 局域网里没有人被接管\n'
+            for _lv in tun tproxy redirect; do
+                _w="$(sed -n "s/^why.$_lv=//p" "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+                [ -n "$_w" ] && printf '      %s: %s\n' "$_lv" "$_w"
+            done
+        else
+            printf '  ! caps 说 %s、现场是 %s — 重跑一次安装命令让它对齐\n' "$_chosen" "$_live"
+        fi
+        _pk="$(datapath_packets)"
+        _pkts="${_pk%% *}"; _dnspkts="${_pk##* }"
+        if [ "$_live" != "none" ]; then
+            if [ "${_pkts:-0}" -gt 0 ] 2>/dev/null; then
+                printf '  ✓ 规则上真的有流量：%s 个包经过\n' "$_pkts"
+            else
+                printf '  ! 规则在，但还没有流量经过 — 刚刚开机/刚重启就是这样；\n'
+                printf '      如果局域网设备已经在用网还是 0，多半是接口名不对（redirect 那一档最常见）\n'
+            fi
+        fi
+    fi
+
+    echo
+    echo "DNS"
+    if [ "${_dnspkts:-0}" -gt 0 ] 2>/dev/null; then
+        printf '  ✓ 局域网 DNS 已进内核：%s 个查询被劫持\n' "$_dnspkts"
+    else
+        printf '  ! 还没有 DNS 查询被劫持 — 设备可能没把路由器当 DNS（或还没开始用网）\n'
+    fi
+
+    echo
+    echo "IPv6"
+    _v6="$(sed -n 's/^ipv6=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    if [ "$_v6" = "1" ]; then
+        printf '  ✓ 已一并接管（局域网设备的 v6 也走代理）\n'
+    else
+        printf '  ! 未接管 — %s\n' "$(sed -n 's/^why.ipv6=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+        printf '      这台机器上局域网设备的 IPv6 会直接出去\n'
+    fi
+
+    echo
+    echo "出口"
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsS -m 12 -x "http://127.0.0.1:$ZP_MIXED" -o /dev/null \
+            "http://www.gstatic.com/generate_204" 2>/dev/null; then
+            printf '  ✓ 经本机代理端口能出网\n'
+        else
+            printf '  ! 经本机代理端口出不去（节点可能全关着，或节点本身不通）\n'
+        fi
+    else
+        printf '  · 这台固件上没有 curl，跳过出口测试\n'
+    fi
+
+    echo
+    echo "面板"
+    for _f in $(servers); do
+        _b="$(field_of "$_f" base)"
+        _key="$(key_of "$_b")"
+        if command -v curl >/dev/null 2>&1 \
+            && curl -fsSk -m 8 -o /dev/null "$_b/api/status" 2>/dev/null; then
+            printf '  ✓ %s 可达\n' "$_key"
+        else
+            printf '  ! %s 不可达（代理照常工作；本机开关会自动落到本机覆盖）\n' "$_key"
+        fi
+    done
+    if [ -s "$ZP_DIR/local.override" ]; then
+        printf '  ! 本机覆盖生效中：%s（交回面板：zeroproxy local-auto）\n' \
+            "$(tr -d '\r\n ' < "$ZP_DIR/local.override")"
+    fi
+
+    echo
+    echo "────────────────────────────────────────────"
+    echo "下一步：以上有 ✗ 或 ! 时，把这一整段发回面板即可定位。"
+}
 
 # 与装机前的快照逐条比对。**逐行**, 不是"看起来差不多" —— 数据面残留是"关掉了但网还是
 # 不对劲"这一类问题的唯一解释, 必须能直接指出来。左右两边: 左=现在, 右=装机前。
@@ -1990,6 +2128,10 @@ revert_report() {
 }
 
 case "${1:-status}" in
+    doctor)
+        # 真机体检: 逐项问"到底行不行", 每项给证据 (判据与输出格式在 doctor() 里)
+        doctor
+        ;;
     status)
         echo "内核:  $( [ "$(running)" = yes ] && echo 运行中 || echo 已停止 )"
         echo "服务器 ($(servers | wc -l | tr -d ' ') 台):"
@@ -2227,7 +2369,7 @@ EOF
         rm -rf "$ZP_DIR" /etc/init.d/zeroproxy /etc/init.d/zeroproxy-agent /etc/init.d/zeroproxy-ui /usr/bin/zeroproxy
         echo "已卸载。这台设备在面板上仍然存在, 请在面板「客户端」里一并移除。"
         ;;
-    *) echo "用法: zeroproxy [status|ui|servers|add <链接>|drop <键>|refresh|geo|on|off|local-auto|revert|log|uninstall]" ;;
+    *) echo "用法: zeroproxy [doctor|status|ui|servers|add <链接>|drop <键>|refresh|geo|on|off|local-auto|revert|log|uninstall]" ;;
 esac
 CLIEOF
     chmod 755 "$ZP_CLI"

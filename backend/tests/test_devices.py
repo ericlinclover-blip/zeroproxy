@@ -626,6 +626,35 @@ def test_local_control_plane_source_and_build_script_ship_with_the_repo():
     serve = open(os.path.join(agent_src, "serve.go"), encoding="utf-8").read()
     assert '"/cgi-bin/zeroproxy"' in serve and '"status"' in serve
     assert '"covered"' in serve and '"mode"' in serve
+    # 版本号只有一处定义 (面板代码里的 AGENT_VERSION): 构建脚本必须从那里读, 否则两边
+    # 一漂移, 面板就会去找一个从来没产出过的文件名 —— 只在装机时才暴露。
+    assert "AGENT_VERSION" in body and "router_client.py" in body
+
+
+def test_doctor_answers_whether_traffic_actually_flows():
+    """`zeroproxy doctor` —— 真机上的第一诊断命令, 回答的是**唯一能证明接管成功**的问题。
+
+    规则存在 ≠ 有流量: 接口名写错时规则照样"装得上", 却一个包都不命中 (L3 那一档最容易)。
+    nft 的规则因此必须带 `counter` —— 不带计数器的规则是看不出有没有流量的; iptables 那边
+    靠 `-L -v`。没流量时必须说"还没有", 而不是谎报"已接管并正常工作"。
+    """
+    import re
+
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+    assert "doctor() {" in text and re.search(r"^\s*doctor$", text, re.M), "要定义并派发它"
+    assert "doctor|status|ui|servers" in text, "用法里要列出它"
+    # ① 现场核对 caps 里那一档是不是真的在 (不看命令退出码)
+    assert "数据面真的在" in text and "现场一致" in text
+    # ② 计数器: 两种数据面都要能算出包数; nft 规则必须带 counter
+    assert "counter meta mark set 0x1ff tproxy" in text
+    assert "counter redirect to :7874" in text
+    assert "datapath_packets" in text and "-L zp_router -v -n" in text
+    # ③ 没流量时的措辞 (也可能只是刚开机, 所以是"还没有"而不是"坏了")
+    assert "还没有流量经过" in text
+    # DNS 单独计数: dnsmasq 一个字节都没改, "设备真的把 DNS 发给了路由器吗"只能靠它回答
+    assert "局域网 DNS 已进内核" in text
 
 
 def test_local_override_lets_the_router_be_switched_without_the_panel():

@@ -61,6 +61,13 @@ function render(state) {
   if (state.core === 'running' && state.mode !== 'none' && state.ipv6 === '0') {
     $('sub').textContent += ' · IPv6 未接管 (v6 会直接出去)';
   }
+  // 规则在 ≠ 有流量: 接口名写错时规则照样装得上, 却一个包都不命中。0 包要写出来,
+  // 但那也可能只是"刚开机" —— 所以措辞是"还没有", 不是"坏了"。
+  if (state.core === 'running' && state.mode !== 'none' && state.packets === 0) {
+    $('sub').textContent += ' · 规则上还没有流量经过';
+  } else if (state.core === 'running' && state.packets > 0) {
+    $('sub').textContent += ` · 已有 ${state.packets} 个包经过`;
+  }
   $('mode').textContent = state.client ? `客户端 v${state.client}` : '';
 
   const on = state.core === 'running';

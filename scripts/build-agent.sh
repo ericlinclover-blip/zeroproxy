@@ -22,7 +22,16 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC="$ROOT/backend/zeroproxy/client/agent"
 DIST="$SRC/dist"
-VERSION="${ZP_AGENT_VERSION:-1.0.0}"
+# 版本号只有一处定义: 面板代码里的 AGENT_VERSION。**不许在这里再写一个字面量** ——
+# 两边一旦漂移, 面板会去找一个 build 从来没产出过的文件名, 结果就是"某一天开始所有
+# 路由器都装不上本地控制面", 而且只在装机时才暴露。这里直接把它读出来。
+VERSION="${ZP_AGENT_VERSION:-$(sed -n \
+    's/^AGENT_VERSION = os.environ.get("ZP_AGENT_VERSION", "\(.*\)")$/\1/p' \
+    "$ROOT/backend/zeroproxy/router_client.py" | head -n1)}"
+if [ -z "$VERSION" ]; then
+    echo "读不到 router_client.py 里的 AGENT_VERSION —— 两边的版本号必须一致, 停在这里。" >&2
+    exit 1
+fi
 
 GO=""
 for candidate in "${GO:-}" go /usr/local/go/bin/go /opt/homebrew/bin/go; do

@@ -114,6 +114,51 @@ func liveMode() (mode string, covered string) {
 	return "none", "none"
 }
 
+// datapathPackets 是数据面上真的过了多少包 —— **规则存在 ≠ 有流量**。接口名写错时规则
+// 照样"装得上", 却一个包都不命中; 这是唯一能证明"真的接管了"的现场证据。
+// 与 CLI 的 datapath_packets 是同一条判据 (两处必须一致, 否则界面与命令行会各说各话)。
+func datapathPackets(mode string) int {
+	switch mode {
+	case "tun":
+		return atoi(readTrimmed("/sys/class/net/zp-tun/statistics/rx_packets"))
+	case "tproxy":
+		out, good := run(probeTimeout, "nft", "list", "table", "inet", "zp_router")
+		if !good {
+			return 0
+		}
+		total := 0
+		for _, m := range reNFTCounter.FindAllStringSubmatch(out, -1) {
+			total += atoi(m[1])
+		}
+		return total
+	case "redirect":
+		out, good := run(probeTimeout, "iptables", "-t", "nat", "-L", "zp_router", "-v", "-n")
+		if !good {
+			return 0
+		}
+		total := 0
+		for i, line := range strings.Split(out, "\n") {
+			if i < 2 { // 表头两行 (Chain xxx / 列名) 不算
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) > 0 {
+				total += atoi(fields[0])
+			}
+		}
+		return total
+	}
+	return 0
+}
+
+func atoi(s string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
 // readCaps 读 /etc/zeroproxy/caps (一行一个 key=value)。本进程直接读文件 —— 不必为了
 // 读一个自己目录里的文本再去 fork 一个 cat (路由器上 fork 是要花钱的)。
 func readCaps(dir string) map[string]string {
@@ -130,7 +175,10 @@ func readCaps(dir string) map[string]string {
 	return caps
 }
 
-var reJSONString = regexp.MustCompile(`"([A-Za-z0-9_]+)"\s*:\s*"([^"]*)"`)
+var (
+	reJSONString = regexp.MustCompile(`"([A-Za-z0-9_]+)"\s*:\s*"([^"]*)"`)
+	reNFTCounter = regexp.MustCompile(`counter packets ([0-9]+)`)
+)
 
 // readServers 读 servers/*.json。文件是扁平的字符串字段 (安装脚本与 CLI 自己写的),
 // 所以这里只认 "键": "值" 这一种写法 —— 与 cgi / CLI 的极简解析保持一致, 不引 YAML。
