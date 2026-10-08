@@ -122,8 +122,22 @@ case "$action" in
     status)
         core="stopped"
         /etc/init.d/zeroproxy running >/dev/null 2>&1 && core="running"
-        mode="tproxy"
-        [ -c /dev/net/tun ] && mode="tun"
+        # 模式按**现场**报 (设备/表真的在不在), 不看 /dev/net/tun 这个节点 —— 它在某些
+        # 固件上存在但内核建不出设备 (真机: 原厂 5.4.281), 那时报 TUN 就是骗人。
+        # covered 是"到底接管到哪": 只接管了局域网 TCP 就不能显示成全屋。
+        mode="none"
+        if ip link show zp-tun >/dev/null 2>&1; then mode="tun"
+        elif nft list table inet zp_router >/dev/null 2>&1; then mode="tproxy"
+        elif iptables -t nat -L zp_router >/dev/null 2>&1; then mode="redirect"
+        fi
+        covered="none"
+        [ "$mode" = "tun" ] && covered="full"
+        [ "$mode" = "tproxy" ] && covered="lan"
+        [ "$mode" = "redirect" ] && covered="lan_tcp"
+        # 数据面没探到任何一级时, 把原因也带上 (界面上直接说"为什么")
+        why="$(sed -n 's/^why.tun=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+        # IPv6 能不能一并接管: 接不了要显示出来 (局域网设备的 v6 会直接出去)
+        ipv6="$(sed -n 's/^ipv6=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
         ver=""
         [ -f "$ZP_DIR/version" ] && ver="$(cat "$ZP_DIR/version" 2>/dev/null)"
         items=""
@@ -135,8 +149,8 @@ case "$action" in
             items="${items:+$items,}{\"key\":\"$(jstr "$key")\",\"base\":\"$(jstr "$base")\",\"id\":\"$(jstr "$did")\"}"
         done
         header
-        printf '{"ok":true,"core":"%s","mode":"%s","client":"%s","servers":[%s]}\n' \
-            "$core" "$mode" "$(jstr "$ver")" "$items"
+        printf '{"ok":true,"core":"%s","mode":"%s","covered":"%s","why":"%s","ipv6":"%s","client":"%s","servers":[%s]}\n' \
+            "$core" "$mode" "$covered" "$(jstr "$why")" "$ipv6" "$(jstr "$ver")" "$items"
         ;;
     add)
         url="$(jval url)"

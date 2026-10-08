@@ -246,7 +246,9 @@ def touch(state: dict, device: dict, info: dict) -> bool:
     report = info.get("report")
     if isinstance(report, dict):
         fresh = {
-            str(k)[:32]: (v if isinstance(v, (int, float, bool)) else str(v)[:64])
+            # 值放宽到 160 字: 设备上报的 `why` 是"这一级为什么不行"的内核原话, 64 字
+            # 常常正好切在关键处 (面板上那枚标签的 tooltip 直接用它)。
+            str(k)[:32]: (v if isinstance(v, (int, float, bool)) else str(v)[:160])
             for k, v in list(report.items())[:20]
         }
         if fresh != device.get("report"):

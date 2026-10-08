@@ -28,6 +28,8 @@ import tempfile
 import time
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 BACKEND = ROOT / "backend"
 sys.path.insert(0, str(BACKEND))
@@ -273,6 +275,43 @@ def main() -> int:
         )
         output = (proc.stdout or "") + (proc.stderr or "")
         record("sing-box 解析订阅", proc.returncode == 0, "check PASS" if proc.returncode == 0 else last_line(output))
+
+    # 路由器端整机配置也要过真内核。**这块原来是空的**: 客户端订阅被真 mihomo 验过, 而
+    # 路由器那份 (tun / dns / 嗅探 / fake-ip) 只被演练里的桩内核 `-t` 放行 —— 桩对任何
+    # 输入都返回 0。于是"字段支持不支持、组合对不对"这类问题只有真机能发现。
+    #
+    # 这里把四档数据面 × 是否接管 IPv6 的组合都过一遍: tun 段该在的在、该没的没, 双栈
+    # 配置 (顶层 ipv6 + dns.ipv6) 真的能被内核吃下去。
+    if mihomo_bin:
+        print("\n[2c] 路由器端配置解析校验 (四档数据面 × IPv6)")
+        code = client.post("/api/devices/pair", json={"label": "verify"}).json()["code"]
+        pair = client.post("/c/pair", json={
+            "code": code, "kind": "router", "hostname": "verify",
+            "model": "verify", "arch": "arm64", "os": "OpenWrt", "version": "verify",
+        }).json()
+        for dp in ("tun", "tproxy", "redirect", "none"):
+            for v6 in (0, 1):
+                text = client.get(
+                    f"/c/sub/{pair['id']}?k={pair['secret']}&format=clash"
+                    f"&rules=smart&datapath={dp}&ipv6={v6}"
+                ).text
+                profile = yaml.safe_load(text)
+                # 先断言"这份配置本身自洽" —— 真内核失败时能立刻分清是配置生成错了,
+                # 还是内核不认这个字段
+                expect_tun = dp == "tun"
+                shape_ok = ("tun" in profile) == expect_tun
+                assert shape_ok, f"{dp} 的 tun 段与数据面不符: {sorted(profile)}"
+                assert profile["ipv6"] is bool(v6)
+                assert profile["dns"]["ipv6"] is bool(v6)
+                path = home / f"router-{dp}-v6{v6}.yaml"
+                path.write_text(text, encoding="utf-8")
+                proc = subprocess.run(
+                    [mihomo_bin, "-t", "-f", str(path), "-d", str(home / "mihomo-data")],
+                    capture_output=True, text=True, timeout=180,
+                )
+                output = (proc.stdout or "") + (proc.stderr or "")
+                ok = proc.returncode == 0 or "test is successful" in output
+                record(f"mihomo 解析路由器配置 (datapath={dp} · ipv6={v6})", ok, last_line(output))
 
     print("\n[2c] 分流模板 (smart / global / direct)")
     templates = {

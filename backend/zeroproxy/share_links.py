@@ -384,13 +384,22 @@ def router_tun(tproxy: bool = True) -> dict:
     return trimmed
 
 
-#: 路由器端 `dns` 段在**没有**分流数据库时的样子: nameserver-policy 的键是
-#: `geosite:private,cn`, 它自己也要 geosite.dat 才成立 (mihomo 会为它去加载数据库)。
-#: 数据库实在取不到时, 宁可少一条"国内域名走国内 DNS"的优化, 也不能让配置加载失败。
-def router_dns(geo: bool = True) -> dict:
-    if geo:
-        return ROUTER_DNS
-    return {k: v for k, v in ROUTER_DNS.items() if k != "nameserver-policy"}
+def router_dns(geo: bool = True, ipv6: bool = False) -> dict:
+    """路由器端 `dns` 段。
+
+    `geo=False` 是降级: nameserver-policy 的键是 `geosite:private,cn`, 它自己也要
+    geosite.dat 才成立 (mihomo 会为它去加载数据库)。数据库实在取不到时, 宁可少一条
+    "国内域名走国内 DNS"的优化, 也不能让配置加载失败。
+
+    `ipv6=True` 时把 DNS 也放开到 v6 —— 与顶层 `ipv6` 一致。**两处必须同时开**: 只开
+    顶层会让 AAAA 解析走不到, 只开 DNS 会让 mihomo 拿到 v6 地址却没法用它。
+    """
+    dns = dict(ROUTER_DNS)
+    if ipv6:
+        dns["ipv6"] = True
+    if not geo:
+        dns.pop("nameserver-policy", None)
+    return dns
 
 
 def template_of(state: dict, override: str | None = None) -> str:
@@ -716,6 +725,8 @@ def clash_profile(
     geo: bool = True,
     base: str = "",
     tproxy: bool = True,
+    datapath: str = "tun",
+    ipv6: bool = False,
 ) -> str:
     """Clash / mihomo 配置。
 
@@ -727,6 +738,13 @@ def clash_profile(
     而不是让路由器自己翻墙去 GitHub —— 装机时它还没有任何代理可用。
     `geo=False` 是**降级**: 面板暂时给不出数据库时, 输出一份不引用 geo 的规则
     (少一层国内直连与广告拦截, 但能跑起来), 等数据到位后 agent 会自己换回来。
+    `datapath` 是设备侧**探测出来的数据面**: tun / tproxy / redirect / none。只有
+    `tun` 才给 `tun` 段 —— 建不出 TUN 设备的机器 (原厂 21.02 / 内核 5.4) 带着它,
+    mihomo 启动时建 tun 失败, 整份配置起不来 (见 README 8.45)。tproxy / redirect
+    都用 `redir-port` + `dns.listen` 那一条路, 配置本身一样, 差别在防火墙侧。
+    `ipv6=True` 表示这台设备的数据面**能一并接管 IPv6**: 顶层 `ipv6` 与 `dns.ipv6`
+    一起打开。不能接管时保持 v4-only —— 那时局域网设备的 v6 会直接出去, 这件事由
+    设备侧如实上报 (caps 的 `why.ipv6`), 面板上会写"IPv6 未接管"。
     `tproxy=False` 同理, 是设备侧的能力: 那台路由器没有 nft/tproxy 时不要写
     `auto-redirect` (它会让 tun 建不起来), 见 router_tun。
     """
@@ -826,7 +844,10 @@ def clash_profile(
             "bind-address": "*",
             "mode": "rule",
             "log-level": "warning",
-            "ipv6": False,
+            # 设备的数据面能覆盖 v6 时才开。开着它 mihomo 会给 tun 分配 v6 地址、
+            # auto-route 一并管 v6; 覆盖不到时保持 v4-only, 并由设备上报"IPv6 未接管"
+            # (真话), 而不是留一个看起来接管了、实际漏出去的假象。
+            "ipv6": bool(ipv6),
             # 并发建连 + 统一延迟: 多设备同时上网时体感差别明显
             "tcp-concurrent": True,
             "unified-delay": True,
@@ -850,7 +871,7 @@ def clash_profile(
                 # 这两类域名被嗅探后推送/米家设备的证书校验会出问题, 跳过
                 "skip-domain": ["Mijia Cloud", "+.push.apple.com"],
             },
-            "dns": router_dns(geo),
+            "dns": router_dns(geo, ipv6),
             "tun": router_tun(tproxy),
             "geox-url": geox,
             # 多服务器模式: 节点由路由器挂成 proxy-providers, 这里留一个空 map 当锚点
@@ -858,6 +879,10 @@ def clash_profile(
             "proxy-groups": groups,
             "rules": rules,
         }
+        # tun 段只在真的能建出 TUN 设备时给。带着它去 redirect / tproxy 模式的机器上,
+        # mihomo 会尝试建设备并失败 —— "配置看着没错、内核却起不来"就是这么来的。
+        if str(datapath or "tun").strip().lower() != "tun":
+            profile.pop("tun", None)
     else:
         profile = {
             "mixed-port": 7890,
@@ -875,11 +900,17 @@ def clash_profile(
         else " (全部直连, 不下载 geo 数据)"
     )
     if router:
+        dp = str(datapath or "tun").strip().lower()
+        dp_head = {
+            "tproxy": "# 全屋透明代理由 tproxy 接管 (路由器自身流量除外), DNS 走 fake-ip + 嗅探;",
+            "redirect": "# 局域网 TCP 由 iptables REDIRECT 接管 (不含 UDP 与路由器自身), DNS 走 fake-ip;",
+            "none": "# 未接管局域网: 只有手动把代理地址填成本机的设备会用到这份配置;",
+        }.get(dp, "# 全屋透明代理由 tun + auto-route 接管, DNS 走 fake-ip + 嗅探;")
         head = [
             "# ZeroProxy 路由器客户端配置 — mihomo",
             "# 由面板自动生成, 请勿手改: 节点启停 / 端口变更 / 分流切换都会自动同步",
             f"# 分流模板: {tpl}{tpl_note}",
-            "# 全屋透明代理由 tun + auto-route 接管, DNS 走 fake-ip + 嗅探;",
+            dp_head,
             "# dnsmasq / 防火墙都不需要改动, 停掉内核即完全恢复原状",
         ]
         if device:
@@ -1211,6 +1242,8 @@ def router_skeleton(
     geo: bool = True,
     base: str = "",
     tproxy: bool = True,
+    datapath: str = "tun",
+    ipv6: bool = False,
 ) -> str:
     """路由器端多服务器模式的骨架 (`?format=skeleton`)。
 
@@ -1219,7 +1252,7 @@ def router_skeleton(
     """
     return clash_profile(
         state, template, router=True, device=device, skeleton=True, geo=geo, base=base,
-        tproxy=tproxy,
+        tproxy=tproxy, datapath=datapath, ipv6=ipv6,
     )
 
 
@@ -1233,6 +1266,8 @@ def subscription_body(
     geo: bool = True,
     base: str = "",
     tproxy: bool = True,
+    datapath: str = "tun",
+    ipv6: bool = False,
 ) -> tuple[str, str]:
     """返回 (响应体, media_type)。
 
@@ -1244,11 +1279,13 @@ def subscription_body(
         return provider_profile(state, prefix=prefix), "text/yaml; charset=utf-8"
     if fmt in ("skeleton", "router-skeleton"):
         return router_skeleton(
-            state, template, device=device, geo=geo, base=base, tproxy=tproxy
+            state, template, device=device, geo=geo, base=base, tproxy=tproxy,
+            datapath=datapath, ipv6=ipv6,
         ), "text/yaml; charset=utf-8"
     if fmt in ("clash", "mihomo", "yaml", "yml"):
         return clash_profile(
-            state, template, router=router, device=device, geo=geo, base=base, tproxy=tproxy
+            state, template, router=router, device=device, geo=geo, base=base,
+            tproxy=tproxy, datapath=datapath, ipv6=ipv6,
         ), "text/yaml; charset=utf-8"
     if fmt in ("singbox-next", "singbox14", "singbox-1.14", "singbox-new"):
         # 面向 sing-box ≥1.14: 用 http_clients 指定下载出口 (无废弃警告)

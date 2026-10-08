@@ -41,9 +41,26 @@ async function call(path, body) {
 }
 
 function render(state) {
+  // 说的是**现场验过的**模式与覆盖范围, 不是"我们打算用什么": 内核在跑但一级都没接管
+  // 时, 这里要明确写"未接管", 而不是含混地写"全屋透明代理" (真机 8.45 的教训)。
+  const MODE_TEXT = {
+    tun: 'TUN 全屋透明代理 (含路由器自身)',
+    tproxy: 'tproxy 全屋透明代理 (路由器自身除外)',
+    redirect: 'iptables REDIRECT — 仅局域网 TCP, 不含 UDP',
+    none: '未接管 — 只有本机代理端口可用',
+  };
+  const modeText = MODE_TEXT[state.mode] || MODE_TEXT.none;
   $('sub').textContent = state.core === 'running'
-    ? `内核运行中 · ${state.mode === 'tun' ? 'TUN 全屋透明代理' : 'tproxy 全屋透明代理'}`
+    ? `内核运行中 · ${modeText}`
     : '内核已停止 — 全屋按普通方式上网';
+  if (state.core === 'running' && state.mode === 'none' && state.why) {
+    $('sub').textContent += ` · ${state.why}`;
+  }
+  // IPv6 是泄漏面, 单独说一句: 局域网设备的 v6 会直接出去 (目标网站看得到真实地址)。
+  // 探不到时后端给 "0"; 老版本没有这一位时是 undefined, 那时不说 (不能凭空断言)。
+  if (state.core === 'running' && state.mode !== 'none' && state.ipv6 === '0') {
+    $('sub').textContent += ' · IPv6 未接管 (v6 会直接出去)';
+  }
   $('mode').textContent = state.client ? `客户端 v${state.client}` : '';
 
   const on = state.core === 'running';

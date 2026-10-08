@@ -48,9 +48,62 @@ export function renderClients(dash) {
 
 function statusPill(d) {
   if (!d.online) return `<span class="pill other"><i class="dot other"></i>离线</span>`;
+  // 本机覆盖优先说。面板不可达时用户能在路由器上直接开关 (zeroproxy on|off), 那之后
+  // 面板改不动它 —— 这时显示"同步中…"会让人以为再等等就好, 而其实要回路由器上
+  // 执行 zeroproxy local-auto 才会交回面板。
+  const override = String((d.report || {}).override || "").toLowerCase();
+  if ((override === "on" || override === "off") && (override === "on") !== !!d.desired) {
+    const want = override === "on" ? "开" : "关";
+    return `<span class="pill warn" title="这台路由器在面板不可达时被本机设成了「${want}」。面板的开关现在改不动它, 直到在路由器上执行 zeroproxy local-auto"><i class="dot warn"></i>本机覆盖 (${want})</span>`;
+  }
   if (d.syncing) return `<span class="pill warn"><i class="dot warn"></i>同步中…</span>`;
-  if (d.connected) return `<span class="pill ok"><i class="dot running"></i>已连接</span>`;
-  return `<span class="pill other"><i class="dot other"></i>已关闭</span>`;
+  if (!d.connected) return `<span class="pill other"><i class="dot other"></i>已关闭</span>`;
+  // "内核在跑" ≠ "流量被接管": 真机 8.45 上内核启动成功, 但 tun 建不出来、tproxy 也
+  // 没有, 局域网里一台设备都没被接管 —— 面板当时还是绿的。设备把现场验过的覆盖范围
+  // 一起报上来 (report.covered), 这里据此把话说细。
+  const cov = coveredOf(d);
+  if (cov === "none") return `<span class="pill bad"><i class="dot err"></i>未接管</span>`;
+  if (cov === "lan_tcp") return `<span class="pill warn"><i class="dot warn"></i>已连接 (仅 TCP)</span>`;
+  return `<span class="pill ok"><i class="dot running"></i>已连接</span>`;
+}
+
+/** 设备上报的数据面与它真正覆盖到的范围。
+ *
+ *  这两个值由路由器**现场验证**后写进 caps 再随心跳上报 (不是面板猜的, 也不是"命令
+ *  跑过了"就算): full=全屋+本机 / lan=全屋(本机除外) / lan_tcp=仅局域网 TCP / none=未接管。
+ */
+const COVERED_LABEL = {
+  full: "全屋 (含路由器自身)",
+  lan: "全屋 (路由器自身除外)",
+  lan_tcp: "仅局域网 TCP",
+  none: "未接管",
+};
+const MODE_LABEL = {
+  tun: "TUN",
+  tproxy: "tproxy",
+  redirect: "iptables REDIRECT",
+  none: "未接管",
+};
+
+function coveredOf(d) {
+  return String((d.report || {}).covered || "").toLowerCase();
+}
+
+/** 设备卡上的那一枚"接管到哪"的标签 (带原因 tooltip)。 */
+function coverageChip(d) {
+  const r = d.report || {};
+  const cov = coveredOf(d);
+  if (!d.online || !d.actual || !cov) return "";
+  const mode = MODE_LABEL[String(r.mode || "").toLowerCase()] || "";
+  const txt = COVERED_LABEL[cov] || cov;
+  const why = r.why ? ` title="${escAttr(r.why)}"` : "";
+  // IPv6 是单独一格: 局域网设备从运营商那里拿到原生 v6, 而只接管 v4 的透明代理对 v6
+  // 等于不存在 —— 那些流量直接出去, 目标网站看到的是真实 v6 地址。设备探得到就不标,
+  // 探不到必须写出来 (它比"全屋已接管"更值得一眼看见)。
+  const v6 = String(r.ipv6 ?? "") === "0" && cov !== "none"
+    ? `<span class="tag-chip" title="这台设备的数据面覆盖不到 IPv6: 局域网设备的 v6 流量会直接出去, 目标网站能看到真实的 v6 地址">IPv6 未接管</span>`
+    : "";
+  return `<span class="tag-chip"${why}>${esc(mode ? `${mode} · ${txt}` : txt)}</span>${v6}`;
 }
 
 /** 内核缓存这一行 —— 回答"现在发这条安装命令, 会不会卡在下载内核上"。
@@ -112,6 +165,33 @@ function restArches(cores) {
   </details>`;
 }
 
+/** 本地控制面 (zpcore) —— 面板分发的可选件。
+ *
+ *  为什么值得单独说一句: 管理界面原来是三条路 (固件 Web 服务 / 它的 cgi / 退回 busybox
+ *  httpd), 三种固件三种坏法, 用户改不了。装上这个静态二进制之后, 路由器自己起服务、
+ *  自己校验令牌、只绑局域网地址 —— "界面能不能打开"就不再是变量。
+ *
+ *  它是可选的: 没准备时装机照常完成, 只是走原来的界面路径。所以这里的口气是"可做",
+ *  不是"缺了会坏"。
+ */
+function agentRow(dash) {
+  const client = (dash && dash.client) || {};
+  const agents = client.agents || [];
+  if (!agents.length) {
+    return `<div class="client-hint">
+      <b>本地控制面 (zpcore) 还没准备</b> —— 这是可选件, 装上之后路由器不再依赖固件的
+      Web 服务器就能打开管理界面; 不装不影响代理。
+      在面板上跑一次 <code class="mono">scripts/build-agent.sh</code>, 把
+      <code class="mono">client/agent/dist/</code> 一起部署即可 (只构建自己那几种架构也行)。
+    </div>`;
+  }
+  const labels = agents.map((a) => esc(a.label || a.arch)).join(" · ");
+  return `<div class="client-hint">
+    本地控制面 zpcore 已准备 <b>${agents.length} 档</b> (${labels}) —— 这些架构的路由器
+    装机时会自动装上, 管理界面由它自己发, 不再依赖固件 Web 服务器。
+  </div>`;
+}
+
 function ago(ts) {
   if (!ts) return "从未";
   const s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
@@ -153,6 +233,7 @@ function deviceCard(d) {
       <div class="dev-tags">
         <span class="tag-chip">分流 · ${esc(tpl)}</span>
         <span class="tag-chip">${d.actual ? "内核运行中" : "内核已停止"}</span>
+        ${coverageChip(d)}
         ${d.version ? `<span class="tag-chip">客户端 v${esc(d.version)}</span>` : ""}
       </div>
       ${d.ui ? `
@@ -195,6 +276,7 @@ function installCard(dash) {
     </div>
   </div>
   ${pairInfo ? "" : coreRow(dash)}
+  ${pairInfo ? "" : agentRow(dash)}
   ${pairInfo ? pairCard(dash) : `
   <div class="client-actions">
     <button class="btn primary" id="btn-pair">生成安装命令</button>
@@ -231,9 +313,11 @@ function pairCard(dash) {
       <button class="btn small" id="btn-copy-cmd">复制</button>
     </div>
     ${coreRow(dash)}
+    ${agentRow(dash)}
     <div class="muted fs-xs mt-2">
       安装过程约 1 分钟 (含 20 MB 内核 + 4 MB 分流数据下载); 结束后终端会告诉你是 TUN
-      还是 tproxy 模式, 以及分流是否已就绪。刷新本页即可看到设备卡片。
+      还是 tproxy 模式, 以及分流是否已就绪; 数据面的覆盖范围 (全屋 / 仅局域网 TCP) 会
+      跟着设备回报显示在卡片上。刷新本页即可看到设备卡片。
     </div>
   </div>`;
 }

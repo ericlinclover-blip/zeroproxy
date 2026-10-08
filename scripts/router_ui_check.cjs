@@ -37,6 +37,8 @@ function makeMock() {
   const state = {
     core: "running",
     mode: "tun",
+    covered: "full",
+    why: "",
     client: "1.0.0",
     servers: [{ key: "hkk_i3_pub_8899", base: "https://hkk.i3.pub:8899", id: "dv056b52958542564a" }],
     log: "zeroproxy-agent: 配置已更新并重载",
@@ -45,7 +47,7 @@ function makeMock() {
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
     res.end(JSON.stringify(body));
   };
-  return http.createServer((req, res) => {
+  const server = http.createServer((req, res) => {
     const url = new URL(req.url, "http://x");
     const action = url.searchParams.get("a") || "";
     const authed = /sysauth/.test(req.headers.cookie || "");
@@ -104,6 +106,9 @@ function makeMock() {
     res.writeHead(200, { "Content-Type": media });
     res.end(fs.readFileSync(full));
   });
+  // 让用例能改这一台"路由器"的现场状态 (例如模拟"内核在跑但一级都没接管")
+  server.zpState = state;
+  return server;
 }
 
 async function main() {
@@ -177,6 +182,21 @@ async function main() {
     await page.click("details summary");
     await page.waitForFunction(() => /zeroproxy-agent/.test(document.getElementById("log").textContent));
     check("日志能展开并显示内容", true);
+
+    // 真机 8.45: 内核启动成功、面板/界面显示"全屋代理已开启", 而 tun 建不出来、tproxy
+    // 也没有 —— 局域网里一台设备都没被接管。所以界面必须按**现场**说话。
+    console.log("\n[7] 内核在跑但一级都没接管 (不许谎报「全屋」)");
+    server.zpState.core = "running";
+    server.zpState.mode = "none";
+    server.zpState.covered = "none";
+    server.zpState.why = "建不出 tun 设备: Operation not supported";
+    await page.reload();
+    await page.waitForSelector(".srv");
+    const noneSub = await page.locator("#sub").innerText();
+    check("明说未接管, 不说成全屋透明代理",
+      /未接管/.test(noneSub) && !/全屋透明代理/.test(noneSub), noneSub);
+    check("把探测到的原因一起显示出来 (不用回终端猜)",
+      /Operation not supported/.test(noneSub), noneSub);
 
     // 浏览器自己会请求 /favicon.ico 之类, 那是模拟器的事, 不算页面问题
     const real = errors.filter((e) => !/favicon|404 \(Not Found\)/.test(e));

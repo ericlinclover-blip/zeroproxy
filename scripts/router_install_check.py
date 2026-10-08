@@ -41,6 +41,7 @@ import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BACKEND = os.path.join(ROOT, "backend")
+AGENT_SRC = os.path.join(BACKEND, "zeroproxy", "client", "agent")
 PYTHON = os.environ.get("ZP_PYTHON") or os.path.join(ROOT, ".venv", "bin", "python")
 if not os.path.exists(PYTHON):  # 没有 venv 就退回系统 python (可能缺依赖, 会在启动时报出来)
     PYTHON = "python3"
@@ -55,6 +56,15 @@ results: list[tuple[str, bool, str]] = []
 def check(name: str, ok: bool, detail: object = "") -> None:
     results.append((name, ok, detail))
     print(f"  {'✓' if ok else '✗'} {name}{' — ' + str(detail) if detail else ''}")
+
+
+def find_go() -> str | None:
+    """本机的 Go 工具链 (zpcore 要它来构建)。没有就跳过那一节 —— 面板发不出这一档时,
+    装机本来就会退回原来的界面路径, 那正是设计里的降级, 不是失败。"""
+    for candidate in (os.environ.get("ZP_GO", ""), "go", "/opt/homebrew/bin/go", "/usr/local/go/bin/go"):
+        if candidate and shutil.which(candidate):
+            return candidate
+    return None
 
 
 def http(method: str, path: str, body=None, cookie: str | None = None):
@@ -87,7 +97,7 @@ def patch_for_local_run(script: str, root: str) -> str:
     out = out.replace(
         '\nmain "$@"\n',
         "\nmain() { detect_env; detect_http; preflight; pair; install_deps; "
-        "install_core; write_files; }\nmain \"$@\"\n",
+        "install_core; write_files; install_zpcore; }\nmain \"$@\"\n",
     )
     return out
 
@@ -295,6 +305,8 @@ class Panel:
 
 
 def main() -> int:
+    import gzip   # 内核与 zpcore 都是 .gz 形态, 这里从头就要用
+
     tmp = tempfile.mkdtemp(prefix="zp-router-check-")
     fake_root = os.path.join(tmp, "root")
     os.makedirs(fake_root, exist_ok=True)
@@ -304,7 +316,40 @@ def main() -> int:
     from zeroproxy import router_client  # noqa: E402
 
     print(f"ZeroProxy 路由器安装演练  (PORT={PORT}, 第二台面板 {PORT + 1})")
-    panels = [Panel(PORT, os.path.join(tmp, "home-a"), "A"),
+    # 先把可选件 (zpcore, 本地控制面) 构建出来 —— 它是"界面不再依赖固件 Web 服务器"那条路。
+    # 没有 Go 就跳过: 面板发不出这一档, 装机退回原来的界面路径 (设计里的降级, 不是失败)。
+    agent_dist = os.path.join(tmp, "agent-dist")
+    os.makedirs(agent_dist, exist_ok=True)
+    go = find_go()
+    agent_env: dict = {}
+    if go:
+        print("\n[0] 构建本地控制面 zpcore")
+        # 真机目标 (linux/arm64) 必须能交叉编译过 —— 这一步证明发到路由器的那一份是构建得出来的
+        cross = subprocess.run(
+            [go, "build", "-trimpath", "-ldflags", "-s -w", "-o",
+             os.path.join(tmp, "zpcore-linux-arm64"), "."],
+            cwd=AGENT_SRC, capture_output=True, text=True,
+            env={**os.environ, "GOOS": "linux", "GOARCH": "arm64", "CGO_ENABLED": "0"},
+        )
+        check("zpcore 能交叉编译出真机用的 linux/arm64", cross.returncode == 0, cross.stderr[-200:])
+        # 演练里那个"路由器"是本机模拟的, 所以跑的这一份得是本机平台的二进制。文件名仍然按
+        # arm64 命名 —— 面板只认文件名里的架构, 而这一节的目的是**真跑一遍接口契约**。
+        host_bin = os.path.join(tmp, "zpcore-host")
+        built = subprocess.run([go, "build", "-o", host_bin, "."],
+                               cwd=AGENT_SRC, capture_output=True, text=True)
+        runs = subprocess.run([host_bin, "version"], capture_output=True, text=True)
+        check("zpcore 能在本机构建并运行",
+              built.returncode == 0 and runs.returncode == 0 and runs.stdout.startswith("zpcore"),
+              (built.stderr or runs.stderr)[-160:])
+        if built.returncode == 0 and runs.returncode == 0:
+            with open(host_bin, "rb") as fh:
+                blob = fh.read()
+            with gzip.open(os.path.join(agent_dist, f"zpcore-arm64-{router_client.AGENT_VERSION}.gz"),
+                           "wb") as out:
+                out.write(blob)
+            agent_env["ZP_AGENT_DIR"] = agent_dist
+
+    panels = [Panel(PORT, os.path.join(tmp, "home-a"), "A", extra_env=agent_env),
               Panel(PORT + 1, os.path.join(tmp, "home-b"), "B")]
     try:
         for panel in panels:
@@ -315,8 +360,20 @@ def main() -> int:
         panel = panels[0]
         http = panel.req
 
+        # 面板真的发得出来吗? 先自己验一次 —— 否则安装脚本里那句"面板没有准备这一档"
+        # 会把"端点坏了"伪装成"没准备", 而两者的下一步完全不同。
+        if go:
+            try:
+                with urllib.request.urlopen(panel.base + "/c/agent/bin/arm64", timeout=30) as resp:
+                    served_blob = resp.read()
+                check("面板把本地控制面制品发得出来",
+                      resp.status == 200 and len(served_blob) > 100000,
+                      f"HTTP {resp.status} · {len(served_blob)} 字节")
+            except urllib.error.HTTPError as exc:
+                check("面板把本地控制面制品发得出来", False,
+                      f"HTTP {exc.code} · {exc.read().decode()[:90]}")
+
         # 面板侧缓存一个"压缩过的假内核": 让安装脚本真的走 gzip 判定 + 解压 + 执行
-        import gzip
         cache = os.path.join(panels[0].home, "data", "client", "cores")
         os.makedirs(cache, exist_ok=True)
         stub = (
@@ -377,10 +434,33 @@ def main() -> int:
 
         generated = os.path.join(fake_root, "config.yaml")
         config_text = open(generated, encoding="utf-8").read() if os.path.exists(generated) else ""
-        check("生成路由器版配置 (tun + fake-ip)",
-              all(k in config_text for k in ("tun:", "fake-ip", "nameserver-policy")))
+        # 这份配置必须与**这台机器探出来的数据面**一致: 建不出 tun 的机器不该拿到 tun 段
+        # (带着它 mihomo 启动就失败)。演练机 (macOS) 没有 tun/nft/iptables, 所以这里
+        # 走的正是"没探到任何一级"那条路 —— 它同样要能生成一份完整、诚实的配置。
+        caps_1 = open(os.path.join(fake_root, "caps"), encoding="utf-8").read()
+        chosen_1 = (re.search(r"^chosen=(\w+)$", caps_1, re.M) or [None, "?"])[1]
+        if chosen_1 == "tun":
+            check("生成路由器版配置 (tun + fake-ip)",
+                  all(k in config_text for k in ("tun:", "fake-ip", "nameserver-policy")))
+        else:
+            check(f"数据面={chosen_1}: 配置不含 tun 段, 分流 / DNS 照旧齐全",
+                  "tun:" not in config_text and "fake-ip" in config_text
+                  and "nameserver-policy" in config_text, chosen_1)
+        check("配置里透明代理端口与策略组都在 (与数据面无关)",
+              "redir-port" in config_text and "tproxy-port" in config_text
+              and "proxy-groups" in config_text)
         for name in ("device.json", "agent.sh", "initd", "initd-agent", "cli", "tproxy.nft"):
             check(f"生成 {name}", os.path.exists(os.path.join(fake_root, name)))
+        # 生成的脚本 (agent / init / CLI) 必须真的能被 sh 解析 —— 它们是 heredoc 里
+        # 写字写出来的, 外层脚本的 `sh -n` 看不到里面, 只有把文件拿出来才验得到。
+        for name in ("agent.sh", "redirect.sh", "initd", "initd-agent", "cli"):
+            path_ = os.path.join(fake_root, name)
+            check(f"{name} 通过 sh -n (语法)",
+                  os.path.exists(path_)
+                  and subprocess.run(["sh", "-n", path_], capture_output=True).returncode == 0)
+        caps_text = open(os.path.join(fake_root, "caps"), encoding="utf-8").read()
+        check("caps 是 schema 2 (chosen / covered / why)",
+              "schema=2" in caps_text and "chosen=" in caps_text and "covered=" in caps_text)
 
         # 分流数据库 (真机上这一步失败 = mihomo 去 GitHub 拉超时, 整份配置校验不过)
         for name in ("geoip.metadb", "geosite.dat"):
@@ -392,6 +472,10 @@ def main() -> int:
         # 版本号是落盘后 sed 替换的: 既不能残留占位符, 也不能把执行位弄丢 (演练抓到过)
         agent_text = open(os.path.join(fake_root, "agent.sh"), encoding="utf-8").read()
         cli_text = open(os.path.join(fake_root, "cli"), encoding="utf-8").read()
+        if go:
+            check("本地控制面从面板装到路由器并可执行",
+                  "本地控制面就绪" in out
+                  and os.access(os.path.join(fake_root, "zpcore"), os.X_OK))
         check("落盘的 agent / CLI 没有残留版本占位符",
               "__ZP_CLIENT_VERSION__" not in agent_text
               and "__ZP_CLIENT_VERSION__" not in cli_text)
@@ -446,8 +530,8 @@ def main() -> int:
         check("降级后仍保留国内 App 直连 (微信 / 支付宝 …)",
               "DOMAIN-SUFFIX,qq.com,🎯 全球直连" in degraded.stdout
               and "DOMAIN-SUFFIX,alipay.com,🎯 全球直连" in degraded.stdout)
-        check("降级配置仍是完整的路由器配置 (tun + 策略组)",
-              "tun:" in degraded.stdout and "proxy-groups:" in degraded.stdout)
+        check("降级配置仍是完整的路由器配置 (策略组 + DNS 都在)",
+              "proxy-groups:" in degraded.stdout and "fake-ip" in degraded.stdout)
         again = subprocess.run(["sh", agent_path, "geo"], capture_output=True, text=True)
         check("agent 能把数据自己取回来", again.returncode == 0
               and os.path.exists(os.path.join(fake_root, "geoip.metadb")))
@@ -675,6 +759,263 @@ def main() -> int:
             if throttle is not None:
                 throttle.close()
             mirror.close()
+
+        # [8] 数据面阶梯: 一台"没有 tun、没有 nf_tables、只有 iptables"的机器
+        print("\n[8] 数据面阶梯: 只能走 iptables REDIRECT 的机器 (原厂 21.02 / 内核 5.4)")
+        # 这正是 README 8.45 那台真机: /dev/net/tun 在但建不出设备, nft 命令在但规则
+        # 下不去。以前它只能得到一句"透明代理未生效"; 现在应该自动落到 L3 —— 局域网 TCP
+        # 被接管, 而且**面板那边也不再给 tun 段** (带着它 mihomo 启动就失败)。
+        fake_tools = os.path.join(tmp, "faketools")
+        os.makedirs(fake_tools, exist_ok=True)
+
+        def _tool(name: str, body: str) -> None:
+            tool_path = os.path.join(fake_tools, name)
+            with open(tool_path, "w") as fh:
+                fh.write("#!/bin/sh\n" + body)
+            os.chmod(tool_path, 0o755)
+
+        # nft: 命令在, 但往下加规则一律失败 (= 内核里没有 nf_tables)
+        _tool("nft", 'echo "Error: Could not process rule: No such file or directory" >&2\n'
+                     "exit 1\n")
+        # ip: 建不出 tun 设备 (原厂 5.4 那台的表现)
+        _tool("ip", 'case "$1 $2" in\n'
+                    '  "tuntap add") echo "ip: ioctl(TUNSETIFF): Operation not supported" >&2; exit 1 ;;\n'
+                    "esac\nexit 0\n")
+        # iptables: 能建链、能加 REDIRECT 规则
+        _tool("iptables", "exit 0\n")
+
+        r_root = os.path.join(tmp, "redirect-root")
+        ok_r, out_r = run_install(
+            "redirect", root=r_root,
+            extra={"PATH": fake_tools + os.pathsep + os.environ.get("PATH", "")},
+        )
+        check("只有 iptables 可用时, 阶梯选中 redirect",
+              ok_r and "iptables REDIRECT" in out_r,
+              [ln.strip() for ln in out_r.splitlines() if "数据面" in ln][:1])
+        r_caps = open(os.path.join(r_root, "caps"), encoding="utf-8").read()
+        check("caps 记下选择与覆盖范围 (chosen=redirect / covered=lan_tcp)",
+              "chosen=redirect" in r_caps and "covered=lan_tcp" in r_caps)
+        check("caps 记下别的几级为什么不行 (面板与 CLI 都读它)",
+              "why.tun=" in r_caps and "why.tproxy=" in r_caps,
+              [ln for ln in r_caps.splitlines() if ln.startswith("why.")][:2])
+        redirect_sh = os.path.join(r_root, "redirect.sh")
+        check("redirect 规则文件落盘且语法正确",
+              os.path.exists(redirect_sh)
+              and subprocess.run(["sh", "-n", redirect_sh], capture_output=True).returncode == 0)
+        r_text = open(redirect_sh, encoding="utf-8").read() if os.path.exists(redirect_sh) else ""
+        check("redirect 只从局域网接口跳 (绝不接管 WAN 入站)",
+              "PREROUTING -i" in r_text and "br-lan" in r_text)
+        r_cfg = yaml.safe_load(open(os.path.join(r_root, "config.yaml"), encoding="utf-8").read())
+        check("redirect 设备的配置里没有 tun 段 (带着它内核起不来)", "tun" not in r_cfg)
+        check("redirect 设备仍拿到 DNS / fake-ip / redir-port",
+              r_cfg["dns"]["enhanced-mode"] == "fake-ip" and r_cfg["redir-port"] == 7892)
+        # IPv6: 这台"机器"上没有 ip6tables —— 必须如实记成未接管, 而不是假装接管了
+        check("没有 ip6tables 时 IPv6 如实记为未接管 (caps.ipv6=0 + 原因)",
+              "ipv6=0" in r_caps and "why.ipv6=" in r_caps
+              and [ln for ln in r_caps.splitlines() if ln.startswith("why.ipv6=")][0].split("=", 1)[1] != "",
+              [ln for ln in r_caps.splitlines() if ln.startswith("why.ipv6=")][:1])
+        check("IPv6 未接管时不给双栈配置 (不给内核管不了的东西)",
+              r_cfg["ipv6"] is False and r_cfg["dns"]["ipv6"] is False)
+
+        # [9] 健康机器: tun / nft 都在的普通 OpenWrt → 阶梯应当仍然选 L1
+        print("\n[9] 健康机器 (tun + nftables 都在): 阶梯选 tun, 行为与以前一致")
+        good = os.path.join(tmp, "goodtools")
+        os.makedirs(good, exist_ok=True)
+
+        def _gtool(name: str, body: str) -> None:
+            tool_path = os.path.join(good, name)
+            with open(tool_path, "w") as fh:
+                fh.write("#!/bin/sh\n" + body)
+            os.chmod(tool_path, 0o755)
+
+        _gtool("nft", "exit 0\n")
+        _gtool("iptables", "exit 0\n")
+        _gtool("ip", "exit 0\n")
+        g_root = os.path.join(tmp, "good-root")
+        ok_g, out_g = run_install("good", root=g_root, extra={
+            "PATH": good + os.pathsep + os.environ.get("PATH", ""),
+            # macOS 上没有 /dev/net/tun; 借 /dev/null (真的字符设备) 表示"这台有 tun"。
+            # 探测里真正作数的是后面那次"建一个设备再删掉"。
+            "ZP_TUN_DEV": "/dev/null",
+        })
+        check("有 tun 的机器仍然走 L1 (tun)", ok_g and "数据面: TUN" in out_g,
+              [ln.strip() for ln in out_g.splitlines() if "数据面" in ln][:1])
+        g_text = open(os.path.join(g_root, "caps"), encoding="utf-8").read()
+        check("caps: chosen=tun / covered=full",
+              "chosen=tun" in g_text and "covered=full" in g_text)
+        # tun 这一档天然能覆盖 v6 (mihomo 给 tun 分配 v6 地址, auto-route 一并管)
+        check("tun 这一档 IPv6 一并接管 (caps.ipv6=1)", "ipv6=1" in g_text)
+        g_cfg = yaml.safe_load(open(os.path.join(g_root, "config.yaml"), encoding="utf-8").read())
+        check("tun 配置里 auto-route 与 fake-ip 都在 (默认行为不变)",
+              g_cfg["tun"]["auto-route"] is True
+              and g_cfg["dns"]["enhanced-mode"] == "fake-ip")
+        check("能接管 v6 时配置是双栈 (顶层 ipv6 + dns.ipv6 同时开)",
+              g_cfg["ipv6"] is True and g_cfg["dns"]["ipv6"] is True)
+
+        # [10] 本地控制面 (zpcore): 自带的界面服务 —— "界面能不能打开"从此与固件无关
+        if go:
+            print("\n[10] 本地控制面 zpcore: 自己起界面服务 (不依赖固件 Web 服务器)")
+            zpcore_bin = os.path.join(fake_root, "zpcore")
+            # 界面文件由 install_ui 落盘; 演练的 main 停在 write_files, 这里按同一份内容补上
+            ui_dir = os.path.join(fake_root, "www", "zeroproxy")
+            os.makedirs(ui_dir, exist_ok=True)
+            for ui_name in ("index.html", "app.js"):
+                _, ui_body, _ = http("GET", f"/c/ui/{ui_name}")
+                with open(os.path.join(ui_dir, ui_name), "w") as fh:
+                    fh.write(ui_body)
+            token = open(os.path.join(fake_root, "ui.token"), encoding="utf-8").read().strip()
+            zport = PORT + 20
+            zproc = subprocess.Popen(
+                [zpcore_bin, "serve", "--dir", fake_root, "--bind", "127.0.0.1",
+                 "--port", str(zport), "--cli", os.path.join(fake_root, "cli"),
+                 "--init", os.path.join(fake_root, "initd")],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            )
+            zbase = f"http://127.0.0.1:{zport}"
+            try:
+                ready = False
+                for _ in range(40):
+                    try:
+                        with urllib.request.urlopen(zbase + "/", timeout=1) as resp:
+                            if b"<title>" in resp.read():
+                                ready = True
+                                break
+                    except Exception:
+                        time.sleep(0.25)
+                check("zpcore 起得来并把页面发出来 (匿名可读)", ready)
+
+                def zcall(query: str, method: str = "GET", payload=None):
+                    req = urllib.request.Request(zbase + "/cgi-bin/zeroproxy" + query, method=method)
+                    if payload is not None:
+                        req.add_header("Content-Type", "application/json")
+                        req.data = json.dumps(payload).encode()
+                    try:
+                        with urllib.request.urlopen(req, timeout=15) as resp:
+                            return resp.status, resp.read().decode()
+                    except urllib.error.HTTPError as exc:
+                        return exc.code, exc.read().decode()
+
+                status_code, _ = zcall("?a=status")
+                check("未带令牌的数据接口一律 403", status_code == 403, status_code)
+                status_code, _ = zcall("?a=status&k=wrong")
+                check("令牌不对也是 403", status_code == 403, status_code)
+                status_code, zbody = zcall(f"?a=status&k={token}")
+                zdata = json.loads(zbody)
+                check("status 契约与原 cgi 一致 (含新的 mode / covered)",
+                      status_code == 200 and zdata.get("ok") is True
+                      and "mode" in zdata and "covered" in zdata, zbody.strip()[:80])
+                check("status 把服务器清单也带上了", len(zdata.get("servers", [])) >= 1,
+                      str(zdata.get("servers"))[:80])
+                status_code, zbody = zcall(f"?a=toggle&k={token}", "POST", {"on": True})
+                zmsg = json.loads(zbody)
+                check("手动动作转发给 CLI 执行 (一处实现, 两个入口)",
+                      status_code == 200 and zmsg.get("ok") is True
+                      and "已请求面板" in zmsg.get("message", ""), zbody.strip()[:80])
+                _, zbody = zcall(f"?a=add&k={token}", "POST", {"url": "ftp://x"})
+                check("非法链接在进 CLI 之前就被挡下",
+                      json.loads(zbody).get("ok") is False, zbody.strip()[:60])
+            finally:
+                zproc.terminate()
+                try:
+                    zproc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    zproc.kill()
+
+            # 绝不把管理界面挂到 WAN 上: 不是局域网地址就拒绝启动
+            wan = subprocess.run(
+                [zpcore_bin, "serve", "--dir", fake_root, "--bind", "0.0.0.0",
+                 "--port", str(zport + 1)],
+                capture_output=True, text=True,
+            )
+            check("拒绝绑 0.0.0.0 (管理界面不该挂到 WAN 上)",
+                  wan.returncode != 0 and "拒绝绑定" in (wan.stdout + wan.stderr),
+                  (wan.stdout + wan.stderr).strip()[:80])
+        else:
+            print("\n[10] 本机没有 Go, 跳过本地控制面那一节 "
+                  "(面板发不出这一档时装机本来就会退回原来的界面路径)")
+
+        # [11] 本机自治: 面板不可达时的开/关, 以及 revert 的逐条比对
+        print("\n[11] 本机覆盖 (面板不可达也能开关) 与 revert 的逐条比对")
+        check("装机时拍了防火墙 / 策略路由快照",
+              os.path.exists(os.path.join(fake_root, "baseline", "taken_at"))
+              and os.path.exists(os.path.join(fake_root, "baseline", "nft.txt"))
+              and os.path.exists(os.path.join(fake_root, "baseline", "ip-rule.txt")))
+
+        # 面板答得上时, on|off 仍然只走面板 (它才是唯一事实来源), 并且顺手清掉本机覆盖
+        open(os.path.join(fake_root, "local.override"), "w").write("off\n")
+        cli_plain = os.path.join(fake_root, "cli-plain.sh")
+        with open(cli_plain, "w") as fh:
+            fh.write(open(os.path.join(fake_root, "cli"), encoding="utf-8").read()
+                     .replace("/etc/init.d/zeroproxy", "true"))
+        out = subprocess.run(["sh", cli_plain, "on"], capture_output=True, text=True)
+        check("面板可达时 on 仍然走面板, 并清掉本机覆盖",
+              "已请求面板" in out.stdout
+              and not os.path.exists(os.path.join(fake_root, "local.override")),
+              out.stdout.strip()[:70])
+
+        # 面板不可达时, on|off 必须落到本机覆盖并**立刻生效**。
+        # "不可达"用**端口 1** 来模拟: 连接立刻被拒 (不像黑洞 IP 那样把 curl 的 -m 20
+        # 挂满, 那样测的就变成超时了), 而且服务器清单本身还在 —— 用户看到的就是这台
+        # 路由器"接了一台, 但那台联系不上"。
+        servers_dir = os.path.join(fake_root, "servers")
+        saved = {n: open(os.path.join(servers_dir, n), encoding="utf-8").read()
+                 for n in os.listdir(servers_dir)}
+        for n in saved:
+            with open(os.path.join(servers_dir, n), "w") as fh:
+                fh.write(saved[n].replace(f"127.0.0.1:{PORT}", "127.0.0.1:1"))
+        open(os.path.join(fake_root, "core.up"), "w").close()
+        out = subprocess.run(["sh", cli_plain, "off"], capture_output=True, text=True)
+        check("面板不可达时 off 落到本机覆盖并立即生效",
+              "面板不可达" in out.stdout
+              and open(os.path.join(fake_root, "local.override"), encoding="utf-8").read().strip() == "off"
+              and not os.path.exists(os.path.join(fake_root, "core.up")),
+              out.stdout.strip().splitlines()[0][:70] if out.stdout.strip() else "")
+
+        # agent 一台面板都联系不上时, 仍然必须执行本机覆盖 (这是它唯一的例外)
+        open(os.path.join(fake_root, "core.up"), "w").close()
+        proc = subprocess.Popen(["sh", agent_path], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
+        time.sleep(5)
+        proc.kill()
+        offline_log = proc.stdout.read() if proc.stdout else ""
+        check("面板全不可达时 agent 仍执行本机覆盖",
+              not os.path.exists(os.path.join(fake_root, "core.up")), offline_log[-160:])
+        for n in saved:
+            with open(os.path.join(servers_dir, n), "w") as fh:
+                fh.write(saved[n])
+        # 面板回来了: 心跳把"本机覆盖=off"如实报上去 (卡片上会写「本机覆盖」而不是「同步中」)
+        # 收进文件而不是管道: `sh -x` 的 trace 里带着中文, 进程被 kill 时管道里可能是
+        # 截断的多字节字符, 直接 read() 会 UnicodeDecodeError。
+        trace_path = os.path.join(tmp, "agent-online-trace.log")
+        with open(trace_path, "w") as trace:
+            proc = subprocess.Popen(["sh", "-x", agent_path], stdout=trace, stderr=subprocess.STDOUT)
+            time.sleep(5)
+            proc.kill()
+        online_log = open(trace_path, encoding="utf-8", errors="replace").read()
+        _, body, _ = http("GET", "/api/devices")
+        # 按**设备 id** 取这一台的记录: 演练里每一节都配一次对, 面板上会留下好几台
+        # (各用各的 root), items[0] 只是"最新创建的那一台", 不是我们在说的这一台。
+        items = json.loads(body)["devices"]["items"]
+        current_id = ""
+        for n in os.listdir(servers_dir):
+            with open(os.path.join(servers_dir, n), encoding="utf-8") as fh:
+                found = re.search(r'"id"\s*:\s*"([^"]+)"', fh.read())
+            if found:
+                current_id = found.group(1)
+        item = next((d for d in items if d.get("id") == current_id), items[0])
+        check("本机覆盖随心跳到了面板 (卡片上会写「本机覆盖」)",
+              str(item.get("report", {}).get("override", "")) == "off",
+              f"{current_id} · {item.get('report')}")
+
+        # revert: 停用 + 拆数据面 + 与装机前快照逐条比对, 并给出结论
+        subprocess.run(["sh", cli_plain, "local-auto"], capture_output=True, text=True)
+        out = subprocess.run(["sh", cli_plain, "revert"], capture_output=True, text=True)
+        check("revert 给出了逐条比对的结论",
+              "结论:" in out.stdout and ("完全回到装机前" in out.stdout or "还有残留" in out.stdout),
+              [ln.strip() for ln in out.stdout.splitlines() if "结论" in ln][:1])
+        check("revert 保留了配置与凭据 (那是 uninstall 的事)",
+              os.path.exists(os.path.join(fake_root, "agent.sh"))
+              and os.path.exists(os.path.join(fake_root, "config.yaml")))
     finally:
         logs = []
         for panel in panels:

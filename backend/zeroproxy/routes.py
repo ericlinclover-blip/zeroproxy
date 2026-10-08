@@ -2975,6 +2975,36 @@ def client_core_binary(arch: str, request: Request):
     )
 
 
+@router.get("/c/agent/bin/{arch}")
+def client_agent_binary(arch: str, request: Request):
+    """本地控制面二进制 (zpcore, .gz)。匿名可达 —— 与内核同一条路。
+
+    装机时路由器还没有任何凭据可用, 而这份东西里不含任何机密 (一个 HTTP 服务 + 一层
+    令牌校验), 泄露它拿不到任何东西 —— 与 /c/bin 的内核完全是同一类东西。
+
+    它是**可选件**: 面板没准备某一档时回 404 + 一句人话, 路由器据此走原来的界面路径
+    (固件 Web 服务 / busybox httpd), 装机不会因此失败。产物由 scripts/build-agent.sh
+    生成到仓库的 client/agent/dist/ (不是 data/ 缓存 —— 它没有上游可下载)。
+    """
+    arch = (arch or "").strip().lower()
+    if arch not in router_client.ARCHES:
+        return _err(f"不支持的架构: {arch}", 404)
+    if not router_client.agent_ready(arch):
+        return _err(
+            f"这台面板没有准备 {arch} 这一档本地控制面 (zpcore, 可选件)。"
+            "在面板上跑一次 scripts/build-agent.sh 并把 client/agent/dist/ 一起部署即可; "
+            "没有它不影响代理 —— 路由器会用原来的界面路径。",
+            404,
+        )
+    path = router_client.agent_file(arch)
+    return FileResponse(
+        path,
+        media_type="application/gzip",
+        headers={"cache-control": "no-store"},
+        filename=os.path.basename(path),
+    )
+
+
 @router.get("/c/core/status")
 def client_core_status(request: Request):
     """内核缓存状态 (`?arch=arm64` 只看一档)。
@@ -3114,6 +3144,8 @@ def client_subscription(
     prefix: str = "",
     geo: int = 1,
     tproxy: int = 1,
+    datapath: str = "",
+    ipv6: int = 0,
 ):
     """设备专属订阅。设备不该拿到主订阅令牌, 所以它走自己的凭据。
 
@@ -3123,6 +3155,12 @@ def client_subscription(
     `?tproxy=0` 是设备侧的 nft / tproxy 能力 (路由器装机时自己探出来的): 面板据此
     不写 `auto-redirect` —— 那一项在不支持它固件上会让整个 tun 建不起来 (见
     share_links.router_tun)。默认 1, 老客户端行为不变。
+    `?datapath=` 是设备探测出来的数据面 (tun / tproxy / redirect / none): 只有 tun
+    才给 `tun` 段 —— 建不出 TUN 设备的机器带着它, mihomo 连启动都起不来 (README 8.45)。
+    空值按 tun 处理, 老客户端行为不变。
+    `?ipv6=1` 是设备侧探出来的"这一档数据面能一并接管 IPv6"。不能接管时保持 v4-only
+    (默认 0, 老客户端行为不变) —— 那时设备的 v6 会直接出去, 这件事由设备如实上报,
+    面板上写"IPv6 未接管", 而不是假装接管了。
     三种输出:
       format=clash     整份路由器配置 (单服务器模式, 内联节点)
       format=skeleton  骨架 (多服务器模式: providers 与组的 use 留空, 由路由器填)
@@ -3152,6 +3190,8 @@ def client_subscription(
             prefix=(prefix or "").strip()[:40],
             geo=bool(geo),
             tproxy=bool(tproxy),
+            datapath=(datapath or "").strip().lower(),
+            ipv6=bool(ipv6),
             # 分流数据库的下载地址指向面板自己 (路由器只需要能访问面板)
             base=share_links.panel_base_url(request, state),
         )

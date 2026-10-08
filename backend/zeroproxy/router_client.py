@@ -21,7 +21,13 @@ import urllib.request
 from .config import paths
 
 #: 路由器端脚本版本 (会显示在面板的设备卡上; 改了脚本就 +1)
-SCRIPT_VERSION = "1.2.3"
+#: 1.3.0: 数据面从"tun 优先 / tproxy 回退"两级改成五级能力阶梯
+#:        (ebpf 只探不选 → tun → tproxy → iptables REDIRECT → 不接管),
+#:        每一级都真探测 + 现场验证; caps 记下 chosen / covered / why,
+#:        面板与路由器界面显示的都是"真的接管到哪", 不再出现"报成功其实没接管"。
+#: 1.4.0: 本机覆盖 (面板不可达时也能开关) + `revert` 逐条比对装机前快照 +
+#:        IPv6 能力探测 (能接管才给双栈配置, 接不了就在面板上写"IPv6 未接管")。
+SCRIPT_VERSION = "1.4.0"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"
@@ -680,7 +686,66 @@ def summary() -> dict:
         # 每一档内核现在的状态 (missing / downloading / ready / error):
         # 面板上那张卡片要能回答"现在发这条安装命令, 会不会卡在下载内核上"。
         "cores": core_states(),
+        # 本地控制面 (zpcore) —— 可选件: 有它时路由器自己起界面服务, 不再依赖固件的
+        # Web 服务器; 没有它只是回到原来的路径, 不影响代理。
+        "agent_version": AGENT_VERSION,
+        "agents": cached_agents(),
         "geo": cached_geo(),
         "geo_names": list(GEO_FILES),
         "cached_at": int(time.time()),
     }
+
+
+# ---------------------------------------------------------------- 本地控制面 (zpcore)
+#
+# 路由器管理界面原来有三条路 (固件 Web 服务 / 它的 cgi / 退回 busybox httpd), 三种坏法各
+# 踩过一次真机。zpcore 把这一段收回自己手里: 一个静态二进制, 自己起服务、自己校验令牌、
+# 自己只绑局域网地址 —— "界面能不能打开"从此与固件无关。
+#
+# 分发方式与 mihomo 内核**刻意做成同一种形态**: 面板直传一个 .gz, 路由器端 gzip -t 判定
+# → 解压 → 跑一次 `version` 校验 → 落盘。那段代码刚在内核那条路上跑过七次真机, 直接复用。
+#
+# 与内核唯一的区别: zpcore 是我们自己的东西, 没有上游可下载, 所以产物跟着**仓库**走
+# (scripts/build-agent.sh 生成到 client/agent/dist/), 不是 data/ 缓存。它是可选件 ——
+# 面板没准备某一档时, 那台路由器自动退回原来的界面路径, 装机不会失败。
+AGENT_VERSION = os.environ.get("ZP_AGENT_VERSION", "1.0.0")
+
+#: 小于这个大小的一律不当二进制 (一份正常的 zpcore.gz 约 2.5 MB)。演练里可以用
+#: ZP_AGENT_MIN_BYTES 调低。
+AGENT_MIN_BYTES = int(os.environ.get("ZP_AGENT_MIN_BYTES", str(256 << 10)))
+
+
+def agent_dir() -> str:
+    explicit = os.environ.get("ZP_AGENT_DIR", "").strip()
+    if explicit:
+        return explicit
+    return os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "client", "agent", "dist"
+    )
+
+
+def agent_file(arch: str) -> str:
+    return os.path.join(agent_dir(), f"zpcore-{arch}-{AGENT_VERSION}.gz")
+
+
+def agent_ready(arch: str) -> bool:
+    if arch not in ARCHES:
+        return False
+    try:
+        return os.path.getsize(agent_file(arch)) >= AGENT_MIN_BYTES
+    except OSError:
+        return False
+
+
+def cached_agents() -> list[dict]:
+    """面板上有哪几档 zpcore 制品 (面板卡片展示用)。"""
+    out = []
+    for arch in ARCHES:
+        try:
+            size = os.path.getsize(agent_file(arch))
+        except OSError:
+            continue
+        if size < AGENT_MIN_BYTES:
+            continue
+        out.append({"arch": arch, "label": ARCH_LABEL.get(arch, arch), "size": size})
+    return out

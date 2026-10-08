@@ -453,43 +453,59 @@ def test_router_profile_degrades_when_panel_has_no_geo_data(client, configured):
 
 
 def test_install_script_probes_capabilities_and_reports_honestly():
-    """TUN 这件事上的三条硬要求: 探得起、说得出、失败别报成功。
+    """数据面这件事上的硬要求: 探得起、说得细、失败别报成功。
 
     真机 (GL-MT3600BE · 原厂 OpenWrt 21.02-SNAPSHOT / 内核 5.4.281) 的教训:
-    `/dev/net/tun` 这个**节点在**, 但内核建不出设备 —— 老代码据此报"TUN 可用", 于是
-    mihomo 起 tun 失败、脚本退回 tproxy, 而 tproxy 也不可用, 结尾却仍然写着
-    "全屋代理已开启"。三件事都要改:
-      ① 探能力要真建一个设备 (节点存在 ≠ 能建), nft / tproxy 也要真下一条规则;
-      ② TUN 起不来时把**内核自己说的原因**打出来, 而不是只报一句"未出现";
-      ③ 都没生效就不能说"已开启" —— 宁可难看, 也不能让人以为好了。
-    探出来的结论写进 /etc/zeroproxy/caps, agent 重建配置时带给面板 (?tproxy=)。
+    `/dev/net/tun` 这个**节点在**, 但内核建不出设备; 同一台机器上 nf_tables 也没有 ——
+    老代码只有"tun 优先 / tproxy 回退"两级, 两级都不可用, 结尾却仍然写着"全屋代理
+    已开启"(README 8.45)。
+
+    现在改成一张**能力阶梯** (tun → tproxy → iptables REDIRECT → 不接管):
+      ① 每一级都真做一次 (建设备再删 / 加规则再撤) —— 节点/命令存在 ≠ 能力存在;
+      ② 失败要留证: 每一级"为什么不行"的内核/程序原话写进 caps, 面板与安装输出都看它;
+      ③ verify 按**现场**再验一次 (设备/表真的在不在), 起不来就顺着阶梯往下试;
+         三级都不行才说"未生效" —— 宁可难看, 也不能让人以为好了。
     """
     from zeroproxy import router_client
 
     text = open(router_client.script_path(), encoding="utf-8").read()
 
-    # ① 能力探测: 都往内核里真做一次
+    # ① 每一级都往内核里真做一次
     assert "ip tuntap add dev zp0probe mode tun" in text, "TUN 要真建一个设备再删掉"
     assert "nft add rule inet zp_probe c meta l4proto tcp tproxy to :1" in text, "tproxy 要真下一条规则"
     assert "nft add table inet zp_probe" in text, "nft 本身能不能下规则也要探 (命令在 ≠ 内核支持)"
+    assert "iptables -t nat -A zp_probe -p tcp -j REDIRECT --to-ports 1" in text, \
+        "iptables REDIRECT 也要真加一条规则 (21.02 / fw3 那类固件唯一走得了的路)"
     assert "write_caps" in text and "autoredirect=" in text, "结论要落盘给 agent 用"
+    # caps 要带 chosen / covered / why.* —— 安装输出、CLI、agent、面板读同一份
+    assert "chosen=" in text and "covered=" in text and "why.tun=" in text
 
-    # ② 失败时把内核日志打出来
+    # ② 失败时把**内核自己说的话**打出来 + 每一级的原因都留证
     assert "与 tun 有关的内核日志" in text
     assert "logread -e zeroproxy" in text
+    assert "CAPS_WHY_TUN" in text and "why.redirect=" in text, "每一级失败的原因都要留证"
 
-    # ③ 诚实: 没生效时不许说"全屋代理已开启"; 有自愈, 而且只在失败之后才跑
-    assert "透明代理未生效" in text, "TUN 与 tproxy 都不行时要说实话"
-    assert "tproxy 规则也没能装上" in text, "tproxy 回退要真的验一下规则装上了没有"
+    # ③ 诚实: 三级都不行时不许说"已开启"; 生效判据要看现场, 不看命令退出码
+    assert "透明代理未生效" in text, "三级都不行时要说实话"
+    assert "datapath_live" in text, "生效与否看设备/表在不在, 不看命令退出码"
+    # 自愈 + 阶梯降级: 都排在"把原因打出来"之后, 且只在失败分支里
     fail_at = text.index("等了 30 秒 TUN 设备仍未出现")
     heal_at = text.index("if tun_retry_without_redirect &&")
     assert fail_at < heal_at, "自愈只能发生在真的失败之后 (能跑的机器一个字节都不动)"
-    # 而且它排在"把内核日志打出来"之后 —— 先让人看见原因, 再动手改配置
-    assert text.index("与 tun 有关的内核日志") < heal_at
+    assert text.index("与 tun 有关的内核日志") < heal_at, "先让人看见原因, 再动手改配置"
     assert 'mv "$ZP_CONF.ar.bak" "$ZP_CONF"' in text, "自愈没成要把配置退回原样"
+    assert "downgrade_datapath" in text and "ladder_below" in text, "起不来要顺着阶梯往下试"
+    assert "rung_usable" in text, "探测本来就没过的级没必要再试"
 
-    # agent 重建配置时把能力带给面板 (单服务器与多服务器骨架两条路都要带)
+    # agent 重建配置时把能力带给面板 (单服务器与多服务器骨架两条路都要带):
+    # 数据面决定面板给不给 tun 段 —— 建不出设备的机器带着它, 内核直接起不来。
     assert text.count("&tproxy=$_tp") == 2
+    assert text.count("&datapath=$_dp") == 2
+    assert text.count("&ipv6=$_ip6") == 2
+    # IPv6 能力: 单独探一次 (v6 的 tproxy 是内核里另一件事), 覆盖不到就记原因
+    assert "nft_v6_ok" in text and "compute_ipv6_cap" in text
+    assert "ip6 daddr ::1/128 tproxy to :1" in text
+    assert "ipv6=" in text and "why.ipv6=" in text
 
 
 def test_install_script_never_fetches_geo_from_the_internet():
@@ -531,6 +547,160 @@ def test_router_reports_its_ui_url_so_the_panel_can_open_it(client, configured):
             "device": device["id"], "k": device["secret"], "ui": bad,
         })
         assert client.get("/api/devices").json()["devices"]["items"][0]["ui"] == ui, bad
+
+
+def test_local_control_plane_is_distributed_like_the_core(tmp_path, monkeypatch, client, configured):
+    """zpcore 走与 mihomo 内核同一条分发路, 但**是可选的**: 面板没准备时就 404 + 一句人话。
+
+    为什么必须可选: 制品跟着仓库走 (scripts/build-agent.sh), 而操作方完全可能只构建了自己
+    那几台路由器的架构, 甚至一个都不构建。这时装机只该"退回原来的界面路径", 不该失败 ——
+    代理本身与这个二进制没有任何关系。
+    """
+    from zeroproxy import router_client
+
+    empty = tmp_path / "dist"
+    empty.mkdir()
+    monkeypatch.setattr(router_client, "agent_dir", lambda: str(empty))
+
+    # 没有制品: 404 + 一句能照着做的说明 (而不是一个空响应)
+    res = client.get("/c/agent/bin/arm64")
+    assert res.status_code == 404
+    assert "可选件" in res.json()["error"] and "build-agent" in res.json()["error"]
+    assert client.get("/c/agent/bin/pdp11").status_code == 404
+
+    # 有制品: 原样发出去 (gz, 与内核同一个 content-type), 面板也能把它列出来
+    blob = b"\x1f\x8b" + b"zpcore-stub" * 30000
+    (empty / f"zpcore-arm64-{router_client.AGENT_VERSION}.gz").write_bytes(blob)
+    served = client.get("/c/agent/bin/arm64")
+    assert served.status_code == 200
+    assert served.content == blob
+    assert served.headers["content-type"] == "application/gzip"
+
+    _login(client)
+    listed = client.get("/api/devices").json()["client"]
+    assert listed["agent_version"] == router_client.AGENT_VERSION
+    assert [a["arch"] for a in listed["agents"]] == ["arm64"]
+
+
+def test_optional_local_control_plane_never_breaks_the_install():
+    """zpcore 是安装脚本里**唯一**的可选件: 它失败绝不能让装机失败。
+
+    这不是理论问题 —— install_zpcore 第一版在"面板没准备这一档"时 return 1, 而 main 里
+    只是一句普通的 `install_zpcore`。`set -e` 下那等于"装到一半静默停下": 演练里 [1] 之后
+    的每一步都没跑, 而终端上只有一句"面板没有准备这一档本地控制面 (可选件)"——
+    看起来像正常降级, 其实是整个安装被掐断了。
+    """
+    import re
+
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+    body = re.search(r"^install_zpcore\(\) \{.*?\n\}", text, re.S | re.M)
+    assert body, "安装脚本里应当有 install_zpcore"
+    assert "return 1" not in body.group(0), "可选件不许用非 0 返回 (set -e 会掐断整个安装)"
+    assert re.search(r"^\s*install_zpcore$", text, re.M), "main 必须真的调用它"
+    # 失败时说的是"走原来的路径", 而不是让用户以为装坏了
+    assert "界面走原来的路径" in text
+    # 与内核同一条下载器: 靠 HTTP 状态码把"面板没有这一档"(404) 与"这条路不通"分开
+    assert 'HTTP_CODE" = "404' in text
+
+
+def test_local_control_plane_source_and_build_script_ship_with_the_repo():
+    """zpcore 的源码与构建脚本要跟着仓库走 —— 它没有上游可以下载 (内核是从 GitHub 取的,
+    它不行)。构建脚本还要覆盖全部架构: 漏一个, 那一档路由器就静默退回旧路径。"""
+    from zeroproxy import router_client
+
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(router_client.__file__))))
+    agent_src = os.path.join(repo, "backend", "zeroproxy", "client", "agent")
+    for name in ("go.mod", "main.go", "serve.go", "system.go"):
+        assert os.path.exists(os.path.join(agent_src, name)), name
+
+    build = os.path.join(repo, "scripts", "build-agent.sh")
+    assert os.path.exists(build)
+    body = open(build, encoding="utf-8").read()
+    for arch in router_client.ARCHES:
+        assert arch in body, f"构建脚本缺 {arch}"
+    assert "GOOS=linux" in body and "CGO_ENABLED=0" in body
+    assert "gzip" in body, "分发的形态是 .gz (与内核同一条路, 复用同一段解压代码)"
+    # 接口契约必须与原来的 cgi 一致, 否则路由器上的页面要跟着改
+    serve = open(os.path.join(agent_src, "serve.go"), encoding="utf-8").read()
+    assert '"/cgi-bin/zeroproxy"' in serve and '"status"' in serve
+    assert '"covered"' in serve and '"mode"' in serve
+
+
+def test_local_override_lets_the_router_be_switched_without_the_panel():
+    """家里网出问题时, 面板往往正好不可达 —— 而那时**最需要**能关掉代理。
+
+    所以本机覆盖 (local.override) 必须:
+      ① 优先于面板的期望状态 (否则"用户以为关了, 又被面板打开"是最坏的结果);
+      ② 在**面板一台都联系不上**的那条分支上也要执行 —— 老代码在那里直接 continue
+         (保持现状), 于是本机覆盖永远不会生效, 等于没有这个功能;
+      ③ 一直保持到用户执行 `zeroproxy local-auto` —— 静默恢复是最危险的语义。
+    """
+    import re
+
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+    assert "local.override" in text and "local-auto" in text
+
+    # ① 覆盖优先: 读到 on/off 就压过面板算出来的 DESIRED_ALL
+    assert re.search(r'case "\$_ov" in on\|off\) OVERRIDE="\$_ov"', text), "只认 on/off"
+    assert 'if [ "$OVERRIDE" = "on" ]; then DESIRED_ALL="true"; else DESIRED_ALL="false"; fi' in text
+
+    # ② 面板全不可达那条分支里也要执行它, 而且要排在 continue 之前
+    offline = text.index("面板不可达 (第 $FAILS 次), 保持当前状态")
+    override_apply = text.index('本机覆盖=off (面板不可达), 停止内核')
+    assert override_apply < offline, "本机覆盖要在'保持现状'之前执行"
+
+    # ③ 只有显式 local-auto 才交回面板; 面板答得上时顺手清掉 (那时面板就是真相源)
+    assert 'rm -f "$ZP_DIR/local.override"' in text
+    assert 'echo "面板不可达 —— 已在本机把全屋代理设为「$1」并立即生效。"' in text
+    # 心跳把这件事如实报上去, 面板卡片才能写「本机覆盖」而不是「同步中」
+    assert '"override":"\'"$OVERRIDE"\'"' in text
+
+
+def test_revert_compares_against_the_install_baseline(tmp_path):
+    """`zeroproxy revert` 不是"我们相信自己的拆卸代码", 而是**逐条比对**装机前的快照。
+
+    这里真的把那段函数抠出来跑: 状态一致时给"完全回到装机前", 有一处差异时必须报出来
+    并指出是哪一项 —— 数据面残留是"关掉了但网还是不对劲"这类问题的唯一解释。
+    """
+    import re
+    import subprocess
+
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+    body = re.search(r"^revert_report\(\) \{.*?\n\}", text, re.S | re.M)
+    assert body, "安装脚本里应当有 revert_report"
+    assert "snapshot_baseline" in text, "快照要在装机时拍"
+    assert re.search(r"^\s*snapshot_baseline$", text, re.M), "write_files 里要调用它"
+
+    root = tmp_path / "zp"
+    base = root / "baseline"
+    base.mkdir(parents=True)
+    (base / "taken_at").write_text("1", encoding="utf-8")
+    names = ("nft", "iptables", "ip6tables", "ip-rule", "ip6-rule")
+    for name in names:
+        (base / f"{name}.txt").write_text("", encoding="utf-8")
+
+    def run() -> str:
+        script = f'ZP_DIR="{root}"\n' + body.group(0) + "\nrevert_report\n"
+        out = subprocess.run(["sh", "-c", script], capture_output=True, text=True)
+        assert out.returncode == 0, out.stderr
+        return out.stdout
+
+    # 本机没有 nft / iptables 时, 两边都是空 —— 那也算"一致" (判据不能依赖文件大小)
+    assert "完全回到装机前" in run()
+
+    (base / "ip-rule.txt").write_text("0:\tfrom all lookup local\n", encoding="utf-8")
+    drifted = run()
+    assert "还有残留" in drifted and "ip-rule" in drifted, drifted
+
+    # 没有快照 (旧版本装的) 时要说清楚, 而不是假装比对过了
+    (base / "taken_at").unlink()
+    assert "没有装机前的快照" in run()
 
 
 def test_install_ui_always_makes_a_token_and_prints_it():
@@ -575,7 +745,10 @@ def test_install_ui_verifies_and_falls_back_to_its_own_httpd():
     # 判据是页面里的 <title> —— cgi 脚本里没有它, 所以"脚本被当文件下载"不会误判成通过
     assert "UI_MARK='<title>ZeroProxy'" in text, "自检要看页面内容, 不能只看状态码"
     assert 'ui_probe "http://127.0.0.1/cgi-bin/zeroproxy"' in text, "先试固件自己的 Web 服务"
-    assert "ui_start_local_httpd" in text, "发不出来要有自带 httpd 的兜底"
+    assert "ui_start_local_server" in text, "发不出来要有自带服务的兜底"
+    # 有 zpcore (面板分发的本地控制面) 时优先用它 —— 它与固件完全无关, 这正是它存在的理由
+    assert 'if [ -x "$ZP_DIR/zpcore" ] && ui_start_local_server; then' in text
+    assert "install_zpcore" in text and "/c/agent/bin/$ARCH" in text, "控制面也从面板取"
 
     # 兜底服务的两条硬约束: 只绑局域网地址 (绝不 0.0.0.0), 且与固件 Web 服务走同一个
     # 脚本 (/cgi-bin/zeroproxy 仍然是唯一入口, 令牌校验照旧在 cgi 里)
@@ -588,7 +761,7 @@ def test_install_ui_verifies_and_falls_back_to_its_own_httpd():
     assert 'printf \'%s\' "$UI_PORT" > "$ZP_DIR/ui.port"' in text
     assert 'cat "$ZP_DIR/ui.port"' in text
     # 两条路都不通时要把兜底服务收拾干净, 不留一个跑不起来的开机服务
-    assert "ui_stop_local_httpd" in text
+    assert "ui_stop_local_server" in text
     assert "zeroproxy-ui disable" in text
 
 
@@ -956,6 +1129,205 @@ def test_router_config_can_drop_auto_redirect_for_devices_that_cannot_use_it(cli
     assert "auto-redirect" not in skeleton["tun"]
 
 
+def test_router_config_only_ships_tun_when_the_device_can_use_it(client, configured):
+    """数据面决定面板给不给 `tun` 段。
+
+    真机 (GL-MT3600BE · 原厂 OpenWrt 21.02-SNAPSHOT / 内核 5.4.281): 客户端探出本机
+    **建不出 TUN 设备**, 但面板照旧给了一份 `tun: enable: true` 的配置 —— mihomo 启动时
+    去建 tun 失败, 整份配置起不来。所以设备把探出来的数据面 (`?datapath=`) 带给面板,
+    面板据此决定给不给这一段: 只有 `tun` 才给; tproxy / redirect / none 都用
+    `redir-port` + `dns.listen` 那条路, 配置一样, 差别在防火墙侧。
+    """
+    _login(client)
+    device = _register(client, _pair_code(client)["code"])
+    sub = f"/c/sub/{device['id']}?k={device['secret']}"
+
+    # 默认 (老客户端 / 支持的设备) 一个字节都不变
+    assert yaml.safe_load(client.get(sub).text)["tun"]["enable"] is True
+    for dp in ("", "tun"):
+        prof = yaml.safe_load(client.get(sub + f"&datapath={dp}").text)
+        assert prof["tun"]["enable"] is True, dp
+        assert prof["tun"]["auto-route"] is True
+
+    # 建不出 TUN 设备的机器: 面板不给 tun 段, 其余照旧
+    for dp in ("tproxy", "redirect", "none"):
+        prof = yaml.safe_load(client.get(sub + f"&datapath={dp}").text)
+        assert "tun" not in prof, dp
+        # 透明代理的两个端口与 DNS 都还在 (redirect / tproxy 都要靠它们)
+        assert prof["redir-port"] == 7892 and prof["tproxy-port"] == 7893, dp
+        assert prof["dns"]["enable"] is True and prof["dns"]["enhanced-mode"] == "fake-ip"
+        assert prof["allow-lan"] is True
+        # 分流数据库仍然只从面板取 (那类机器上更不可能连得上 GitHub)
+        assert "/c/geo/geosite.dat" in prof["geox-url"]["geosite"]
+
+    # 多服务器骨架走同一条路 (它也是路由器端配置)
+    skel = yaml.safe_load(client.get(sub + "&format=skeleton&datapath=redirect").text)
+    assert "tun" not in skel
+    assert skel["proxy-providers"] == {}
+
+
+def test_ipv6_is_taken_over_only_when_the_device_says_it_can(client, configured):
+    """IPv6 是**泄漏面**, 不是加分项。
+
+    局域网设备从运营商那里拿到原生 v6 地址; 只接管 v4 的透明代理对 v6 等于不存在 ——
+    那些流量直接出去, 目标网站看到的是用户的真实 v6 地址。而 mihomo 自己的
+    `ipv6: false` 并不会真的关掉 v6 协议栈 (上游 issue #2254), 所以这件事只能由设备
+    探完再决定, 而且**探不到时必须说出来**, 不能假装接管了。
+    """
+    _login(client)
+    device = _register(client, _pair_code(client)["code"])
+    sub = f"/c/sub/{device['id']}?k={device['secret']}"
+
+    # 默认 (老客户端 / 接管不了 v6 的设备): 一个字节不变
+    off = yaml.safe_load(client.get(sub).text)
+    assert off["ipv6"] is False and off["dns"]["ipv6"] is False
+    assert yaml.safe_load(client.get(sub + "&ipv6=0").text)["ipv6"] is False
+
+    # 设备说能一并接管: 顶层与 DNS 两处**同时**打开 (只开一处是半吊子)
+    on = yaml.safe_load(client.get(sub + "&ipv6=1").text)
+    assert on["ipv6"] is True
+    assert on["dns"]["ipv6"] is True
+    # v4 那一套不受影响
+    assert on["dns"]["enhanced-mode"] == "fake-ip"
+    assert set(on["dns"]["nameserver-policy"]) == {"geosite:private,cn"}
+    assert on["tun"]["auto-route"] is True
+
+    # 多服务器骨架同一条路
+    skel = yaml.safe_load(client.get(sub + "&format=skeleton&ipv6=1").text)
+    assert skel["ipv6"] is True and skel["dns"]["ipv6"] is True
+
+
+def test_install_script_ships_a_lan_only_redirect_datapath():
+    """L3: iptables REDIRECT —— 给 21.02 / fw3 / 内核 5.4 那一代固件准备的路。
+
+    那类机器上没有 nf_tables (nft 命令在、规则下不去), 原厂固件连 tun 都建不出来。
+    以前客户端在那种机器上只能报"未生效"; 加上这一级之后, 局域网 TCP 至少被接管。
+
+    两条硬约束:
+      ① 只接管**从局域网接口进来**的流量 —— 绝不能用"所有接口"兜底, 那会把 WAN 侧入站
+         也接管, 比不接管更糟;
+      ② 跳转规则加不上 (接口名不对) 要**如实返回失败**, 让 verify 判它没生效, 而不是
+         留下一条指向空气的规则还报成功 (8.45 的教训)。
+    """
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+
+    # 探测与落地都要有
+    assert "redirect_ok()" in text and "zp_redirect_apply" in text and "zp_redirect_clear" in text
+    assert "REDIRECT --to-ports" in text
+
+    # ① 只从局域网接口进来 (接口名可从 uci / lan_ip 反查, 兜底 br-lan)
+    assert "-I PREROUTING -i" in text, "跳转规则必须限定接口"
+    assert "ZP_LANIF" in text and "br-lan" in text
+
+    # ② 加不上就撤掉并返回失败 (不许报成功)
+    assert "if ! iptables -t nat -I PREROUTING" in text
+
+    # DNS 也要一并劫持 (fake-ip 才能按域名分流); 私有地址与代理端口自身先放行
+    assert "--dport 53 -j REDIRECT" in text
+    assert "198.18.0.0/16" in text and "-j RETURN" in text
+
+    # 拆卸只动自己的链 (别人的规则一条不碰) —— 停服务 / 卸载两处都要调用
+    assert "-F zp_router" in text and "-X zp_router" in text
+    assert text.count("zp_redirect_clear") >= 4, "定义 + apply + stop_service + uninstall"
+    # IPv6 那一半: 有 ip6tables 就一起接管, 没有就**如实记进 caps** (装不出规则也不许说接管了)
+    assert "ip6tables -t nat -I PREROUTING" in text
+    assert "zp_redirect_v6" in text and "ip6 daddr @local6" in text
+
+
+def test_datapath_ladder_helpers_run_on_any_sh():
+    """阶梯的两个纯函数: 往下试的顺序, 以及"这一级探测过了没有"。
+
+    它们决定降级的顺序 —— 顺序错了会在明明有 tproxy 的机器上直接掉到 redirect, 或者在
+    只有 redirect 的机器上空转。抠出来在真实 sh 里跑一遍 (与 json_get_bool 那条同理)。
+    """
+    import re
+    import subprocess
+
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+    parts = []
+    for name in ("ladder_below", "rung_usable"):
+        match = re.search(rf"^{name}\(\) \{{.*?\n\}}", text, re.S | re.M)
+        assert match, f"安装脚本里应当有 {name}"
+        parts.append(match.group(0))
+    script = "\n".join(parts) + """
+NET_TUN=1; NET_TPROXY=0; NET_REDIRECT=1
+ladder_below tun
+rung_usable tun && echo tun-yes || echo tun-no
+rung_usable tproxy && echo tproxy-yes || echo tproxy-no
+rung_usable redirect && echo redirect-yes || echo redirect-no
+ladder_below redirect
+"""
+    out = subprocess.run(["sh", "-c", script], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["tproxy", "redirect", "tun-yes", "tproxy-no", "redirect-yes"], out.stdout
+
+
+def test_datapath_wiring_is_complete_and_caps_says_what_it_chose(tmp_path):
+    """阶梯那条调用链必须首尾相接, 而且选完要把结论落进 caps。
+
+    为什么专门盯这个: 安装演练跑到 `write_files` 就停了 (本机没有 procd), `verify()`
+    那条链 (choose → set → apply → downgrade) 在自动化里**跑不到** —— 这次就是这么漏掉
+    一个 `set_datapath` 的定义 (`set_datapath: not found` 只会在真机的降级分支上爆)。
+    所以这里把纯函数抠出来, 在真实 sh 里真的调一遍: 缺定义会以 `not found` 暴露, 选错级
+    会以 chosen / covered 对不上暴露。
+    """
+    import re
+    import subprocess
+
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+
+    # 一、verify 这条链上用到的函数一个都不能缺 (纯静态, 便宜且直接命中 not found)
+    defined = set(re.findall(r"^([A-Za-z_][A-Za-z0-9_]*)\(\) \{", text, re.M))
+    needed = {
+        "kernel_ge", "lan_iface", "nft_ok", "tproxy_ok", "tun_ok", "redirect_ok", "ebpf_ok",
+        "choose_datapath", "set_datapath", "write_caps", "caps_write",
+        "rung_usable", "ladder_below",
+        "datapath_live", "wait_datapath", "apply_datapath", "downgrade_datapath",
+        "tun_retry_without_redirect",
+    }
+    assert needed <= defined, f"被调用但没有定义: {sorted(needed - defined)}"
+
+    # 二、真的跑一遍: 挑级 → 写 caps → 换级 → 再写 caps
+    parts = []
+    for name in ("caps_write", "write_caps", "compute_ipv6_cap", "set_datapath", "choose_datapath"):
+        match = re.search(rf"^{name}\(\) \{{.*?\n\}}", text, re.S | re.M)
+        assert match, f"安装脚本里应当有 {name}"
+        parts.append(match.group(0))
+    root = str(tmp_path)
+    script = (
+        f'ZP_DIR="{root}"\n'
+        "NET_TUN=1; NET_NFT=1; NET_TPROXY=1; NET_REDIRECT=1; NET_EBPF=0\n"
+        'CAPS_WHY_TUN=""; CAPS_WHY_TPROXY="tproxy 不行"; CAPS_WHY_REDIRECT=""; CAPS_WHY_EBPF="内核太老"\n'
+        'DATAPATH=""; COVERED=""\n'
+        + "\n".join(parts)
+        + '\nchoose_datapath; echo "chosen=$DATAPATH covered=$COVERED"\n'
+        'sed -n "s/^chosen=/caps.chosen=/p" "$ZP_DIR/caps"\n'
+        "NET_TUN=0\n"
+        'choose_datapath; echo "chosen=$DATAPATH covered=$COVERED"\n'
+        'set_datapath redirect; echo "chosen=$DATAPATH covered=$COVERED"\n'
+        'sed -n "s/^why.ipv6=/ipv6why=/p" "$ZP_DIR/caps"\n'
+        'grep -c "^why.tproxy=tproxy 不行$" "$ZP_DIR/caps"\n'
+    )
+    out = subprocess.run(["sh", "-c", script], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+    lines = out.stdout.split()
+    assert lines[0] == "chosen=tun" and lines[1] == "covered=full"
+    assert "caps.chosen=tun" in out.stdout
+    assert "chosen=tproxy" in lines and "covered=lan" in lines, lines
+    assert "chosen=redirect" in lines and "covered=lan_tcp" in lines, lines
+    # IPv6 能力是 chosen 的函数, 必须跟着一起落盘 (本机没有 ip6tables → redirect 只能 v4,
+    # 而且要说得出原因 —— 这是"不许假装接管了"那一半)
+    assert re.search(r"^ipv6why=\S", out.stdout, re.M), out.stdout
+    # why.* 原样留着 (含中文与空格), 面板 / CLI 直接读
+    assert "1" in lines[-1:], lines
+
+
 def test_device_subscription_requires_secret(client, configured):
     _login(client)
     device = _register(client, _pair_code(client)["code"])
@@ -1042,6 +1414,33 @@ def test_heartbeat_reports_state_and_returns_desired(client, configured):
     assert item["actual"] is True
     assert item["connected"] is True
     assert item["syncing"] is False
+
+
+def test_heartbeat_carries_how_far_the_router_really_took_over(client, configured):
+    """"内核在跑"≠"流量被接管" —— 设备把现场验过的数据面与覆盖范围一起报上来。
+
+    真机 8.45: 内核启动成功, 但 tun 建不出来、tproxy 也没有, 局域网里一台设备都没被接管,
+    面板却还是绿的"已连接"。所以设备每轮心跳带 `report: {mode, covered, why}`, 面板据此
+    把话说细 (未接管 / 仅局域网 TCP / 全屋)。这三个值必须原样进面板视图 —— 它们同时是
+    面板设备卡那枚标签的数据源, 也是排障时唯一能看到的"为什么"。
+    """
+    _login(client)
+    device = _register(client, _pair_code(client)["code"])
+    client.post("/c/report", json={
+        "device": device["id"], "k": device["secret"], "actual": True,
+        "report": {
+            "mode": "redirect",
+            "covered": "lan_tcp",
+            "why": "建不出 tun 设备: Operation not supported",
+            "client": "1.3.0",
+        },
+    })
+    item = client.get("/api/devices").json()["devices"]["items"][0]
+    assert item["report"]["mode"] == "redirect"
+    assert item["report"]["covered"] == "lan_tcp"
+    assert "Operation not supported" in item["report"]["why"]
+    # 覆盖范围受限, 但"开关开着且内核真在跑"这件事仍然成立 —— 面板要能同时表达两件事
+    assert item["connected"] is True
 
 
 def test_toggle_writes_desired_and_device_sees_it(client, configured):

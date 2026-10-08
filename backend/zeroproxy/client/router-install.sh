@@ -33,6 +33,9 @@ ZP_SVC=zeroproxy
 ZP_API=127.0.0.1:9090
 # 代理端口 (config.yaml 的 mixed-port)
 ZP_MIXED=7890
+#: TUN 设备节点。Linux 上是 /dev/net/tun; 少数系统 (FreeBSD) 用 /dev/tun ——
+#: 用 ZP_TUN_DEV 指过去即可。真正的判据仍然是"能不能建出设备", 这个值只决定去哪找。
+TUN_DEV="${ZP_TUN_DEV:-/dev/net/tun}"
 
 TLS_OPTS=""
 ARCH=""
@@ -481,20 +484,96 @@ pkg_update() {
     fi
 }
 
-# 三项网络能力, 装机时各探一次。结论有三处要用, 必须是同一份:
-#   * 安装输出怎么说话;
-#   * 写进 /etc/zeroproxy/caps —— agent 重建配置时把 tproxy 能力带给面板 (?tproxy=0/1),
-#     面板据此不写 auto-redirect (那一项在不支持它的固件上会让整个 tun 建不起来);
-#   * verify 判断"退回 tproxy"到底退成功了没有。
+# 数据面能力阶梯, 装机时**每一级都真做一次**, 结论写进 /etc/zeroproxy/caps。
+#
+# 为什么是一张阶梯而不是一对布尔值: "这台机器支持什么"不是编译期常量。真机上见过
+# 太多反例 —— /dev/net/tun 在但建不出设备、nft 命令在但内核没有 nf_tables、原厂固件
+# 的 kmod 和它自己那个内核不匹配。老代码只有"tun 优先 / tproxy 回退"两级, 于是那台
+# 原厂 21.02 机器两级都不可用, 结尾却还写着"全屋代理已开启"(见 README 8.45)。
+#
+# 阶梯 (从优到劣):
+#   L0 ebpf      eBPF, 直连真旁路 (内核 >=5.17 + BTF) —— 本版本只探不选, 留给性能模式
+#   L1 tun       内核接管路由与 DNS, 覆盖全屋 + 路由器自身
+#   L2 tproxy    nftables, 覆盖全屋 (路由器自身流量除外)
+#   L3 redirect  iptables nat REDIRECT, 覆盖局域网 TCP —— 21.02 / fw3 那类固件的唯一路
+#   L4 none      不接管; 只有显式配了代理的设备能用 (状态照实说, 不假装)
+#
+# caps 里还有 chosen (实际选中的一级) 与 covered (这一级覆盖到哪) —— 安装输出、CLI、
+# agent 上报、面板显示都读同一份, 于是"谁被接管了"只有一处定义。
 NET_TUN=0
 NET_NFT=0
 NET_TPROXY=0
+NET_REDIRECT=0
+NET_EBPF=0
+#: 这一档数据面能不能**一并接管 IPv6**。局域网设备从运营商那里拿到的是原生 v6 地址,
+#: 只接管 v4 的透明代理对 v6 等于不存在 —— 那些流量直接出去, 目标网站看到的是用户的
+#: 真实 v6 地址 (看起来一切正常, 代理却等于没装)。而 mihomo 自己的 `ipv6: false` 并不
+#: 真的关掉 v6 协议栈 (上游 issue #2254), 所以这件事只能由我们在数据面这一层回答。
+NET_IPV6=0
+#: 最近一次探测的失败原因 (内核/程序的原话优先)。写进 caps, 面板与 UI 都要看得见 ——
+#: 8.45 的真机就是只有一句"未出现", 只能靠用户截图才拼出原因。
+PROBE_WHY=""
+CAPS_WHY_TUN=""
+CAPS_WHY_TPROXY=""
+CAPS_WHY_REDIRECT=""
+CAPS_WHY_EBPF=""
+CAPS_WHY_IPV6=""
+#: 生效的数据面与它覆盖的范围 (choose_datapath 填, verify 可能再降级)
+DATAPATH=""
+COVERED=""
+
+# 内核主次版本是否 >= 给定值 (dae 那一级要看内核, 5.17 是它绑定 LAN 的下限)。
+kernel_ge() {
+    _k="$(uname -r 2>/dev/null || true)"
+    _maj="$(printf '%s' "$_k" | sed -n 's/^\([0-9][0-9]*\)\..*/\1/p')"
+    _min="$(printf '%s' "$_k" | sed -n 's/^[0-9][0-9]*\.\([0-9][0-9]*\).*/\1/p')"
+    [ -n "$_maj" ] || return 1
+    [ -n "$_min" ] || _min=0
+    if [ "$_maj" -gt "$1" ] 2>/dev/null; then return 0; fi
+    if [ "$_maj" -eq "$1" ] 2>/dev/null && [ "$_min" -ge "$2" ] 2>/dev/null; then return 0; fi
+    return 1
+}
+
+# 局域网接口名。redirect 那一级只接管从它进来的流量 —— 所以这个值必须是**局域网**的:
+# 猜成 0.0.0.0/所有接口等于把 WAN 侧入站也接管, 比不接管更糟。
+#
+# 依次问: uci 的 lan.device / lan.ifname → 拿 lan_ip 反查 → br-lan。候选要真的存在
+# (/sys/class/net 或 ip link) 才用它; 存在性也判不出来时退回 br-lan (OpenWrt 上局域网
+# 桥的固定名字), 运行时 zp_redirect_iface 还会再用 uci 校正一次。
+lan_iface() {
+    _cand="$(uci -q get network.lan.device 2>/dev/null || true)"
+    [ -n "$_cand" ] || _cand="$(uci -q get network.lan.ifname 2>/dev/null || true)"
+    if [ -z "$_cand" ]; then
+        _ip="$(lan_ip 2>/dev/null || true)"
+        if [ -n "$_ip" ]; then
+            _cand="$(ip -o -4 addr show 2>/dev/null \
+                | sed -n "s/^[0-9][0-9]*: \([^ ]*\) *inet $_ip\/.*/\1/p" | head -n1)"
+        fi
+    fi
+    for _d in "$_cand" br-lan; do
+        [ -n "$_d" ] || continue
+        if [ -d "/sys/class/net/$_d" ]; then
+            printf '%s' "$_d"; return 0
+        fi
+        if ip link show "$_d" >/dev/null 2>&1; then
+            printf '%s' "$_d"; return 0
+        fi
+    done
+    printf '%s' "${_cand:-br-lan}"
+}
 
 # nft 能不能真的下规则。有 nft 命令 ≠ 内核里有 nf_tables —— 原厂精简固件上见过
 # "命令在、规则下不去"的组合, 而那一项正是 auto-redirect 依赖的东西。
 nft_ok() {
-    command -v nft >/dev/null 2>&1 || return 1
-    nft add table inet zp_probe 2>/dev/null || return 1
+    PROBE_WHY=""
+    if ! command -v nft >/dev/null 2>&1; then
+        PROBE_WHY="本机没有 nft 命令"
+        return 1
+    fi
+    if ! _nft_err="$(nft add table inet zp_probe 2>&1)"; then
+        PROBE_WHY="nft 规则下不去 (内核里没有 nf_tables): ${_nft_err:-命令失败}"
+        return 1
+    fi
     nft delete table inet zp_probe 2>/dev/null || true
     return 0
 }
@@ -503,17 +582,26 @@ nft_ok() {
 # 为什么不用"模块在不在": tproxy 有可能被编进内核 (那时 /sys/module 里没有它), 而
 # `nft` 会把模块按需加载 —— 真加一条规则才是这件事的最终判据。探针用完就撤掉。
 tproxy_ok() {
-    nft_ok || return 1
-    nft add table inet zp_probe 2>/dev/null || return 1
-    if ! nft add chain inet zp_probe c '{ type filter hook prerouting priority -150; policy accept; }' 2>/dev/null; then
-        nft delete table inet zp_probe 2>/dev/null || true
+    PROBE_WHY=""
+    if ! nft_ok; then
+        PROBE_WHY="${PROBE_WHY:-nft 不可用}"
         return 1
     fi
-    if nft add rule inet zp_probe c meta l4proto tcp tproxy to :1 2>/dev/null; then
+    if ! nft add table inet zp_probe 2>/dev/null; then
+        PROBE_WHY="nft 表建不起来"
+        return 1
+    fi
+    if ! nft add chain inet zp_probe c '{ type filter hook prerouting priority -150; policy accept; }' 2>/dev/null; then
+        nft delete table inet zp_probe 2>/dev/null || true
+        PROBE_WHY="内核不接受 prerouting 链 (nf_tables 不完整)"
+        return 1
+    fi
+    if _tp_err="$(nft add rule inet zp_probe c meta l4proto tcp tproxy to :1 2>&1)"; then
         nft delete table inet zp_probe 2>/dev/null || true
         return 0
     fi
     nft delete table inet zp_probe 2>/dev/null || true
+    PROBE_WHY="tproxy 规则下不去 (内核里没有 nft_tproxy): ${_tp_err:-命令失败}"
     return 1
 }
 
@@ -522,14 +610,113 @@ tproxy_ok() {
 # mihomo 起 tun 失败、脚本却一直以为 TUN 没问题。判据: 真建一个再删掉; `ip` 不带
 # tuntap 子命令时, 退化成"模块在不在"。
 tun_ok() {
-    [ -c /dev/net/tun ] || return 1
-    if ip tuntap add dev zp0probe mode tun 2>/dev/null; then
+    PROBE_WHY=""
+    if [ ! -c "$TUN_DEV" ]; then
+        PROBE_WHY="$TUN_DEV 不存在 (缺 kmod-tun)"
+        return 1
+    fi
+    if _tun_err="$(ip tuntap add dev zp0probe mode tun 2>&1)"; then
         ip link del zp0probe 2>/dev/null || ip tuntap del dev zp0probe mode tun 2>/dev/null || true
         return 0
     fi
-    [ -d /sys/module/tun ] && return 0
-    grep -q '^tun ' /proc/modules 2>/dev/null && return 0
+    if [ -d /sys/module/tun ]; then return 0; fi
+    if grep -q '^tun ' /proc/modules 2>/dev/null; then return 0; fi
+    PROBE_WHY="建不出 tun 设备: ${_tun_err:-Operation not supported}"
     return 1
+}
+
+# iptables nat + REDIRECT —— 阶梯上最老、也最抗造的一级。
+#
+# 为什么必须有它: OpenWrt 21.02 / 内核 5.4 / fw3 那一代固件没有 nf_tables (nft 命令在、
+# 规则下不去), 原厂 GL.iNet 更狠 —— 连 tun 都建不出来。8.45 那台机器上 TUN 与 tproxy
+# 双双不可用, 结尾只能写"未生效"。而 iptables 从 2.4 内核起就在, 那条路它一定能走。
+# 代价是只能接管 TCP (REDIRECT 不适用于 UDP), 所以这一级的 covered 是 lan_tcp ——
+# 覆盖到哪就说到哪, 不夸大。
+#
+# 判据同样是"真做一次": 建一条自己的链、加一条 REDIRECT 规则、再整体撤掉。
+redirect_ok() {
+    PROBE_WHY=""
+    if ! command -v iptables >/dev/null 2>&1; then
+        PROBE_WHY="本机没有 iptables 命令"
+        return 1
+    fi
+    if ! iptables -t nat -N zp_probe 2>/dev/null; then
+        PROBE_WHY="iptables 的 nat 表不可用"
+        return 1
+    fi
+    if _rd_err="$(iptables -t nat -A zp_probe -p tcp -j REDIRECT --to-ports 1 2>&1)"; then
+        iptables -t nat -F zp_probe 2>/dev/null || true
+        iptables -t nat -X zp_probe 2>/dev/null || true
+        return 0
+    fi
+    iptables -t nat -F zp_probe 2>/dev/null || true
+    iptables -t nat -X zp_probe 2>/dev/null || true
+    PROBE_WHY="REDIRECT 规则下不去: ${_rd_err:-命令失败}"
+    return 1
+}
+
+# eBPF (dae) 能不能用 —— 本版本**只探不选**。
+# 它的性能收益是量级的 (直连流量真旁路, 不过用户态), 但前提苛刻 (内核 >=5.17 + BTF) 且
+# 多一个二进制要面板分发, 所以先把结论记进 caps, 让面板知道这台机器有没有性能模式的底子。
+# 这一级不做任何实际改动 (只读内核版本与 BTF 节点), 所以探测本身没有副作用。
+ebpf_ok() {
+    PROBE_WHY=""
+    if ! kernel_ge 5 17; then
+        PROBE_WHY="内核 $(uname -r 2>/dev/null) 低于 5.17"
+        return 1
+    fi
+    if [ ! -r /sys/kernel/btf/vmlinux ]; then
+        PROBE_WHY="内核没有 BTF (/sys/kernel/btf/vmlinux 不存在)"
+        return 1
+    fi
+    return 0
+}
+
+# 内核能不能按 IPv6 目标做 tproxy (nft 的 inet 表天然同时看 v4/v6, 但"支持 v6 的 tproxy"
+# 是内核里的另一件事 —— 老内核上有过只编了 v4 的情况)。探针同样用完就撤。
+nft_v6_ok() {
+    PROBE_WHY=""
+    nft_ok || { PROBE_WHY="${PROBE_WHY:-nft 不可用}"; return 1; }
+    if ! nft add table inet zp_probe6 2>/dev/null; then
+        PROBE_WHY="nft 表建不起来"
+        return 1
+    fi
+    if ! nft add chain inet zp_probe6 c '{ type filter hook prerouting priority -150; policy accept; }' 2>/dev/null; then
+        nft delete table inet zp_probe6 2>/dev/null || true
+        PROBE_WHY="内核不接受 prerouting 链"
+        return 1
+    fi
+    if _v6_err="$(nft add rule inet zp_probe6 c ip6 daddr ::1/128 tproxy to :1 2>&1)"; then
+        nft delete table inet zp_probe6 2>/dev/null || true
+        return 0
+    fi
+    nft delete table inet zp_probe6 2>/dev/null || true
+    PROBE_WHY="IPv6 tproxy 规则下不去: ${_v6_err:-内核不支持}"
+    return 1
+}
+
+# 这一档数据面能不能一并接管 IPv6。判据是"数据面本身能覆盖 v6 吗":
+#   tun     能 —— mihomo 给 tun 分配 v6 地址, auto-route 一并管 v6
+#   tproxy  要看内核支不支持 v6 的 tproxy (探一次)
+#   redirect 只有本机有 ip6tables 才行
+#   none    谈不上
+# 覆盖不了时**不做静默处理**: 记进 caps 并一路报到面板 —— 卡片上会写"IPv6 未接管",
+# 用户至少知道自己暴露在哪。
+compute_ipv6_cap() {
+    NET_IPV6=0
+    CAPS_WHY_IPV6=""
+    case "$DATAPATH" in
+        tun)    NET_IPV6=1 ;;
+        tproxy) if nft_v6_ok; then NET_IPV6=1; else CAPS_WHY_IPV6="$PROBE_WHY"; fi ;;
+        redirect)
+            if command -v ip6tables >/dev/null 2>&1; then NET_IPV6=1
+            else CAPS_WHY_IPV6="本机没有 ip6tables (老固件), 局域网 IPv6 会直接出去"; fi
+            ;;
+        *)      CAPS_WHY_IPV6="透明代理没有生效, IPv6 自然也谈不上接管" ;;
+    esac
+    if [ "$NET_IPV6" = "0" ] && [ -z "$CAPS_WHY_IPV6" ]; then
+        CAPS_WHY_IPV6="这一档数据面覆盖不到 IPv6"
+    fi
 }
 
 # 能力落盘 (agent 读它决定给面板报 ?tproxy=)。格式极简: 一行一个 key=value,
@@ -545,56 +732,144 @@ write_caps() {
     caps_write "$_ar"
 }
 
-# 落一份 caps。自愈那一步要单独改 autoredirect, 所以单独抽出来。
+# 落一份 caps (schema 2)。自愈那一步要单独改 autoredirect, 所以单独抽出来。
+#
+# 格式仍是一行一个 key=value (路由器上没有 jq, 用 sed 取就够)。新增的 chosen / covered
+# 回答的是"这台机器现在到底走哪条路、覆盖到哪", 而 why.* 回答"别的路为什么不行" ——
+# 安装输出、CLI、agent 上报、面板显示读的都是这一份, 不允许各处各写一遍。
 caps_write() {
+    _ar="${1:-1}"
+    mkdir -p "$ZP_DIR" 2>/dev/null || true
+    _oneline() { printf '%s' "$1" | tr -d '\r\n'; }
     {
+        printf 'schema=2\n'
         printf 'tun=%s\n' "$NET_TUN"
         printf 'nft=%s\n' "$NET_NFT"
         printf 'tproxy=%s\n' "$NET_TPROXY"
-        printf 'autoredirect=%s\n' "$1"
+        printf 'redirect=%s\n' "$NET_REDIRECT"
+        printf 'ebpf=%s\n' "$NET_EBPF"
+        printf 'ipv6=%s\n' "$NET_IPV6"
+        printf 'autoredirect=%s\n' "$_ar"
+        printf 'chosen=%s\n' "${DATAPATH:-none}"
+        printf 'covered=%s\n' "${COVERED:-none}"
+        printf 'why.tun=%s\n' "$(_oneline "$CAPS_WHY_TUN")"
+        printf 'why.tproxy=%s\n' "$(_oneline "$CAPS_WHY_TPROXY")"
+        printf 'why.redirect=%s\n' "$(_oneline "$CAPS_WHY_REDIRECT")"
+        printf 'why.ebpf=%s\n' "$(_oneline "$CAPS_WHY_EBPF")"
+        printf 'why.ipv6=%s\n' "$(_oneline "$CAPS_WHY_IPV6")"
     } > "$ZP_DIR/caps"
 }
 
+# 换一级数据面: 设 DATAPATH / COVERED 并落进 caps。**"哪一级覆盖到哪"只有这一处映射** ——
+# 安装输出、CLI、agent 上报、面板显示都从 caps 读, 不允许各处各写一遍。
+set_datapath() {
+    case "$1" in
+        tun)      DATAPATH="tun"; COVERED="full" ;;
+        tproxy)   DATAPATH="tproxy"; COVERED="lan" ;;
+        redirect) DATAPATH="redirect"; COVERED="lan_tcp" ;;
+        *)        DATAPATH="none"; COVERED="none" ;;
+    esac
+    # IPv6 能力是"选中哪一级"的函数 (tun 天然能覆盖 v6, redirect 要看有没有 ip6tables),
+    # 所以跟着一起算、一起落盘 —— 降级换级时它也会跟着重算。
+    compute_ipv6_cap
+    write_caps
+}
+
+# 从已探到的能力里挑一级 (顺序即优先级)。注意"探到"不等于"起得来" —— 8.45 那台机器
+# 探测说 TUN 可用, 实际建不出设备, 所以 verify() 还会再验一次并按阶梯往下降。
+choose_datapath() {
+    if [ "$NET_TUN" = "1" ]; then set_datapath tun
+    elif [ "$NET_TPROXY" = "1" ]; then set_datapath tproxy
+    elif [ "$NET_REDIRECT" = "1" ]; then set_datapath redirect
+    else set_datapath none
+    fi
+}
+
+# 这一级的能力探测过了没有 (verify 降级时只试探通的级)
+rung_usable() {
+    case "$1" in
+        tun)      [ "$NET_TUN" = "1" ] ;;
+        tproxy)   [ "$NET_TPROXY" = "1" ] ;;
+        redirect) [ "$NET_REDIRECT" = "1" ] ;;
+        *)        return 1 ;;
+    esac
+}
+
+# 阶梯上排在某一级后面的几级 (从优到劣)
+ladder_below() {
+    case "$1" in
+        tun)    printf '%s\n' tproxy redirect ;;
+        tproxy) printf '%s\n' redirect ;;
+        *)      : ;;
+    esac
+}
+
 install_deps() {
-    step "准备网络内核模块"
+    step "探测网络数据面能力"
     # 软件源不可用 / 源对不上内核, 在路由器上都很常见, 不算致命 —— 模块可能本来就在。
     pkg_update || true
     pkg_install kmod-tun || true
     modprobe tun 2>/dev/null || true
-    if tun_ok; then NET_TUN=1; fi
-    if nft_ok; then NET_NFT=1; fi
 
+    # 每一级都真做一次。探测只做可撤销的动作 (建设备再删 / 加规则再撤), 不改任何东西。
+    if tun_ok; then NET_TUN=1; else CAPS_WHY_TUN="$PROBE_WHY"; fi
+    if nft_ok; then NET_NFT=1; else CAPS_WHY_TPROXY="$PROBE_WHY"; fi
     if [ "$NET_NFT" = "1" ]; then
-        if tproxy_ok; then NET_TPROXY=1; fi
-        if [ "$NET_TPROXY" = "0" ]; then
+        if tproxy_ok; then
+            NET_TPROXY=1
+        else
+            CAPS_WHY_TPROXY="$PROBE_WHY"
+            # 模块可能只是没装/没加载: 补一次再试 (装不上就算了, 不算致命)
             pkg_install kmod-nft-tproxy || true
             modprobe nft_tproxy 2>/dev/null || true
-            if tproxy_ok; then NET_TPROXY=1; fi
+            if tproxy_ok; then NET_TPROXY=1; CAPS_WHY_TPROXY=""; fi
         fi
     fi
-    write_caps
+    if redirect_ok; then NET_REDIRECT=1; else CAPS_WHY_REDIRECT="$PROBE_WHY"; fi
+    if ebpf_ok; then NET_EBPF=1; else CAPS_WHY_EBPF="$PROBE_WHY"; fi
 
-    if [ "$NET_TUN" = "1" ]; then
-        ok "TUN 可用 (kmod-tun 已就绪)"
-        # 有 TUN 就用不到 tproxy —— 装不上只是"少一条用不到的回退", 说清楚即可。
-        if [ "$NET_TPROXY" = "0" ]; then
-            if [ "$NET_NFT" = "0" ]; then
-                note "tproxy 回退不可用 (内核里没有 nf_tables, nft 下的规则不生效) —— TUN 模式下用不到它"
-            else
-                note "tproxy 回退不可用 (内核 / 软件源里没有 nft_tproxy) —— TUN 模式下用不到它, 不影响任何功能"
+    # 选中哪一级, 并把 chosen / covered / ipv6 / why.* 一起落进 caps (全链路共用这一份)
+    choose_datapath
+
+    case "$DATAPATH" in
+        tun)
+            ok "数据面: TUN (全屋设备 + 路由器自身)"
+            # 用不到的那几级: 只说一句说明, 不用警告 —— 那是"少一条用不到的回退", 不是问题。
+            if [ "$NET_TPROXY" = "0" ]; then
+                if [ "$NET_NFT" = "0" ]; then
+                    note "tproxy 回退不可用 (内核里没有 nf_tables) —— TUN 模式下用不到它"
+                else
+                    note "tproxy 回退不可用 (内核 / 软件源里没有 nft_tproxy) —— TUN 模式下用不到它, 不影响任何功能"
+                fi
             fi
-        fi
-        return 0
+            ;;
+        tproxy)
+            ok "数据面: tproxy (全屋设备; 路由器自身流量除外)"
+            note "本机建不出 TUN 设备: ${CAPS_WHY_TUN:-未知原因}"
+            ;;
+        redirect)
+            ok "数据面: iptables REDIRECT (局域网 TCP)"
+            note "这台固件没有 nf_tables、也建不出 tun —— 用最老也最抗造的一条路接管局域网"
+            if [ -n "$CAPS_WHY_TUN" ]; then note "tun 不可用: $CAPS_WHY_TUN"; fi
+            if [ -n "$CAPS_WHY_TPROXY" ]; then note "tproxy 不可用: $CAPS_WHY_TPROXY"; fi
+            ;;
+        *)
+            DEPENDENCY_NOTE="no-datapath"
+            warn "TUN / tproxy / iptables REDIRECT 三条路都没探通 —— 全屋透明代理这次不会生效"
+            if [ -n "$CAPS_WHY_TUN" ]; then note "tun: $CAPS_WHY_TUN"; fi
+            if [ -n "$CAPS_WHY_TPROXY" ]; then note "tproxy: $CAPS_WHY_TPROXY"; fi
+            if [ -n "$CAPS_WHY_REDIRECT" ]; then note "redirect: $CAPS_WHY_REDIRECT"; fi
+            note "本机的代理端口一直可用 (局域网设备手动把代理填成 $(lan_ip):$ZP_MIXED)"
+            ;;
+    esac
+    if [ "$NET_EBPF" = "1" ]; then
+        note "这台机器有 eBPF 数据面的底子 (内核 $(uname -r) + BTF) —— 性能模式留给后续版本"
     fi
-    # 没有 TUN: tproxy 就是唯一的路, 它不可用才是真问题。
-    DEPENDENCY_NOTE="tun-missing"
-    warn "本机建不出 TUN 设备 (/dev/net/tun 在, 但内核里没有可用的 tun)"
-    if [ "$NET_TPROXY" = "1" ]; then
-        warn "稍后改用 tproxy 模式 (全屋设备生效, 路由器自身流量除外)"
+    if [ "$NET_IPV6" = "1" ]; then
+        note "IPv6 一并接管 (局域网设备的 v6 流量也走代理, 不会漏出去)"
     else
-        warn "TUN 与 tproxy 都不可用 —— 全屋透明代理这次不会生效。
-  手动补一次: kmod 这两个包 (apk add kmod-tun kmod-nft-tproxy; 24.10 及更早用 opkg install)"
-        DEPENDENCY_NOTE="tun-tproxy-missing"
+        note "IPv6 未接管: ${CAPS_WHY_IPV6:-这一档数据面覆盖不到 v6}"
+        note "  这台机器上, 局域网设备的 IPv6 会直接出去 —— 面板上也会这么标"
     fi
 }
 
@@ -957,9 +1232,34 @@ config_failure() {
     die "拉取/校验配置失败, 请回面板确认已有可用节点"
 }
 
+# 装机前的"地面真相"快照 (防火墙规则 / 策略路由)。`zeroproxy revert` 靠它回答一个具体
+# 问题: 停掉内核、拆掉数据面之后, 这台机器**是不是真的**回到了装机前 —— 逐条比对, 而不是
+# 靠我们相信自己的拆卸代码。这台机器的每一台都可能不一样 (固件/HNAT/运营商), 所以"原状"
+# 只能自己拍。
+#
+# 只在第一次安装时拍: 重跑安装命令时我们自己的规则可能正在生效, 那时候拍等于把残渣当原状。
+snapshot_baseline() {
+    _dir="$ZP_DIR/baseline"
+    # 判据用 taken_at 而不是某个快照文件的大小: 有些机器上 nft / iptables-save 本来就
+    # 输出为空 (没有 nftables), 用大小判会"每次都当成没拍过"。
+    [ -f "$_dir/taken_at" ] && return 0
+    mkdir -p "$_dir" 2>/dev/null || return 0
+    (nft list ruleset 2>/dev/null || true) > "$_dir/nft.txt"
+    (iptables-save 2>/dev/null || true) > "$_dir/iptables.txt"
+    (ip6tables-save 2>/dev/null || true) > "$_dir/ip6tables.txt"
+    (ip rule show 2>/dev/null || true) > "$_dir/ip-rule.txt"
+    (ip -6 rule show 2>/dev/null || true) > "$_dir/ip6-rule.txt"
+    (date +%s 2>/dev/null || true) > "$_dir/taken_at"
+}
+
 write_files() {
     step "写入运行文件"
     mkdir -p "$ZP_DIR"
+    # 装机前的"地面真相"快照。`zeroproxy revert` 用它证明"停掉内核即完全恢复原状"是真的,
+    # 而不是靠我们相信自己的拆卸代码 —— 拆干净没拆干净, 比对说了算。
+    # 只在**规则还没被我们改过**的时候拍 (write_files 早于 verify 落数据面规则); 已经拍过
+    # 就不覆盖: 重跑安装时我们自己的规则可能正生效, 那时候拍会把残渣当成"原状"。
+    snapshot_baseline
 
     # tproxy 回退方案用的 nft 规则 (只在 TUN 不可用时由 init 脚本加载)。
     # 优先级用数字而不是符号名 (dstnat/mangle): 数字在各版本 nft 上行为一致。
@@ -973,9 +1273,20 @@ table inet zp_router {
                      169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16,
                      224.0.0.0/4, 240.0.0.0/4, 198.18.0.0/16 }
     }
+    # IPv6 那一半。**不能只做 v4**: 局域网设备从运营商那里拿到原生 v6, 而只接管 v4 的
+    # 透明代理对 v6 是不存在的 —— 那些流量会直接出去 (真机上看起来一切正常, 但目标网站
+    # 看到的是你的真实 v6 地址, 代理等于没装)。mihomo 自己的 `ipv6: false` 也挡不住它
+    # (上游 issue #2254: "TUN interface does not disable IPv6 protocol stack"), 所以这里
+    # 必须显式接管: 私有地址与链路本地先放行 (局域网互访 / 邻居发现), 其余进代理。
+    set local6 {
+        type ipv6_addr
+        flags interval
+        elements = { ::1/128, fc00::/7, fe80::/10, ff00::/8 }
+    }
     chain pre {
         type filter hook prerouting priority -150; policy accept;
         ip daddr @local4 return
+        ip6 daddr @local6 return
         meta mark 0x1ff return
         meta l4proto { tcp, udp } th dport { 22, 53, 7890, 7874, 9092, 9090 } return
         meta l4proto tcp meta mark set 0x1ff tproxy to :7893 accept
@@ -984,11 +1295,108 @@ table inet zp_router {
     chain dns {
         type nat hook prerouting priority -105; policy accept;
         ip daddr @local4 return
+        ip6 daddr @local6 return
         udp dport 53 redirect to :7874
         tcp dport 53 redirect to :7874
     }
 }
 NFTEOF
+
+    # redirect 数据面 (iptables nat)。只在 TUN 与 tproxy 都不可用时启用 (chosen=redirect)。
+    #
+    # 为什么单独抽成一个能 source 的文件: 装 / 开 / 关 / 卸载四个地方都要用它, 而它们
+    # 分别是三个进程 (安装脚本 / init 脚本 / CLI) —— 一处实现, 四处同一份。tproxy.nft
+    # 是"数据" (nft -f 直接读), 这里是"动作" (要按 LAN 接口名增删), 所以写成函数。
+    #
+    # 只接管**从局域网接口进来**的 TCP: REDIRECT 不适用于 UDP, 所以 covered=lan_tcp;
+    # 路由器自身出站与 WAN 侧入站一个字节都不碰。UDP 那部分要 TUN 或 tproxy 才做得到,
+    # 这台固件给不了 —— 那就如实少给, 而不是假装给全了。
+    _lanif="$(lan_iface 2>/dev/null || true)"
+    cat > "$ZP_DIR/redirect.sh" <<REDIRECTEOF
+#!/bin/sh
+# ZeroProxy iptables REDIRECT 数据面 (局域网 TCP 透明代理)。
+# 由安装脚本生成, 请勿手改 —— 重跑安装命令会覆盖。
+ZP_REDIR_PORT=7892
+ZP_DNS_PORT=7874
+ZP_LANIF="$_lanif"
+
+# 局域网接口名。装机时确定不下来 (没有 uci / 接口还没起来) 就退回 br-lan —— 但绝不
+# 退化成"所有接口": 那会把 WAN 侧入站也接管, 是比不接管更糟的结果。
+zp_redirect_iface() {
+    if [ -n "\$ZP_LANIF" ]; then printf '%s' "\$ZP_LANIF"; return 0; fi
+    _d="\$(uci -q get network.lan.device 2>/dev/null || uci -q get network.lan.ifname 2>/dev/null || true)"
+    [ -n "\$_d" ] || _d=br-lan
+    printf '%s' "\$_d"
+}
+
+# 只撤自己的那条链 (zp_router): 别人的规则一条不碰。
+zp_redirect_clear() {
+    _if="\$(zp_redirect_iface)"
+    while iptables -t nat -D PREROUTING -i "\$_if" -j zp_router 2>/dev/null; do :; done
+    iptables -t nat -F zp_router 2>/dev/null || true
+    iptables -t nat -X zp_router 2>/dev/null || true
+    if command -v ip6tables >/dev/null 2>&1; then
+        while ip6tables -t nat -D PREROUTING -i "\$_if" -j zp_router 2>/dev/null; do :; done
+        ip6tables -t nat -F zp_router 2>/dev/null || true
+        ip6tables -t nat -X zp_router 2>/dev/null || true
+    fi
+}
+
+zp_redirect_apply() {
+    command -v iptables >/dev/null 2>&1 || return 1
+    _if="\$(zp_redirect_iface)"
+    zp_redirect_clear
+    iptables -t nat -N zp_router 2>/dev/null || return 1
+    # 私有 / 保留地址直连: 局域网互访、管理页面、以及 mihomo 自己都不该被绕一圈。
+    for _net in 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 \
+                172.16.0.0/12 192.0.0.0/24 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4 \
+                198.18.0.0/16; do
+        iptables -t nat -A zp_router -d "\$_net" -j RETURN
+    done
+    # 已标记的 (mihomo 自己的出站) 直连 —— 否则会成环。
+    iptables -t nat -A zp_router -m mark --mark 0x1ff -j RETURN
+    # 代理端口本身的入站不再被劫持 (否则内核与内核自己绕圈)。
+    iptables -t nat -A zp_router -p tcp --dport 7890 -j RETURN
+    iptables -t nat -A zp_router -p tcp --dport "\$ZP_REDIR_PORT" -j RETURN
+    # DNS 先劫持 (fake-ip 才能按域名分流; TCP 53 也一起)。
+    iptables -t nat -A zp_router -p udp --dport 53 -j REDIRECT --to-ports "\$ZP_DNS_PORT"
+    iptables -t nat -A zp_router -p tcp --dport 53 -j REDIRECT --to-ports "\$ZP_DNS_PORT"
+    # 其余 TCP 进 redir-port。
+    iptables -t nat -A zp_router -p tcp -j REDIRECT --to-ports "\$ZP_REDIR_PORT"
+    # 只从局域网接口进来 —— 路由器自身与 WAN 入站不接管。
+    # 接口名不对 (设备上没有这个接口) 时这一步会失败: 那就把刚建的链撤掉并**如实返回
+    # 失败** —— 让装机时的验证判它"没生效", 而不是留下一条指向空气的规则。
+    if ! iptables -t nat -I PREROUTING -i "\$_if" -j zp_router 2>/dev/null; then
+        zp_redirect_clear
+        return 1
+    fi
+    # IPv6 那一半 (同一套规则, 换 ip6tables)。**没有 ip6tables 就不做** —— 那一档会被
+    # 如实记进 caps (ipv6=0), 面板上会写"IPv6 未接管", 而不是假装全接管了。
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -t nat -N zp_router 2>/dev/null || return 0
+        for _net6 in ::1/128 fc00::/7 fe80::/10 ff00::/8; do
+            ip6tables -t nat -A zp_router -d "\$_net6" -j RETURN
+        done
+        ip6tables -t nat -A zp_router -m mark --mark 0x1ff -j RETURN
+        ip6tables -t nat -A zp_router -p tcp --dport 7890 -j RETURN
+        ip6tables -t nat -A zp_router -p tcp --dport "\$ZP_REDIR_PORT" -j RETURN
+        ip6tables -t nat -A zp_router -p udp --dport 53 -j REDIRECT --to-ports "\$ZP_DNS_PORT"
+        ip6tables -t nat -A zp_router -p tcp --dport 53 -j REDIRECT --to-ports "\$ZP_DNS_PORT"
+        ip6tables -t nat -A zp_router -p tcp -j REDIRECT --to-ports "\$ZP_REDIR_PORT"
+        if ! ip6tables -t nat -I PREROUTING -i "\$_if" -j zp_router 2>/dev/null; then
+            ip6tables -t nat -F zp_router 2>/dev/null || true
+            ip6tables -t nat -X zp_router 2>/dev/null || true
+        fi
+    fi
+    return 0
+}
+
+zp_redirect_live() { iptables -t nat -L zp_router >/dev/null 2>&1; }
+
+# 这一档能不能一并接管 IPv6 (没有 ip6tables 的老固件不行)。给安装脚本写 caps 用。
+zp_redirect_v6() { command -v ip6tables >/dev/null 2>&1 && return 0 || return 1; }
+REDIRECTEOF
+    chmod 755 "$ZP_DIR/redirect.sh"
 
     # 控制 agent: 每 15 秒向面板上报一次状态并取回"期望开关 + 配置版本"。
     # 面板是唯一的事实来源 —— 路由器本地改开关也是请求面板去改 (见 CLI)。
@@ -1013,6 +1421,26 @@ GEO_FILES="geoip.metadb geosite.dat"
 ZP_VERSION="__ZP_CLIENT_VERSION__"
 
 log() { logger -t zeroproxy-agent "$*"; }
+
+# 拼 JSON 字符串 (原因里可能有引号/反斜杠 —— 内核原话什么都可能有)
+json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\r\n'; }
+
+# 内核现在**真的**接管到哪。不看 caps 里的意图, 看现场 —— 这正是"永不撒谎"那一半:
+# 面板上显示的是这个值, 不是"我们打算用什么"。
+#   full     tun 在   → 全屋设备 + 路由器自身
+#   lan      nft 表在 → 全屋设备 (路由器自身流量除外)
+#   lan_tcp  iptables 链在 → 只有局域网 TCP
+#   none     内核停着, 或规则被外 force 清了 → 未接管
+actual_covered() {
+    if ip link show zp-tun >/dev/null 2>&1; then printf 'full'; return 0; fi
+    if command -v nft >/dev/null 2>&1 && nft list table inet zp_router >/dev/null 2>&1; then
+        printf 'lan'; return 0
+    fi
+    if command -v iptables >/dev/null 2>&1 && iptables -t nat -L zp_router >/dev/null 2>&1; then
+        printf 'lan_tcp'; return 0
+    fi
+    printf 'none'
+}
 
 # ---------------------------------------------------------------- 服务器清单
 
@@ -1136,6 +1564,31 @@ caps_flag() {
     esac
 }
 
+# caps 里的一个键 (一行一个 key=value)。老版本 (schema 1) 的 caps 没有 chosen,
+# 那时按 tun 报 —— 升级上来的机器行为不变。
+caps_get() { sed -n "s/^$1=//p" "$ZP_DIR/caps" 2>/dev/null | head -n1; }
+
+# 这台设备现在走的数据面。面板据此决定要不要给 tun 段 (redirect/tproxy 模式下带 tun
+# 段会让内核起不来)。判据是本机 caps 里的 chosen —— 装机时探的, 并且可能已被降级。
+datapath_flag() {
+    _v="$(caps_get chosen)"
+    case "$_v" in
+        tun|tproxy|redirect|none) printf '%s' "$_v" ;;
+        *) printf 'tun' ;;
+    esac
+}
+
+# 这一档数据面能不能一并接管 IPv6 (装机时探的)。面板据此决定给不给双栈配置 ——
+# 覆盖不到还给双栈, 等于让内核去管它管不了的东西。老 caps 没有这一位时按 0 报:
+# 宁可在面板上显示"IPv6 未接管", 也不能说成接管了。
+ipv6_flag() {
+    _v="$(caps_get ipv6)"
+    case "$_v" in
+        0|1) printf '%s' "$_v" ;;
+        *) printf '0' ;;
+    esac
+}
+
 build_config() {
     migrate_servers
     _first="$(first_server)"
@@ -1149,11 +1602,15 @@ build_config() {
     # (真机现象: 装完 zp-tun 一直不出现, 脚本退回 tproxy, 而那台机器的 tproxy 也是
     # 同一个原因不可用 —— 全屋透明代理名存实亡)。判据同样只能是本机。
     _tp="$(caps_flag)"
+    # 数据面本身也由本机决定: 面板看到 redirect 就不给 tun 段 (这台固件建不出设备,
+    # 带上它内核直接起不来)。
+    _dp="$(datapath_flag)"
+    _ip6="$(ipv6_flag)"
     if [ "$_n" -le 1 ]; then
-        http_get "$_b/c/sub/$_i?k=$_k&format=clash&rules=smart&geo=$_geo&tproxy=$_tp"
+        http_get "$_b/c/sub/$_i?k=$_k&format=clash&rules=smart&geo=$_geo&tproxy=$_tp&datapath=$_dp&ipv6=$_ip6"
         return $?
     fi
-    _skel="$(http_get "$_b/c/sub/$_i?k=$_k&format=skeleton&rules=smart&geo=$_geo&tproxy=$_tp")" || return 1
+    _skel="$(http_get "$_b/c/sub/$_i?k=$_k&format=skeleton&rules=smart&geo=$_geo&tproxy=$_tp&datapath=$_dp&ipv6=$_ip6")" || return 1
     [ -n "$_skel" ] || return 1
     # provider 段落走临时文件而不是 `awk -v block=...`: -v 的值里带换行时, BSD awk
     # 直接报 "newline in string", busybox awk 的转义处理也不一致 (本机演练抓到的)。
@@ -1287,8 +1744,31 @@ while true; do
     # 新设备默认就是"开", 所以只有"没人碰过"的面板不会干扰。
     DESIRED_ALL="true"
     REV=""
+    # 本机覆盖 (面板不可达时的开/关, 见 CLI 的 on|off)。它优先于面板的期望状态 ——
+    # 否则"家里网出问题时连关都关不掉"这件事永远解决不了: 面板不可达时 CLI 写的就是它。
+    # 一旦写了就**一直生效** (面板恢复也不会自动改回去), 想交回面板执行
+    # `zeroproxy local-auto` —— 静默恢复是最坏的结果 (用户以为关了, 其实又被打开)。
+    OVERRIDE=""
+    if [ -f "$ZP_DIR/local.override" ]; then
+        _ov="$(tr -d '\r\n ' < "$ZP_DIR/local.override" 2>/dev/null || true)"
+        case "$_ov" in on|off) OVERRIDE="$_ov" ;; esac
+    fi
+    if [ -n "$OVERRIDE" ]; then
+        if [ "$OVERRIDE" = "on" ]; then DESIRED_ALL="true"; else DESIRED_ALL="false"; fi
+    fi
     # 管理界面地址 (带令牌) 只算一次 —— 每台面板都收到同一份, 面板据此给一个可点的入口
     UI_URL_REPORT="$(ui_url 2>/dev/null || true)"
+    # 数据面: 这台设备现在走哪条路、真的接管到哪。面板据此把"已连接"说细 ——
+    # 只接管了局域网 TCP 就不该显示成全屋 (真机 8.45 的教训)。
+    DP_REPORT="$(datapath_flag)"
+    COV_REPORT="$(actual_covered)"
+    IPV6_REPORT="$(ipv6_flag)"
+    WHY_REPORT=""
+    case "$DP_REPORT" in
+        tun)      WHY_REPORT="$(caps_get why.tun)" ;;
+        tproxy)   WHY_REPORT="$(caps_get why.tproxy)" ;;
+        redirect) WHY_REPORT="$(caps_get why.redirect)" ;;
+    esac
     for _f in $(server_files); do
         _b="$(field_of "$_f" base)"; _i="$(field_of "$_f" id)"; _k="$(field_of "$_f" secret)"
         [ -n "$_b" ] || continue
@@ -1296,7 +1776,10 @@ while true; do
         if core_up; then BODY="$BODY"',"actual":true'; else BODY="$BODY"',"actual":false'; fi
         [ -n "$UI_URL_REPORT" ] && BODY="$BODY"',"ui":"'"$UI_URL_REPORT"'"'
         [ -n "$LAST_REV" ] && BODY="$BODY"',"rev":"'"$LAST_REV"'"'
-        BODY="$BODY"'}'
+        BODY="$BODY"',"report":{"mode":"'"$DP_REPORT"'","covered":"'"$COV_REPORT"'"'
+        BODY="$BODY"',"why":"'"$(json_escape "$WHY_REPORT")"'"'
+        BODY="$BODY"',"client":"'"$ZP_VERSION"'","override":"'"$OVERRIDE"'"'
+        BODY="$BODY"',"ipv6":"'"$IPV6_REPORT"'"}}'
         RESP="$(http_post "$_b/c/report" "$BODY" || true)"
         if [ -z "$RESP" ]; then
             FAILS=$((FAILS + 1))
@@ -1311,6 +1794,17 @@ while true; do
 
     if [ -z "$REV" ]; then
         # 一台都没应答: 保持现状而不是把代理关掉 —— 断网时"维持可用"比"忠于面板"重要
+        # (本机覆盖是唯一的例外: 那是用户**明确**表达的意图, 必须执行 —— 它存在的理由
+        #  正是"面板挂了也要能开关"。)
+        if [ -n "$OVERRIDE" ]; then
+            if [ "$OVERRIDE" = "on" ] && ! core_up; then
+                log "本机覆盖=on (面板不可达), 启动内核"
+                switch_core on
+            elif [ "$OVERRIDE" = "off" ] && core_up; then
+                log "本机覆盖=off (面板不可达), 停止内核"
+                switch_core off
+            fi
+        fi
         [ $((FAILS % 20)) -eq 1 ] && log "面板不可达 (第 $FAILS 次), 保持当前状态"
         sleep "$SLEEP"
         continue
@@ -1349,26 +1843,51 @@ USE_PROCD=1
 ZP_DIR=/etc/zeroproxy
 CONF="$ZP_DIR/config.yaml"
 
+# 按 caps 里的 chosen 落数据面规则。三件事要一起做: 撤掉**别的**模式的规则 (昨天 tun、
+# 今天 redirect 时不留残渣), 落当前这一套, 再刷一次 dnsmasq 让它丢掉旧缓存。
+zp_apply_datapath() {
+    _mode="$(sed -n 's/^chosen=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    case "$_mode" in
+        tun|tproxy|redirect) ;;
+        *)
+            # 老版本升级上来的 caps 没有 chosen: 保留原来的判据 (tun 能力位 + 设备节点)
+            if [ -f "$ZP_DIR/caps" ]; then
+                if grep -q '^tun=1' "$ZP_DIR/caps" 2>/dev/null; then _mode=tun; else _mode=tproxy; fi
+            elif [ ! -c /dev/net/tun ]; then
+                _mode=tproxy
+            else
+                _mode=tun
+            fi
+            ;;
+    esac
+
+    # 撤掉不用的那两套 (只动我们自己的表/链)
+    if [ "$_mode" != "tproxy" ]; then
+        nft delete table inet zp_router 2>/dev/null || true
+    fi
+    if [ "$_mode" != "redirect" ] && [ -f "$ZP_DIR/redirect.sh" ]; then
+        . "$ZP_DIR/redirect.sh"
+        zp_redirect_clear 2>/dev/null || true
+    fi
+
+    # 落当前这一套
+    if [ "$_mode" = "tproxy" ]; then
+        nft -f "$ZP_DIR/tproxy.nft" 2>/dev/null || true
+    elif [ "$_mode" = "redirect" ] && [ -f "$ZP_DIR/redirect.sh" ]; then
+        . "$ZP_DIR/redirect.sh"
+        zp_redirect_apply 2>/dev/null || true
+    fi
+    killall -HUP dnsmasq 2>/dev/null || true
+}
+
 start_service() {
     [ -x "$ZP_DIR/mihomo" ] || return 0
     [ -f "$CONF" ] || return 0
 
     # TUN 模式: 由内核接管路由与 DNS, 不需要动防火墙。
-    # 走 TUN 还是 tproxy, 按**装机时探出来的能力**决定 (caps), 而不是"节点在不在":
-    # 原厂固件上 /dev/net/tun 存在但内核建不出设备, 那时该走 tproxy 而不是空转。
-    # caps 不在 (从老版本升上来的) 就退回原来的节点判断。
-    _mode=tun
-    if [ -f "$ZP_DIR/caps" ]; then
-        grep -q '^tun=1' "$ZP_DIR/caps" 2>/dev/null || _mode=tproxy
-    elif [ ! -c /dev/net/tun ]; then
-        _mode=tproxy
-    fi
-    if [ "$_mode" = "tproxy" ]; then
-        nft -f "$ZP_DIR/tproxy.nft" 2>/dev/null || true
-    else
-        nft delete table inet zp_router 2>/dev/null || true
-    fi
-    killall -HUP dnsmasq 2>/dev/null || true
+    # 走哪一级由 caps 里的 chosen 决定 (装机时探测 + 必要时降级), 而不是"节点在不在":
+    # 原厂固件上 /dev/net/tun 存在但内核建不出设备, 那时该走 tproxy / redirect 而不是空转。
+    zp_apply_datapath
 
     procd_open_instance
     procd_set_param command "$ZP_DIR/mihomo" -d "$ZP_DIR" -f "$CONF"
@@ -1381,6 +1900,10 @@ start_service() {
 
 stop_service() {
     nft delete table inet zp_router 2>/dev/null || true
+    if [ -f "$ZP_DIR/redirect.sh" ]; then
+        . "$ZP_DIR/redirect.sh"
+        zp_redirect_clear 2>/dev/null || true
+    fi
     killall -HUP dnsmasq 2>/dev/null || true
 }
 
@@ -1427,6 +1950,45 @@ servers() { ls "$SERVERS"/*.json 2>/dev/null; }
 
 running() { /etc/init.d/zeroproxy running >/dev/null 2>&1 && echo yes || echo no; }
 
+# 与装机前的快照逐条比对。**逐行**, 不是"看起来差不多" —— 数据面残留是"关掉了但网还是
+# 不对劲"这一类问题的唯一解释, 必须能直接指出来。左右两边: 左=现在, 右=装机前。
+revert_report() {
+    _dir="$ZP_DIR/baseline"
+    # 同上: 判断"拍过没有"看 taken_at。机器上没有 nftables 时 nft.txt 本来就是空的,
+    # 用大小判会把"拍过了、而且现在也对得上"误报成"没有快照"。
+    if [ ! -f "$_dir/taken_at" ]; then
+        echo "本机没有装机前的快照 (旧版本装的, 或者快照被删了) —— 无法逐条比对。"
+        echo "  自己看一眼: nft list ruleset | grep -i zp_ ; iptables -t nat -L zp_router ; ip rule"
+        return 0
+    fi
+    _drift=0
+    for _pair in "nft:nft list ruleset" "iptables:iptables-save" "ip6tables:ip6tables-save" "ip-rule:ip rule show" "ip6-rule:ip -6 rule show"; do
+        _name="${_pair%%:*}"
+        _cmd="${_pair#*:}"
+        _base="$_dir/$_name.txt"
+        [ -f "$_base" ] || continue
+        _cur="$(eval "$_cmd" 2>/dev/null || true)"
+        if [ "$_cur" = "$(cat "$_base" 2>/dev/null || true)" ]; then
+            printf '  ✓ %-9s 与装机前一致\n' "$_name"
+            continue
+        fi
+        _drift=1
+        printf '  ! %-9s 与装机前**不一致** (左=现在, 右=装机前):\n' "$_name"
+        _now_file="$ZP_DIR/.revert.$_name"
+        printf '%s\n' "$_cur" > "$_now_file"
+        if command -v diff >/dev/null 2>&1; then
+            diff "$_now_file" "$_base" 2>/dev/null | head -n 8 | sed 's/^/      /'
+        fi
+        rm -f "$_now_file"
+    done
+    if [ "$_drift" = "0" ]; then
+        echo "结论: 已完全回到装机前的状态 (防火墙与策略路由逐条一致)。"
+    else
+        echo "结论: 还有残留 —— 上面标 ! 的那几项; 把这段发回面板可以定位。"
+    fi
+    return 0
+}
+
 case "${1:-status}" in
     status)
         echo "内核:  $( [ "$(running)" = yes ] && echo 运行中 || echo 已停止 )"
@@ -1440,14 +2002,31 @@ case "${1:-status}" in
             echo "模式:  TUN (全屋透明, 含路由器自身)"
         elif nft list table inet zp_router >/dev/null 2>&1; then
             echo "模式:  tproxy (全屋透明, 本机自身流量除外)"
+        elif iptables -t nat -L zp_router >/dev/null 2>&1; then
+            echo "模式:  redirect (局域网 TCP 透明代理; 不含 UDP 与本机自身流量)"
         else
             echo "模式:  未生效 (只有本机代理端口可用)"
         fi
         if [ -f "$ZP_DIR/caps" ]; then
-            printf '能力:  tun=%s nft=%s tproxy=%s (装机时探测)\n' \
+            printf '能力:  tun=%s nft=%s tproxy=%s redirect=%s ebpf=%s (装机时探测)\n' \
                 "$(sed -n 's/^tun=//p' "$ZP_DIR/caps" | head -n1)" \
                 "$(sed -n 's/^nft=//p' "$ZP_DIR/caps" | head -n1)" \
-                "$(sed -n 's/^tproxy=//p' "$ZP_DIR/caps" | head -n1)"
+                "$(sed -n 's/^tproxy=//p' "$ZP_DIR/caps" | head -n1)" \
+                "$(sed -n 's/^redirect=//p' "$ZP_DIR/caps" | head -n1)" \
+                "$(sed -n 's/^ebpf=//p' "$ZP_DIR/caps" | head -n1)"
+            _chosen="$(sed -n 's/^chosen=//p' "$ZP_DIR/caps" | head -n1)"
+            _covered="$(sed -n 's/^covered=//p' "$ZP_DIR/caps" | head -n1)"
+            [ -n "$_chosen" ] && printf '选择:  %s (覆盖 %s)\n' "$_chosen" "${_covered:-?}"
+            # 另外几级为什么不行 —— 面板上显示的就是这一份, 排障时不用再猜
+            for _lv in tun tproxy redirect; do
+                _why="$(sed -n "s/^why.$_lv=//p" "$ZP_DIR/caps" | head -n1)"
+                [ -n "$_why" ] && printf '原因:  %s: %s\n' "$_lv" "$_why"
+            done
+        fi
+        # 本机覆盖: 面板不可达时用 zeroproxy on|off 写下的那份意图 (它优先于面板)
+        if [ -s "$ZP_DIR/local.override" ]; then
+            printf '覆盖:  本机覆盖「%s」—— 面板说了不算, 直到你执行 zeroproxy local-auto\n' \
+                "$(tr -d '\r\n ' < "$ZP_DIR/local.override")"
         fi
         if command -v curl >/dev/null 2>&1; then
             curl -fsS -m 8 "http://127.0.0.1:9090/version" 2>/dev/null | head -c 200 && echo
@@ -1543,18 +2122,53 @@ EOF
         fi
         ;;
     on|off)
-        # 本地开关同样以面板为准: 告诉面板改期望状态, agent 下一轮生效
+        # 先按"面板是唯一事实来源"走: 告诉面板改期望状态, agent 下一轮生效。
+        # 面板**不可达**时才退回本机覆盖 —— 家里网出问题时连"关掉代理"都做不到, 是最坏
+        # 的结果; 而这时恰恰是面板最容易不可达的时候。
         ON=$([ "$1" = on ] && echo true || echo false)
         [ -n "$FIRST" ] || { echo "还没有接入任何服务器"; exit 1; }
+        _base="$(field_of "$FIRST" base)"
         ID="$(field_of "$FIRST" id)"
         KEY="$(field_of "$FIRST" secret)"
         BODY='{"device":"'"$ID"'","k":"'"$KEY"'","set_desired":'"$ON"'}'
+        _sent=0
         if command -v curl >/dev/null 2>&1; then
-            curl -fsSk -m 15 -H 'Content-Type: application/json' --data "$BODY" "$(field_of "$FIRST" base)/c/report" >/dev/null
+            curl -fsSk -m 15 -H 'Content-Type: application/json' --data "$BODY" "$_base/c/report" >/dev/null 2>&1 && _sent=1
         else
-            uclient-fetch -q --no-check-certificate -O - --post-data "$BODY" "$(field_of "$FIRST" base)/c/report" >/dev/null
+            uclient-fetch -q --no-check-certificate -O - --post-data "$BODY" "$_base/c/report" >/dev/null 2>&1 && _sent=1
         fi
-        echo "已请求面板把总开关设为「$1」, 约 15 秒内生效 (zeroproxy status 查看)"
+        if [ "$_sent" = "1" ]; then
+            # 面板答上了 —— 它是唯一事实来源, 顺手清掉本机覆盖 (否则面板以后改不动它)
+            rm -f "$ZP_DIR/local.override" 2>/dev/null || true
+            echo "已请求面板把总开关设为「$1」, 约 15 秒内生效 (zeroproxy status 查看)"
+            exit 0
+        fi
+        umask 077
+        printf '%s\n' "$1" > "$ZP_DIR/local.override"
+        umask 022
+        if [ "$1" = "on" ]; then
+            /etc/init.d/zeroproxy start >/dev/null 2>&1 || true
+            touch "$ZP_DIR/core.up"
+        else
+            rm -f "$ZP_DIR/core.up"
+            /etc/init.d/zeroproxy stop >/dev/null 2>&1 || true
+            nft delete table inet zp_router 2>/dev/null || true
+            if [ -f "$ZP_DIR/redirect.sh" ]; then
+                . "$ZP_DIR/redirect.sh"
+                zp_redirect_clear 2>/dev/null || true
+            fi
+        fi
+        killall -HUP dnsmasq 2>/dev/null || true
+        echo "面板不可达 —— 已在本机把全屋代理设为「$1」并立即生效。"
+        echo "  这是**本机覆盖**: 面板恢复后也不会自动改回去。交回面板: zeroproxy local-auto"
+        ;;
+    local-auto)
+        if [ -s "$ZP_DIR/local.override" ]; then
+            rm -f "$ZP_DIR/local.override"
+            echo "已清除本机覆盖 —— 总开关重新由面板决定 (agent 下一轮生效, 约 15 秒)。"
+        else
+            echo "本来就没有本机覆盖 —— 总开关一直由面板决定。"
+        fi
         ;;
     ui)
         # 端口在 ui.port 里 (安装时定下的): 空 = 固件自己的 Web 服务, 有值 = 自带 httpd。
@@ -1571,6 +2185,28 @@ EOF
         "$ZP_DIR/agent.sh" geo force && echo "分流数据库已更新" \
             || echo "取分流数据库失败 (面板不可达, 或面板自己取不到上游数据)"
         ;;
+    revert)
+        # 停用代理并拆掉数据面, 然后**证明**拆干净了 —— 与装机前快照逐条比对。
+        # 保留配置与凭据 (那是 uninstall 的事): 想恢复只要再跑一次面板上的更新命令
+        # (`wget -qO- <面板>/c/install.sh | sh`), 它会按现有 state 重新落地并重新启用。
+        echo "正在停服务并拆掉数据面…"
+        /etc/init.d/zeroproxy-agent stop >/dev/null 2>&1 || true
+        /etc/init.d/zeroproxy-agent disable >/dev/null 2>&1 || true
+        /etc/init.d/zeroproxy stop >/dev/null 2>&1 || true
+        /etc/init.d/zeroproxy disable >/dev/null 2>&1 || true
+        /etc/init.d/zeroproxy-ui stop >/dev/null 2>&1 || true
+        /etc/init.d/zeroproxy-ui disable >/dev/null 2>&1 || true
+        rm -f "$ZP_DIR/core.up"
+        nft delete table inet zp_router 2>/dev/null || true
+        if [ -f "$ZP_DIR/redirect.sh" ]; then
+            . "$ZP_DIR/redirect.sh"
+            zp_redirect_clear 2>/dev/null || true
+        fi
+        # tun 的 auto-route 规则随内核退出自动回收; 这里只兜我们自己加过的东西
+        killall -HUP dnsmasq 2>/dev/null || true
+        revert_report
+        echo "配置与凭据都还在。重新启用: 跑一次面板上的更新命令 (wget -qO- <面板>/c/install.sh | sh)"
+        ;;
     update)
         echo "重新执行面板上的安装命令即可升级 (配置与凭据会保留)"
         ;;
@@ -1583,11 +2219,15 @@ EOF
         /etc/init.d/zeroproxy stop >/dev/null 2>&1 || true
         /etc/init.d/zeroproxy disable >/dev/null 2>&1 || true
         nft delete table inet zp_router 2>/dev/null || true
+        if [ -f "$ZP_DIR/redirect.sh" ]; then
+            . "$ZP_DIR/redirect.sh"
+            zp_redirect_clear 2>/dev/null || true
+        fi
         killall -HUP dnsmasq 2>/dev/null || true
         rm -rf "$ZP_DIR" /etc/init.d/zeroproxy /etc/init.d/zeroproxy-agent /etc/init.d/zeroproxy-ui /usr/bin/zeroproxy
         echo "已卸载。这台设备在面板上仍然存在, 请在面板「客户端」里一并移除。"
         ;;
-    *) echo "用法: zeroproxy [status|ui|servers|add <链接>|drop <键>|refresh|geo|on|off|log|uninstall]" ;;
+    *) echo "用法: zeroproxy [status|ui|servers|add <链接>|drop <键>|refresh|geo|on|off|local-auto|revert|log|uninstall]" ;;
 esac
 CLIEOF
     chmod 755 "$ZP_CLI"
@@ -1621,6 +2261,66 @@ CLIEOF
 }
 
 # ---------------------------------------------------------------- 网页界面
+# ---------------------------------------------------------------- 本地控制面 (zpcore)
+# 可选件: 面板准备了这一档就装, 没准备就退回原来的界面路径 —— **任何失败都不该让装机失败**,
+# 所以这里全部是 note 而不是 warn/die。
+#
+# 注意它**永远返回 0**: 这是脚本里唯一的"可选件", 而 `set -e` 下任何非 0 的返回都会把
+# 整个安装掐断 (真机意义上的"装到一半停下")。调用方要看结果就查 $ZP_DIR/zpcore 在不在。
+#
+# 形态与 mihomo 内核**刻意一样**: 面板直传一个 .gz, 路由器端 gzip -t 判定 → 解压 →
+# 跑一次 `version` 确认它真能执行 → 落盘。那段代码刚在内核那条路上跑过七次真机。
+# 区别只有分发位置: zpcore 是我们自己的东西, 没有上游可下, 产物跟着仓库走
+# (scripts/build-agent.sh 生成), 所以面板读的是仓库目录而不是 data/ 缓存。
+ZPCORE_MIN_BYTES="${ZP_AGENT_MIN_BYTES:-65536}"
+
+install_zpcore() {
+    step "准备本地控制面 (可选件)"
+    if [ -x "$ZP_DIR/zpcore" ] && "$ZP_DIR/zpcore" version >/dev/null 2>&1; then
+        ok "本地控制面已就位: $("$ZP_DIR/zpcore" version 2>/dev/null | head -n1)"
+        return 0
+    fi
+    # 上一次留下的坏文件 (没解开 / 架构不对) 会让每次重跑都死在同一个地方: 先清掉。
+    rm -f "$ZP_DIR/zpcore" "$ZP_DIR/.zpcore.gz" 2>/dev/null || true
+    _tmp="$ZP_DIR/.zpcore.gz"
+    # 用与内核同一条下载器 (http_fetch_to): 它带 HTTP 状态码, 于是"面板说没有这一档"
+    # (404) 与"这条路走不通"能分开说 —— 以前两者都是同一句"没准备", 排障时指错方向。
+    if ! http_fetch_to "$ZP_BASE/c/agent/bin/$ARCH" "$_tmp" 300 0; then
+        if [ "$HTTP_CODE" = "404" ]; then
+            note "面板没有准备这一档本地控制面 (可选件) —— 界面走原来的路径"
+        else
+            note "这次没取到本地控制面 (HTTP ${HTTP_CODE:-?}) —— 界面走原来的路径"
+        fi
+        rm -f "$_tmp"
+        return 0
+    fi
+    _size="$(wc -c < "$_tmp" 2>/dev/null | tr -d ' ' || true)"
+    if [ "${_size:-0}" -lt "$ZPCORE_MIN_BYTES" ]; then
+        rm -f "$_tmp"
+        note "面板没有准备 $ARCH 这一档本地控制面 (可选件) —— 界面走原来的路径"
+        return 0
+    fi
+    # gzip 判定只用 gzip -t (busybox 一定有) —— 与内核那一步同一条路, 同一套理由。
+    if gzip -t "$_tmp" >/dev/null 2>&1; then
+        if ! gzip -dc "$_tmp" > "$ZP_DIR/zpcore" 2>/dev/null; then
+            rm -f "$_tmp" "$ZP_DIR/zpcore"
+            note "本地控制面解压失败 —— 界面走原来的路径"
+            return 0
+        fi
+    else
+        cp "$_tmp" "$ZP_DIR/zpcore"
+    fi
+    rm -f "$_tmp"
+    chmod 755 "$ZP_DIR/zpcore"
+    if ! "$ZP_DIR/zpcore" version >/dev/null 2>&1; then
+        rm -f "$ZP_DIR/zpcore"
+        note "本地控制面在这台机器上跑不起来 (架构不匹配?) —— 界面走原来的路径"
+        return 0
+    fi
+    ok "本地控制面就绪: $("$ZP_DIR/zpcore" version 2>/dev/null | head -n1)"
+    return 0
+}
+
 # 界面文件 (一个页面 + 一个 cgi) 落盘只是第一步; 第二步 —— "让本机的 Web 服务真的把它
 # 发出去" —— 在固件之间差别很大, 真机踩过三种:
 #   * uhttpd (OpenWrt 默认): 文档根 /www, /cgi-bin/ 会执行脚本 —— 落盘即通;
@@ -1663,28 +2363,37 @@ ui_busybox() {
     return 1
 }
 
-ui_stop_local_httpd() {
+ui_stop_local_server() {
     /etc/init.d/zeroproxy-ui stop >/dev/null 2>&1 || true
     /etc/init.d/zeroproxy-ui disable >/dev/null 2>&1 || true
     rm -f "$ZP_INIT_UI"
 }
 
-# 固件的 Web 服务发不出页面时的兜底: 自带的 busybox httpd —— 它的约定很简单
-# ("url 以 /cgi-bin/ 开头就当 cgi 执行"), 与固件自己那套 nginx/uhttpd 无关, 所以在哪台
-# 机器上都一样。只绑**局域网地址**: 每多一个监听口都是事实, 所以绝不退化成 0.0.0.0
-# (那等于把管理界面挂到 WAN 上)。授权照旧只认界面令牌, 与走固件 Web 服务时同一条路。
-ui_start_local_httpd() {
-    _bb="$(ui_busybox 2>/dev/null || true)"
-    [ -n "$_bb" ] || return 1
-    # --list 不是所有 busybox 都给; 给的话就顺手确认 httpd 这个 applet 编进去了。
-    if "$_bb" --list >/dev/null 2>&1; then
-        "$_bb" --list | grep -qx httpd || return 1
+# 自带的界面服务 —— 不依赖固件的 Web 服务器。两条路, 一个 init 服务:
+#   * 有 zpcore (面板分发的本地控制面): 静态二进制自己起 HTTP 服务、自己校验令牌、
+#     自己只绑局域网地址。"界面能不能打开"从此与固件无关 —— 这才是它存在的理由。
+#   * 没有 zpcore: 退回 busybox httpd (约定只有一条 "url 以 /cgi-bin/ 开头就当 cgi 执行")。
+# 两条路都只绑**局域网地址**: 每多一个监听口都是事实, 所以绝不退化成 0.0.0.0 (那等于把
+# 管理界面挂到 WAN 上)。授权两者共用同一个 ui.token 文件, 与走固件 Web 服务时同一条路。
+#
+# 参数 `busybox` 可以强制走第二条 (zpcore 存在但起不来时, 还有一次机会)。
+ui_start_local_server() {
+    _force_bb="${1:-}"
+    _have_zp=0
+    if [ "$_force_bb" != "busybox" ] && [ -x "$ZP_DIR/zpcore" ]; then _have_zp=1; fi
+    _bb=""
+    if [ "$_have_zp" = "0" ]; then
+        _bb="$(ui_busybox 2>/dev/null || true)"
+        [ -n "$_bb" ] || return 1
+        # --list 不是所有 busybox 都给; 给的话就顺手确认 httpd 这个 applet 编进去了。
+        if "$_bb" --list >/dev/null 2>&1; then
+            "$_bb" --list | grep -qx httpd || return 1
+        fi
+        [ -s "$ZP_DIR/www/cgi-bin/zeroproxy" ] || return 1
     fi
-    _root="$ZP_DIR/www"
-    [ -s "$_root/cgi-bin/zeroproxy" ] || return 1
     cat > "$ZP_INIT_UI" <<'UIINITEOF'
 #!/bin/sh /etc/rc.common
-# ZeroProxy 网页管理界面 (固件没有把 /cgi-bin/ 交给脚本时用的兜底 httpd)。
+# ZeroProxy 网页管理界面 (自带的, 不依赖固件的 Web 服务器)。
 # 只绑局域网地址: 找不到 LAN 地址就不启动, 绝不退化成 0.0.0.0。
 START=98
 USE_PROCD=1
@@ -1700,11 +2409,24 @@ lan_ip() {
 }
 
 start_service() {
-    [ -x "$ZP_DIR/www/cgi-bin/zeroproxy" ] || return 0
+    # 有 zpcore 就用它, 否则用 busybox httpd; 两样都没有就不启动
+    if [ -x "$ZP_DIR/zpcore" ]; then
+        :
+    elif [ -x "$ZP_DIR/www/cgi-bin/zeroproxy" ] && [ -n "$BB" ]; then
+        :
+    else
+        return 0
+    fi
     _ip="$(lan_ip)"
     [ -n "$_ip" ] || return 0
     procd_open_instance
-    procd_set_param command "$BB" httpd -f -p "$_ip:$UI_PORT" -h "$ZP_DIR/www"
+    if [ -x "$ZP_DIR/zpcore" ]; then
+        procd_set_param command "$ZP_DIR/zpcore" serve \
+            --dir "$ZP_DIR" --bind "$_ip" --port "$UI_PORT" \
+            --cli /usr/bin/zeroproxy --init /etc/init.d/zeroproxy
+    else
+        procd_set_param command "$BB" httpd -f -p "$_ip:$UI_PORT" -h "$ZP_DIR/www"
+    fi
     procd_set_param respawn 3600 5 5
     procd_set_param stdout 1
     procd_set_param stderr 1
@@ -1725,8 +2447,8 @@ UIINITEOF
         ui_probe "http://$(lan_ip):$UI_PORT/cgi-bin/zeroproxy" && return 0
         _w=$((_w + 1))
     done
-    # 起不来说明这台设备上没有可用的 busybox httpd —— 收干净, 不留一个跑不起来的服务。
-    ui_stop_local_httpd
+    # 起不来就收干净, 不留一个跑不起来的服务 (调用方还有别的路可以试)。
+    ui_stop_local_server
     return 1
 }
 
@@ -1782,21 +2504,27 @@ install_ui() {
         rm -f /tmp/luci-indexcache* /tmp/luci-modulecache/* 2>/dev/null || true
     fi
 
-    # 谁把页面发出去? 先试固件自己的 Web 服务 (80 端口, 不开新端口), 发不出来再起自带
-    # 的 httpd。两条路都要**当场验过**才算数。
+    # 谁把页面发出去? 三条路, 按"与固件的关系"从松到紧:
+    #   ① 自带的本地控制面 (zpcore, 面板分发的可选件) —— 与固件完全无关;
+    #   ② 固件自己的 Web 服务 (80 端口, 不开新端口) —— 能用就不折腾;
+    #   ③ 自带的 busybox httpd —— 只在 ② 发不出来时用。
+    # 每一条都要**当场验过**才算数 (8.44 的教训: HTTP 200 也可能是把脚本当文本发出来)。
     : > "$ZP_DIR/ui.port"
-    if [ -d /www ] && { ui_probe "http://127.0.0.1/cgi-bin/zeroproxy" || ui_probe "http://$(lan_ip)/cgi-bin/zeroproxy"; }; then
+    if [ -x "$ZP_DIR/zpcore" ] && ui_start_local_server; then
+        printf '%s' "$UI_PORT" > "$ZP_DIR/ui.port"
+        ok "管理界面已装好 (自带控制面 zpcore · 端口 $UI_PORT — 不依赖固件的 Web 服务器)"
+    elif [ -d /www ] && { ui_probe "http://127.0.0.1/cgi-bin/zeroproxy" || ui_probe "http://$(lan_ip)/cgi-bin/zeroproxy"; }; then
         if [ "$_luci" = "1" ]; then
             ok "管理界面已装好 (LuCI 菜单: 服务 → ZeroProxy)"
         else
             ok "管理界面已装好"
         fi
-        # 上一次可能是靠自带 httpd 发的 (固件升级后 /cgi-bin/ 又能用了): 收掉它,
+        # 上一次可能是靠自带服务发的 (固件升级后 /cgi-bin/ 又能用了): 收掉它,
         # 不留一个多余的监听口。
         if [ -f "$ZP_INIT_UI" ]; then
-            ui_stop_local_httpd
+            ui_stop_local_server
         fi
-    elif ui_start_local_httpd; then
+    elif ui_start_local_server busybox; then
         printf '%s' "$UI_PORT" > "$ZP_DIR/ui.port"
         ok "管理界面已装好 (这台固件没有把 /cgi-bin/ 交给脚本, 已用自带 httpd 在 $UI_PORT 端口发出)"
     else
@@ -1820,32 +2548,80 @@ install_ui() {
 }
 
 # ---------------------------------------------------------------- 启动与自检
-# tproxy 回退: **只有规则真的装进去了才算生效**。以前这里是 `nft -f ... || true`, 于是
-# "规则没装上"和"装上了"在输出里长得一模一样, 结尾还照样报"tproxy 全屋生效" —— 真机上
-# 就出现过这种"看着全绿、其实全屋没有代理"的状态 (原厂固件没有 nft/tproxy)。
-tproxy_fallback() {
-    killall -HUP dnsmasq 2>/dev/null || true
-    nft -f "$ZP_DIR/tproxy.nft" 2>/dev/null || true
-    if nft list table inet zp_router >/dev/null 2>&1; then
-        ACTIVE_MODE="tproxy"
-        # 兜一下"能力探测判错"这种可能: 探测说建不出 TUN, 而内核其实建出来了 —— 那时
-        # 两套同时生效会互相打架 (真机踩过: tun 明明是好的, 却又叠了一层 tproxy 规则)。
-        _w=0
-        while [ "$_w" -lt 3 ]; do
-            if ip link show zp-tun >/dev/null 2>&1; then
-                nft delete table inet zp_router 2>/dev/null || true
-                ACTIVE_MODE="tun"
-                ok "TUN 已建立: 全屋设备 (含路由器自身) 透明代理生效"
-                return 0
-            fi
-            sleep 1
-            _w=$((_w + 1))
-        done
-        ok "已启用 tproxy 模式 (全屋设备生效, 路由器自身流量除外)"
-    else
-        ACTIVE_MODE="none"
-        warn "tproxy 规则也没能装上 —— 这次全屋透明代理**没有**生效"
+# 数据面是否真的在生效 —— 判据是现场 (设备在不在 / 表在不在), 不是"我们用命令下过一次"。
+# 这是"永不撒谎"的落点: 8.45 那台机器上 nft -f 退出码是 0, 表却没建起来。
+datapath_live() {
+    case "$1" in
+        tun)      ip link show zp-tun >/dev/null 2>&1 ;;
+        tproxy)   nft list table inet zp_router >/dev/null 2>&1 ;;
+        redirect) iptables -t nat -L zp_router >/dev/null 2>&1 ;;
+        *)        return 1 ;;
+    esac
+}
+
+# 等某一级真的生效。30 秒是量出来的: mihomo 启动到 zp-tun 出现之间有十几秒 ——
+# 只查一次会误判成"没建出来", 于是错误地退回下一级并把两套规则叠在一起 (真机踩过)。
+wait_datapath() {
+    _w=0
+    while [ "$_w" -lt 30 ]; do
+        if datapath_live "$1"; then return 0; fi
+        sleep 1
+        _w=$((_w + 1))
+    done
+    return 1
+}
+
+# 换一级数据面: 改 caps → 让面板按新能力重发配置 (有没有 tun 段由它决定: 建不出设备的
+# 机器带着 tun 段, 内核直接起不来) → 校验 → 替换 → 重启内核。
+# 任一步失败就把配置与 caps **一起**回滚 —— 两件事必须一起回, 否则下一轮重建配置又会
+# 拿一份不一致的配置去覆盖。
+apply_datapath() {
+    _want="$1"
+    _prev_dp="$DATAPATH"; _prev_cov="$COVERED"
+    _bak=""
+    if [ -f "$ZP_CONF" ]; then
+        if cp "$ZP_CONF" "$ZP_CONF.dp.bak" 2>/dev/null; then _bak="$ZP_CONF.dp.bak"; fi
     fi
+    set_datapath "$_want"
+    if ! "$ZP_DIR/agent.sh" config > "$ZP_CONF.new" 2>/dev/null \
+        || ! grep -q '^proxy-groups:' "$ZP_CONF.new" 2>/dev/null \
+        || ! "$ZP_BIN" -t -d "$ZP_DIR" -f "$ZP_CONF.new" >/dev/null 2>&1; then
+        rm -f "$ZP_CONF.new"
+        DATAPATH="$_prev_dp"; COVERED="$_prev_cov"; write_caps
+        if [ -n "$_bak" ]; then mv "$_bak" "$ZP_CONF" 2>/dev/null || true; fi
+        return 1
+    fi
+    mv "$ZP_CONF.new" "$ZP_CONF"
+    if [ -n "$_bak" ]; then rm -f "$_bak"; fi
+    /etc/init.d/zeroproxy restart >/dev/null 2>&1 || true
+    return 0
+}
+
+# 当前这一级真的起不来时, 顺着阶梯往下试 —— 每级都真的等它生效, 全都不行才认"未接管"。
+# 能力探测没过的级直接跳过 (没必要装一个已经知道不行的)。
+downgrade_datapath() {
+    for _next in $(ladder_below "$ACTIVE_MODE"); do
+        if ! rung_usable "$_next"; then
+            note "$_next 这一级的能力探测本来就没过, 跳过"
+            continue
+        fi
+        note "改用 $_next …"
+        if apply_datapath "$_next" && wait_datapath "$_next"; then
+            ACTIVE_MODE="$_next"
+            return 0
+        fi
+        # 探测说行、现场说不行 (典型: 接口名不对 / 权限) → 把原因写进 caps,
+        # 结尾与面板显示的都是它, 而不是一句"没生效"。
+        case "$_next" in
+            tun)      CAPS_WHY_TUN="规则/设备没有真正生效 (探测通过、运行时失败)" ;;
+            tproxy)   CAPS_WHY_TPROXY="规则没有真正生效 (nft 表没建起来)" ;;
+            redirect) CAPS_WHY_REDIRECT="规则没有真正生效 (iptables 链没建起来 / 接口名不对)" ;;
+        esac
+        write_caps
+    done
+    set_datapath none
+    ACTIVE_MODE="none"
+    return 1
 }
 
 # TUN 起不来时的一次自愈 —— 只在真的失败过之后才做, 能跑的机器一个字节都不动。
@@ -1919,43 +2695,39 @@ verify() {
     fi
     ok "内核已启动"
 
-    ACTIVE_MODE="tproxy"
-    if [ "$NET_TUN" = "1" ]; then
-        # 等内核把设备建出来: mihomo 启动到 zp-tun 出现之间有十几秒 —— 只查一次会
-        # 误判成"没建出来", 于是错误地退回 tproxy 并把那套 nft 规则也加上
-        # (真机上就是这么发生的: tun 明明是好的, 却又叠了一层 tproxy)。
-        _wait=0
-        while [ "$_wait" -lt 30 ]; do
-            ip link show zp-tun >/dev/null 2>&1 && break
-            sleep 1
-            _wait=$((_wait + 1))
-        done
-        if ip link show zp-tun >/dev/null 2>&1; then
-            ACTIVE_MODE="tun"
-            # 清掉可能被误加上的 tproxy 规则 (两者同时生效会互相打架)
-            nft delete table inet zp_router 2>/dev/null || true
-            ok "TUN 已建立: 全屋设备 (含路由器自身) 透明代理生效"
-        else
-            # 这里必须把**内核自己说的原因**打出来: 一台设备一种原因 (没有 tun 模块 /
-            # nft 不支持 auto-redirect / 权限), 光看"没建出来"没法定位 —— 上一版就是
-            # 只有一句警告, 于是只能靠用户截图猜。
+    # 数据面: 从 caps 里那一级开始, **真的等它生效** (不是"命令跑过就算")。
+    ACTIVE_MODE="${DATAPATH:-none}"
+    if [ "$ACTIVE_MODE" = "tun" ]; then
+        if ! wait_datapath tun; then
+            # 把**内核自己说的原因**打出来: 一台设备一种原因 (没有 tun 模块 / nft 不支持
+            # auto-redirect / 权限), 光看"没建出来"没法定位 —— 上一版只有一句警告,
+            # 于是只能靠用户截图猜。
             warn "等了 30 秒 TUN 设备仍未出现, 与 tun 有关的内核日志:"
             logread -e zeroproxy 2>/dev/null \
                 | grep -iE 'tun|tproxy|nft|permission|denied|not permitted|no such|error' \
                 | tail -n 6 >&2 || true
-            # 再试一次: 去掉 auto-redirect 重建配置 (只在失败后做, 见 tun_retry_without_redirect)
-            if tun_retry_without_redirect && ip link show zp-tun >/dev/null 2>&1; then
-                ACTIVE_MODE="tun"
-                nft delete table inet zp_router 2>/dev/null || true
-                ok "TUN 已建立 (已按这台固件去掉 auto-redirect): 全屋透明代理生效"
-            else
-                tproxy_fallback
+            # 一次自愈: 去掉 auto-redirect 重建配置再试 (只在失败之后才做)
+            if tun_retry_without_redirect && wait_datapath tun; then
+                ok "TUN 已建立 (已按这台固件去掉 auto-redirect)"
             fi
         fi
-    else
-        warn "本机建不出 TUN 设备 (见上面的能力探测), 改用 tproxy 模式"
-        tproxy_fallback
+    elif [ "$ACTIVE_MODE" != "none" ]; then
+        wait_datapath "$ACTIVE_MODE" || true
     fi
+
+    # 这一级真的没起来 → 顺着阶梯往下试。降级成功时会顺带重建配置 (不再带 tun 段),
+    # 于是"这台固件建不出设备"这件事不会再拖垮整条链路。
+    if [ "$ACTIVE_MODE" != "none" ] && ! datapath_live "$ACTIVE_MODE"; then
+        warn "当前数据面 ($ACTIVE_MODE) 没有生效 —— 顺着阶梯往下试"
+        downgrade_datapath || true
+    fi
+
+    case "$ACTIVE_MODE" in
+        tun)      ok "TUN 已建立: 全屋设备 (含路由器自身) 透明代理生效" ;;
+        tproxy)   ok "已启用 tproxy: 全屋设备生效 (路由器自身流量除外)" ;;
+        redirect) ok "已启用 iptables REDIRECT: 局域网 TCP 生效 (不含 UDP 与本机自身)" ;;
+        *)        warn "全屋透明代理这次没有生效 —— 本机代理端口仍然可用" ;;
+    esac
 
     # 等节点就绪再测: provider 是内核启动后异步拉的, 立刻测一定失败 —— 那句
     # "出口测试未通过" 于是变成一条误导 (真机反馈里它一直挂着, 让人以为代理坏了)。
@@ -1964,11 +2736,13 @@ verify() {
         _w=0
         while [ "$_w" -lt 30 ]; do
             _now="$(curl -s -m 3 "http://127.0.0.1:9090/proxies/%F0%9F%9A%80%20%E8%8A%82%E7%82%B9%E9%80%89%E6%8B%A9" 2>/dev/null | sed -n 's/.*"now":"\([^"]*\)".*/\1/p')"
-            [ -n "$_now" ] && [ "$_now" != "DIRECT" ] && break
+            # 写成 if 而不是 `a && b && break`: 后者的失败态会留在 while 体末尾,
+            # 在 `set -e` 下是一颗定时炸弹 (busybox ash 与 dash 的处理还不完全一样)。
+            if [ -n "$_now" ] && [ "$_now" != "DIRECT" ]; then break; fi
             sleep 2
             _w=$((_w + 1))
         done
-        [ -n "$_now" ] && ok "节点已就绪 (当前选中: $_now)"
+        if [ -n "$_now" ]; then ok "节点已就绪 (当前选中: $_now)"; fi
     fi
     # 真实出口测试: 经代理端口请求一次, 只作为信息展示 —— 节点全关时失败是正常的。
     # 用 curl 是因为 busybox 的 wget 不支持 -x (代理), 没有 curl 就跳过这一步。
@@ -1990,26 +2764,50 @@ report_up() {
 
 finish() {
     printf '\n%s────────────────────────────────────────────%s\n' "$C_B" "$C_R"
-    if [ "${ACTIVE_MODE:-tproxy}" = "none" ]; then
-        # 之前这里是无条件报"全屋代理已开启" —— 而 TUN 建不出来、tproxy 也装不上时,
-        # 局域网里其实一台设备都没被接管。宁可说难看的话, 也不能让人以为好了。
-        printf '%s透明代理未生效%s —— 这台设备上 TUN 与 tproxy 都用不了\n' "$C_E" "$C_R"
-        printf '  原因: TUN 设备没建出来 (内核没有可用的 tun), 而 tproxy 需要的\n'
-        printf '        nf_tables / nft_tproxy 这台固件也没有。\n'
-        printf '  下一步任选一条:\n'
-        printf '    1) 补内核模块后重跑这条安装命令:\n'
-        printf '         opkg install kmod-tun kmod-nft-tproxy    (OpenWrt 25.12 及更新: apk add ...)\n'
-        printf '    2) 换成带 TUN / nftables 支持的固件 (原厂精简固件常常两个都缺)\n'
-        printf '  路由器本机的代理端口一直可用 (http://%s:%s), 只是没有接管局域网设备。\n' "$(lan_ip)" "$ZP_MIXED"
-    else
-        ok "全屋代理已开启 —— 手机 / 电脑 / 电视连上这台路由器即可用"
-    fi
-    printf '  设备名   %s\n' "$MODEL"
-    case "${ACTIVE_MODE:-tproxy}" in
-        tun)    printf '  模式     TUN 全屋透明代理 (含路由器自身)\n' ;;
-        tproxy) printf '  模式     tproxy 全屋透明代理 (本机自身流量除外)\n' ;;
-        *)      printf '  模式     未生效 (只有本机代理端口可用)\n' ;;
+    # 说什么话, 取决于**真的生效到哪** (ACTIVE_MODE 是现场验过的, 不是探测的意图)。
+    # 之前这里只看"tun 有没有建出来", 于是 tproxy 也没装上的机器照样报"已开启"(8.45)。
+    case "${ACTIVE_MODE:-none}" in
+        tun)
+            ok "全屋代理已开启 —— 手机 / 电脑 / 电视连上这台路由器即可用" ;;
+        tproxy)
+            ok "全屋代理已开启 —— 手机 / 电脑 / 电视连上这台路由器即可用"
+            printf '  %s\n' "（路由器自身的流量不经代理: 这台固件建不出 TUN 设备）" ;;
+        redirect)
+            ok "局域网代理已开启 —— 手机 / 电脑 / 电视的 TCP 流量已接管"
+            printf '  %s\n' "（UDP / QUIC 与本机自身流量不在覆盖范围 —— 这是这台固件上能做到的最大范围）" ;;
+        *)
+            printf '%s透明代理未生效%s —— 这台设备上 TUN / tproxy / iptables REDIRECT 都用不了\n' "$C_E" "$C_R"
+            printf '  原因 (探测时记下的原话, 面板上也能看到):\n'
+            for _lv in tun tproxy redirect; do
+                _w="$(sed -n "s/^why.$_lv=//p" "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+                if [ -n "$_w" ]; then printf '    %-9s %s\n' "$_lv" "$_w"; fi
+            done
+            printf '  下一步任选一条:\n'
+            printf '    1) 补内核模块后重跑这条安装命令:\n'
+            printf '         opkg install kmod-tun kmod-nft-tproxy    (OpenWrt 25.12 及更新: apk add ...)\n'
+            printf '    2) 换成带 TUN / nftables 支持的固件 (原厂精简固件常常都缺)\n'
+            printf '  路由器本机的代理端口一直可用 (http://%s:%s), 只是没有接管局域网设备。\n' "$(lan_ip)" "$ZP_MIXED"
+            ;;
     esac
+    printf '  设备名   %s\n' "$MODEL"
+    case "${ACTIVE_MODE:-none}" in
+        tun)      printf '  模式     TUN 全屋透明代理 (含路由器自身)\n' ;;
+        tproxy)   printf '  模式     tproxy 全屋透明代理 (本机自身流量除外)\n' ;;
+        redirect) printf '  模式     iptables REDIRECT 局域网 TCP (不含 UDP 与本机自身)\n' ;;
+        *)        printf '  模式     未生效 (只有本机代理端口可用)\n' ;;
+    esac
+    case "${COVERED:-none}" in
+        full)    _cov_text="全屋设备 + 路由器自身" ;;
+        lan)     _cov_text="全屋设备 (路由器自身除外)" ;;
+        lan_tcp) _cov_text="局域网 TCP (不含 UDP)" ;;
+        *)       _cov_text="未接管" ;;
+    esac
+    printf '  覆盖     %s\n' "$_cov_text"
+    if [ "$NET_IPV6" = "1" ]; then
+        printf '  IPv6     已一并接管 (局域网设备的 v6 流量也走代理)\n'
+    else
+        printf '  IPv6     %s未接管%s —— %s\n' "$C_Y" "$C_R" "${CAPS_WHY_IPV6:-这一档数据面覆盖不到 v6}"
+    fi
     if [ -n "$TUN_HEALED" ]; then
         printf '  调整     这台固件上 auto-redirect 会让 tun 起不来, 已自动去掉 (功能不受影响)\n'
         printf '           %s\n' "要重新试它: 把 /etc/zeroproxy/caps 里的 autoredirect 改成 1 后重跑安装命令"
@@ -2036,6 +2834,7 @@ main() {
     install_deps
     install_core
     write_files
+    install_zpcore
     install_ui
     verify
     report_up
