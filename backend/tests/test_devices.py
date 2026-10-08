@@ -718,8 +718,13 @@ def test_doctor_answers_whether_traffic_actually_flows():
     assert "datapath_packets" in text and "-L zp_router -v -n" in text
     # ③ 没流量时的措辞 (也可能只是刚开机, 所以是"还没有"而不是"坏了")
     assert "还没有流量经过" in text
-    # DNS 单独计数: dnsmasq 一个字节都没改, "设备真的把 DNS 发给了路由器吗"只能靠它回答
-    assert "局域网 DNS 已进内核" in text
+    # DNS 那一行不能拿计数器当判据: 局域网设备查的是**路由器自己的 dnsmasq**(本机服务),
+    # 既不进 tun 也不命中 53 重定向 —— 计数为 0 本来就正常。第一版把它写成"设备可能没把
+    # 路由器当 DNS", 方向正好反了 (真机上它打着"!" 而代理一切正常)。
+    assert "sniffed_hosts() {" in text, "要按'嗅探出域名的连接数'判断分流是否在工作"
+    assert "按域名分流在工作" in text
+    assert "设备可能没把路由器当 DNS" not in text, "那句是错的, 方向反了"
+    assert "是正常的" in text and "nft" in text  # 解释里要讲清为什么 0 是正常的
 
 
 def test_panel_version_is_bumped_when_the_readme_says_so():

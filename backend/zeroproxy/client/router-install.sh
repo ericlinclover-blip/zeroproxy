@@ -2029,6 +2029,19 @@ datapath_packets() {
     esac
 }
 
+# 有多少条连接被**嗅探出了域名** —— 这是"按域名分流真的在工作"的证据, 三种数据面都成立。
+#
+# 为什么不拿 DNS 计数器当判据: 局域网设备通常查**路由器自己的 dnsmasq**, 那是本机服务 ——
+# 既不进 tun, 也不会命中 nft/iptables 里那条"53 重定向"(它只拦发往外部 DNS 的查询)。
+# 所以"DNS 计数为 0"是正常状态, 不是故障。第一版 doctor 把它写成"设备可能没把路由器当
+# DNS", 方向正好反了 (真机上 DNS 那一行打着"!", 而代理其实一切正常)。
+sniffed_hosts() {
+    command -v curl >/dev/null 2>&1 || return 1
+    _conn="$(curl -s -m 5 "http://$ZP_API/connections" 2>/dev/null || true)"
+    [ -n "$_conn" ] || return 1
+    printf '%s' "$_conn" | grep -o '"host"[ ]*:[ ]*"[^"]\{1,\}"' | wc -l | tr -d ' '
+}
+
 # 真机体检。它问的每一句都是"到底行不行", 每一条都给证据 —— 装机之后、出问题时第一个
 # 应该跑的命令。设计上它只能在真机上给出完整答案 (本机没有"局域网侧"这回事), 所以
 # 演练只验它的判据与输出格式。
@@ -2079,12 +2092,20 @@ doctor() {
     fi
 
     echo
-    echo "DNS"
-    if [ "${_dnspkts:-0}" -gt 0 ] 2>/dev/null; then
-        printf '  ✓ 局域网 DNS 已进内核：%s 个查询被劫持\n' "$_dnspkts"
+    echo "DNS 与按域名分流"
+    # 判据是"嗅探出域名的连接数", 不是 DNS 计数器 —— 见 sniffed_hosts() 上面那段的理由:
+    # 局域网设备查的是路由器自己的 dnsmasq (本机服务), DNS 计数为 0 是正常的。
+    _sniffed="$(sniffed_hosts 2>/dev/null || true)"
+    if [ -n "$_sniffed" ] && [ "${_sniffed:-0}" -gt 0 ] 2>/dev/null; then
+        printf '  ✓ 按域名分流在工作：%s 条连接被嗅探出域名\n' "$_sniffed"
     else
-        printf '  ! 还没有 DNS 查询被劫持 — 设备可能没把路由器当 DNS（或还没开始用网）\n'
+        printf '  · 暂时没有"被嗅探出域名"的连接（设备还没开始用网?）\n'
     fi
+    if [ "$(running)" = yes ] && [ "${_dnspkts:-0}" -gt 0 ] 2>/dev/null; then
+        printf '  · 另有 %s 个查询是设备直接查外部 DNS 的，已被内核接管\n' "$_dnspkts"
+    fi
+    printf '    局域网设备通常查路由器自己的 dnsmasq —— 那是本机服务，不进 tun 也不命中 53 重定向，\n'
+    printf '    所以"DNS 计数为 0"是正常的；要证明的是上面那条（按域名分流）。\n'
 
     echo
     echo "IPv6"

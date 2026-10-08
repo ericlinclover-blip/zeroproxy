@@ -844,9 +844,15 @@ def main() -> int:
         check("doctor: 现场与 caps 一致时说'数据面真的在'",
               "数据面真的在（redirect）" in doctor,
               [ln.strip() for ln in doctor.splitlines() if "现场" in ln][:1])
-        check("doctor: 从规则计数器算出真的有多少包经过 (54 + DNS 3)",
-              "55 个包经过" in doctor and "3 个查询被劫持" in doctor,
-              [ln.strip() for ln in doctor.splitlines() if "包经过" in ln or "劫持" in ln][:2])
+        check("doctor: 从规则计数器算出真的有多少包经过 (12+3+40=55)",
+              "55 个包经过" in doctor,
+              [ln.strip() for ln in doctor.splitlines() if "包经过" in ln][:1])
+        # DNS 那一行**不许**再写成"设备可能没把路由器当 DNS": 局域网设备查的是路由器自己的
+        # dnsmasq (本机服务), 计数为 0 本来就正常 —— 真机上它打着"!" 而代理一切正常。
+        check("doctor: DNS 那一行不再把'计数为 0'当成故障",
+              "按域名分流" in doctor and "是正常的" in doctor
+              and "设备可能没把路由器当 DNS" not in doctor,
+              [ln.strip() for ln in doctor.splitlines() if "DNS" in ln or "域名分流" in ln][:2])
 
         # [9] 健康机器: tun / nft 都在的普通 OpenWrt → 阶梯应当仍然选 L1
         print("\n[9] 健康机器 (tun + nftables 都在): 阶梯选 tun, 行为与以前一致")
