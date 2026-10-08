@@ -509,7 +509,8 @@ def test_install_script_probes_capabilities_and_reports_honestly():
     # 报错要只留**第一行**: nft 的第二行起是命令回显 + ^^^ 标记, 整段塞进面板就变成
     # "No such file or directoryadd rule inet zp_probe c ...^^^^^^^^" 那种看不懂的东西
     # (真机截图里就是)。五个探测的报错全都要过它。
-    assert "err_line() {" in text and text.count("$(err_line ") == 5
+    # 五个探测的报错都要过它 (内核版本那条提示也用, 所以是 "至少")
+    assert "err_line() {" in text and text.count("$(err_line ") >= 5
 
     # iptables 的 nat 表可能只是模块没加载 —— 老固件上它是唯一的出路, 不能一次判死
     assert "modprobe iptable_nat" in text
@@ -620,6 +621,53 @@ def test_optional_local_control_plane_never_breaks_the_install():
     assert "界面走原来的路径" in text
     # 与内核同一条下载器: 靠 HTTP 状态码把"面板没有这一档"(404) 与"这条路不通"分开
     assert 'HTTP_CODE" = "404' in text
+    # **每次都试着取面板当前那一版, 取不到才沿用本机已有的**。旧版是"有二进制就跳过",
+    # 于是面板把 AGENT_VERSION 抬上去之后, 已装好的路由器永远停在第一次那一版 ——
+    # 真机上就是这么停在 1.0.0 的 (面板已经在发 1.1.1)。
+    assert "zpcore.new" in text, "新的一律先落 .new, 跑通才替换 (别毁掉正在用的那份)"
+    assert "_old_ver" in text and "本地控制面已是最新" in text and "本地控制面升级" in text
+
+
+def test_installed_artifacts_are_replaced_when_the_panel_bumps_its_version():
+    """"能跑"不等于"是对的版本" —— 内核与 zpcore 的复用都要对版本。
+
+    真机排查时发现两处同一类问题: 面板把 CORE_VERSION / AGENT_VERSION 抬上去, 已装好的
+    机器会用着老的一份**永远不换** (它跑得起来, 于是复用的判据一直是"通过")。内核那条更
+    隐蔽 —— 它固定版本就是为了防"字段废弃导致全屋断网", 结果反而变成了"永远不升级"。
+    """
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+    # 内核: 除了"能跑", 还要和面板要的那一版一致
+    assert "core_version_ok" in text, "内核复用要看版本"
+    assert "core_reusable && core_version_ok" in text
+    assert "PANEL_CORE_VERSION" in text, "面板要哪一版从 /c/core/status 拿"
+    assert 'json_get "$_json" core_version' in text
+    # 老面板没有这个字段时按"一致"处理 —— 行为与本改动之前完全相同
+    assert '[ -n "$PANEL_CORE_VERSION" ] || return 0' in text
+    # 客户端版本落盘 (界面上"客户端 v…"那一格读它, 真机上一直是空的)
+    assert 'printf \'%s\' "$ZP_CLIENT_VERSION" > "$ZP_DIR/version"' in text
+
+
+def test_zpcore_version_number_has_exactly_one_source():
+    """zpcore 的版本号只有一个来源: 面板代码里的 AGENT_VERSION, 构建时注入。
+
+    源码里写第二个数字的代价是真实的: 面板发的是 1.1.1, 而安装输出与 `zpcore version`
+    都报 1.0.0 —— 排查时没法从它自报的版本判断装的是哪一版 (只能去翻响应里有没有某个
+    新字段)。构建脚本也必须真的把 -X 传进去, 否则源码里那个 "dev" 会跟着发出去。
+    """
+    import os
+
+    from zeroproxy import router_client
+
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(router_client.__file__))))
+    src = open(os.path.join(repo, "backend", "zeroproxy", "client", "agent", "main.go"),
+               encoding="utf-8").read()
+    assert "var agentVersion" in src and "const agentVersion" not in src, "要是 var 才能被注入"
+    assert 'agentVersion = "dev"' in src, "源码里的默认值只能是 dev (说明它不是发布版)"
+
+    build = open(os.path.join(repo, "scripts", "build-agent.sh"), encoding="utf-8").read()
+    assert "-X main.agentVersion=$VERSION" in build, "构建时必须把版本号注入进去"
 
 
 def test_local_control_plane_source_and_build_script_ship_with_the_repo():

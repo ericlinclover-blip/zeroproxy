@@ -32,8 +32,11 @@ func ok(timeout time.Duration, name string, args ...string) bool {
 	return good
 }
 
+// logf 走 **stdout** 而不是 stderr: procd 把 stderr 记成 `daemon.err`, 于是每次重启
+// 日志里都躺一条看着像错误的东西 (真机上就是这样: `daemon.err zpcore[…]`), 日子久了对
+// 真正的错误就麻木了。stdout 记成 user.notice, 是"说一句话"的正确档位。
 func logf(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "zpcore: "+format+"\n", args...)
+	fmt.Fprintf(os.Stdout, "zpcore: "+format+"\n", args...)
 }
 
 // discoverLANIP 找本机的局域网地址。三处用它 (绑定 / 界面地址), 而**不能**拿它当

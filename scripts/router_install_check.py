@@ -335,7 +335,11 @@ def main() -> int:
         # 演练里那个"路由器"是本机模拟的, 所以跑的这一份得是本机平台的二进制。文件名仍然按
         # arm64 命名 —— 面板只认文件名里的架构, 而这一节的目的是**真跑一遍接口契约**。
         host_bin = os.path.join(tmp, "zpcore-host")
-        built = subprocess.run([go, "build", "-o", host_bin, "."],
+        # 版本号靠构建时注入 (面板代码里的 AGENT_VERSION 是唯一来源); 演练也照这条走,
+        # 否则装出来的二进制会自报 "dev", 下面那条"它自报的版本 == 面板要的那一版"就没意义
+        built = subprocess.run(
+            [go, "build", "-ldflags", f"-X main.agentVersion={router_client.AGENT_VERSION}",
+             "-o", host_bin, "."],
                                cwd=AGENT_SRC, capture_output=True, text=True)
         runs = subprocess.run([host_bin, "version"], capture_output=True, text=True)
         check("zpcore 能在本机构建并运行",
@@ -896,6 +900,12 @@ def main() -> int:
         if go:
             print("\n[10] 本地控制面 zpcore: 自己起界面服务 (不依赖固件 Web 服务器)")
             zpcore_bin = os.path.join(fake_root, "zpcore")
+            # 装上去的那一份必须**自报面板要的那一版**。真机上它是 1.0.0 而面板在发 1.1.1 ——
+            # 源码里写死过一个版本号, 排查时只能靠"响应里有没有某个字段"反推装的是哪一版。
+            zver = subprocess.run([zpcore_bin, "version"], capture_output=True, text=True).stdout.strip()
+            check("装上的 zpcore 自报的版本 == 面板要的那一版",
+                  zver == f"zpcore {router_client.AGENT_VERSION}",
+                  f"{zver!r} vs zpcore {router_client.AGENT_VERSION}")
             # 界面文件由 install_ui 落盘; 演练的 main 停在 write_files, 这里按同一份内容补上
             ui_dir = os.path.join(fake_root, "www", "zeroproxy")
             os.makedirs(ui_dir, exist_ok=True)

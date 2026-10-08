@@ -81,8 +81,11 @@ for arch in $TARGETS; do
     out="$DIST/zpcore-$arch-$VERSION"
     # -trimpath: 不要把本机路径写进二进制 (别人反查得到你的目录结构, 也没必要)
     # -s -w:     去掉符号表, 路由器闪存寸土寸金
+    # -X:        把版本号**注入**进去 —— 源码里不写第二遍 (写死过一次, 结果面板发 1.1.1、
+    #            二进制自报 1.0.0, 真机排查时被它绕进去)
     # shellcheck disable=SC2086
-    if env GOOS=linux CGO_ENABLED=0 $envs "$GO" build -trimpath -ldflags "-s -w" -o "$out" . ; then
+    if env GOOS=linux CGO_ENABLED=0 $envs "$GO" build -trimpath \
+        -ldflags "-s -w -X main.agentVersion=$VERSION" -o "$out" . ; then
         gzip -9 -c "$out" > "$out.gz" && rm -f "$out"
         printf '  ✓ %-9s %s KB (压缩后)\n' "$arch" "$(( $(wc -c < "$out.gz") / 1024 ))"
     else

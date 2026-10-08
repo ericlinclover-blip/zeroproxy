@@ -908,6 +908,7 @@ PANEL_MIRRORS=""
 PANEL_SHA=""
 PANEL_SIZE=""
 PANEL_PREFER="panel"
+PANEL_CORE_VERSION=""
 #: 面板最近一次状态回执的原文 (进度显示用)
 PANEL_STATUS_JSON=""
 #: 最近一次下载的实测结果 (core_download 填)
@@ -976,6 +977,19 @@ core_read_panel() {
     PANEL_SIZE="$(json_get_num "$_json" size)"
     PANEL_PREFER="$(json_get "$_json" prefer)"
     [ -n "$PANEL_PREFER" ] || PANEL_PREFER="panel"
+    # 面板要的那一版内核 —— 用来判断本机这份是不是该换了 (见 install_core)
+    PANEL_CORE_VERSION="$(json_get "$_json" core_version)"
+}
+
+# 本机内核是不是面板要的那一版。**只看"能不能跑"是不够的**: 面板把 CORE_VERSION 抬上去
+# 之后, 已装好的路由器会一直用着老内核 (它跑得起来, 于是永远不换)。
+# 面板版本较旧、没给这个字段时按"一致"处理 —— 行为与本改动之前完全相同。
+core_version_ok() {
+    [ -n "$PANEL_CORE_VERSION" ] || return 0
+    case "$("$ZP_BIN" -v 2>/dev/null | head -n1)" in
+        *"$PANEL_CORE_VERSION"*) return 0 ;;
+    esac
+    return 1
 }
 
 # 落盘前的校验: 大小像内核, 且 (面板给了摘要时) sha256 对得上。
@@ -1098,9 +1112,18 @@ install_core() {
     # 复用旧文件前必须确认它真的跑得起来: 上一次失败可能留下一个没解开的 gz
     # (chmod 是成功的, 只看 -x 会以为装好了, 于是每次重跑都在同一个地方再挂一次)。
     # (预检那边算空间用的是同一个判据, 见 core_reusable。)
-    if core_reusable; then
-        ok "内核已存在且可执行, 跳过下载"
+    #
+    # 但"跑得起来"还不够 —— **还要和面板要的那一版一致**。旧版只看能不能跑, 于是面板把
+    # CORE_VERSION 抬上去之后 (安全修复 / 字段变更), 已经装好的路由器会一直用着老内核:
+    # 它跑得起来, 于是永远不换。真机上排查内核问题时才发现这条。
+    CORE_STARTED="$(date +%s 2>/dev/null || echo 0)"
+    core_read_panel
+    if core_reusable && core_version_ok; then
+        ok "内核已存在且可执行 (版本 $PANEL_CORE_VERSION), 跳过下载"
         return 0
+    fi
+    if core_reusable; then
+        note "本机内核是 $(err_line "$("$ZP_BIN" -v 2>/dev/null | head -n1)"), 面板要的是 $PANEL_CORE_VERSION —— 换一版"
     fi
     rm -f "$ZP_BIN"
     _tmp="$ZP_DIR/.mihomo.gz"
@@ -1111,8 +1134,6 @@ install_core() {
     # 默认先走 ① —— 但国内家宽到面板可能只有几十 KB/s, 而直连镜像往往快得多,
     # 所以 ① 有一个观察窗口 (CORE_PANEL_BUDGET), 太慢就让位给 ②。
     # 面板说 prefer=mirror (ZP_ROUTER_SOURCE) 时顺序反过来。
-    CORE_STARTED="$(date +%s 2>/dev/null || echo 0)"
-    core_read_panel
     _ok=0
     if [ "$PANEL_PREFER" = "mirror" ]; then
         warn "面板建议先走直连镜像 (ZP_ROUTER_SOURCE=mirror)"
@@ -1272,6 +1293,10 @@ write_files() {
     # 只在**规则还没被我们改过**的时候拍 (write_files 早于 verify 落数据面规则); 已经拍过
     # 就不覆盖: 重跑安装时我们自己的规则可能正生效, 那时候拍会把残渣当成"原状"。
     snapshot_baseline
+    # 客户端版本落盘: 本地控制面 (/cgi-bin/zeroproxy 的 status) 与 CLI 都会读它。
+    # 不写这一行的话界面上"客户端 v…"那一格永远是空的 —— 真机上就是这样, 无害但会让人
+    # 以为版本没装上。
+    printf '%s' "$ZP_CLIENT_VERSION" > "$ZP_DIR/version"
 
     # tproxy 回退方案用的 nft 规则 (只在 TUN 不可用时由 init 脚本加载)。
     # 优先级用数字而不是符号名 (dstnat/mangle): 数字在各版本 nft 上行为一致。
@@ -2436,12 +2461,19 @@ ZPCORE_MIN_BYTES="${ZP_AGENT_MIN_BYTES:-65536}"
 
 install_zpcore() {
     step "准备本地控制面 (可选件)"
+    # **每次都试着取面板当前那一版**, 取不到才沿用本机已有的。
+    #
+    # 不能"有二进制就跳过": 面板把 AGENT_VERSION 抬上去之后, 已经装好的路由器会永远停在
+    # 第一次装上的那一版 —— 真机上就是这么停在 1.0.0 的, 而面板已经在发 1.1.1 (然后
+    # 因为源码里还写着一个版本号, 连它自报的版本都是错的)。新的一律先落到 .new, 跑通了
+    # 才替换 —— 正在用的那一份不能被一个坏下载毁掉。
+    _have=0
     if [ -x "$ZP_DIR/zpcore" ] && "$ZP_DIR/zpcore" version >/dev/null 2>&1; then
-        ok "本地控制面已就位: $("$ZP_DIR/zpcore" version 2>/dev/null | head -n1)"
-        return 0
+        _have=1
+        _old_ver="$("$ZP_DIR/zpcore" version 2>/dev/null | head -n1)"
     fi
     # 上一次留下的坏文件 (没解开 / 架构不对) 会让每次重跑都死在同一个地方: 先清掉。
-    rm -f "$ZP_DIR/zpcore" "$ZP_DIR/.zpcore.gz" 2>/dev/null || true
+    rm -f "$ZP_DIR/.zpcore.gz" "$ZP_DIR/zpcore.new" 2>/dev/null || true
     _tmp="$ZP_DIR/.zpcore.gz"
     # 用与内核同一条下载器 (http_fetch_to): 它带 HTTP 状态码, 于是"面板说没有这一档"
     # (404) 与"这条路走不通"能分开说 —— 以前两者都是同一句"没准备", 排障时指错方向。
@@ -2452,32 +2484,48 @@ install_zpcore() {
             note "这次没取到本地控制面 (HTTP ${HTTP_CODE:-?}) —— 界面走原来的路径"
         fi
         rm -f "$_tmp"
+        if [ "$_have" = "1" ]; then ok "沿用本机已有的: $_old_ver"; fi
         return 0
     fi
     _size="$(wc -c < "$_tmp" 2>/dev/null | tr -d ' ' || true)"
     if [ "${_size:-0}" -lt "$ZPCORE_MIN_BYTES" ]; then
         rm -f "$_tmp"
         note "面板没有准备 $ARCH 这一档本地控制面 (可选件) —— 界面走原来的路径"
+        if [ "$_have" = "1" ]; then ok "沿用本机已有的: $_old_ver"; fi
         return 0
     fi
     # gzip 判定只用 gzip -t (busybox 一定有) —— 与内核那一步同一条路, 同一套理由。
     if gzip -t "$_tmp" >/dev/null 2>&1; then
-        if ! gzip -dc "$_tmp" > "$ZP_DIR/zpcore" 2>/dev/null; then
-            rm -f "$_tmp" "$ZP_DIR/zpcore"
+        if ! gzip -dc "$_tmp" > "$ZP_DIR/zpcore.new" 2>/dev/null; then
+            rm -f "$_tmp" "$ZP_DIR/zpcore.new"
             note "本地控制面解压失败 —— 界面走原来的路径"
+            if [ "$_have" = "1" ]; then ok "沿用本机已有的: $_old_ver"; fi
             return 0
         fi
     else
-        cp "$_tmp" "$ZP_DIR/zpcore"
+        cp "$_tmp" "$ZP_DIR/zpcore.new"
     fi
     rm -f "$_tmp"
-    chmod 755 "$ZP_DIR/zpcore"
-    if ! "$ZP_DIR/zpcore" version >/dev/null 2>&1; then
-        rm -f "$ZP_DIR/zpcore"
+    chmod 755 "$ZP_DIR/zpcore.new"
+    if ! "$ZP_DIR/zpcore.new" version >/dev/null 2>&1; then
+        rm -f "$ZP_DIR/zpcore.new"
         note "本地控制面在这台机器上跑不起来 (架构不匹配?) —— 界面走原来的路径"
+        if [ "$_have" = "1" ]; then ok "沿用本机已有的: $_old_ver"; fi
         return 0
     fi
-    ok "本地控制面就绪: $("$ZP_DIR/zpcore" version 2>/dev/null | head -n1)"
+    _new_ver="$("$ZP_DIR/zpcore.new" version 2>/dev/null | head -n1)"
+    if [ "$_have" = "1" ] && [ "$_old_ver" = "$_new_ver" ]; then
+        rm -f "$ZP_DIR/zpcore.new"
+        ok "本地控制面已是最新: $_new_ver"
+        return 0
+    fi
+    if [ "$_have" = "1" ]; then
+        mv "$ZP_DIR/zpcore.new" "$ZP_DIR/zpcore"
+        ok "本地控制面升级: $_old_ver → $_new_ver"
+    else
+        mv "$ZP_DIR/zpcore.new" "$ZP_DIR/zpcore"
+        ok "本地控制面就绪: $_new_ver"
+    fi
     return 0
 }
 

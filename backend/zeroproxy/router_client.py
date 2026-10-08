@@ -29,8 +29,9 @@ from .config import paths
 #:        IPv6 能力探测 (能接管才给双栈配置, 接不了就在面板上写"IPv6 未接管")。
 #: 1.4.1: `zeroproxy doctor` 真机体检 + 规则计数器 (规则存在 ≠ 有流量经过)。
 #: 1.4.2: 内核起不来时**先顺着阶梯降级再 die** (旧版在这里直接死, 于是有 iptables
-#:        可走的老固件停在"未接管"); 探测报错只留第一行; 没接管时报出每一级的原因。
-SCRIPT_VERSION = "1.4.2"
+#:        可走的老固件停在"没接管"); 探测报错只留第一行; 没接管时报出每一级的原因。
+#: 1.4.3: 内核与 zpcore 的"复用"都要对版本 —— 面板抬版本号, 已装好的路由器以前#:        永远换不了; zpcore 版本号只有一处 (构建时注入), 不再自报错的版本。
+SCRIPT_VERSION = "1.4.3"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"
@@ -711,7 +712,7 @@ def summary() -> dict:
 # 与内核唯一的区别: zpcore 是我们自己的东西, 没有上游可下载, 所以产物跟着**仓库**走
 # (scripts/build-agent.sh 生成到 client/agent/dist/), 不是 data/ 缓存。它是可选件 ——
 # 面板没准备某一档时, 那台路由器自动退回原来的界面路径, 装机不会失败。
-AGENT_VERSION = os.environ.get("ZP_AGENT_VERSION", "1.1.1")
+AGENT_VERSION = os.environ.get("ZP_AGENT_VERSION", "1.2.0")
 
 #: 小于这个大小的一律不当二进制 (一份正常的 zpcore.gz 约 2.5 MB)。演练里可以用
 #: ZP_AGENT_MIN_BYTES 调低。

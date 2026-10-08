@@ -25,9 +25,13 @@ import (
 	"path/filepath"
 )
 
-// : 客户端版本 (与 router-install.sh 的 ZP_CLIENT_VERSION 对应; 面板按它决定发哪一版二进制)。
-// : 单独一个常量是有意的: 二进制可以落后于脚本 (老机器上留着上一版), 只要接口不变就能跑。
-const agentVersion = "1.0.0"
+// 版本号由构建脚本用 `-ldflags -X main.agentVersion=…` 注入, **唯一来源是面板代码里的
+// AGENT_VERSION** (它同时决定面板分发的文件名)。
+//
+// 为什么不再写死一个字面量: 这里原来写着 "1.0.0", 而面板一路发到 1.1.1 —— 真机上安装
+// 输出与 `zpcore version` 都报 1.0.0, 排查时只能靠"响应里有没有某个字段"去反推装的是
+// 哪一版 (我就这么被绕进去过)。两处版本号 = 迟早对不上。
+var agentVersion = "dev"
 
 const usage = `zpcore —— ZeroProxy 路由器本地控制面
 
