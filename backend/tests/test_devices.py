@@ -496,6 +496,23 @@ def test_install_script_probes_capabilities_and_reports_honestly():
     assert 'mv "$ZP_CONF.ar.bak" "$ZP_CONF"' in text, "自愈没成要把配置退回原样"
     assert "downgrade_datapath" in text and "ladder_below" in text, "起不来要顺着阶梯往下试"
     assert "rung_usable" in text, "探测本来就没过的级没必要再试"
+    # **内核起不来本身就是数据面起不来的一种**: tun 段在这台固件上建不出设备时, mihomo
+    # 会直接退出 (procd 不停重启它), 控制口永远不响应。旧版在这里直接 die —— 于是
+    # "顺着阶梯往下试"根本没机会跑: 真机 (GL-MT3600BE · 原厂 21.02) 上就停在"未接管",
+    # 而它明明还有 iptables 可走。顺序必须是: 等控制口 → 失败就降级 → 还失败才 die。
+    api_at = text.index("if ! wait_core_api; then")
+    retry_at = text.index("if downgrade_datapath && wait_core_api; then")
+    die_at = text.index('die "内核启动失败')
+    assert api_at < retry_at < die_at, "先试降级, 再决定要不要 die"
+    assert "wait_core_api() {" in text, "等控制口要单独成一个函数 (两处都要用)"
+
+    # 报错要只留**第一行**: nft 的第二行起是命令回显 + ^^^ 标记, 整段塞进面板就变成
+    # "No such file or directoryadd rule inet zp_probe c ...^^^^^^^^" 那种看不懂的东西
+    # (真机截图里就是)。五个探测的报错全都要过它。
+    assert "err_line() {" in text and text.count("$(err_line ") == 5
+
+    # iptables 的 nat 表可能只是模块没加载 —— 老固件上它是唯一的出路, 不能一次判死
+    assert "modprobe iptable_nat" in text
 
     # agent 重建配置时把能力带给面板 (单服务器与多服务器骨架两条路都要带):
     # 数据面决定面板给不给 tun 段 —— 建不出设备的机器带着它, 内核直接起不来。

@@ -243,12 +243,16 @@ func currentStatus(cfg serveConfig) statusResp {
 	caps := readCaps(cfg.dir)
 	why := ""
 	if mode == "none" {
+		// 一级都没接管时把**每一级为什么不行**都带上: 只报"选中的那一级"会漏掉关键信息
+		// (真机截图里选的是 tun, 屏幕上却只有 tproxy 的原因, 于是没人知道 iptables 那条路
+		//  到底为什么也没用上)。与 agent.sh 的心跳报的是同一份。
+		var parts []string
 		for _, level := range []string{"tun", "tproxy", "redirect"} {
 			if v := caps["why."+level]; v != "" {
-				why = v
-				break
+				parts = append(parts, level+": "+v)
 			}
 		}
+		why = strings.Join(parts, " · ")
 	}
 	return statusResp{
 		OK:      true,

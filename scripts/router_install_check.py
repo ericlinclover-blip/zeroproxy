@@ -1046,6 +1046,13 @@ def main() -> int:
         check("本机覆盖随心跳到了面板 (卡片上会写「本机覆盖」)",
               str(item.get("report", {}).get("override", "")) == "off",
               f"{current_id} · {item.get('report')}")
+        # 一级都没接管时 (这台模拟机就是), why 必须带上**每一级**的原因。
+        # 真机截图里选的是 tun, 屏幕上却只有 tproxy 的原因 —— 于是没人知道 iptables
+        # 那条路到底为什么也没用上, 而这恰恰是那台机器唯一的出路。
+        why_text = str(item.get("report", {}).get("why", ""))
+        check("一级都没接管时, why 里带上每一级的原因 (不是只报选中的那条)",
+              all(f"{lv}:" in why_text for lv in ("tun", "tproxy", "redirect")),
+              why_text[:140])
 
         # revert: 停用 + 拆数据面 + 与装机前快照逐条比对, 并给出结论
         subprocess.run(["sh", cli_plain, "local-auto"], capture_output=True, text=True)

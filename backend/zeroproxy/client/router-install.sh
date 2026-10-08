@@ -522,6 +522,11 @@ CAPS_WHY_IPV6=""
 DATAPATH=""
 COVERED=""
 
+# 外部命令的报错往往是**多行** (nft 的第一行才是内核说的话, 第二行开始是命令回显 +
+# `^^^` 标记)。整段塞进面板/界面就成了一坨看不懂的东西 —— 真机截图里正是
+# "No such file or directoryadd rule inet zp_probe c ...^^^^^^^^"。只留第一行。
+err_line() { printf '%s' "$1" | head -n1 | tr -d '\r' | cut -c1-120; }
+
 # 内核主次版本是否 >= 给定值 (dae 那一级要看内核, 5.17 是它绑定 LAN 的下限)。
 kernel_ge() {
     _k="$(uname -r 2>/dev/null || true)"
@@ -571,7 +576,7 @@ nft_ok() {
         return 1
     fi
     if ! _nft_err="$(nft add table inet zp_probe 2>&1)"; then
-        PROBE_WHY="nft 规则下不去 (内核里没有 nf_tables): ${_nft_err:-命令失败}"
+        PROBE_WHY="nft 规则下不去 (内核里没有 nf_tables): $(err_line "${_nft_err:-命令失败}")"
         return 1
     fi
     nft delete table inet zp_probe 2>/dev/null || true
@@ -601,7 +606,7 @@ tproxy_ok() {
         return 0
     fi
     nft delete table inet zp_probe 2>/dev/null || true
-    PROBE_WHY="tproxy 规则下不去 (内核里没有 nft_tproxy): ${_tp_err:-命令失败}"
+    PROBE_WHY="tproxy 规则下不去 (内核里没有 nft_tproxy): $(err_line "${_tp_err:-命令失败}")"
     return 1
 }
 
@@ -621,7 +626,7 @@ tun_ok() {
     fi
     if [ -d /sys/module/tun ]; then return 0; fi
     if grep -q '^tun ' /proc/modules 2>/dev/null; then return 0; fi
-    PROBE_WHY="建不出 tun 设备: ${_tun_err:-Operation not supported}"
+    PROBE_WHY="建不出 tun 设备: $(err_line "${_tun_err:-Operation not supported}")"
     return 1
 }
 
@@ -641,8 +646,15 @@ redirect_ok() {
         return 1
     fi
     if ! iptables -t nat -N zp_probe 2>/dev/null; then
-        PROBE_WHY="iptables 的 nat 表不可用"
-        return 1
+        # nat 表可能只是**模块没加载** —— 老固件 (原厂 21.02 那类) 上 iptables 是唯一的
+        # 路, 不能因为一个模块没加载就把它判死 (真机上这一级本该救场)。试一把再判。
+        modprobe iptable_nat 2>/dev/null || true
+        modprobe nf_nat 2>/dev/null || true
+        modprobe nf_conntrack 2>/dev/null || true
+        if ! iptables -t nat -N zp_probe 2>/dev/null; then
+            PROBE_WHY="iptables 的 nat 表不可用 (试过加载 iptable_nat 也没成)"
+            return 1
+        fi
     fi
     if _rd_err="$(iptables -t nat -A zp_probe -p tcp -j REDIRECT --to-ports 1 2>&1)"; then
         iptables -t nat -F zp_probe 2>/dev/null || true
@@ -651,7 +663,7 @@ redirect_ok() {
     fi
     iptables -t nat -F zp_probe 2>/dev/null || true
     iptables -t nat -X zp_probe 2>/dev/null || true
-    PROBE_WHY="REDIRECT 规则下不去: ${_rd_err:-命令失败}"
+    PROBE_WHY="REDIRECT 规则下不去: $(err_line "${_rd_err:-命令失败}")"
     return 1
 }
 
@@ -691,7 +703,7 @@ nft_v6_ok() {
         return 0
     fi
     nft delete table inet zp_probe6 2>/dev/null || true
-    PROBE_WHY="IPv6 tproxy 规则下不去: ${_v6_err:-内核不支持}"
+    PROBE_WHY="IPv6 tproxy 规则下不去: $(err_line "${_v6_err:-内核不支持}")"
     return 1
 }
 
@@ -1769,11 +1781,17 @@ while true; do
     COV_REPORT="$(actual_covered)"
     IPV6_REPORT="$(ipv6_flag)"
     WHY_REPORT=""
-    case "$DP_REPORT" in
-        tun)      WHY_REPORT="$(caps_get why.tun)" ;;
-        tproxy)   WHY_REPORT="$(caps_get why.tproxy)" ;;
-        redirect) WHY_REPORT="$(caps_get why.redirect)" ;;
-    esac
+    if [ "$COV_REPORT" = "none" ]; then
+        # 一级都没接管时, 把**每一级为什么不行**都带上。只报"选中的那一级"会漏掉关键信息:
+        # 真机截图里选的是 tun, 而屏幕上只有 tproxy 的原因, 于是没人知道 iptables 那条路
+        # 到底为什么也没用上。
+        for _lv in tun tproxy redirect; do
+            _w="$(caps_get "why.$_lv")"
+            if [ -n "$_w" ]; then
+                WHY_REPORT="${WHY_REPORT:+$WHY_REPORT · }$_lv: $_w"
+            fi
+        done
+    fi
     for _f in $(server_files); do
         _b="$(field_of "$_f" base)"; _i="$(field_of "$_f" id)"; _k="$(field_of "$_f" secret)"
         [ -n "$_b" ] || continue
@@ -2713,6 +2731,17 @@ wait_datapath() {
     return 1
 }
 
+# 内核控制口在不在 (mihomo 真起来了没有)。冷启动到监听 9090 通常 2~5 秒, 给 15 秒。
+wait_core_api() {
+    _i=0
+    while [ "$_i" -lt 15 ]; do
+        if http_get "http://$ZP_API/version" >/dev/null 2>&1; then return 0; fi
+        sleep 1
+        _i=$((_i + 1))
+    done
+    return 1
+}
+
 # 换一级数据面: 改 caps → 让面板按新能力重发配置 (有没有 tun 段由它决定: 建不出设备的
 # 机器带着 tun 段, 内核直接起不来) → 校验 → 替换 → 重启内核。
 # 任一步失败就把配置与 caps **一起**回滚 —— 两件事必须一起回, 否则下一轮重建配置又会
@@ -2824,21 +2853,27 @@ verify() {
     touch "$ZP_DIR/core.up"
     /etc/init.d/zeroproxy restart >/dev/null 2>&1 || true
 
-    _i=0
-    while [ "$_i" -lt 15 ]; do
-        sleep 1
-        _i=$((_i + 1))
-        if http_get "http://$ZP_API/version" >/dev/null 2>&1; then break; fi
-    done
-    if ! http_get "http://$ZP_API/version" >/dev/null 2>&1; then
-        warn "内核控制口没有响应, 最近日志:"
-        logread -e zeroproxy 2>/dev/null | tail -n 8 >&2 || true
-        die "内核启动失败。把上面的日志发给面板即可定位 (通常是节点配置或内存不足)。"
-    fi
-    ok "内核已启动"
-
     # 数据面: 从 caps 里那一级开始, **真的等它生效** (不是"命令跑过就算")。
     ACTIVE_MODE="${DATAPATH:-none}"
+
+    # 内核起不来**本身就是数据面起不来的一种**: tun 段在这台固件上建不出设备时, mihomo
+    # 会直接退出 (procd 不停重启它), 控制口永远不响应。旧版在这里直接 die —— 于是
+    # "顺着阶梯往下试"那条路根本没机会跑: 真机 (GL-MT3600BE · 原厂 21.02 固件) 上就
+    # 停在"未接管", 而它明明还有 iptables 可走。所以先试降级, 再决定要不要 die。
+    if ! wait_core_api; then
+        warn "内核控制口没有响应, 最近日志:"
+        logread -e zeroproxy 2>/dev/null | tail -n 8 >&2 || true
+        if [ "$ACTIVE_MODE" != "none" ]; then
+            note "先换一级数据面再试 —— 这类失败多半是 tun 段在这台固件上建不出来"
+            if downgrade_datapath && wait_core_api; then
+                ok "换成 $ACTIVE_MODE 之后内核起来了"
+            fi
+        fi
+        if ! wait_core_api; then
+            die "内核启动失败。把上面的日志发给面板即可定位 (通常是节点配置或内存不足)。"
+        fi
+    fi
+    ok "内核已启动"
     if [ "$ACTIVE_MODE" = "tun" ]; then
         if ! wait_datapath tun; then
             # 把**内核自己说的原因**打出来: 一台设备一种原因 (没有 tun 模块 / nft 不支持

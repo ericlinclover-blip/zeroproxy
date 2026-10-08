@@ -94,9 +94,12 @@ function coverageChip(d) {
   const r = d.report || {};
   const cov = coveredOf(d);
   if (!d.online || !d.actual || !cov) return "";
+  const why = r.why ? ` title="${escAttr(r.why)}"` : "";
+  // 覆盖范围是 none 时**不挂模式标签**: "TUN · 未接管" 自相矛盾 (真机截图里就是这么显示
+  // 的), 而它正是这一整套改动要消灭的那种"看起来接管了"。要说就说一句"未接管"。
+  if (cov === "none") return `<span class="tag-chip"${why}>未接管</span>`;
   const mode = MODE_LABEL[String(r.mode || "").toLowerCase()] || "";
   const txt = COVERED_LABEL[cov] || cov;
-  const why = r.why ? ` title="${escAttr(r.why)}"` : "";
   // IPv6 是单独一格: 局域网设备从运营商那里拿到原生 v6, 而只接管 v4 的透明代理对 v6
   // 等于不存在 —— 那些流量直接出去, 目标网站看到的是真实 v6 地址。设备探得到就不标,
   // 探不到必须写出来 (它比"全屋已接管"更值得一眼看见)。
