@@ -1,4 +1,4 @@
-"""路由器客户端的服务端部分: 安装脚本渲染 + 内核二进制分发。
+"""路由器客户端的服务端部分: 安装脚本渲染 + 内核二进制 / 分流数据 / 内核 BTF 分发。
 
 为什么由面板分发内核二进制
 ------------------------
@@ -7,12 +7,15 @@ release 域名经常不可达, 用户看到的是"装到一半卡住"。所以�
 它在服务器侧, 可以多镜像重试, 并且只成功下载一次就缓存下来。
 路由器因此只需要访问**一个地址** (面板自己的域名), 一条防火墙规则、一张证书。
 
-二进制不入库、不进备份, 缓存在 `data/client/cores/` (见 paths), 可随时删掉重下。
+二进制不入库、不进备份, 缓存在 `data/client/cores/` 与 `data/client/btf/` (见 paths),
+可随时删掉重下。
 """
 from __future__ import annotations
 
-import os
 import hashlib
+import json
+import os
+import re
 import threading
 import time
 import urllib.error
@@ -81,7 +84,12 @@ from .config import paths
 #:         用 `-U` 一条命令 + 签名不可信时才退 --allow-untrusted; 内核模块没装成时把原话
 #:         与**这台机器能用**的补装命令一起说出来, 固件 / 包管理器 / 失败原因落进 caps,
 #:         status 与 doctor 都报它们 (8.76)。
-SCRIPT_VERSION = "1.4.24"
+#: 1.4.25: 真机 (GL-MT3600BE · 25.12.5) 那句"内核没有 BTF"不再是终点 —— 检测到就**自动补**:
+#:         先问本机软件源 (`vmlinux-btf`), 再问面板 (/c/btf, 与内核 / 分流数据库同一套分发),
+#:         装上后按 cilium/ebpf 与 libbpf 的那张候选表**验证真的就位**才算数。
+#:         只在"内核 >=5.17 且系列在 6.6 / 6.12 内"时才动手 (不然白占闪存);
+#:         补不上就说清哪一种原因, 以及它只影响未来的性能档 (8.77)。
+SCRIPT_VERSION = "1.4.25"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"
@@ -753,6 +761,275 @@ def fetch_geo(
                                         f"太慢: {rate / 1024:.0f} KB/s (换下一个镜像)"
                                     )
                 if size < minimum:
+                    errors.append(f"{source} 体积异常 ({size} 字节)")
+                    continue
+                os.replace(tmp, dst)
+                return True, f"已下载 {size // 1024} KB", dst
+            except (urllib.error.URLError, OSError, TimeoutError) as exc:
+                errors.append(f"{source} {exc}")
+            finally:
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+    return False, "; ".join(errors)[-300:], ""
+
+
+# ---------------------------------------------------------------- 内核 BTF (CO-RE 类型信息)
+# 为什么要有这一段 (2026-10 真机: GL-MT3600BE · OpenWrt 25.12.5 · 内核 6.12.94):
+# 不带 CONFIG_DEBUG_INFO_BTF 编译的固件没有 /sys/kernel/btf/vmlinux, CO-RE eBPF 程序
+# (dae / daed 这一类, 也是本项目"性能档"的候选) 就加载不起来 —— 路由器端探测到的正是
+# 这种情况。**这件事在固件上能补, 不必重刷**: 社区 (kenzok8/vmlinux-btf) 拿同一份内核
+# 源码再编一个带 BTF 的影子内核, 用 pahole 导出 detached BTF, 装到
+# /usr/lib/debug/boot/vmlinux-<内核版本>; 而 cilium/ebpf 与 libbpf 在 sysfs 里找不到
+# BTF 时**正好会回退到这个路径** (候选顺序与路由器端的 btf_find 一致)。
+#
+# 包名里带内核版本 (vmlinux-btf-6.12.103-r1-aarch64_cortex-a53.apk), 而 BTF 在**同一
+# minor 系列内兼容** (6.12.x 的包装在别的 6.12.y 上也行 —— 包的 postinst 自己按
+# uname -r 建软链)。所以路由器把自己 uname -r 报上来, 面板按 minor 系列 + 架构挑包。
+#
+# 分发方式与内核二进制 / 分流数据库完全一致: **面板去取, 路由器只访问面板一个地址**
+# (装机时那台路由器还没有任何代理可用, 让它自己去 GitHub 是 2.9.2 的教训)。
+BTF_REPO = os.environ.get("ZP_BTF_REPO", "kenzok8/vmlinux-btf").strip()
+BTF_API = os.environ.get("ZP_BTF_API", "https://api.github.com").rstrip("/")
+#: 社区包覆盖的内核系列 (它的支持矩阵: 24.10 的 6.6 + 25.12 的 6.12)。别的系列没有包
+#: —— 那就如实说"这一档补不了", 而不是让路由器挂在那里等。
+BTF_SERIES = ("6.6", "6.12")
+#: 取 BTF 包的总时限 (秒)。文件只有几 MB, 但装机时路由器正挂在请求上等 —— 所以它有
+#: **硬上限**, 到点就回一句人话 (与内核那条路同一个原则: 不许"一直转").
+BTF_DEADLINE = int(os.environ.get("ZP_BTF_DEADLINE", "90"))
+BTF_SOURCE_TIMEOUT = int(os.environ.get("ZP_BTF_SOURCE_TIMEOUT", "45"))
+#: 低于这个大小一律当下载失败 (正常的 BTF blob 几 MB; 反代回的 HTML 页面只有几十 KB)。
+BTF_MIN_BYTES = int(os.environ.get("ZP_BTF_MIN_BYTES", str(256 << 10)))
+#: 手上已经放好包 (data/client/btf/) 的人可以把它钉死, 跳过上游资产清单那一步。
+BTF_VERSION = os.environ.get("ZP_BTF_VERSION", "").strip()
+
+
+def btf_dir() -> str:
+    return os.path.join(paths()["data_dir"], "client", "btf")
+
+
+def btf_minor(kver: str) -> str:
+    """6.12.94 → '6.12'。BTF 只在这个粒度上要求匹配。"""
+    parts = (kver or "").strip().split(".")
+    if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        return ""
+    return f"{parts[0]}.{parts[1]}"
+
+
+def btf_asset_pattern(ext: str) -> "re.Pattern[str]":
+    """包名 → (内核版本, 架构)。两种包的命名不一样 (与上游发布件一致):
+         apk: vmlinux-btf-6.12.103-r1-aarch64_cortex-a53.apk
+         ipk: vmlinux-btf_6.6.151-r1_aarch64_cortex-a53.ipk
+    """
+    if ext == "apk":
+        return re.compile(r"^vmlinux-btf-(\d+\.\d+\.\d+)-r\d+-([A-Za-z0-9_.+-]+)\.apk$")
+    return re.compile(r"^vmlinux-btf_(\d+\.\d+\.\d+)-r\d+_([A-Za-z0-9_.+-]+)\.ipk$")
+
+
+def btf_arch_fallbacks(arch: str) -> list[str]:
+    """架构候选 (按优先级)。aarch64 的细分目标常常没有包, 但通用档能跑同一份 BTF。"""
+    arch = (arch or "").strip()
+    if not arch:
+        return []
+    out = [arch]
+    if arch.startswith("aarch64_") and arch != "aarch64_generic":
+        out.append("aarch64_generic")
+    return out
+
+
+def btf_version_key(version: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(p) for p in version.split("."))
+    except ValueError:
+        return (0,)
+
+
+def btf_arch_of(name: str, ext: str) -> str:
+    """包名 → 架构 (只在给用户列"上游有哪些架构"时用)。"""
+    m = btf_asset_pattern(ext).match(name)
+    return m.group(2) if m else ""
+
+
+def btf_cached(minor: str, arch: str, ext: str) -> str:
+    """缓存里有没有匹配的包 (支持手工放进去 —— 面板取不到上游时的兜底)。
+
+    先按架构精确匹配, 再退到通用档; 同一个架构有多份时取版本最高的那一份。
+    缓存里只有别的内核系列的包时返回空 —— 那对这台机器没有意义, 别发出去。
+    """
+    pattern = btf_asset_pattern(ext)
+    best_key: tuple[int, ...] = (0,)
+    best_rank = 999
+    best_path = ""
+    try:
+        names = os.listdir(btf_dir())
+    except OSError:
+        return ""
+    for rank, want in enumerate(btf_arch_fallbacks(arch)):
+        for name in names:
+            m = pattern.match(name)
+            if not m or m.group(2) != want:
+                continue
+            if minor and btf_minor(m.group(1)) != minor:
+                continue
+            key = btf_version_key(m.group(1))
+            if (key, -rank) > (best_key, -best_rank):
+                best_key, best_rank, best_path = key, rank, os.path.join(btf_dir(), name)
+    if not best_path:
+        return ""
+    try:
+        if os.path.getsize(best_path) < BTF_MIN_BYTES:
+            return ""
+    except OSError:
+        return ""
+    return best_path
+
+
+def btf_asset_url(name: str) -> str:
+    return f"https://github.com/{BTF_REPO}/releases/download/latest/{name}"
+
+
+def btf_upstream_assets() -> tuple[bool, str, list[dict]]:
+    """问一次上游 release 的资产清单。返回 (ok, 说明, [{name, url, size}])。
+
+    只在缓存里没有时才问, 而且**只问一次** (装机时路由器挂在请求上等, 这里不能反复
+    重试上游)。ZP_BTF_VERSION 钉了版本的人直接跳过这一步 (仍然要过镜像下载)。
+    """
+    if BTF_VERSION:
+        return True, "已钉版本", [{"version": BTF_VERSION}]
+    url = f"{BTF_API}/repos/{BTF_REPO}/releases/tags/latest"
+    headers = {"User-Agent": UA, "Accept": "application/vnd.github+json"}
+    try:
+        request = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(request, timeout=20) as resp:
+            payload = json.loads(resp.read().decode("utf-8", "replace"))
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return False, f"上游资产清单取不到 ({exc})", []
+    assets = []
+    for item in payload.get("assets", []) or []:
+        name = str(item.get("name") or "")
+        if not name:
+            continue
+        assets.append({
+            "name": name,
+            "url": str(item.get("browser_download_url") or btf_asset_url(name)),
+            "size": int(item.get("size") or 0),
+        })
+    if not assets:
+        return False, "上游 release 里一个资产都没有", []
+    return True, "ok", assets
+
+
+def btf_pick(assets: list[dict], minor: str, arch: str, ext: str) -> list[dict]:
+    """按 (minor 系列 + 架构) 挑候选: 精确架构优先、通用档兜底, 版本高的优先。"""
+    pattern = btf_asset_pattern(ext)
+    picked: list[dict] = []
+    for rank, want in enumerate(btf_arch_fallbacks(arch)):
+        group: list[tuple[tuple[int, ...], dict]] = []
+        for item in assets:
+            name = str(item.get("name") or "")
+            m = pattern.match(name) if name else None
+            if not m:
+                # 钉版本时清单里只有版本号, 资产名要按架构拼
+                version = str(item.get("version") or "")
+                if not version or btf_minor(version) != minor:
+                    continue
+                sep = "-" if ext == "apk" else "_"
+                name = f"vmlinux-btf{sep}{version}-r1{sep}{want}.{ext}"
+                m = pattern.match(name)
+                if not m:
+                    continue
+                item = {"name": name, "url": btf_asset_url(name), "size": 0}
+            if m.group(2) != want or btf_minor(m.group(1)) != minor:
+                continue
+            group.append((btf_version_key(m.group(1)), {**item, "rank": rank}))
+        group.sort(key=lambda pair: pair[0], reverse=True)
+        picked.extend(item for _, item in group)
+    return picked
+
+
+def btf_pending_text(kver: str, arch: str, ext: str, why: str) -> str:
+    """取不到时给路由器端的一句人话 —— 要说清"怎么办", 以及"它到底影响什么"。"""
+    return (
+        f"面板没能给这台设备准备内核 BTF 包 (内核 {kver or '?'} · {arch or '?'} · {ext}): {why}\n"
+        f"1) 面板自己取不到上游时, 手动把匹配的包 (vmlinux-btf*{btf_minor(kver)}*{arch}*.{ext}) "
+        f"放进 {btf_dir()}/ 再重跑安装命令 —— 面板会直接把它发给路由器;\n"
+        f"2) 上游: https://github.com/{BTF_REPO}/releases (tag: latest)。\n"
+        "这一档只关系到 eBPF 性能档 (dae 那一类), **不影响当前的 TUN / tproxy 数据面**。"
+    )
+
+
+def btf_fetch(kver: str, arch: str, ext: str, *, deadline: float | None = None) -> tuple[bool, str, str]:
+    """准备这台设备要的 BTF 包。返回 (ok, 说明, 本地路径)。
+
+    顺序: 缓存 (含手工放进去的) → 上游资产清单 → 按镜像下载。
+    """
+    kver = (kver or "").strip()
+    arch = (arch or "").strip()
+    ext = (ext or "apk").strip().lower()
+    if ext not in ("apk", "ipk"):
+        return False, f"不认识的包格式: {ext}", ""
+    if not btf_minor(kver):
+        return False, f"没给出内核版本 (收到 {kver!r})", ""
+    if not arch:
+        return False, "没给出设备架构", ""
+
+    minor = btf_minor(kver)
+    cached = btf_cached(minor, arch, ext)
+    if cached:
+        return True, "已缓存", cached
+    if minor not in BTF_SERIES:
+        return False, (
+            f"这台内核是 {minor} 系列 —— 社区的 BTF 包只覆盖 {' / '.join(BTF_SERIES)} "
+            "(补 BTF 要有对应系列的影子内核, 别的系列没有现成件)"
+        ), ""
+
+    ok, detail, assets = btf_upstream_assets()
+    if not ok:
+        return False, detail, ""
+    picks = btf_pick(assets, minor, arch, ext)
+    if not picks:
+        available = sorted({a for item in assets if (a := btf_arch_of(item.get("name") or "", ext))})
+        return False, (
+            f"上游没有 (内核 {minor} 系列 · {arch} · {ext}) 这一档的包; "
+            f"该格式上游有的架构: {', '.join(available) or '无'}"
+        ), ""
+
+    if deadline is None:
+        deadline = time.time() + BTF_DEADLINE
+    os.makedirs(btf_dir(), exist_ok=True)
+    errors: list[str] = []
+    for pick in picks:
+        name = str(pick["name"])
+        dst = os.path.join(btf_dir(), name)
+        url = str(pick.get("url") or btf_asset_url(name))
+        tmp = dst + ".part"
+        for template in MIRRORS:
+            left = deadline - time.time()
+            if left <= 2:
+                errors.append(f"总时间超限 ({BTF_DEADLINE}s)")
+                break
+            source = template.format(url=url)
+            try:
+                request = urllib.request.Request(source, headers={"User-Agent": UA})
+                with urllib.request.urlopen(request, timeout=_budget_for(template, left, BTF_SOURCE_TIMEOUT)) as resp:
+                    status = getattr(resp, "status", 200)
+                    if status is not None and status != 200:
+                        errors.append(f"{source} HTTP {status}")
+                        continue
+                    size = 0
+                    with open(tmp, "wb") as fh:
+                        while True:
+                            # 与内核那条一样: 只有墙钟管得住"一直有数据但极慢"的连接
+                            if time.time() > deadline:
+                                raise TimeoutError(f"总时间超限 ({BTF_DEADLINE}s)")
+                            chunk = resp.read(1 << 17)
+                            if not chunk:
+                                break
+                            fh.write(chunk)
+                            size += len(chunk)
+                if size < BTF_MIN_BYTES:
                     errors.append(f"{source} 体积异常 ({size} 字节)")
                     continue
                 os.replace(tmp, dst)

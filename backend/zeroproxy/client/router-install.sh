@@ -49,6 +49,8 @@ ACTIVE_MODE=""
 #: 而 TUN 建不出来、tproxy 回退也没有 nft 规则 (README 8.76)。
 FW_RELEASE=""
 FW_GEN=""
+#: 固件自己的目标名 (DISTRIB_ARCH): BTF 包是按它挑的, 比 uname -m 细一档
+FW_ARCH=""
 PKG_MGR=""
 PKG_MGR_NOTE=""
 #: 内核模块没装上的原因。pkg_install 把命令**第一行原话**记进 DEPS_WHY, 调用方攒进
@@ -426,8 +428,15 @@ detect_env() {
     # 注意 `|| true`: 在 `set -e` 下, 带命令替换的赋值会继承子命令的退出码 ——
     # sed 读不到文件 (测试机/非标准环境) 会把整个脚本静默干掉, 一行输出都没有。
     FW_RELEASE="$(sed -n "s/^DISTRIB_RELEASE=['\"]\(.*\)['\"].*/\1/p" /etc/openwrt_release 2>/dev/null || true)"
+    # 固件自己的目标名 (aarch64_cortex-a53 / mipsel_24kc …)。**BTF 包按这个挑** ——
+    # 它比 uname -m 细一档, 而社区的包正是按它来命名的 (与 dae 那边同一个理由:
+    # apk 的 --print-arch 只给到 CPU 家族, 会把子目标丢掉)。
+    FW_ARCH="$(sed -n "s/^DISTRIB_ARCH=['\"]\(.*\)['\"].*/\1/p" /etc/openwrt_release 2>/dev/null || true)"
     if [ -n "$FW_RELEASE" ]; then OS_NAME="OpenWrt $FW_RELEASE"; else OS_NAME="OpenWrt"; fi
-    KERNEL="$(uname -r)"
+    #: 内核版本。默认就是 uname -r; ZP_KERNEL 只在"演练 / 特殊环境"里覆盖 —— 本机演练
+    #: 跑在 macOS 上时 uname -r 是个与 OpenWrt 毫无关系的版本号, 而 BTF 那一档是按**内核
+    #: 系列**挑包的 (6.6 / 6.12), 没有这个旋钮那一节就没法验。
+    KERNEL="${ZP_KERNEL:-$(uname -r)}"
     detect_pkgmgr
 }
 
@@ -750,7 +759,7 @@ err_line() { printf '%s' "$1" | head -n1 | tr -d '\r' | cut -c1-120; }
 
 # 内核主次版本是否 >= 给定值 (dae 那一级要看内核, 5.17 是它绑定 LAN 的下限)。
 kernel_ge() {
-    _k="$(uname -r 2>/dev/null || true)"
+    _k="${KERNEL:-$(uname -r 2>/dev/null || true)}"
     _maj="$(printf '%s' "$_k" | sed -n 's/^\([0-9][0-9]*\)\..*/\1/p')"
     _min="$(printf '%s' "$_k" | sed -n 's/^[0-9][0-9]*\.\([0-9][0-9]*\).*/\1/p')"
     [ -n "$_maj" ] || return 1
@@ -888,22 +897,188 @@ redirect_ok() {
     return 1
 }
 
-# eBPF (dae) 能不能用 —— 本版本**只探不选**。
-# 它的性能收益是量级的 (直连流量真旁路, 不过用户态), 但前提苛刻 (内核 >=5.17 + BTF) 且
-# 多一个二进制要面板分发, 所以先把结论记进 caps, 让面板知道这台机器有没有性能模式的底子。
-# 这一级不做任何实际改动 (只读内核版本与 BTF 节点), 所以探测本身没有副作用。
-ebpf_ok() {
-    PROBE_WHY=""
+# ---------------------------------------------------------------- 内核 BTF (CO-RE 类型信息)
+# 不带 CONFIG_DEBUG_INFO_BTF 编译的固件没有 /sys/kernel/btf/vmlinux, 于是 CO-RE eBPF
+# (dae / daed 那一类, 也是"性能档"的候选) 加载不起来 —— 真机 (GL-MT3600BE · 25.12.5)
+# 上探测到的正是这个。
+#
+# **这件事在固件上能补, 不必重刷**: 社区 (kenzok8/vmlinux-btf) 拿同一份内核源码再编一个
+# 带 BTF 的影子内核, 用 pahole 导出 detached BTF, 装到
+# /usr/lib/debug/boot/vmlinux-<内核版本> —— cilium/ebpf 与 libbpf 在 sysfs 里找不到 BTF
+# 时**正好会回退到这个路径** (下面 BTF_CANDIDATES 的顺序就是它们那份候选表), 所以补上它
+# 之后 eBPF 那一档就真的可用了。包名里带内核版本, BTF 在**同一 minor 系列内兼容**
+# (6.12.x 的包装在别的 6.12.y 上 —— 包的 postinst 会按 uname -r 自己建软链), 所以这里
+# 只要把 uname -r 告诉面板, 由它挑包。
+#
+# 补的动作有三条路, 顺序即优先级:
+#   1. 本机软件源 (有些固件/feed 里就有这个包) —— 一条命令, 最省事;
+#   2. 面板 (/c/btf): 与内核二进制 / 分流数据库完全同一个协议 —— 面板去取, 路由器只访问
+#      面板一个地址 (装机时这台路由器还没有任何代理可用, 让它自己去 GitHub 是 2.9.2 的教训);
+#   3. 补不上就如实说清楚: 是"这个内核系列没有现成件"还是"这次没取到", 以及**它到底
+#      影响什么** (只影响性能档; 当前的 TUN / tproxy 数据面一个字节都不受影响)。
+#
+# 只在"这一档本来就可能有戏"时才动手 —— 内核低于 5.17 (dae 绑定 LAN 的下限) 或内核系列
+# 不在社区包覆盖范围内时, 装了也没用, 那就别去占人家的闪存。
+BTF_PATH=""
+BTF_HOW=""
+BTF_WHY=""
+
+# 候选路径: 与 libbpf / cilium/ebpf 的查找顺序一致 (findVMLinux)。
+# 顺序有意义: sysfs 里那份是内核自带的, 排第一; 后面的都是"补进来的"。
+btf_candidates() {
+    printf '%s\n' \
+        "/sys/kernel/btf/vmlinux" \
+        "/boot/vmlinux-$KERNEL" \
+        "/lib/modules/$KERNEL/vmlinux-$KERNEL" \
+        "/lib/modules/$KERNEL/build/vmlinux" \
+        "/usr/lib/modules/$KERNEL/kernel/vmlinux" \
+        "/usr/lib/debug/boot/vmlinux-$KERNEL" \
+        "/usr/lib/debug/boot/vmlinux-$KERNEL.debug" \
+        "/usr/lib/debug/lib/modules/$KERNEL/vmlinux"
+}
+
+# 按上面那个顺序找第一个**可读**的 BTF。找不到就什么都不输出。
+btf_find() {
+    for _b in $(btf_candidates); do
+        [ -r "$_b" ] && { printf '%s' "$_b"; return 0; }
+    done
+    return 1
+}
+
+# 这个文件像不像一份 BTF? 只用来**验证我们刚装上去的那一份**, 不用来否定内核自带的。
+# 判据是"够大 + 不是一页 HTML/文本" —— 真实的 vmlinux BTF 是几 MB 的二进制, 而失败的
+# 下载往往是几十 KB 的网页或错误页 (面板/反代很爱回这种东西)。
+# 下限可用 ZP_BTF_MIN_BYTES 调低: 演练里的假包只有几百字节 (与 ZP_CORE_MIN_BYTES 同一个
+# 用法 —— 真机上的判据不该被演练的方便改掉)。
+btf_plausible() {
+    [ -s "$1" ] || return 1
+    _bs="$(wc -c < "$1" 2>/dev/null | tr -d ' ' || true)"
+    [ "${_bs:-0}" -ge "${ZP_BTF_MIN_BYTES:-65536}" ] 2>/dev/null || return 1
+    if head -c 8 "$1" 2>/dev/null | grep -qi '<!doc\|<html'; then return 1; fi
+    return 0
+}
+
+# 这一档值不值得补: 内核 >=5.17 (dae 绑定 LAN 的下限) + 内核系列在社区包的覆盖范围内
+# (6.6 / 6.12) + 闪存放得下 (几 MB)。不满足时把理由记进 BTF_WHY —— 结论照实说。
+btf_worth_fixing() {
     if ! kernel_ge 5 17; then
-        PROBE_WHY="内核 $(uname -r 2>/dev/null) 低于 5.17"
+        BTF_WHY="内核 $KERNEL 低于 5.17 —— 这一档本来就用不上"
         return 1
     fi
-    if [ ! -r /sys/kernel/btf/vmlinux ]; then
-        PROBE_WHY="内核没有 BTF (/sys/kernel/btf/vmlinux 不存在)"
+    _series="$(printf '%s' "$KERNEL" | sed -n 's/^\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p')"
+    case "$_series" in
+        6.6|6.12) ;;
+        *)
+            BTF_WHY="社区 BTF 包只覆盖 6.6 / 6.12 两个内核系列 (这台是 ${_series:-未知})"
+            return 1 ;;
+    esac
+    _bfree="$(df -k /overlay 2>/dev/null | awk 'NR==2{print $4}' || true)"
+    [ -n "$_bfree" ] || _bfree="$(df -k / 2>/dev/null | awk 'NR==2{print $4}' || true)"
+    # 上游那份包是 1.2~1.7 MB (压缩), 解开后是几 MB 的 BTF; 再留一倍余量。
+    if [ -n "$_bfree" ] && [ "$_bfree" -lt 12288 ] 2>/dev/null; then
+        BTF_WHY="可用空间不足 ($((_bfree / 1024)) MB) —— 这个包连下载带解开要几 MB"
         return 1
     fi
     return 0
 }
+
+# 从面板取匹配的 BTF 包并装上。返回值: 0 = 现在真的有了。
+btf_from_panel() {
+    _ext=ipk
+    [ "$PKG_MGR" = "apk" ] && _ext=apk
+    [ "$PKG_MGR" = "none" ] && { BTF_WHY="本机没有包管理器, 装不了 BTF 包"; return 1; }
+    _tmp="$ZP_DIR/btf.pkg"
+    _err=""
+    #: 只有"面板明确给了 200 **而且**文件像那么回事"才算拿到。
+    #: 为什么两个都要: 体积闸门单独做判据时, 一份 502 的错误正文 (几百字节) 也可能过闸 ——
+    #: 8.75 那次真机就是栽在"闸门比的是错误正文的大小"上。这里状态码在前、体积在后,
+    #: 于是"面板说没有"永远不会被当成"拿到了一个包"。
+    _got=0
+    for _a in $(btf_arch_list); do
+        _url="$ZP_BASE/c/btf?kver=$KERNEL&arch=$_a&fmt=$_ext"
+        progress_note "面板正在准备内核 BTF 包 (内核 $KERNEL · $_a)…"
+        # 面板那一侧有硬上限 (ZP_BTF_DEADLINE, 默认 90 秒); 这里给足余量。
+        if http_fetch_to "$_url" "$_tmp" 180 0 && btf_plausible "$_tmp"; then
+            _got=1
+            break
+        fi
+        # 面板失败时正文的第一行就是写给人看的原因 (404/502 的 body) —— 直接拿它当原因。
+        # 不能用 show_body: 它是往 stderr 打的 (那是给人看的), 这里要的是字符串。
+        _body="$(sed -n '1p' "$_tmp" 2>/dev/null | tr -d '\r' | cut -c1-160 || true)"
+        _err="${_body:-面板没有这一档的包 (HTTP ${HTTP_CODE:-?})}"
+    done
+    if [ "$_got" != "1" ]; then
+        BTF_WHY="${_err:-面板没有这一档的包}"
+        rm -f "$_tmp"
+        return 1
+    fi
+    # 本地包一律没有签名 (自建件), apk 必须显式放行 —— 与上一轮 kmod 那条同一个道理。
+    if [ "$PKG_MGR" = "apk" ]; then
+        apk add --allow-untrusted "$_tmp" >/dev/null 2>&1 || true
+    else
+        opkg install "$_tmp" >/dev/null 2>&1 || true
+    fi
+    rm -f "$_tmp"
+    if BTF_PATH="$(btf_find)"; then
+        BTF_HOW=panel
+        return 0
+    fi
+    BTF_WHY="面板给的包装上了, 但 $KERNEL 还是没有 BTF (包与内核不匹配?)"
+    return 1
+}
+
+# 架构候选: OpenWrt 的目标名 (aarch64_cortex-a53 这种), 细分的没有就退通用档。
+btf_arch_list() {
+    [ -n "$FW_ARCH" ] || return 0
+    printf '%s\n' "$FW_ARCH"
+    case "$FW_ARCH" in
+        aarch64_*) [ "$FW_ARCH" = "aarch64_generic" ] || printf '%s\n' aarch64_generic ;;
+    esac
+}
+
+# 缺 BTF 时**自动补**。补上就把结论写进 BTF_PATH / BTF_HOW, 补不上写 BTF_WHY。
+btf_ensure() {
+    BTF_PATH=""
+    BTF_HOW=""
+    BTF_WHY=""
+    if BTF_PATH="$(btf_find)"; then
+        # 内核自带的 (sysfs) 与"以前补进来的"都算就绪 —— 后者用 detached 路径
+        case "$BTF_PATH" in
+            /sys/kernel/btf/vmlinux) BTF_HOW=kernel ;;
+            *)                       BTF_HOW=detached ;;
+        esac
+        return 0
+    fi
+    [ "${ZP_BTF:-1}" = "0" ] && { BTF_WHY="已按 ZP_BTF=0 跳过自动补齐"; return 1; }
+    btf_worth_fixing || return 1
+
+    # 1) 本机软件源里就有这个包
+    if pkg_install vmlinux-btf; then
+        if BTF_PATH="$(btf_find)"; then BTF_HOW=feed; return 0; fi
+    fi
+    # 2) 面板分发 (与内核 / 分流数据库同一条协议)
+    if btf_from_panel; then return 0; fi
+    return 1
+}
+
+# eBPF (dae) 能不能用 —— 本版本**只探不选**。
+# 它的性能收益是量级的 (直连流量真旁路, 不过用户态), 但前提苛刻 (内核 >=5.17 + BTF) 且
+# 多一个二进制要面板分发, 所以先把结论记进 caps, 让面板知道这台机器有没有性能模式的底子。
+# 这一级不做任何实际改动 (只读内核版本与 BTF), 所以探测本身没有副作用。
+ebpf_ok() {
+    PROBE_WHY=""
+    if ! kernel_ge 5 17; then
+        PROBE_WHY="内核 $KERNEL 低于 5.17"
+        return 1
+    fi
+    if ! btf_ok; then
+        PROBE_WHY="内核没有 BTF (${BTF_WHY:-/sys/kernel/btf/vmlinux 不存在, 也没有补进来})"
+        return 1
+    fi
+    return 0
+}
+
+btf_ok() { [ -n "$(btf_find)" ]; }
 
 # 内核能不能按 IPv6 目标做 tproxy (nft 的 inet 表天然同时看 v4/v6, 但"支持 v6 的 tproxy"
 # 是内核里的另一件事 —— 老内核上有过只编了 v4 的情况)。探针同样用完就撤。
@@ -985,7 +1160,15 @@ offload_state() {
 # 默认**不带**它 (为了省体积), 所以绝大多数路由器上这一档永远是"看得见、吃不着"。
 ebpf_detail() {
     if [ "$NET_EBPF" = "1" ]; then
-        printf '内核 %s + BTF 都在 —— 这一档技术上可用' "$(uname -r 2>/dev/null)"
+        case "${BTF_HOW:-}" in
+            kernel)   printf '内核 %s + BTF 都在 —— 这一档技术上可用' "$KERNEL" ;;
+            detached) printf '内核 %s + BTF 就绪 (detached: %s)' "$KERNEL" "${BTF_PATH:-?}" ;;
+            feed|panel) printf '内核 %s + BTF 已自动补上 (%s: %s)' \
+                            "$KERNEL" \
+                            "$( [ "$BTF_HOW" = "feed" ] && printf '软件源' || printf '面板分发' )" \
+                            "${BTF_PATH:-?}" ;;
+            *)        printf '内核 %s + BTF 就绪' "$KERNEL" ;;
+        esac
     else
         printf '%s' "${CAPS_WHY_EBPF:-内核条件不满足}"
     fi
@@ -1039,6 +1222,12 @@ caps_write() {
         printf 'fwgen=%s\n' "$(_oneline "$FW_GEN")"
         printf 'pkgmgr=%s\n' "$PKG_MGR"
         printf 'deps_why=%s\n' "$(_oneline "$DEPS_FAILED")"
+        # BTF: 内核类型信息 (eBPF 性能档的前提)。how = kernel(自带) / detached(以前补的) /
+        # feed(软件源补的) / panel(面板分发的) —— 面板与 doctor 都读这三个值。
+        printf 'btf=%s\n' "$NET_EBPF"
+        printf 'btf_how=%s\n' "$BTF_HOW"
+        printf 'btf_path=%s\n' "$(_oneline "$BTF_PATH")"
+        printf 'why.btf=%s\n' "$(_oneline "$BTF_WHY")"
         printf 'tun=%s\n' "$NET_TUN"
         printf 'nft=%s\n' "$NET_NFT"
         printf 'tproxy=%s\n' "$NET_TPROXY"
@@ -1145,6 +1334,9 @@ install_deps() {
         fi
     fi
     if redirect_ok; then NET_REDIRECT=1; else CAPS_WHY_REDIRECT="$PROBE_WHY"; fi
+    # eBPF 那一档的前提是"内核 BTF (CO-RE 类型信息)" —— 缺了就**自动补** (社区有现成包,
+    # 见 btf_ensure 顶部): 先问本机软件源, 再问面板, 两个都拿不到就把原因说清楚。
+    btf_ensure || true
     if ebpf_ok; then NET_EBPF=1; else CAPS_WHY_EBPF="$PROBE_WHY"; fi
 
     # WAN 的 MTU 与转发卸载 (性能那一半: 大包别死在路上 / 别让卸载把代理绕过去)。
@@ -1196,9 +1388,12 @@ install_deps() {
             ;;
     esac
     if [ "$NET_EBPF" = "1" ]; then
-        note "eBPF 数据面可用: $(ebpf_detail) —— 性能模式留给后续版本 (见设计文档 Phase 3)"
+        note "eBPF 性能档前提就绪: $(ebpf_detail)"
+        note "  数据面仍是 ${DATAPATH:-当前这一档}; eBPF 那一档 (直连旁路) 留给后续版本 (设计文档 Phase 3)"
     else
-        note "eBPF 数据面不可用: $(ebpf_detail)"
+        note "eBPF 性能档不可用: $(ebpf_detail)"
+        # 把影响面说清楚: 这句话长得像"装坏了", 而它其实只关系到未来的性能模式。
+        note "  这一档只影响未来的「直连旁路」性能模式 —— 当前的 ${DATAPATH:-数据面} 不受影响"
     fi
     if [ -n "$WAN_MTU" ] && [ "$TUN_MTU" != "1500" ]; then
         note "WAN 的 MTU 是 $WAN_MTU (PPPoE?), tun 按 $TUN_MTU 收包 —— 免得封装之后成超包"
@@ -2991,9 +3186,24 @@ doctor() {
     fi
     _ebpf="$(sed -n 's/^ebpf=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
     if [ "$_ebpf" = "1" ]; then
-        printf '  · eBPF 挡位可用（内核 + BTF 都在）—— 性能模式尚未实现\n'
+        _bhow="$(sed -n 's/^btf_how=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+        _bpath="$(sed -n 's/^btf_path=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+        case "$_bhow" in
+            feed|panel) printf '  ✓ eBPF 挡位的前提就绪（内核 BTF 已自动补上: %s）—— 性能模式尚未实现\n' "$_bpath" ;;
+            detached)   printf '  ✓ eBPF 挡位的前提就绪（detached BTF: %s）—— 性能模式尚未实现\n' "$_bpath" ;;
+            *)          printf '  · eBPF 挡位可用（内核自带 BTF）—— 性能模式尚未实现\n' ;;
+        esac
     else
         printf '  · eBPF 挡位不可用: %s\n' "$(sed -n 's/^why.ebpf=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+        # 缺的是 BTF 时给一条能照着做的下一步 (手动把包放进面板是最稳的那条)
+        _bwhy="$(sed -n 's/^why.btf=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+        case "$_bwhy" in
+            "") ;;
+            *没有包管理器*) ;;
+            *)
+                printf '      补 BTF: 装机时脚本会自动补 (先问本机软件源, 再问面板)。这次没成: %s\n' "$_bwhy"
+                printf '      %s\n' "手动: 把匹配的 vmlinux-btf 包放进面板的 data/client/btf/ 后重跑安装命令" ;;
+        esac
     fi
     printf '    想测这台机器自己能跑多快: zeroproxy bench\n'
 
@@ -3158,12 +3368,21 @@ case "${1:-status}" in
             echo "模式:  未生效 (只有本机代理端口可用)"
         fi
         if [ -f "$ZP_DIR/caps" ]; then
-            printf '能力:  tun=%s nft=%s tproxy=%s redirect=%s ebpf=%s (装机时探测)\n' \
+            printf '能力:  tun=%s nft=%s tproxy=%s redirect=%s ebpf=%s btf=%s (装机时探测)\n' \
                 "$(sed -n 's/^tun=//p' "$ZP_DIR/caps" | head -n1)" \
                 "$(sed -n 's/^nft=//p' "$ZP_DIR/caps" | head -n1)" \
                 "$(sed -n 's/^tproxy=//p' "$ZP_DIR/caps" | head -n1)" \
                 "$(sed -n 's/^redirect=//p' "$ZP_DIR/caps" | head -n1)" \
-                "$(sed -n 's/^ebpf=//p' "$ZP_DIR/caps" | head -n1)"
+                "$(sed -n 's/^ebpf=//p' "$ZP_DIR/caps" | head -n1)" \
+                "$(sed -n 's/^btf=//p' "$ZP_DIR/caps" | head -n1)"
+            # 内核 BTF 是装机时**自动补**的 (25.12 那台真机就是缺这个) —— 补过就写清来源
+            _bhow="$(sed -n 's/^btf_how=//p' "$ZP_DIR/caps" | head -n1)"
+            case "$_bhow" in
+                feed|panel)
+                    printf '性能档: 内核 BTF 已自动补上 (%s: %s)\n' \
+                        "$( [ "$_bhow" = "feed" ] && printf '本机软件源' || printf '面板分发' )" \
+                        "$(sed -n 's/^btf_path=//p' "$ZP_DIR/caps" | head -n1)" ;;
+            esac
             _chosen="$(sed -n 's/^chosen=//p' "$ZP_DIR/caps" | head -n1)"
             _covered="$(sed -n 's/^covered=//p' "$ZP_DIR/caps" | head -n1)"
             [ -n "$_chosen" ] && printf '选择:  %s (覆盖 %s)\n' "$_chosen" "${_covered:-?}"
@@ -4170,6 +4389,15 @@ finish() {
     esac
     printf '  设备名   %s\n' "$MODEL"
     printf '  固件     %s · 包管理器 %s\n' "$OS_NAME" "${PKG_MGR:-未知}"
+    # BTF 是这次装机**自动补上**的时候要专门说一句 (用户没做任何事, 但机器上多装了几 MB):
+    # 不补上就写清"还是不能用, 为什么", 以及它只关系到未来的性能档。
+    if [ "$BTF_HOW" = "feed" ] || [ "$BTF_HOW" = "panel" ]; then
+        printf '  性能档   已自动补上内核 BTF (%s: %s)\n' \
+            "$( [ "$BTF_HOW" = "feed" ] && printf '本机软件源' || printf '面板分发' )" "$BTF_PATH"
+    elif [ "${NET_EBPF:-0}" != "1" ]; then
+        printf '  性能档   eBPF 那一档还不能用: %s\n' "${CAPS_WHY_EBPF:-内核条件不满足}"
+        printf '           %s\n' "(只影响未来的直连旁路性能模式; 当前数据面一个字节都不受影响)"
+    fi
     case "${ACTIVE_MODE:-none}" in
         tun)      printf '  模式     TUN 全屋透明代理 (含路由器自身)\n' ;;
         tproxy)   printf '  模式     tproxy 全屋透明代理 (本机自身流量除外)\n' ;;

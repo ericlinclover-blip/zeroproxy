@@ -2921,6 +2921,46 @@ def client_install_script_pinned(request: Request):
     )
 
 
+@router.get("/c/btf")
+def client_btf_package(request: Request, kver: str = "", arch: str = "", fmt: str = "apk"):
+    """内核 BTF 包 (CO-RE 类型信息)。匿名可达 —— 与 /c/bin 同性质, 不含任何凭据。
+
+    为什么由面板发: 不带 CONFIG_DEBUG_INFO_BTF 编译的固件没有 /sys/kernel/btf/vmlinux,
+    于是 CO-RE eBPF (dae / daed 那一类, 也是"性能档"的候选) 加载不起来; 补它的办法是
+    装一个**匹配内核**的 detached BTF 包, 而那个包在 GitHub 上 —— 装机时这台路由器还
+    没有任何代理可用。与内核二进制 / 分流数据库同一条思路: 面板去取、缓存好, 路由器
+    只访问面板一个地址。
+
+    参数: `kver` = uname -r (只要 major.minor 对得上), `arch` = DISTRIB_ARCH
+    (`aarch64_cortex-a53` 这类目标名), `fmt` = `apk|ipk` (按本机包管理器来)。
+
+    **注册顺序有讲究**: 它只有一个路径段, 必须排在 `/c/{code}` 前面 —— 否则会被那条
+    "配对码" 路由吃掉 (表现是 404 "配对码无效或已过期", 与 /c/install.sh 同一个坑)。
+
+    **有硬上限**: 取不到就回一句人话 —— 404 = 这一档上游本来就没有 (永久), 502 = 这次
+    没取到 (可以再试)。不让路由器挂在这里等, 是 8.41 那次真机事故定下来的规矩。
+    """
+    state = load_state()
+    if not state["configured"]:
+        return _err("面板尚未初始化", 409)
+    ok, detail, path = router_client.btf_fetch(kver, arch, fmt)
+    if not ok:
+        permanent = detail.startswith(("这台内核是", "上游没有", "不认识的包格式", "没给出"))
+        text = router_client.btf_pending_text(kver, arch, fmt, detail)
+        return Response(
+            text + "\n",
+            status_code=404 if permanent else 502,
+            media_type="text/plain; charset=utf-8",
+            headers={"cache-control": "no-store"},
+        )
+    return FileResponse(
+        path,
+        media_type="application/octet-stream",
+        headers={"cache-control": "no-store"},
+        filename=os.path.basename(path),
+    )
+
+
 @router.get("/c/{code}")
 def client_install_script(code: str, request: Request):
     """安装脚本本体 (`wget -qO- <面板>/c/<配对码> | sh` 拉的就是它)。"""

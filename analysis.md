@@ -1,6 +1,6 @@
 # ZeroProxy 架构现状
 
-> 快照: **2026-10-09** · 面板 **v2.11.25** · 路由器客户端 **v1.4.24** · `state.json` schema **v5**
+> 快照: **2026-10-10** · 面板 **v2.11.26** · 路由器客户端 **v1.4.25** · `state.json` schema **v5**
 > 本文回答"**现在是什么样**"。另外两份文档分工不同, 不要混读:
 > `README.md` 是逐版开发日志 (4000+ 行, 每一版为什么这么改、哪次真机踩的坑);
 > `docs/RESEARCH.md` 与 `docs/ROUTER-CLIENT-REDESIGN.md` 是竞品调研与设计依据。
@@ -267,7 +267,8 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
 设备侧接口 (`/c/*`): `GET /c/{code}` 安装脚本 · `POST /c/pair` 配对码换凭据 ·
 `GET /c/bin/{arch}` 内核 · `GET /c/agent/bin/{arch}` zpcore 制品 · `GET /c/sub/{id}?k=…` 该设备的配置 ·
 `POST /c/report` 心跳 · `GET /c/core/status` · `GET /c/geo/{name}` 分流数据库 · `GET /c/ui/{name}` 本地界面资源 ·
-`GET /c/bench/{mb}` 内建基准。
+`GET /c/bench/{mb}` 内建基准 · `GET /c/btf?kver=&arch=&fmt=` 内核 BTF 包 (按内核 minor 系列 +
+架构挑, 缓存后分发; 上游 `kenzok8/vmlinux-btf`, 也可手工放进 `data/client/btf/`)。
 
 ---
 
@@ -299,6 +300,14 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
   **快照逐条比对**, 给出「一致 / 还有残留 + 差在哪一项」的结论。`zeroproxy doctor` 用带 `counter` 的规则
   回答「规则存在 ≠ 有流量经过」。
 * **IPv6 一并接管**: 设备装机时探一次这一档数据面能否覆盖 v6, 能就给双栈配置, 接不了如实上报。
+* **内核 BTF 自动补齐**: 不带 `CONFIG_DEBUG_INFO_BTF` 的固件没有 `/sys/kernel/btf/vmlinux`,
+  CO-RE eBPF (dae 那一类, 也是"性能档"的候选) 就用不了。检测到缺失时自动补: 先问本机软件源
+  (`vmlinux-btf`), 再问面板 (`/c/btf` —— 面板按 minor 系列 + 架构挑包、缓存、发下来, 与内核
+  二进制同一套分发), 装上后用 **cilium/ebpf 与 libbpf 的候选路径表**验证真的就位, 结论
+  (`btf` / `btf_how` / `btf_path` / `why.btf`) 落进 `caps`, `status` 与 `doctor` 读同一份。
+  只在"有戏"时动手 (内核 ≥5.17 且系列在 6.6 / 6.12 内), 补不上就说清原因与影响面 (只影响
+  性能档, 不影响当前数据面)。上游是 `kenzok8/vmlinux-btf` 的 release, 也可手工放进
+  `data/client/btf/`。
 
 ---
 
@@ -365,9 +374,9 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
 
 | 脚本 | 覆盖 |
 |---|---|
-| `backend/tests/` (pytest) | **297 通过 + 6 skip** (无真实内核二进制时跳过)。dry-run 全流程 + 安全边界 + 状态迁移 |
+| `backend/tests/` (pytest) | **303 通过 + 6 skip** (无真实内核二进制时跳过)。dry-run 全流程 + 安全边界 + 状态迁移 |
 | `scripts/verify.py` | 用真实 Xray/Hysteria/mihomo/sing-box 校验生成的配置与订阅 (含**两台机器真跑一条链**) |
-| `scripts/router_install_check.py` | **125 项**。真的用 shell 跑一遍路由器安装脚本: 五类机器 (含 OpenWrt 25.12 / apk 三态) / 本机覆盖 / revert 比对 / zpcore 真跑 |
+| `scripts/router_install_check.py` | **135 项**。真的用 shell 跑一遍路由器安装脚本: 六类机器 (含 OpenWrt 25.12 / apk 三态 / 缺 BTF 与自带 BTF 两种机器) / 本机覆盖 / revert 比对 / zpcore 真跑 |
 | `scripts/browser_check.cjs` | **157 项**, 真 Chromium 走「初始化 → 仪表盘」全流程 + 交互 + CSP + 截图 |
 | `scripts/clients_check.cjs` | 真实浏览器点客户端开关 |
 | `scripts/router_ui_check.cjs` | 路由器本地界面 (含「没有更新记录时不许凭空长出进度面板」这类判据) |

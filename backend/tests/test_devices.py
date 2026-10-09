@@ -331,6 +331,116 @@ def test_a_slow_mirror_is_dropped_for_the_next_one(configured, monkeypatch):
     assert elapsed < 20, f"没有及时放弃慢镜像 ({elapsed:.1f}s)"
 
 
+#: 上游真实的资产名 (kenzok8/vmlinux-btf, tag: latest) —— 拿它当基准, 免得断言与上游脱节
+BTF_ASSETS = [
+    "SHA256SUMS",
+    "vmlinux-btf-6.12.103-r1-aarch64_cortex-a53.apk",
+    "vmlinux-btf-6.12.103-r1-aarch64_cortex-a72.apk",
+    "vmlinux-btf-6.12.103-r1-aarch64_generic.apk",
+    "vmlinux-btf-6.12.103-r1-x86_64.apk",
+    "vmlinux-btf_6.6.151-r1_aarch64_cortex-a53.ipk",
+    "vmlinux-btf_6.6.151-r1_aarch64_generic.ipk",
+    "vmlinux-btf_6.6.151-r1_x86_64.ipk",
+]
+
+
+def _btf_assets() -> list[dict]:
+    from zeroproxy import router_client
+
+    return [{"name": n, "url": router_client.btf_asset_url(n), "size": 3 << 20} for n in BTF_ASSETS]
+
+
+def test_btf_pick_matches_the_minor_series_and_prefers_the_exact_arch():
+    """BTF 只要求"同一个内核 minor 系列 + 架构"; 精确架构优先, aarch64 通用档兜底。
+
+    真机 (GL-MT3600BE · 25.12.5 · 内核 6.12.94) 缺 BTF —— 上游那份包是 6.12.103 的,
+    而 BTF 在同一 minor 系列内兼容 (包的 postinst 自己按 uname -r 建软链), 所以这台机器
+    正好能补上。这一条钉的就是"怎么挑包"。
+    """
+    from zeroproxy import router_client as rc
+
+    assets = _btf_assets()
+    names = [p["name"] for p in rc.btf_pick(assets, rc.btf_minor("6.12.94"), "aarch64_cortex-a53", "apk")]
+    assert names and names[0].endswith("aarch64_cortex-a53.apk"), names
+    assert any(n.endswith("aarch64_generic.apk") for n in names), "细分目标没有包时要退通用档"
+    # 6.12 没有 ipk、armv7 根本不在上游的发布矩阵里 —— 对不上就是没有, 别硬套
+    assert rc.btf_pick(assets, "6.12", "aarch64_cortex-a53", "ipk") == []
+    assert rc.btf_pick(assets, "6.12", "armv7", "apk") == []
+    assert rc.btf_minor("6.12.94") == "6.12"
+
+
+def test_btf_fetch_says_why_it_cannot_help(client, configured):
+    """补不了的时候要说清**哪一种**补不了 —— 系列没有包 / 没给够信息, 完全两回事。"""
+    from zeroproxy import router_client
+
+    ok, detail, path = router_client.btf_fetch("5.4.281", "aarch64_cortex-a53", "apk")
+    assert not ok and path == ""
+    assert "6.6" in detail and "6.12" in detail, detail
+    assert not router_client.btf_fetch("", "aarch64_cortex-a53", "apk")[0]
+    assert not router_client.btf_fetch("6.12.94", "", "apk")[0]
+    assert not router_client.btf_fetch("6.12.94", "aarch64_cortex-a53", "deb")[0]
+
+
+def test_btf_package_endpoint_serves_a_cached_package(client, configured, monkeypatch):
+    """缓存里有匹配的包时直接发给路由器 (运营方手工放进 data/client/btf/ 也走这条路)。"""
+    from zeroproxy import router_client
+
+    monkeypatch.setattr(router_client, "BTF_MIN_BYTES", 16)
+    name = "vmlinux-btf-6.12.103-r1-aarch64_cortex-a53.apk"
+    path = os.path.join(router_client.btf_dir(), name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(b"btf" * 64)
+    res = client.get("/c/btf?kver=6.12.94&arch=aarch64_cortex-a53&fmt=apk")
+    assert res.status_code == 200, res.text
+    assert res.content == b"btf" * 64
+    # 别的内核系列别想拿这份去糊弄 (6.6 的设备要 6.6 的包)
+    res66 = client.get("/c/btf?kver=6.6.141&arch=aarch64_cortex-a53&fmt=apk")
+    assert res66.status_code in (404, 502), res66.text
+
+
+def test_btf_endpoint_never_hangs_and_says_exactly_what_to_do(client, configured, monkeypatch):
+    """取不到时: 立刻回一句能读懂的话 + 手工兜底路径 + "它不影响什么"。
+
+    与内核那条是同一个规矩 (8.41): 不许把请求挂在同步取件上。BTF 包小, 所以面板给的
+    是**有硬上限**的一次尝试, 失败就说清楚 —— 而不是"一直转"。
+    """
+    from zeroproxy import router_client
+
+    monkeypatch.setattr(router_client, "btf_upstream_assets",
+                        lambda: (False, "上游资产清单取不到 (超时)", []))
+    res = client.get("/c/btf?kver=6.12.94&arch=aarch64_cortex-a53&fmt=apk")
+    assert res.status_code == 502, res.text
+    assert router_client.btf_dir() in res.text, "要告诉运营方包该放进哪个目录"
+    assert "不影响当前的 TUN / tproxy 数据面" in res.text, "别让用户以为装坏了"
+    # 清单拿到了、但这一档没有 (armv7 不在上游矩阵里) → 永久性的 404, 不是"再试试"
+    monkeypatch.setattr(router_client, "btf_upstream_assets", lambda: (True, "ok", _btf_assets()))
+    res = client.get("/c/btf?kver=6.12.94&arch=armv7&fmt=apk")
+    assert res.status_code == 404, res.text
+
+
+def test_btf_fetch_downloads_through_the_mirrors_then_caches(client, configured, monkeypatch):
+    """清单 → 镜像下载 → 落盘缓存; 第二次直接命中缓存 (不再问上游)。"""
+    from zeroproxy import router_client
+
+    body = b"B" * (8 << 10)
+    srv = _Static(body)
+    try:
+        monkeypatch.setattr(router_client, "BTF_MIN_BYTES", 1024)
+        monkeypatch.setattr(router_client, "MIRRORS", (srv.url,))
+        monkeypatch.setattr(router_client, "btf_upstream_assets", lambda: (True, "ok", _btf_assets()))
+        ok, detail, path = router_client.btf_fetch("6.12.94", "aarch64_cortex-a53", "apk")
+        assert ok and path.endswith("aarch64_cortex-a53.apk"), detail
+        assert open(path, "rb").read() == body
+        asked = []
+        monkeypatch.setattr(router_client, "btf_upstream_assets",
+                            lambda: (asked.append(1), (True, "ok", []))[1])
+        ok2, detail2, _ = router_client.btf_fetch("6.12.94", "aarch64_cortex-a53", "apk")
+        assert ok2 and detail2 == "已缓存" and not asked, "缓存命中不该再去问上游"
+    finally:
+        srv.close()
+
+
 def test_core_status_hands_the_router_a_usable_mirror_table(client, configured, monkeypatch):
     """状态接口要给路由器**可用的完整地址**, 而且第一个是运营方自建的镜像。
 
@@ -1821,6 +1931,43 @@ def test_install_script_picks_the_right_package_manager_per_firmware():
     assert "24.10" in text and "停止维护" in text
     # 装完之后的两个现场入口: status 报固件与包管理器, doctor 报"模块没装上 + 怎么补"
     assert "包管理器 %s" in code, "zeroproxy status 要报出固件与包管理器"
+
+
+def test_install_script_auto_fixes_missing_kernel_btf():
+    """真机 (GL-MT3600BE · 25.12.5 · 内核 6.12.94) 缺 BTF —— 检测到就**自动补**。
+
+    机制 (社区现成的解法): 装一份匹配内核的 detached BTF 到
+    /usr/lib/debug/boot/vmlinux-<内核版本>, 而 cilium/ebpf 与 libbpf 在 sysfs 里没有 BTF
+    时**正好会回退到那里** —— 所以候选路径与顺序必须与它们一致。补的动作两条路: 先问
+    本机软件源, 再问面板 (/c/btf, 与内核 / 分流数据库同一套分发)。补不上就如实说清是
+    哪一种原因, 以及它只影响未来的性能档。
+    """
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+    code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+
+    # 候选路径: 与 libbpf / cilium-ebpf 的 findVMLinux 一致 (sysfs 那份排第一, 补进来的在
+    # /usr/lib/debug/boot/ —— 社区的包就落在那里)
+    assert "/sys/kernel/btf/vmlinux" in code
+    assert "/usr/lib/debug/boot/vmlinux-$KERNEL" in code
+    assert "/boot/vmlinux-$KERNEL" in code
+    # 自动补: 本机软件源 → 面板; 本地包没有签名, apk 要显式放行
+    assert "vmlinux-btf" in code and "/c/btf?kver=" in code
+    assert "apk add --allow-untrusted" in code
+    # 只在"有戏"时才动手 (内核 >=5.17; 社区包只覆盖 6.6 / 6.12) —— 不然是白占闪存
+    assert "btf_worth_fixing" in code
+    assert "6.6|6.12" in code.replace(" ", ""), "覆盖的内核系列要写进判据"
+    # 先补, 再判 eBPF (顺序反了就等于没补)
+    assert code.index("btf_ensure || true") < code.index("if ebpf_ok; then NET_EBPF=1")
+    # 结论落进 caps: 面板 / status / doctor 读的都是这一份
+    for key in ("btf=", "btf_how=", "btf_path=", "why.btf="):
+        assert f"printf '{key}" in code, f"caps 要记 {key}"
+    # 补不上时把影响面说清楚 —— 那句话长得像"装坏了"
+    assert "只影响未来的" in code and "性能档" in code
+    # 内核版本走 $KERNEL (可被 ZP_KERNEL 覆盖): 演练跑在 macOS 上时 uname -r 与 OpenWrt
+    # 毫无关系, 而 BTF 是按内核系列挑包的
+    assert 'KERNEL="${ZP_KERNEL:-$(uname -r)}"' in code
 
 
 @pytest.mark.parametrize("name", ["index.html", "app.js", "cgi", "menu.json", "acl.json", "status.js"])

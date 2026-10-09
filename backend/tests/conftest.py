@@ -38,6 +38,9 @@ os.environ.setdefault("ZP_CORE_MIRRORS", "http://127.0.0.1:9/{url}")
 # 分流数据库的镜像表同理: 面板那条路没走通时, 客户端会去够镜像 —— 而这里说的是
 # "测试一个包都不许出网"。死地址让它立刻失败 (见 router_client._geo_mirror_list)。
 os.environ.setdefault("ZP_GEO_MIRRORS", "http://127.0.0.1:9/{url}")
+# 内核 BTF 包的上游资产清单 (api.github.com) 同理: 测试一个包都不许出网。需要走
+# "清单 → 镜像下载"那条路的用例自己 monkeypatch btf_upstream_assets。
+os.environ.setdefault("ZP_BTF_API", "http://127.0.0.1:9")
 
 # 改配置默认走后台任务 (v2.6.9): 接口立刻回执 + 前端轮询 /api/apply/job。
 # 测试里必须同步执行 —— 后台线程活过用例就会踩到下一个用例的 $ZP_HOME

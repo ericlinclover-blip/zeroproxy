@@ -96,6 +96,11 @@ def patch_for_local_run(script: str, root: str) -> str:
     # 25.12 / apk 那一节就是在这上面做文章的 (见 [12])。放在上面那条 re.sub 之后:
     # 先让它按原样匹配掉 "没有 OpenWrt 就 die" 那句, 再改路径。
     out = out.replace("/etc/openwrt_release", os.path.join(root, "openwrt_release"))
+    # 内核 BTF 的两条路也要落到临时目录里, 否则 [13] 那一节没法验:
+    #   * /sys/kernel/btf/vmlinux —— 内核自带的那份 (真机上由固件决定);
+    #   * /usr/lib/debug/boot/vmlinux-<内核版本> —— 补进来的 detached BTF (社区的包装在这)。
+    out = out.replace("/sys/kernel/btf/vmlinux", os.path.join(root, "sys/kernel/btf/vmlinux"))
+    out = out.replace("/usr/lib/debug", os.path.join(root, "usr/lib/debug"))
     # 本机没有 procd / systemd, 自检那一步 (启动 mihomo + 等控制口) 必然失败 ——
     # 这里停在"文件已落盘", 服务编排由真机验证; 但配置生成与 agent 逻辑照跑。
     out = out.replace(
@@ -259,6 +264,10 @@ class Panel:
             "ZP_GEODATA_AUTO": "0",
             "ZP_APPLY_ASYNC": "0",
             "ZP_CORE_MIN_BYTES": "16",   # 假内核只有几百字节
+            "ZP_BTF_MIN_BYTES": "16",    # [13] 的假 BTF 包同理
+            # BTF 包的上游资产清单 (api.github.com) 也换掉: 演练必须离线可跑, 而且这一节
+            # 验的是"缓存里有匹配的包时面板发不发得出来", 不是"面板能不能访问 GitHub"。
+            "ZP_BTF_API": "http://127.0.0.1:9",
             "ZP_GEO_MIN_BYTES": "16",    # 分流数据库同理 (演练不下载真的 4 MB)
             # 分流数据库的镜像表也换掉: 面板那条路万一没走通, 客户端会去够镜像 ——
             # 演练必须离线可跑, 不能因为网络脸色而红 (与 ZP_CORE_MIRRORS 同一个理由)。
@@ -433,7 +442,9 @@ def main() -> int:
                 fh.write(text)
             # ZP_CORE_MIN_BYTES 与面板侧同名: 演练里那个假内核只有几百字节, 真机上
             # 65536 的下限是用来挡"面板返回的是一句话"的 (见 install_core)。
-            env = {**os.environ, "ZP_CORE_MIN_BYTES": "16", **(extra or {})}
+            # ZP_BTF_MIN_BYTES 同理: [13] 那一节的假 BTF 包也只有几百字节。
+            env = {**os.environ, "ZP_CORE_MIN_BYTES": "16", "ZP_BTF_MIN_BYTES": "16",
+                   **(extra or {})}
             proc = subprocess.run(["sh", path], capture_output=True, text=True, env=env)
             print(f"---- 安装输出 ({label}) ----")
             print(proc.stdout.strip())
@@ -1318,6 +1329,128 @@ def main() -> int:
         check("doctor 把「内核模块没装上」连同补装命令一起报出来",
               "内核模块没装上" in doc.stdout and "opkg install kmod-tun kmod-nft-tproxy" in doc.stdout,
               [ln.strip() for ln in doc.stdout.splitlines() if "补装" in ln][:1])
+
+        # [13] 内核 BTF: 缺了就自动补 (真机 GL-MT3600BE · OpenWrt 25.12.5 · 内核 6.12.94)
+        # 那台机器缺 /sys/kernel/btf/vmlinux, 而 eBPF 那一档的前提正是它。社区的解法是把
+        # 匹配内核的 detached BTF 装到 /usr/lib/debug/boot/vmlinux-<内核版本> ——
+        # cilium/ebpf 与 libbpf 在 sysfs 里找不到 BTF 时正好回退到那里。三件事各跑一遍:
+        #   (A) 面板手上没有 → 如实说"补不上 + 它影响什么", 不假装 (先跑: 要求缓存是空的);
+        #   (B) 面板有这一档 → 自动装上, caps 记 btf=1 + 来源, doctor 也报出来;
+        #   (C) 内核自带 BTF 的机器: 一个字节都不动 (不去装包)。
+        print("\n[13] 内核 BTF: 检测到缺失就自动补 (eBPF 性能档的前提)")
+        btf_tools = os.path.join(tmp, "btftools")
+        os.makedirs(btf_tools, exist_ok=True)
+        btf_kver = "6.12.94"
+        btf_pkg_name = "vmlinux-btf-6.12.103-r1-aarch64_cortex-a53.apk"
+
+        def _btf_apk(root: str, log: str) -> None:
+            """假 apk: 软件源里没有 vmlinux-btf (真机上它只在社区 feed 里), 但能把面板
+            发来的本地包装上 —— 装上之后像真包那样在 /usr/lib/debug/boot/ 留一份 BTF。"""
+            _write_tool(
+                btf_tools, "apk",
+                f'echo "apk $*" >> "{log}"\n'
+                'case "$*" in\n'
+                '  *"--allow-untrusted"*)\n'
+                '    f="$(echo "$*" | sed "s/.*--allow-untrusted //")"\n'
+                f'    mkdir -p "{root}/usr/lib/debug/boot"\n'
+                f'    cp "$f" "{root}/usr/lib/debug/boot/vmlinux"\n'
+                f'    ln -sf vmlinux "{root}/usr/lib/debug/boot/vmlinux-$ZP_KERNEL"\n'
+                "    exit 0 ;;\n"
+                "  *kmod-*)\n"
+                "    exit 0 ;;\n"     # 别把 [13] 的注意力引到内核模块上
+                "esac\n"
+                'echo "ERROR: unable to select packages: vmlinux-btf (no such package)" >&2\n'
+                "exit 3\n",
+            )
+
+        # (A) 面板手上没有这一档 → 如实说"补不上 + 它影响什么", 不假装。
+        # 先跑这一条: 它要求面板的 BTF 缓存是空的 (下面那一条会往缓存里放一份)。
+        b_root = os.path.join(tmp, "btf-root-b")
+        os.makedirs(b_root, exist_ok=True)
+        _fw_release(b_root, "25.12.5")
+        apk_log_b = os.path.join(tmp, "btf-apk-b.log")
+        _btf_apk(b_root, apk_log_b)
+        ok_btf_b, out_btf_b = run_install(
+            "btf-missing", root=b_root,
+            extra={"PATH": btf_tools + os.pathsep + os.environ.get("PATH", ""),
+                   "ZP_KERNEL": btf_kver},
+        )
+        b_caps_b = open(os.path.join(b_root, "caps"), encoding="utf-8").read()
+        check("面板没有这一档时: eBPF 挡位如实记成不可用 (btf=0 + 原因)",
+              ok_btf_b and "btf=0" in b_caps_b and "why.btf=" in b_caps_b
+              and [ln for ln in b_caps_b.splitlines() if ln.startswith("why.btf=")][0] != "why.btf=",
+              [ln for ln in b_caps_b.splitlines() if ln.startswith(("btf", "why.btf"))])
+        # 面板回的是 502 + 一句人话 —— 那份**错误正文**绝不能被当成"包"装下去
+        # (8.75 那次真机就是栽在"闸门比的是错误正文的大小": 状态码要排在体积前面)。
+        b_log_b = open(apk_log_b, encoding="utf-8").read().splitlines() if os.path.exists(apk_log_b) else []
+        check("面板说没有时不许拿它的错误正文当包来装 (状态码在前, 体积在后)",
+              not any("--allow-untrusted" in ln for ln in b_log_b), b_log_b)
+        check("并且说清它只影响性能档 (当前数据面不受影响)",
+              "只影响未来的" in out_btf_b or "不影响当前的" in out_btf_b,
+              [ln.strip() for ln in out_btf_b.splitlines() if "性能档" in ln][:2])
+
+        # (B) 面板缓存里有一份匹配的包 → 路由器应当自动装上并用它
+        btf_cache = os.path.join(panels[0].home, "data", "client", "btf")
+        os.makedirs(btf_cache, exist_ok=True)
+        with open(os.path.join(btf_cache, btf_pkg_name), "wb") as fh:
+            fh.write(b"detached-btf-stub" * 8)
+        apk_log_a = os.path.join(tmp, "btf-apk-a.log")
+        a_root = os.path.join(tmp, "btf-root-a")
+        os.makedirs(a_root, exist_ok=True)
+        _fw_release(a_root, "25.12.5")     # 固件标识: 包按 DISTRIB_ARCH 挑 (aarch64_cortex-a53)
+        _btf_apk(a_root, apk_log_a)
+        ok_btf, out_btf = run_install(
+            "btf-auto", root=a_root,
+            extra={"PATH": btf_tools + os.pathsep + os.environ.get("PATH", ""),
+                   "ZP_KERNEL": btf_kver},
+        )
+        bt_caps = open(os.path.join(a_root, "caps"), encoding="utf-8").read()
+        bt_log = open(apk_log_a, encoding="utf-8").read().splitlines() if os.path.exists(apk_log_a) else []
+        check("缺 BTF 时自动从面板取包并装上 (caps: btf=1 + 来源=panel)",
+              ok_btf and "btf=1" in bt_caps and "btf_how=panel" in bt_caps,
+              [ln for ln in bt_caps.splitlines() if ln.startswith(("btf", "why.btf"))])
+        check("先试本机软件源 (没有这个包), 再用面板发来的本地包 (--allow-untrusted)",
+              any("vmlinux-btf" in ln for ln in bt_log)
+              and any("--allow-untrusted" in ln for ln in bt_log), bt_log)
+        check("补上之后 eBPF 那一档真的可用了 (探测读的就是同一个路径)",
+              "btf=1" in bt_caps and "ebpf=1" in bt_caps)
+        check("装完就把话说出来: 补上了 + 来源 + 路径",
+              "BTF" in out_btf and "已自动补上" in out_btf,
+              [ln.strip() for ln in out_btf.splitlines() if "BTF" in ln][:2])
+        # 桩目录里那份 BTF (假包落的盘) 真的在 —— 也就是"补上"不是嘴上说说
+        check("detached BTF 真的落在 /usr/lib/debug/boot/vmlinux-<内核版本>",
+              os.path.exists(os.path.join(a_root, "usr/lib/debug/boot", f"vmlinux-{btf_kver}")),
+              os.listdir(os.path.join(a_root, "usr/lib/debug/boot")))
+
+        # (C) 内核自带 BTF 的机器: 一个字节都不动
+        c_root = os.path.join(tmp, "btf-root-c")
+        os.makedirs(os.path.join(c_root, "sys/kernel/btf"), exist_ok=True)
+        _fw_release(c_root, "25.12.5")
+        with open(os.path.join(c_root, "sys/kernel/btf/vmlinux"), "wb") as fh:
+            fh.write(b"kernel-provided-btf")
+        apk_log_c = os.path.join(tmp, "btf-apk-c.log")
+        _btf_apk(c_root, apk_log_c)
+        ok_btf_c, _ = run_install(
+            "btf-native", root=c_root,
+            extra={"PATH": btf_tools + os.pathsep + os.environ.get("PATH", ""),
+                   "ZP_KERNEL": btf_kver},
+        )
+        c_caps = open(os.path.join(c_root, "caps"), encoding="utf-8").read()
+        c_log = open(apk_log_c, encoding="utf-8").read() if os.path.exists(apk_log_c) else ""
+        check("内核自带 BTF 时不动它 (btf_how=kernel, 不去装任何包)",
+              ok_btf_c and "btf_how=kernel" in c_caps and "vmlinux-btf" not in c_log,
+              [ln for ln in c_caps.splitlines() if ln.startswith("btf")])
+
+        # 现场入口也要报: doctor 里那一行 (装完之后用户唯一会看的地方)
+        cli_btf = os.path.join(a_root, "cli-check-btf.sh")
+        with open(os.path.join(a_root, "cli"), encoding="utf-8") as fh:
+            cli_text = fh.read().replace("/etc/zeroproxy", a_root).replace("/etc/init.d/zeroproxy", "true")
+        with open(cli_btf, "w") as fh:
+            fh.write(cli_text)
+        doc_btf = subprocess.run(["sh", cli_btf, "doctor"], capture_output=True, text=True)
+        check("doctor 报出「BTF 已自动补上」以及它在哪",
+              "BTF 已自动补上" in doc_btf.stdout and "usr/lib/debug/boot" in doc_btf.stdout,
+              [ln.strip() for ln in doc_btf.stdout.splitlines() if "eBPF" in ln][:1])
     finally:
         logs = []
         for panel in panels:
