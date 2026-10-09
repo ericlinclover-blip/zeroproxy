@@ -1,6 +1,6 @@
 # ZeroProxy 架构现状
 
-> 快照: **2026-10-10** · 面板 **v2.11.30** · 路由器客户端 **v1.4.27** · `state.json` schema **v5**
+> 快照: **2026-10-10** · 面板 **v2.11.31** · 路由器客户端 **v1.4.27** · `state.json` schema **v5**
 > 本文回答"**现在是什么样**"。另外两份文档分工不同, 不要混读:
 > `README.md` 是逐版开发日志 (4000+ 行, 每一版为什么这么改、哪次真机踩的坑);
 > `docs/RESEARCH.md` 与 `docs/ROUTER-CLIENT-REDESIGN.md` 是竞品调研与设计依据。
@@ -280,12 +280,23 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
 
 ## 11. 路由器端 (`client/`)
 
-用户拿到的是面板生成的一行命令 (形状随 8.81 变过, 现在由 `routes._install_command` 渲染):
-它在路由器上**自带重试与证书兜底** —— 逐次尝试 (wget / uclient-fetch, 默认 5 次, 中间打出
-"第 N 次没拿到"), 第一次失败后改用 `--no-check-certificate` (面板还在自签阶段的唯一出路),
-只运行**以 `#!` 开头**的正文 (面板的 4xx 正文不再被喂给 `sh`), 取不到就把下载工具的原话与
-一句"面板不可达 / 域名解析不了 / 端口没开 / 证书不受信"打在终端上并以非 0 退出。配对码
-失效 / 面板未初始化时, `/c/*` 下发的是**一份能跑的说明脚本** (而不是路由器拿不到的 4xx 正文)。
+用户拿到的是面板生成的一行命令 (`routes._install_command` 渲染, 配对命令与固定更新命令同一处;
+长度必须 < 220 字符 —— 它会原样显示在面板的代码框里, 8.81 那一版 570 字符的"全家桶"在界面上
+就是一堵 shell 墙, 见 README 8.82):
+
+```sh
+(f=/tmp/zp-install.sh;for i in 1 2 3 4 5;do wget -T 20 -O "$f" "https://<面板>/c/<配对码>"&&exec sh "$f";sleep 2;done;exit 1)
+```
+
+* **重试 5 次** (这条链路实测约四成 SYN 会被丢, 8.63); **`&& exec sh`** = 只运行取到的东西
+  (旧写法 `| sh` 会把空正文喂给 shell, 退出码还变成 sh 的); **不打 `-q`** = 失败由下载工具
+  自己说 (`Connection error` / `SSL error`); 取不到以**非 0** 结束。
+* **证书校验由面板按自己的状态决定** (`_panel_tls_skip_verify`): 域名面板 + Let's Encrypt
+  才校验证书, 自签阶段 / 用 IP 打开时直接带 `--no-check-certificate` —— 用户不必理解
+  "什么时候该加 -k"。
+* 配对码失效 / 面板未初始化时, `/c/*` 下发的是**一份能跑的说明脚本** (而不是路由器很可能
+  拿不到的 4xx 正文): 打印原因、以 2 退出 —— 旧的 `wget -qO- … | sh` 也照样看得见。
+
 为什么不能再回到 `wget -qO- … | sh`: `-q` 会把丢包 / 4xx / 证书错误**全部**变成"屏幕上什么都
 没有", 而它只试一次 —— 真机 (OpenWrt 25.12) 就是这么回报的 (README 8.81)。
 
@@ -405,9 +416,9 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
 
 | 脚本 | 覆盖 |
 |---|---|
-| `backend/tests/` (pytest) | **316 通过 + 6 skip** (无真实内核二进制时跳过)。dry-run 全流程 + 安全边界 + 状态迁移 |
+| `backend/tests/` (pytest) | **317 通过 + 6 skip** (无真实内核二进制时跳过)。dry-run 全流程 + 安全边界 + 状态迁移 |
 | `scripts/verify.py` | 用真实 Xray/Hysteria/mihomo/sing-box 校验生成的配置与订阅 (含**两台机器真跑一条链**) |
-| `scripts/router_install_check.py` | **166 项**。真的用 shell 跑一遍路由器安装脚本: 七类机器 (含 OpenWrt 25.12 / apk 三态 / BTF 两种现场 / 性能模式的进-出-回退) / 本机覆盖 / revert 比对 / zpcore 真跑 / **第一跳** (面板生成的那一行命令外面顶一个 uclient-fetch 替身: 丢包重试、自签证书兜底、配对码失效时读得到原因, 且旧写法的"什么都没有发生"被钉在测试里) |
+| `scripts/router_install_check.py` | **167 项**。真的用 shell 跑一遍路由器安装脚本: 七类机器 (含 OpenWrt 25.12 / apk 三态 / BTF 两种现场 / 性能模式的进-出-回退) / 本机覆盖 / revert 比对 / zpcore 真跑 / **第一跳** (面板生成的那一行命令外面顶一个 uclient-fetch 替身: 丢包重试、自签面板按证书状态跳过校验、配对码失效时读得到原因; 旧写法的"什么都没有发生"与命令长度都钉在测试里) |
 | `scripts/browser_check.cjs` | **157 项**, 真 Chromium 走「初始化 → 仪表盘」全流程 + 交互 + CSP + 截图 |
 | `scripts/clients_check.cjs` | 真实浏览器点客户端开关 |
 | `scripts/router_ui_check.cjs` | **62 项**。路由器本地界面 (含「没有更新记录时不许凭空长出进度面板」这类判据, 以及性能模式那块表盘: 真实浏览器里点一次, 看刻度/进度/表针/出口/熄火) |

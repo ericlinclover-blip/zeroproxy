@@ -1779,7 +1779,7 @@ def main() -> int:
             def log_message(self, *args):  # pragma: no cover
                 pass
 
-        # uclient-fetch 的替身: 带 -q 就**什么都不说** (真机上失败时就是这个样子),
+        # uclient-fetch 的替身: 带 -q 就**什么都不说**, 不带就把失败说出来 (真机的行为),
         # 默认校验证书 (自签会失败), 用 ZP_SHIM_FAILS 模拟"前几次 SYN 被丢掉"。
         shim_dir = os.path.join(tmp, "shim")
         os.makedirs(shim_dir, exist_ok=True)
@@ -1807,10 +1807,15 @@ def main() -> int:
                 "done\n"
                 "[ -n \"$url\" ] || exit 1\n"
                 "[ \"$out\" = \"-\" ] && out=\n"      # -O- = 写到标准输出 (真机上的含义)
+                # 真机上的 uclient-fetch 不打 -q 时会把失败原话打出来 (Connection error /
+                # SSL error / Download failed) —— 这正是"不许静默"那条判据要看到的东西。
+                "[ \"$q\" = 1 ] || echo \"Downloading '$url'\" >&2\n"
                 "if [ -n \"$ZP_SHIM_CNT\" ]; then\n"
                 "  n=0; [ -f \"$ZP_SHIM_CNT\" ] && n=$(cat \"$ZP_SHIM_CNT\")\n"
                 "  if [ \"$n\" -lt \"${ZP_SHIM_FAILS:-0}\" ]; then\n"
-                "    echo $((n+1)) > \"$ZP_SHIM_CNT\"; exit 1\n"
+                "    echo $((n+1)) > \"$ZP_SHIM_CNT\"\n"
+                "    [ \"$q\" = 1 ] || echo \"Connection error\" >&2\n"
+                "    exit 1\n"
                 "  fi\n"
                 "fi\n"
                 "if [ \"$q\" = 1 ]; then set -- -s; else set -- -sS; fi\n"
@@ -1863,26 +1868,36 @@ def main() -> int:
         rc_new, out_new = first_hop(new_cmd, fails=2)
         check("第一跳: 前两次丢包后自己重试成功 (脚本真的跑起来了)",
               rc_new == 0 and "ZP-FIRST-HOP-OK" in out_new, out_new.strip()[:100])
-        check("第一跳: 丢包那两次在屏幕上说了话 (不是静默等待)", "重试" in out_new,
-              [ln for ln in out_new.splitlines() if "重试" in ln][:1])
+        check("第一跳: 丢包那两次在屏幕上说了话 (下载工具自己报的, 不是一片空白)",
+              "Connection error" in out_new,
+              [ln for ln in out_new.splitlines() if "error" in ln.lower()][:2])
 
         if tls_base:
-            rc_tls, out_tls = first_hop(zp_routes._install_command(tls_base, code_probe))
-            check("第一跳: 面板还在自签阶段也能装上 (第二次尝试跳过证书校验)",
+            # 面板**自己**知道证书状态: 自签/用 IP 打开时, 这一行直接带 --no-check-certificate
+            # (让用户去理解"什么时候该加 -k"是错的)。校验证书的那一版在这里必然失败 ——
+            # 但那也是**响的**, 不再是一片空白。
+            rc_tls, out_tls = first_hop(
+                zp_routes._install_command(tls_base, code_probe, insecure=True))
+            check("第一跳: 面板还在自签阶段也能装上 (面板按自己的证书状态加 --no-check-certificate)",
                   rc_tls == 0 and "ZP-FIRST-HOP-OK" in out_tls, out_tls.strip()[:100])
-            rc_tls_old, out_tls_old = first_hop(f"wget -qO- {tls_base}/c/{code_probe} | sh")
+            rc_old_tls, out_old_tls = first_hop(f"wget -qO- {tls_base}/c/{code_probe} | sh")
             check("对照 (旧写法): 自签面板上一个字都不说 —— 那个错误以前没人看得见",
-                  out_tls_old.strip() == "", repr(out_tls_old[:60]))
+                  out_old_tls.strip() == "", repr(out_old_tls[:60]))
 
         rc_dead, out_dead = first_hop(zp_routes._install_command("http://127.0.0.1:9", code_probe))
-        check("第一跳: 面板整个不可达时说清是哪一类 (不再是空屏幕)",
-              rc_dead != 0 and "取不到安装脚本" in out_dead, out_dead.strip()[:120])
+        check("第一跳: 面板整个不可达时以非 0 结束, 且终端里有下载工具的原话",
+              rc_dead != 0 and ("Failed to connect" in out_dead or "Connection error" in out_dead),
+              out_dead.strip()[-160:])
 
         # 配对码失效: 面板下发的是**能跑的说明** (不是 4xx 正文), 第一跳会把它原样念出来
         _, pair_body, _ = panel.req("POST", "/api/devices/pair", {"label": "first-hop"})
         pair = json.loads(pair_body)
-        check("第一跳命令仍然是一行, 且不再把面板正文直接喂给 sh",
-              "\n" not in pair["command"] and "| sh" not in pair["command"])
+        check("第一跳命令仍然是一行, 不再把面板正文直接喂给 sh, 也不再打 -q",
+              "\n" not in pair["command"] and "| sh" not in pair["command"]
+              and " -q " not in pair["command"])
+        check("第一跳命令够短 (面板上要能读、能贴 —— 上一版 570 字符的『全家桶』在界面上"
+              "就是一堵 shell 墙, 用户截图反馈过)",
+              len(pair["command"]) < 220, f"{len(pair['command'])} 字符")
         panel.req("POST", "/c/pair", {"code": pair["code"], "kind": "router", "arch": "arm64"})
         rc_used, out_used = first_hop(pair["command"])
         check("第一跳: 配对码已经用过时, 终端里读得到原因 (而不是一片空白)",

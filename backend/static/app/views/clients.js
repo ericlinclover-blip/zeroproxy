@@ -230,9 +230,15 @@ function routerTab(dash, routers) {
       <button class="btn ghost small" id="btn-add-device">＋ 再接入一台路由器</button>
       <span class="muted fs-xs">换节点 / 改分流请在面板改 —— 路由器会自动同步, 不用再登上去。</span>
     </div>
-    <div class="muted fs-xs mt-2">
-      升级路由器上的客户端 (界面 / agent) 用这条固定的更新命令, <b>不需要配对码, 也不会多出一台设备</b>:
-      <code class="mono">${esc(updateCmd)}</code>
+    <div class="cmd-card">
+      <div class="cmd-head">
+        <b>升级路由器上的客户端</b>
+        <span class="muted fs-xs">不需要配对码, 也不会多出一台设备</span>
+      </div>
+      <div class="cmd-box">
+        <code class="mono">${esc(updateCmd)}</code>
+        <button class="btn small" data-copy-cmd="${escAttr(updateCmd)}">复制</button>
+      </div>
     </div>
     ${pairInfo ? pairCard() : ""}`;
 }
@@ -333,7 +339,8 @@ function pairCard(dash) {
     ${coreRow(dash)}
     ${agentRow(dash)}
     <div class="muted fs-xs mt-2">
-      这一行<b>自带重试与证书兜底</b> (网络抖一下不会白跑), 取不到脚本时会把原因打在终端上。
+      这一行<b>自带 5 次重试</b> (这条链路约四成连接会被丢, 只试一次等于白跑), 失败时下载
+      工具自己会把原因打在终端上 (连不上 / 证书 / 域名解析), 不会再是"什么都没发生"。
       安装过程约 1 分钟 (含 20 MB 内核 + 4 MB 分流数据下载); 结束后终端会告诉你是 TUN
       还是 tproxy 模式, 以及分流是否已就绪; 数据面的覆盖范围 (全屋 / 仅局域网 TCP) 会
       跟着设备回报显示在卡片上。刷新本页即可看到设备卡片。
@@ -389,6 +396,10 @@ function bind(dash, routers) {
 
   document.querySelectorAll("[data-sub-copy]").forEach((el) => {
     el.onclick = () => copyText(el.dataset.subCopy);
+  });
+  // 更新命令也是"复制走的东西" —— 面板上不再把它铺成正文 (那是一堵 shell 墙)
+  document.querySelectorAll("[data-copy-cmd]").forEach((el) => {
+    el.onclick = () => copyText(el.dataset.copyCmd);
   });
   document.querySelectorAll("[data-sub-qr]").forEach((el) => {
     el.onclick = () => {

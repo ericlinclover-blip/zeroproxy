@@ -804,13 +804,14 @@ def _dashboard_body(state: dict, request: Request, traffic: dict | None = None) 
     if traffic is None:
         traffic = services.xray_stats(state)
     sub = share_links.subscription_url(request, state)
+    base = share_links.panel_base_url(request, state)
     # 面板首屏要的只有"最近这几条 + 各分类的条数", 更早的走 /api/audit 按需拉
     audit = config.audit_query(state, limit=20)
     return {
         "configured": state["configured"],
         "domain": state["domain"],
         "admin_user": state["admin"]["username"],
-        "panel_url": share_links.panel_base_url(request, state),
+        "panel_url": base,
         "subscription_url": sub,
         "subscription_formats": {
             "base64": sub,
@@ -844,9 +845,11 @@ def _dashboard_body(state: dict, request: Request, traffic: dict | None = None) 
         "devices": devices.view(state),
         # update_command 一起带上: 面板上那条"固定的更新命令"必须与生成安装命令的
         # 那一份**同一处渲染** —— 界面里手写一份的话, 改了命令这边就会漂移。
+        # `insecure` 由面板按自己的证书状态决定 (自签 / 用 IP 打开时跳过校验, 见
+        # _panel_tls_skip_verify) —— 用户不必去理解"什么时候该加 -k"。
         "client": {
             **router_client.summary(),
-            "update_command": _install_command(share_links.panel_base_url(request, state), ""),
+            "update_command": _install_command(base, "", _panel_tls_skip_verify(state, base)),
         },
         "xhttp": state.get("xhttp", {}),
         "ports": state.get("ports", {}),
@@ -2783,44 +2786,57 @@ class DeviceReportIn(BaseModel):
 #: 一个很贵的结论" 这条规矩对第一跳同样成立, 而它以前是唯一没被这条规矩覆盖的一跳。
 INSTALL_CMD_RETRIES = 5
 
-#: 第一跳命令的模板。`$c` 是路由器上的下载工具: OpenWrt 默认只有 wget (uclient-fetch
-#: 提供的那个名字), 个别系统上连 wget 都没有、只有 uclient-fetch —— 两个都认, 参数一样。
-#: 第二次尝试带 --no-check-certificate: 那是**面板自签阶段**唯一能走通的路 (脚本内部
-#: 的 TLS_OPTS 回退是同一个道理)。
+#: 第一跳命令的模板。
+#:
+#: **它必须是一行, 而且必须短** —— 这块面板是给人看、给人复制的: 上一版把它写成
+#: 570 字符的"重试 + 证书兜底 + 正文校验"全家桶, 结果用户在界面上看到一堵 shell 墙
+#: (那张截图就是反馈)。所以这里只留两件真正常用的事, 其余交给别处:
+#:
+#:   * **重试 __ZP_RETRIES__ 次**: 这条链路实测约四成 SYN 会被丢 (README 8.63), 只试一次
+#:     等于四分之一的安装会失败; `&& exec sh` 只在**取到了**才执行, 所以不会把空正文 /
+#:     面板的 4xx 正文喂给 shell (那正是旧写法 `| sh` 的毛病)。
+#:   * **不打 `-q`**: 少了它, 下载工具自己会把失败原话说出来 ("Connection error /
+#:     SSL error / Download failed") —— 旧写法把**所有**失败都吞成一片空白, 那才是
+#:     真机反馈里"执行后没有任何反馈"的根子。
+#:   * **取不到就以非 0 结束**: `wget … | sh` 的退出码是 sh 的, 空输入时是 0 ——
+#:     连自动化都看不出这次没成。
+#:   * **证书校验按面板的实际状态来** (__ZP_TLS__): 面板还在自签阶段 (用 IP 打开 /
+#:     Let's Encrypt 没签下来) 时, 校验证书的请求必然失败, 那就直接带
+#:     `--no-check-certificate`; 有真证书时不带。这段判断在服务端做 (面板知道自己的
+#:     证书状态), 命令里就不必再写一遍 —— 界面上的长度就是这么省下来的。
 _INSTALL_CMD = (
-    "(z=/tmp/zp-install.sh;c=wget;command -v wget >/dev/null 2>&1||c=uclient-fetch;i=0;"
-    "until $c -q -T 20 -O \"$z\" __ZP_URL__||"
-    "$c -q -T 20 --no-check-certificate -O \"$z\" __ZP_URL__;do i=$((i+1));"
-    "if [ \"$i\" -ge __ZP_RETRIES__ ];then "
-    "echo \"!! 取不到安装脚本 —— 面板不可达 / 域名解析不了 / 端口没开 / 证书不受信 "
-    "(试了 __ZP_RETRIES__ 次, 上面的 -T 20 是单次超时)\";exit 1;fi;"
-    "echo \"  · 第 $i 次没拿到 (网络抖了一下), 重试…\";sleep \"$i\";done;"
-    # 整个子 shell 里只跑"看起来像脚本"的正文; 取不到就以非 0 退出 —— 让调用方 (人、脚本、
-    # 自动化) 都能看出这一次没成, 而不是"命令跑完了、什么都没发生"。
-    "if head -c2 \"$z\" 2>/dev/null|grep -q \"#!\";then sh \"$z\";"
-    "elif [ -s \"$z\" ];then echo \"!! 面板返回的不是安装脚本, 原文:\";head -n3 \"$z\";exit 1;"
-    "else exit 1;fi)"
+    "(f=/tmp/zp-install.sh;for i in __ZP_SEQ__;do "
+    "wget -T 20 __ZP_TLS__-O \"$f\" __ZP_URL__&&exec sh \"$f\";"
+    "sleep 2;done;exit 1)"
 )
 
 
-def _install_command(base: str, code: str) -> str:
+def _panel_tls_skip_verify(state: dict, base: str) -> bool:
+    """这一行要不要带 `--no-check-certificate`。
+
+    只有"**域名**面板 + **Let's Encrypt** 证书"才放心让路由器校验证书:
+      * 面板还在自签阶段 (引导期, 证书没签下来) —— 校验必然失败;
+      * 用 IP 打开的面板 —— nginx 那个 8899 的 default_server 是自签证书, 校验也必然失败。
+    这两种都是**面板自己知道**的事实, 让面板判断, 用户就不用去理解"什么时候该加 -k"。
+    """
+    host = base.split("://", 1)[-1].split("/", 1)[0].split(":", 1)[0].strip().lower()
+    domain = (state.get("domain") or "").strip().lower()
+    if not host or not domain or host != domain:
+        return True
+    return state.get("cert", {}).get("type") != "letsencrypt"
+
+
+def _install_command(base: str, code: str, insecure: bool = False) -> str:
     """面板生成的那一行安装命令 (路由器终端里粘贴的就是它)。
 
     `code` 为空 = 固定地址的更新命令 (`/c/install.sh`, 不带配对码)。
 
     **为什么不是 `wget -qO- <url> | sh`** —— 真机反馈: 在 OpenWrt 25.12 的路由器上执行
-    面板生成的链接, "没有任何反馈, 执行失败"。四个毛病叠在一起就是这个现象:
+    面板生成的链接, "没有任何反馈, 执行失败": `-q` 把**所有**失败都吞掉, 而它只试一次;
+    `| sh` 又把退出码变成 sh 的 (空输入时是 0)。见 `_INSTALL_CMD` 的注释。
 
-      ① `-q` 把**所有**失败都吞掉。一发丢包、一次 4xx、一个证书错误, 在用户眼里都是
-         "什么都没发生" —— 连该重试还是该换配置都看不出来;
-      ② 只试一次。脚本内部早就改成了"重试 5 次"(这条链路实测约四成 SYN 会被丢,
-         见 README 8.63 的真机记录), 而第一跳一直是"一次不成就算了";
-      ③ 面板还在自签阶段 (用 IP 打开、证书还没签) 时, 校验证书的请求必然失败 ——
-         脚本内部会退到"跳过校验并告警", 第一跳却不会, 于是整条命令死在第一跳;
-      ④ `| sh` 会把面板 4xx 的正文直接喂给 shell, 用户在终端里看到一堆语法错。
-
-    现在这四件事都在命令里: 重试 + 证书兜底 + **只运行看起来像脚本的正文** + 失败时把
-    工具原话打出来。它仍然是一行 —— 复制粘贴的体验没有变。
+    长度也是要求: 这一行会原样出现在面板的代码框里 (用户要读、要复制), 500 多字符的
+    "全家桶"在界面上就是一堵墙 —— 那不是这个位置该背的信息量。
     """
     url = f"{base}/c/{code}" if code else f"{base}/c/install.sh"
     # 与 render_script 同一条规矩: 命令会被粘进 shell, 出现这些字符就直接拒绝渲染。
@@ -2829,7 +2845,8 @@ def _install_command(base: str, code: str) -> str:
     return (
         _INSTALL_CMD
         .replace("__ZP_URL__", f'"{url}"')
-        .replace("__ZP_RETRIES__", str(INSTALL_CMD_RETRIES))
+        .replace("__ZP_SEQ__", " ".join(str(n) for n in range(1, INSTALL_CMD_RETRIES + 1)))
+        .replace("__ZP_TLS__", "--no-check-certificate " if insecure else "")
     )
 
 
@@ -2881,7 +2898,9 @@ def device_pair(payload: DevicePairIn, request: Request):
             "code": entry["code"],
             "expires_at": entry["expires_at"],
             "url": f"{base}/c/{entry['code']}",
-            "command": _install_command(base, entry["code"]),
+            "command": _install_command(
+                base, entry["code"], _panel_tls_skip_verify(state, base)
+            ),
             "ttl": devices.PAIR_TTL,
         }
 
@@ -2891,11 +2910,12 @@ def device_list(request: Request):
     state = load_state()
     if not _require_auth(state, request):
         return _err("未登录", 401)
+    base = share_links.panel_base_url(request, state)
     return {
         "devices": devices.view(state),
         "client": {
             **router_client.summary(),
-            "update_command": _install_command(share_links.panel_base_url(request, state), ""),
+            "update_command": _install_command(base, "", _panel_tls_skip_verify(state, base)),
         },
     }
 

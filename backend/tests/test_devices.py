@@ -68,25 +68,52 @@ def test_pair_returns_copyable_command(client, configured):
 
 
 def test_install_command_survives_one_dropped_packet(client, configured):
-    """第一跳必须自带重试 + 证书兜底 + 失败时能说话。
+    """第一跳必须是一行**够短**的命令, 自带重试, 而且失败时要说话。
 
     真机 (OpenWrt 25.12) 反馈的原话是"执行面板生成的链接后, 没有任何反馈, 执行失败" ——
     旧写法 `wget -qO- <url> | sh` 会把**所有**失败都吞掉 (-q), 而且只试一次。
+
+    中间的教训也要钉住: 第一版修复把它写成了"重试 + 证书兜底 + 正文校验 + 失败摘要"的
+    570 字符全家桶 —— 行为是对的, 但那一行会**原样显示在面板上**, 用户看到的就是一堵
+    shell 墙 (截图反馈)。所以这里同时断言长度。
     """
+    import re
+
     _login(client)
     cmd = _pair_code(client)["command"]
     assert "\n" not in cmd, "面板给的仍然是一行 (复制粘贴的体验不许变)"
+    assert len(cmd) < 220, f"面板上要能读: {len(cmd)} 字符已经是一堵墙了"
     assert "-qO-" not in cmd, "`-q` + 管道给 sh 的旧写法不许回来: 它把失败都藏起来"
+    assert not re.search(r"(^|[\s(])-q(\s|$)", cmd), "`-q` 会把失败吞成一片空白"
     # 丢包不是"一次不成就算了": 面板那条链路实测约四成 SYN 会被丢掉
-    assert "重试" in cmd and "sleep" in cmd, "要能自己重试 (真机上四成 SYN 会被丢)"
-    # 面板还在自签阶段 (用 IP 打开、证书还没签) 时, 校验证书的请求必然失败
-    assert "--no-check-certificate" in cmd
-    # OpenWrt 上的 wget 是 uclient-fetch 提供的名字, 个别系统上只有 uclient-fetch
-    assert "uclient-fetch" in cmd
-    # 只运行"看起来像脚本"的正文 —— 面板的 4xx 正文不许被喂给 sh
-    assert "head -c2" in cmd and "grep -q" in cmd
-    # 取不到时要说清是哪一类, 而不是让用户对着空屏幕
-    assert "取不到安装脚本" in cmd
+    assert "for i in 1 2 3 4 5" in cmd and "sleep 2" in cmd, "要能自己重试"
+    assert "&&exec sh" in cmd, "**取到了**才执行 —— 旧写法 `| sh` 会把空正文喂进去"
+    assert "exit 1" in cmd, "取不到时要以非 0 结束 (旧写法的退出码是 sh 的, 空输入时是 0)"
+    assert "-T 20" in cmd, "单次超时: 黑洞路由不许让用户对着不动的屏幕等"
+
+
+def test_install_command_tls_flag_follows_the_panel_cert(client, configured):
+    """证书校验按**面板自己的状态**决定 —— 用户不必理解"什么时候该加 -k"。
+
+    只有"域名面板 + Let's Encrypt 证书"才放心让路由器校验证书; 自签阶段 (引导期) 与
+    用 IP 打开的面板 (nginx 那个 8899 的 default_server 是自签证书) 校验证书**必然**失败,
+    那时直接带 `--no-check-certificate` —— 选择权在服务端, 命令里就不必写第二遍。
+    """
+    from zeroproxy import routes
+
+    le = {"domain": DOMAIN, "cert": {"type": "letsencrypt"}}
+    self_signed = {"domain": DOMAIN, "cert": {"type": "selfsigned"}}
+    assert not routes._panel_tls_skip_verify(le, f"https://{DOMAIN}:8899")
+    assert routes._panel_tls_skip_verify(self_signed, f"https://{DOMAIN}:8899")
+    assert routes._panel_tls_skip_verify(le, "https://203.0.113.9:8899"), "用 IP 打开的是自签"
+
+    # 端到端: 测试夹具那台面板没有 ACME (自签) → 给出的命令里带着它
+    _login(client)
+    assert "--no-check-certificate" in _pair_code(client)["command"]
+    # 而域名 + 真证书时**不许**带 (那才是该验证的时候)
+    assert "--no-check-certificate" not in routes._install_command(
+        f"https://{DOMAIN}:8899", "deadbeef"
+    )
 
 
 def test_devices_appear_on_dashboard(client, configured):

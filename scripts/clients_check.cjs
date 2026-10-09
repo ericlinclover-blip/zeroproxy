@@ -135,12 +135,14 @@ async function main() {
     await page.click("#btn-pair");
     await page.waitForSelector(".cmd-box code", { timeout: 10000 });
     const cmd = await page.locator(".cmd-box code").innerText();
-    // 第一跳带重试 + 证书兜底 + "只运行看起来像脚本的正文" (见 routes._install_command) ——
-    // 旧写法 wget -qO- … | sh 会把所有失败都吞掉, 真机上表现为"什么都没有发生"。
-    check("生成安装命令 (带重试与证书兜底, 不再是 -qO- 静默管道)",
-      /\/c\/[0-9a-f]{32}/.test(cmd.trim()) && /重试/.test(cmd) && /--no-check-certificate/.test(cmd)
-      && !/-qO-/.test(cmd),
-      cmd.trim().slice(0, 60) + "…");
+    // 第一跳: 一行、够短、自带重试、不再静默 (见 routes._install_command)。
+    // 旧写法 wget -qO- … | sh 把所有失败都吞掉, 真机上表现为"什么都没有发生";
+    // 中间那版 570 字符的"全家桶"在面板上是一堵 shell 墙 (用户截图反馈)。
+    const c = cmd.trim();
+    check("生成安装命令 (一行、够短、自带重试、不再静默)",
+      /\/c\/[0-9a-f]{32}/.test(c) && c.length < 220 && /for i in 1 2 3 4 5/.test(c)
+      && /&&exec sh/.test(c) && !/-qO-/.test(c),
+      `${c.length} 字符 · ${c.slice(0, 46)}…`);
     await page.locator("#sec-clients").scrollIntoViewIfNeeded();
     await page.screenshot({ path: path.join(SHOT_DIR, "clients-install.png") });
 
@@ -185,6 +187,13 @@ async function main() {
       await uiLink.getAttribute("href"));
     check("这个入口是新窗口打开 (不把面板页面顶掉)",
       (await uiLink.getAttribute("target")) === "_blank");
+    // 更新命令以前被铺成正文里的一长串 shell (一堵墙, 用户截图反馈过): 现在它必须和
+    // 安装命令一样待在代码框里, 并且有「复制」按钮 —— 那才是它的用途。
+    const updCard = page.locator(".cmd-card", { hasText: "升级路由器上的客户端" });
+    check("更新命令在代码框里 (不再铺成正文)", await updCard.count() === 1);
+    check("更新命令也够短 (面板上能读)",
+      (await updCard.locator("code").innerText()).trim().length < 220);
+    check("更新命令带「复制」按钮", await updCard.locator("[data-copy-cmd]").count() === 1);
     const glow = await page.locator(".bigswitch input:checked + .track").count();
     check("开关打开时有发光样式", glow === 1);
     // 真机上这里是"看起来像个按钮"的下拉 —— 用计算样式盯住它 (自绘箭头 + ghost 同款边框)
