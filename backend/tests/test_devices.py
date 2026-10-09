@@ -729,6 +729,38 @@ def test_local_control_plane_is_distributed_like_the_core(tmp_path, monkeypatch,
     assert [a["arch"] for a in listed["agents"]] == ["arm64"]
 
 
+def test_install_script_only_repairs_credentials_on_a_real_refusal():
+    """拉配置失败时, 只有"面板**明确**拒绝"才重新配对 —— 丢包绝不许触发重新配对。
+
+    真机 (8.68, 21.02 那台) 就是这么演了一遍: 四次超时被判成"面板拒绝了这台设备的凭据",
+    脚本拿同一个配对码又配了一次 —— 面板上**多出一台设备**, 新凭据随后又被同一个丢包卡住,
+    最后丢给用户一句"请回面板确认已有可用节点" (方向全错, 而且面板要多清一台)。
+
+    分辨办法是 agent 带出来的 curl 退出码: 22 = -f 说的 HTTP 层面失败 (403/404…, 面板答了
+    而且说不行), 7/28 = 连不上 / 超时 (根本没问到)。
+    """
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+    # 退出码必须先接住: `if ! cmd` 里的 $? 是取反之后的结果 (永远是 0), 那样判不出东西
+    assert "_cfg_rc=$?" in text
+    # 重新配对只挂在"HTTP 层面被拒"上
+    assert '[ "$_cfg_rc" = "22" ]' in text
+    # 正文被截断成空 (HTTP 200 + 空 body) 也算"没拿到" —— 不能掉进"面板上没有节点"那句话
+    assert "_cfg_ok=1" in text
+    # 丢包那条分支必须单独存在, 而且不许出现"凭据/重新接入"这种把人引去重新配对的措辞
+    parts = text.split('elif [ -n "$ZP_CODE" ]; then', 1)
+    assert len(parts) == 2, "拉配置失败时, 丢包那条分支应当单独存在"
+    loss_branch = parts[1].split("\n        else", 1)[0]
+    assert "再跑一次" in loss_branch
+    assert "重新接入" not in loss_branch and "拒绝了这台设备的凭据" not in loss_branch
+    # 降级配置那句不许再说"不含国内直连" —— 内联的域名层永远在 (8.68 的日志里它就在撒谎)。
+    # 只查**真正的输出**: 注释里解释"以前那句是错的"是可以的。
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    assert "不含国内直连" not in code
+    assert "国内常用域名" in code
+
+
 def test_optional_local_control_plane_never_breaks_the_install():
     """zpcore 是安装脚本里**唯一**的可选件: 它失败绝不能让装机失败。
 

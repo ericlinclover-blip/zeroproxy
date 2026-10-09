@@ -171,12 +171,24 @@ class Throttle:
         import urllib.request as _req
 
         self.chunk, self.delay = chunk, delay
+        #: 这些路径"请求进去了但没有回应" —— 用来复现"面板整体是好的, 只有某一段在丢包"。
+        self.hang: tuple[str, ...] = ()
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
 
             def _proxy(self):
+                if outer.hang and self.path.startswith(outer.hang):
+                    # 一段路在丢包: 请求收下了, 回复**断在半路** (真机上丢包长这样 —— 有时是
+                    # 一直等到超时, 有时是中间设备直接把它截断)。关键是这里**没有**一个正常的
+                    # HTTP 答复, 客户端不许把这种情况判成"面板拒绝了凭据"。
+                    # (用截断而不是"睡到超时": 两者在客户端眼里走的是同一条分支, 而演练要快。)
+                    self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                                     b"Content-Length: 4096\r\n\r\n")
+                    self.wfile.flush()
+                    self.close_connection = True
+                    return
                 body = None
                 if "Content-Length" in self.headers:
                     body = self.rfile.read(int(self.headers["Content-Length"]))
@@ -619,6 +631,49 @@ def main() -> int:
         check("旧凭据被拒后自动重新接入", ok and "重新接入" in out, f"旧 {old_id}")
         check("面板上换成一台新设备 (没有卡死在旧凭据)",
               len(items) == 1 and items[0]["id"] != old_id, items[0]["id"] if items else "无")
+
+        print("\n[4b] 只是丢包时**不许**判成\"凭据被拒\": 不重新配对, 也不撒谎")
+        # 真机 8.68 (21.02 那台) 的样子: 面板整体是好的 (脚本 / 内核 / 分流数据都取到),
+        # 只有"拉配置"那一段一直在丢包 —— 四次超时。老代码把它判成"面板拒绝了这台设备的
+        # 凭据", 于是拿同一个配对码又配了一次: 面板上**多出一台设备**, 新凭据随后又被同一个
+        # 丢包卡住, 最后丢给用户一句"请回面板确认已有可用节点"。这里就复现这一段。
+        drop = Throttle(panels[0].base)
+        drop.hang = ("/c/sub",)          # 只有配置那一段会一直不回话
+        # 用一份**已经接入过**的机器副本, 并把凭据里的 base 换成压过的地址 —— 这样安装会走
+        # "沿用原有凭据"那条路 (不配对), 面板上就不会有"合法的新设备"来干扰计数:
+        # 真机 8.68 上多出来的那台, 正是**重新配对**凭空造的。
+        cfg_root = os.path.join(tmp, "cfg-drop-root")
+        shutil.copytree(fake_root, cfg_root, dirs_exist_ok=True)
+        # 两处都要改: pair() 是拿 device.json 里的 base 跟本次的 ZP_BASE 比 (不一样就判成
+        # "换了面板、直接重新配对"), 而配置那一侧读的是 servers/*.json。
+        cred_files = [os.path.join(cfg_root, "device.json")] + [
+            os.path.join(cfg_root, "servers", n) for n in os.listdir(os.path.join(cfg_root, "servers"))
+        ]
+        for cpath in cred_files:
+            with open(cpath, encoding="utf-8") as fh:
+                saved = json.load(fh)
+            saved["base"] = drop.base
+            with open(cpath, "w", encoding="utf-8") as fh:
+                json.dump(saved, fh)
+        _, body, _ = panels[0].req("GET", "/api/devices")
+        n_before = len(json.loads(body)["devices"]["items"])
+        ok_drop, out_drop = run_install("cfg-drop", root=cfg_root, base=drop.base)
+        check("走的是\"沿用原有凭据\"那条路 (没有重新配对的动作)",
+              "已接入过" in out_drop and "已接入:" not in out_drop,
+              [ln.strip() for ln in out_drop.splitlines() if "接入" in ln][:2])
+        check("拉配置被丢包卡住 → 装不上 (如实失败)", not ok_drop,
+              [ln.strip() for ln in out_drop.splitlines() if "安装失败" in ln][:1])
+        check("说的是\"面板暂时联系不上\", 不是\"拒绝了凭据\"",
+              "面板暂时联系不上" in out_drop and "拒绝了这台设备的凭据" not in out_drop,
+              [ln.strip() for ln in out_drop.splitlines() if "凭据" in ln or "联系不上" in ln][:2])
+        check("**没有**去重新配对 (输出里不该出现\"重新接入\")",
+              "重新接入" not in out_drop,
+              [ln.strip() for ln in out_drop.splitlines() if "接入" in ln][:2])
+        _, body, _ = panels[0].req("GET", "/api/devices")
+        n_after = len(json.loads(body)["devices"]["items"])
+        check("面板上的设备数没变 (不会平白多出一台)", n_after == n_before,
+              f"{n_before} → {n_after}")
+        drop.close()
 
         print("\n[5] 空间预检: 只有真要装内核时才该卡 90 MB"
               " (真机: 首次失败的安装留下内核, 重跑时只剩 89 MB 被判空间不足)")
