@@ -2670,14 +2670,48 @@ EOF
         _base="$(field_of "$FIRST" base)"
         _log="$ZP_DIR/update.log"
         : > "$_log" 2>/dev/null || true
+        # 先把面板要发的那份脚本取下来, **看一眼它的版本** —— 比本机旧就停下。
+        #
+        # 为什么需要这道闸门: 按钮触发的更新会把路由器上的**全部客户端文件**换成面板那一版。
+        # 面板还没更新时点下去 = 把机器**降级**, 而且会覆盖掉本机刚拿到的东西。真机上踩过:
+        # 面板 2.11.9 / 本机 1.4.11, 点按钮之后页面报"未知操作: update" —— 因为覆盖回来的
+        # 旧 cgi 里没有那个动作分支。
+        _tmp="$ZP_DIR/.update-script"
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSk -m 60 "$_base/c/install.sh" -o "$_tmp" 2>/dev/null || true
+        else
+            uclient-fetch -q --no-check-certificate -O "$_tmp" "$_base/c/install.sh" 2>/dev/null || true
+        fi
+        _panel_ver=""
+        if [ -s "$_tmp" ]; then
+            _panel_ver="$(sed -n 's/^ZP_CLIENT_VERSION="\(.*\)"/\1/p' "$_tmp" | head -n1)"
+        fi
+        if [ -z "$_panel_ver" ]; then
+            rm -f "$_tmp"
+            echo "取不到面板的安装脚本 (面板不可达?) —— 稍后再试, 或看 zeroproxy update-log"
+            exit 1
+        fi
+        # 版本比较 (a<b → -1, = → 0, > → 1)。只看前三位, 够用。
+        _cmp="$(awk -v a="$_panel_ver" -v b="$ZP_VERSION" 'BEGIN{
+            n=split(a,x,"."); m=split(b,y,".");
+            for(i=1;i<=3;i++){ x[i]+=0; y[i]+=0;
+                if (x[i]>y[i]) { print 1; exit }
+                if (x[i]<y[i]) { print -1; exit } }
+            print 0 }')"
+        if [ "$_cmp" = "-1" ]; then
+            rm -f "$_tmp"
+            # 变量名后面紧跟中文时必须写 ${VAR}: 有的 shell 会把高字节算进变量名,
+            # `set -u` 下就变成 "unbound variable" —— 偏偏只在真的走到这一行时才炸。
+            echo "面板上是 v${_panel_ver}，这台机器已经是 v${ZP_VERSION} —— 那不是升级。"
+            echo "  面板那边可能还没更新完: 先在面板点「检查更新 → 一键更新」, 再回来点这个按钮。"
+            exit 0
+        fi
+        echo "面板版本 v$_panel_ver (本机 v$ZP_VERSION) —— 开始更新。"
         (
-            if command -v curl >/dev/null 2>&1; then
-                curl -fsSk -m 600 "$_base/c/install.sh" 2>>"$_log" | sh >>"$_log" 2>&1
-            else
-                uclient-fetch -q --no-check-certificate -O - "$_base/c/install.sh" \
-                    2>>"$_log" | sh >>"$_log" 2>&1
-            fi
+            # 用刚取下来的那一份跑 —— 不再下第二次 (版本也已经核对过了)
+            sh "$_tmp" >>"$_log" 2>&1
             _rc=$?
+            rm -f "$_tmp"
             echo "EXIT=$_rc" >> "$_log"
             if [ "$_rc" = "0" ]; then
                 logger -t zeroproxy "客户端更新完成 (刷新本页看版本号)"

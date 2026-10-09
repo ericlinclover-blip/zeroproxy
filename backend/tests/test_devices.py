@@ -974,6 +974,12 @@ def test_one_click_update_is_wired_everywhere():
     assert 'update.log' in text and "logger -t zeroproxy" in text
     # 后台: 提交后立刻回话, 过程写文件
     assert ") &" in text.split("update)")[1].split("update-log)")[0]
+    # 降级闸门: 面板比本机旧时**拦下**。按钮触发的更新会替换路由器上的全部客户端文件 ——
+    # 面板还没更新时点下去等于降级 (真机上踩过: 覆盖回来的旧 cgi 没有 update 分支, 按钮
+    # 点完立刻又报"未知操作")。先把脚本取下来看一眼版本, 旧的就别跑。
+    upd = text.split("update)")[1].split("update-log)")[0]
+    assert "_panel_ver" in upd and "那不是升级" in upd
+    assert ".update-script" in upd, "取下来的那份直接跑, 不再下第二次"
     # 界面上的按钮 + zpcore 的透传
     page, _m, _n = router_client.ui_file("index.html")
     assert 'id="update"' in page and "更新客户端" in page
