@@ -137,11 +137,14 @@ def test_security_headers(client):
 
 
 def test_csp_drops_unsafe_inline_but_whitelists_the_theme_bootstrap(client):
-    """script-src 不再放行任意内联脚本, 但 head 里那段"首屏前应用主题"必须仍然跑得起来。
+    """script-src / style-src 都不再放行 unsafe-inline, 但主题引导脚本必须仍然跑得起来。
 
     前者是这次收紧的收益 (注入一个 <script> 已经执行不了); 后者是它的代价, 而且失败方式
     很安静 —— 脚本被拦下只会让深色模式退回浅色, 面板上几乎看不出来。所以哈希按 index.html
     的实际内容在启动时算, 并由这条测试盯住。
+
+    style-src 同理: 收紧的收益是"注入 style 也执行不了", 代价是进度条 / 延迟条 / 流量条
+    的宽度得改走 CSSOM —— 漏掉一处的样子是那条子永远停在 CSS 默认的 width:0, 页面上不报错。
     """
     import base64
     import hashlib
@@ -151,6 +154,10 @@ def test_csp_drops_unsafe_inline_but_whitelists_the_theme_bootstrap(client):
     csp = client.get("/api/status").headers["Content-Security-Policy"]
     script_src = csp.split("script-src", 1)[1].split(";", 1)[0]
     assert "'unsafe-inline'" not in script_src, "script-src 不该再放行任意内联脚本"
+    style_src = csp.split("style-src", 1)[1].split(";", 1)[0]
+    assert "'unsafe-inline'" not in style_src, (
+        "style-src 不该再放行内联 style —— 条状进度 / 流量宽度必须走 CSSOM (lib/dom.js 的 applyWidths)"
+    )
 
     with open(os.path.join(zp_main._static_dir(), "index.html"), encoding="utf-8") as fh:
         html = fh.read()

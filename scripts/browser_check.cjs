@@ -1027,6 +1027,31 @@ async function main() {
     });
     check("注入的 <script> 执行不了 (script-src 不再放行 unsafe-inline)",
       injectedBlocked, "");
+    // style-src 也收紧了: 收益同样是"注入执行不了", 代价是条状进度 / 延迟 / 流量的宽度
+    // 必须走 CSSOM —— 漏掉一处的样子是那条子永远停在 CSS 默认的 width:0, 页面上不报错。
+    const styleBlocked = await page.evaluate(() => {
+      const target = document.querySelector("#sec-audit") || document.body;
+      const s = document.createElement("style");
+      s.textContent = "#sec-audit{outline:5px solid rgb(1,2,3)}";
+      document.head.appendChild(s);
+      s.remove();
+      return getComputedStyle(target).outlineStyle;
+    });
+    check("注入的 <style> 也执行不了 (style-src 不再放行 unsafe-inline)",
+      styleBlocked === "none", styleBlocked);
+    // 反面: 该落上的必须真的落上 —— 所有带 data-w 的条子都得已经由 applyWidths 赋过宽度
+    // (没赋值时 el.style.width 是空串, 计算宽度退回 0)。
+    const barState = await page.evaluate(() => {
+      const els = [...document.querySelectorAll("[data-w]")];
+      return {
+        n: els.length,
+        unapplied: els.filter((el) => !el.style.width).length,
+        nonZero: els.filter((el) => parseFloat(getComputedStyle(el).width) > 0).length,
+      };
+    });
+    check("带 data-w 的条子都真的落上了宽度 (CSSOM 赋值不受 style-src 约束)",
+      barState.n > 0 && barState.unapplied === 0 && barState.nonZero > 0,
+      `${barState.n} 条 · 未落宽度 ${barState.unapplied} · 非零宽 ${barState.nonZero}`);
     // 上面那次注入是故意的, 浏览器必然记一条 CSP 违规 —— 和"故意输错密码"一样,
     // 把它从待检查的 console 错误里摘掉, 否则「无 console 错误」会稳挂。
     for (let i = consoleErrors.length - 1; i >= 0; i -= 1) {

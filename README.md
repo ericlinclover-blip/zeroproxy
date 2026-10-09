@@ -79,7 +79,7 @@ curl -fsSL https://github.i3.pub/https://raw.githubusercontent.com/ericlinclover
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` **273 项** (267 passed + 6 skipped; 带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (105 项, 含**两台机器真跑一条链** 与**四档数据面 × IPv6 的路由器配置过真 mihomo**) + `scripts/router_install_check.py` (**94 项**, 真的用 shell 跑一遍路由器安装脚本, 内含四类机器 / 本机覆盖 / revert 比对 / zpcore 真跑) + `scripts/browser_check.cjs` (155 项) + `scripts/clients_check.cjs` (26 项, 真实浏览器点开关) + `scripts/router_ui_check.cjs` (18 项) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` **291 项通过 + 6 skip** (带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (105 项, 含**两台机器真跑一条链** 与**四档数据面 × IPv6 的路由器配置过真 mihomo**) + `scripts/router_install_check.py` (**110 项**, 真的用 shell 跑一遍路由器安装脚本, 内含四类机器 / 本机覆盖 / revert 比对 / zpcore 真跑) + `scripts/browser_check.cjs` (157 项) + `scripts/clients_check.cjs` (26 项, 真实浏览器点开关) + `scripts/router_ui_check.cjs` (18 项) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 | **看得懂的界面 (v2.6.0)** | 控制台布局: 左侧锚点导航 (带计数角标 + 滚动高亮) + 顶部指标条 (健康节点 / 落地出口 IP / 平均延迟 + 迷你折线 / 运行时长) + 节点密集表格 (名称 / 地址状态 / **握手延迟条** / **上下行双轨** / 开关与复制) + **流量卡 (双弧圆环 + 实时速率曲线 + 逐节点双色流量条)** + 链式链路拓扑 (你的设备 → 本机入口 → 落地端) + 程序更新闭环; 动效全部走 `transform`/自绘 rAF 并受 `prefers-reduced-motion` 约束 |
 
@@ -4126,3 +4126,31 @@ registry 指到 `docker.i3.pub`; ② 或者只是想让**你自己 VPS 上的 Do
 `pytest` 290 → **291 项**: 新增一条静态回归 —— 自建反代必须在两张表里**且排在公共前缀
 前面**、Xray / Hysteria / tarball 三条路必须走那个助手 (不许留"wget 直连 GitHub"的老写法)、
 分流数据那张表也要把自建反代排第一。`upgrade_sim.sh` 不受影响 (它把 `curl` 打桩了, 不看 URL)。
+
+### 8.73 v2.11.22: `style-src` 也收紧了 —— 那 8 处内联宽度改走 CSSOM
+
+早先给面板收 CSP 时只收了 `script-src`, `style-src` 一直留着 `'unsafe-inline'`, 理由写在
+`security_headers` 的注释里: 进度条 / 延迟条 / 流量条的宽度是运行时算的, 写在 innerHTML 模板的
+`style="width:42%"` 里, 想收紧得先把它们改成 CSSOM 赋值。这一版把那 8 处改完了。
+
+为什么值得改: 只要 `unsafe-inline` 还在, "往页面里注入一个 `style=` 属性、或一段 `<style>`"
+这条路就是开的 —— 面板是纯单页应用, 注入点本来就不多, 但这属于"能关就关"的一类, 而它挡着的正是
+界面欺骗 (覆盖 UI / 伪造提示) 最顺手的那种注入。
+
+改法必须两处一起动, 否则宽度会**静默停到 0**:
+
+* 模板不再写 `style="width:42%"`, 改写字面量属性 `data-w="42"` (证书条那条还要个底色, 写 `data-bg`);
+* 插入文档后由 `lib/dom.js` 新增的 `applyWidths(root)` 用 CSSOM 逐个赋值 —— `el.style.width = …`
+  是脚本改样式对象, **不受 `style-src` 约束** (受约束的是内联 style **属性**)。五个挂载点:
+  `lib/jobs.js` 的落地进度条、`views/update.js` 的升级进度条、`views/status.js` 的延迟条与上下行
+  双轨、`views/traffic.js` 的双轨与证书有效期条。
+
+失败方式很安静: 漏掉一个挂载点, 那条子只会停在 CSS 默认的 `width:0`, 页面上不报错, 得开控制台
+才看得到 —— 所以回归里正面 (该落上的落上了) 反面 (该拦的拦住了) 两边都钉。
+
+#### 回归
+
+* `pytest` **291 项** (本次没新增用例): `test_csp_drops_unsafe_inline_but_whitelists_the_theme_bootstrap`
+  扩成同时断言 `script-src` 与 `style-src` 都不含 `'unsafe-inline'`。
+* `scripts/browser_check.cjs` 155 → **157 项** (真 Chromium): 注入的 `<style>` 执行不了;
+  页面上所有带 `data-w` 的条子都已经由 `applyWidths` 赋过宽度、且至少有一条非零宽。

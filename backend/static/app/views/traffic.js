@@ -3,7 +3,7 @@
  *  三块放在一起是因为它们共用同一个"改设置 → 落地 → 回灌"的收尾 (settleApply),
  *  且系统卡片里的证书 / 服务状态与仪表盘其它部分没有交叉。
  */
-import { $, esc, escAttr, toast } from "../lib/dom.js";
+import { $, esc, escAttr, toast, applyWidths } from "../lib/dom.js";
 import { fmtBytes, fmtUptime, fmtTime, STATE_TXT, stateClass } from "../lib/format.js";
 import { clearDraft } from "../lib/drafts.js";
 import { api, markDisconnected, syncAfterDrop } from "../lib/api.js";
@@ -66,11 +66,12 @@ export function renderTraffic(traffic) {
           <span class="nm">${esc(n.name)}</span>
           <span class="val">↑${fmtBytes(u)} ↓${fmtBytes(d)} · ${share}%</span>
           <span class="rail" title="上行 ${fmtBytes(u)} / 下行 ${fmtBytes(d)}">
-            <i class="up" style="width:${w(u)}%"></i><i class="dn" style="width:${w(d)}%"></i>
+            <i class="up" data-w="${w(u)}"></i><i class="dn" data-w="${w(d)}"></i>
           </span>
         </div>`;
       })
       .join("");
+    applyWidths(bars);   // 双轨条的宽度走 CSSOM (见 lib/dom.js)
   }
   sampleRate();
 }
@@ -436,7 +437,7 @@ export function renderSystem(d) {
       </div>
       <div class="kv mt-3"><span class="k">类型</span><span>${certName}</span></div>
       <div class="kv"><span class="k">剩余有效期</span><span>${days} 天</span></div>
-      <div class="bar"><i style="width:${barPct}%;background:${barColor}"></i></div>
+      <div class="bar"><i data-w="${barPct}" data-bg="${barColor}"></i></div>
       ${c.type === "selfsigned" ? '<div class="note">自签证书: 客户端已带 allowInsecure, 不影响使用; 点「申请证书」可再试一次 Let\'s Encrypt (需域名已解析、80 端口可达)</div>' : ""}
     </div>
     <div class="card">
@@ -460,6 +461,7 @@ export function renderSystem(d) {
         <input type="file" id="restore-file" class="hidden" accept="application/json,.json">
       </div>
     </div>`;
+  applyWidths($("#sys-grid"));   // 证书有效期条的宽度与底色都走 CSSOM (见 lib/dom.js)
   const renewBtn = $("#btn-renew");
   if (renewBtn) renewBtn.onclick = async () => {
     const label = renewBtn.textContent;

@@ -1,5 +1,5 @@
 /** 程序更新: 版本对比 → 确认弹窗 → 逐步进度 → 结果卡。 */
-import { $, esc, toast, revealSection } from "../lib/dom.js";
+import { $, esc, toast, revealSection, applyWidths } from "../lib/dom.js";
 import { fmtTime } from "../lib/format.js";
 import { openConfirm } from "../lib/dialog.js";
 import { api } from "../lib/api.js";
@@ -74,6 +74,7 @@ export function renderUpdate() {
     $("#update-hint").textContent = "升级只替换程序代码, 密钥 / 订阅令牌 / 节点配置全部保留";
   }
   $("#update-body").innerHTML = lines.join("");
+  applyWidths($("#update-body"));   // 升级进度条的宽度走 CSSOM (见 lib/dom.js)
 
   const runBtn = $("#btn-update-run");
   const topBtn = $("#btn-update");
@@ -139,7 +140,7 @@ function updateStepsHtml(last) {
   // 升级进行中给进度条加 `.live` (斜纹跑马), 停下来了就恢复静态 —— 一眼区分"在动"和"卡住"
   const live = last.state === "running" || last.state === "queued";
   return `<div class="ustep-wrap">${rows}</div>
-    <div class="bar${live ? " live" : ""}"><i class="${failedAt >= 0 ? "bad" : ""}" style="width:${pct}%"></i></div>
+    <div class="bar${live ? " live" : ""}"><i class="${failedAt >= 0 ? "bad" : ""}" data-w="${pct}"></i></div>
     <div class="muted fs-sm mt-1">${summary}${
       last.started_at ? ` · 已用 ${fmtDuration(Math.max(0, updateNow() - last.started_at))}` : ""
     }</div>`;

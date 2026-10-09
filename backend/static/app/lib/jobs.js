@@ -8,7 +8,7 @@
  *       (等上一次落地 → 发请求 → 渲染 → 断线核对)。放在这里而不是某个视图里,
  *       是因为链式、高级设置、分流模板都要用它。
  */
-import { $, esc, toast } from "./dom.js";
+import { $, esc, toast, applyWidths } from "./dom.js";
 import { api, sleep, markDisconnected, syncAfterDrop } from "./api.js";
 import { S, redrawDash } from "./state.js";
 
@@ -55,9 +55,10 @@ export function renderApplyStrip(st) {
     <span class="grow">
       <b>${title}</b>
       <span class="muted"> · 第 ${index}/${total} 步 · ${esc(st.current || "")} · 已用 ${secs}s</span>
-      <div class="bar${running ? " live" : ""}"><i class="${bad ? "bad" : ""}" style="width:${bad ? 100 : pct}%"></i></div>
+      <div class="bar${running ? " live" : ""}"><i class="${bad ? "bad" : ""}" data-w="${bad ? 100 : pct}"></i></div>
       ${bad ? `<div class="muted fs-sm mt-1">${esc(st.error || "")}</div>` : ""}
     </span></div>`;
+  applyWidths(box);   // 进度条的宽度只能走 CSSOM (style-src 不放行内联 style)
 }
 
 /** 轮询后台任务直到跑完; 返回最终 steps (拿不到就返回 [])。

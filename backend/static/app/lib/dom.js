@@ -5,6 +5,24 @@ export const $ = (s) => document.querySelector(s);
 export const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 export const escAttr = esc;
 
+/** 把模板里的 `data-w` / `data-bg` 落成真实样式 (CSSOM)。
+ *
+ *  为什么不能直接写 `style="width:42%"`: 面板的 `style-src` 已经不再放行
+ *  `unsafe-inline`, 模板里的内联 style **会被浏览器拦掉** —— 而失败方式是安静的:
+ *  进度条 / 流量条只会停在 CSS 默认的 `width:0` 上, 页面上看不出报错, 得开控制台
+ *  才知道。所以宽度与数据驱动的底色改走 CSSOM: 模板只写字面量 (data-w / data-bg),
+ *  插入文档后由这里逐个赋值 —— `el.style.*` 是脚本操作样式对象, 不受 style-src 管。
+ *
+ *  传进来的 root 必须**已经在文档里**, 否则 querySelectorAll 找不到那些条子, 它们
+ *  会永远停在 0 宽。 */
+export function applyWidths(root) {
+  if (!root) return;
+  root.querySelectorAll("[data-w]").forEach((el) => {
+    el.style.width = el.dataset.w + "%";
+    if (el.dataset.bg) el.style.setProperty("background", el.dataset.bg);
+  });
+}
+
 export function toast(msg) {
   const t = $("#toast");
   t.textContent = msg;

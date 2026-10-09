@@ -4,7 +4,7 @@
  *  renderSidebar, 拆开就得来回 import。对外只暴露 renderNodes / renderKpis /
  *  renderDashboardBanner / runProbe。
  */
-import { $, esc, escAttr, toast, copyText } from "../lib/dom.js";
+import { $, esc, escAttr, toast, copyText, applyWidths } from "../lib/dom.js";
 import {
   fmtBytes, fmtUptime, fmtTime, STATE_TXT, stateClass, nodeStateClass, nodeStateText, PROTO_BADGE,
 } from "../lib/format.js";
@@ -122,7 +122,7 @@ export function renderNodes() {
         const bar =
           p.ok === true && p.ms
             ? `<span class="latbar"><i class="${p.ms <= 120 ? "ok" : p.ms <= 250 ? "warn" : "bad"}"
-                 style="width:${latPct(p.ms, minMs, maxMs)}%"></i></span>`
+                 data-w="${latPct(p.ms, minMs, maxMs)}"></i></span>`
             : "";
         lat = `<div class="nc-lat"><span class="ping ${cls}" title="${escAttr(p.detail || "")}">${esc(text)}</span>${bar}</div>`;
       }
@@ -133,8 +133,8 @@ export function renderNodes() {
         ? `<div class="nc-traffic">
              <div class="vals">↑${fmtBytes(tr.uplink)} · ↓${fmtBytes(tr.downlink)}</div>
              <div class="duo">
-               <span class="rail up" title="上行 ${fmtBytes(tr.uplink)}"><i style="width:${barPct(tr.uplink)}%"></i></span>
-               <span class="rail dn" title="下行 ${fmtBytes(tr.downlink)}"><i style="width:${barPct(tr.downlink)}%"></i></span>
+               <span class="rail up" title="上行 ${fmtBytes(tr.uplink)}"><i data-w="${barPct(tr.uplink)}"></i></span>
+               <span class="rail dn" title="下行 ${fmtBytes(tr.downlink)}"><i data-w="${barPct(tr.downlink)}"></i></span>
              </div>
            </div>`
         : `<div class="nc-traffic"><span class="muted fs-xs">—</span></div>`;
@@ -156,6 +156,7 @@ export function renderNodes() {
       </div>`;
     })
     .join("");
+  applyWidths($("#node-grid"));   // 延迟条 / 双轨条的宽度走 CSSOM (见 lib/dom.js)
 
   document.querySelectorAll("[data-node]").forEach((el) =>
     (el.onchange = async () => {

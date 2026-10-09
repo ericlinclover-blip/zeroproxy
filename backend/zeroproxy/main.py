@@ -162,8 +162,11 @@ def security_headers(static_dir: str) -> dict:
     页面上只剩 head 里那一小段"首屏前应用主题"必须内联 (deferred 的模块跑完已经画过一帧,
     深色模式会先闪一次白)。这一段用 sha256 白名单放行 —— 于是"往页面里注入一个 <script>"
     这条路彻底堵死, 而它原来是开的。
-    `style-src` 仍保留 'unsafe-inline': 进度条 / 流量条 / 速率曲线还有 7 处宽度是运行时算的
-    (写在 innerHTML 模板里), 属于内联 style 属性, 收紧它得先把那些改成 CSSOM 赋值。
+    `style-src` **也不再放 'unsafe-inline'**: 内联 style 属性原本挡着这条路 —— 进度条 /
+    延迟条 / 流量条那几处宽度是运行时算的, 一直写在 innerHTML 模板里。现在模板只写
+    `data-w` / `data-bg` 两个字面量属性, 插入文档后由 `lib/dom.js` 的 `applyWidths()`
+    用 CSSOM 赋值 (`el.style.*` 不受 style-src 约束) —— 于是"往页面里注入一个 <style>
+    或一段 style= 属性"同样执行不了, 而条子的宽度一个像素都没变。
     """
     script_src = " ".join(["'self'", *inline_script_hashes(static_dir)])
     return {
@@ -173,7 +176,7 @@ def security_headers(static_dir: str) -> dict:
         "Permissions-Policy": "geolocation=(), microphone=(), camera=()",
         "Cross-Origin-Opener-Policy": "same-origin",
         "Content-Security-Policy": (
-            "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
+            "default-src 'self'; img-src 'self' data:; style-src 'self'; "
             f"script-src {script_src}; connect-src 'self'; form-action 'self'; "
             "base-uri 'none'; frame-ancestors 'none'"
         ),
