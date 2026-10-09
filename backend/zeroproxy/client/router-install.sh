@@ -3379,6 +3379,77 @@ deps_hint() {
         *)    printf '本机没有 apk / opkg —— 内核模块只能从固件里补' ;;
     esac
 }
+# LuCI 那三件套 (菜单 / 权限 / 承载页) 的就地修复。
+#
+# 为什么 CLI 里要有这一条: 它们的失败方式**恰好**是"用户什么都点不开" —— 菜单里点
+# 「服务 → ZeroProxy」得到 403 (ACL 读不出来), 或者菜单干脆不见 (菜单 JSON 坏了)。
+# 那一刻用户能拿到的唯一入口是 SSH, 所以修它的办法必须是一条命令, 而不是"把安装命令
+# 再跑一遍"(那要求面板可达, 还要等一分钟)。
+# 数据来源按顺序: 面板 (最新) → 本机缓存 $ZP_DIR/luci/ (装机时放的内置兜底, 离线也能修)。
+ui_fix() {
+    _base=""
+    [ -n "${FIRST:-}" ] && _base="$(field_of "$FIRST" base)"
+    _fixed=0
+    _missing=0
+    for _f in menu.json acl.json status.js; do
+        case "$_f" in
+            status.js) _dst=/www/luci-static/resources/view/zeroproxy/status.js ;;
+            menu.json) _dst=/usr/share/luci/menu.d/luci-app-zeroproxy.json ;;
+            acl.json)  _dst=/usr/share/rpcd/acl.d/luci-app-zeroproxy.json ;;
+        esac
+        # 已经是一份好的就别动它 (也许只是另一处坏了)
+        _fine=0
+        if [ -s "$_dst" ]; then
+            case "$_f" in
+                status.js) _fine=1 ;;
+                *) [ "$(head -c 1 "$_dst" 2>/dev/null)" = "{" ] && _fine=1 ;;
+            esac
+        fi
+        [ "$_fine" = "1" ] && continue
+        _tmp="$_dst.new.$$"
+        _got=0
+        if [ -n "$_base" ]; then
+            mkdir -p "$(dirname "$_dst")" 2>/dev/null || true
+            if command -v curl >/dev/null 2>&1; then
+                curl -fsSk -m 15 "$_base/c/ui/$_f" -o "$_tmp" 2>/dev/null && [ -s "$_tmp" ] && _got=1
+            else
+                uclient-fetch -q --no-check-certificate -T 15 -O "$_tmp" "$_base/c/ui/$_f" 2>/dev/null \
+                    && [ -s "$_tmp" ] && _got=1
+            fi
+            if [ "$_got" = "1" ]; then
+                mv "$_tmp" "$_dst" && chmod 644 "$_dst" 2>/dev/null || true
+                _fixed=$((_fixed + 1))
+                continue
+            fi
+            rm -f "$_tmp"
+        fi
+        # 面板不可达 (或没给这一份) → 用本机那份内置兜底
+        if [ -s "$ZP_DIR/luci/$_f" ]; then
+            mkdir -p "$(dirname "$_dst")" 2>/dev/null || true
+            cp "$ZP_DIR/luci/$_f" "$_dst" && chmod 644 "$_dst" 2>/dev/null || true
+            _fixed=$((_fixed + 1))
+        else
+            _missing=$((_missing + 1))
+        fi
+    done
+    # rpcd 要重新读 ACL; LuCI 的菜单索引是**它自己缓存的** (/tmp/luci-indexcache*), 只 reload
+    # rpcd 不够 —— 这两件事一起做才叫"修好了"。
+    /etc/init.d/rpcd reload >/dev/null 2>&1 || /etc/init.d/rpcd restart >/dev/null 2>&1 || true
+    rm -f /tmp/luci-indexcache* /tmp/luci-modulecache/* 2>/dev/null || true
+    if [ "$_missing" != "0" ]; then
+        echo "修不了: 有 $_missing 份既没拿到面板的、本机也没有兜底副本。"
+        echo "  重跑一次安装命令 (或把面板升到 v2.11.28 再试) —— 那会把这三份一起放好。"
+        return 1
+    fi
+    if [ "$_fixed" = "0" ]; then
+        echo "LuCI 那三件套本来就是好的 (菜单 / 权限 / 承载页都在), 已顺手清掉菜单索引缓存。"
+    else
+        echo "已修好 $_fixed 份: 菜单 / 权限 / 承载页现在都在。"
+        echo "  去 LuCI 里重新点一次「服务 → ZeroProxy」(可能要刷新一下页面)。"
+    fi
+    return 0
+}
+
 FIRST="$(ls "$SERVERS"/*.json 2>/dev/null | head -n1)"
 
 field_of() { sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" | head -n1; }
@@ -3738,6 +3809,23 @@ doctor() {
     else
         printf '  · 性能模式开不了: %s\n' \
             "$(sed -n 's/^perf_why=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    fi
+    # LuCI 那三件套 (菜单 / 权限 / 承载页)。它们坏掉时的症状最坑人: 菜单里点「服务 →
+    # ZeroProxy」只回一个 **403**, 页面上没有半个字说明原因 (真机事故, README 8.79)。
+    # 所以体检里单独报一句, 并给出那条能就地修好的命令。
+    if [ -d /usr/share/luci/menu.d ]; then
+        _luci_bad=""
+        [ -s /www/luci-static/resources/view/zeroproxy/status.js ] || _luci_bad="承载页"
+        [ "$(head -c 1 /usr/share/luci/menu.d/luci-app-zeroproxy.json 2>/dev/null)" = "{" ] \
+            || _luci_bad="${_luci_bad:+$_luci_bad / }菜单"
+        [ "$(head -c 1 /usr/share/rpcd/acl.d/luci-app-zeroproxy.json 2>/dev/null)" = "{" ] \
+            || _luci_bad="${_luci_bad:+$_luci_bad / }权限"
+        if [ -n "$_luci_bad" ]; then
+            printf '  ✗ LuCI 集成缺了: %s —— 菜单里点「服务 → ZeroProxy」会报 403\n' "$_luci_bad"
+            printf '      下一步: zeroproxy ui fix (就地修好, 不需要面板)\n'
+        else
+            printf '  ✓ LuCI 集成齐备 (菜单 / 权限 / 承载页)\n'
+        fi
     fi
     printf '    想测这台机器自己能跑多快: zeroproxy bench\n'
 
@@ -4159,6 +4247,12 @@ EOF
         echo "  已记下 —— 面板设备卡上会显示这两个数字 (agent 下一轮心跳带过去)"
         ;;
     ui)
+        if [ "${2:-}" = "fix" ]; then
+            # `zeroproxy ui fix`: 修 LuCI 那三件套 (菜单 / 权限 / 承载页)。真机上它们坏掉的
+            # 症状就是"菜单里点进去 403" —— 那时用户只能 SSH, 所以修法必须是一条命令。
+            ui_fix
+            exit $?
+        fi
         # 端口在 ui.port 里 (安装时定下的): 空 = 固件自己的 Web 服务, 有值 = 自带 httpd。
         _port="$(cat "$ZP_DIR/ui.port" 2>/dev/null)"
         [ -n "$_port" ] && _port=":$_port"
@@ -4568,6 +4662,141 @@ UIINITEOF
     return 1
 }
 
+# ---------------------------------------------------------------- 界面文件的落盘 (原子 + 兜底)
+# 真机事故 (README 8.79): 升级之后 LuCI 里点「服务 → ZeroProxy」直接 **403**。
+#
+# 现场是这么来的: 那三个小文件以前是这么写的 ——
+#     http_get "$ZP_BASE/c/ui/acl.json" > /usr/share/rpcd/acl.d/luci-app-zeroproxy.json || true
+# 重定向**先把目标文件清空**, 而 `|| true` 把失败咽掉。面板正好在重启的那一次 (nginx 回
+# 502, 或者链路抖了一下), 一份好端端的 ACL 就被换成了 0 字节 —— rpcd 读不了它, 我们的
+# ACL 组等于不存在, LuCI 的菜单依赖检查不过, 于是那个页面**只回一个 403**, 谁也不告诉
+# "为什么"。三个文件都走这条写法, 所以 menu.json 与承载页也可能一起坏掉。
+#
+# 修法两条, 缺一不可:
+#   1. **原子写**: 先下到临时文件, 验过 (非空 / 像个 JSON) 再 mv 过去; 取不到就**保留
+#      本机原来那一份**, 绝不让一次失败的请求毁掉一个能用的文件;
+#   2. **内置兜底**: 这三份一共几百字节、且很稳定 —— 让"点不点得开"依赖一次网络请求,
+#      等于把它押在链路脸色上。面板能给就用面板的 (方便以后改样式), 给不出就用内置的
+#      那一份 (同时留一份在 $ZP_DIR/luci/, 离线也能修 —— 见 CLI 的 `zeroproxy ui fix`)。
+ui_file_ok() {  # $1=文件 $2=期望的首字符 ('' = 只要非空)
+    [ -s "$1" ] || return 1
+    [ -z "$2" ] && return 0
+    [ "$(head -c 1 "$1" 2>/dev/null)" = "$2" ]
+}
+
+# 原子取一个界面文件。返回 0 = 目标文件现在是好的 (新下的 / 原来的 / 内置的)。
+ui_put() {  # $1=url $2=目标 $3=期望首字符 $4=内置兜底的名字 ('' = 没有)
+    _u="$1"; _dst="$2"; _want="$3"; _builtin="${4:-}"
+    _tmp="$_dst.new.$$"
+    if http_get "$_u" > "$_tmp" 2>/dev/null && ui_file_ok "$_tmp" "$_want"; then
+        mv "$_tmp" "$_dst"
+        chmod 644 "$_dst" 2>/dev/null || true
+        return 0
+    fi
+    rm -f "$_tmp"
+    # 本机这一份还好好的 → 一个字节都不动 (升级不拿能用的东西冒险)
+    ui_file_ok "$_dst" "$_want" && { note "面板没给出 $(basename "$_dst") —— 保留本机已有的那份"; return 0; }
+    [ -n "$_builtin" ] || return 1
+    luci_builtin "$_builtin" > "$_dst" 2>/dev/null || return 1
+    chmod 644 "$_dst" 2>/dev/null || true
+    note "面板没给出 $_builtin —— 用内置的那一份"
+    return 0
+}
+
+# 内置的 LuCI 三件套 (菜单 / 权限 / 承载页)。**内容与仓库里的 client/luci/ 逐字节一致** ——
+# pytest 里有一条断言钉着这件事, 免得两边漂移 (漂移的症状是"某个固件上的菜单突然不见了")。
+# 用法: luci_builtin <menu.json|acl.json|status.js>  (写到 stdout)
+luci_builtin() {
+    case "$1" in
+        menu.json) cat <<'ZP_LUCI_MENU'
+{
+	"admin/services/zeroproxy": {
+		"title": "ZeroProxy",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "zeroproxy/status"
+		},
+		"depends": {
+			"acl": [ "luci-app-zeroproxy" ]
+		}
+	}
+}
+ZP_LUCI_MENU
+            ;;
+        acl.json) cat <<'ZP_LUCI_ACL'
+{
+	"luci-app-zeroproxy": {
+		"description": "ZeroProxy 路由器客户端 (管理页面 + 会话校验)",
+		"read": {
+			"ubus": {
+				"session": [ "get" ]
+			}
+		},
+		"write": {}
+	}
+}
+ZP_LUCI_ACL
+            ;;
+        status.js) cat <<'ZP_LUCI_STATUS'
+'use strict';
+/* LuCI 菜单里的那一页。
+ *
+ * 真正的界面是 /www/zeroproxy/ 下的静态页面 (原生 JS, 与面板同一套卡片风格)。
+ * 这里只做一件事: 用 LuCI 自己的登录态把它框进来 —— 于是"能不能打开这个管理面"
+ * 由 LuCI 的 root 登录决定, 我们不用也不该再发明一套认证。
+ */
+'require view';
+
+return view.extend({
+	render: function () {
+		return E('iframe', {
+			src: '/cgi-bin/zeroproxy',
+			style: 'width:100%;height:78vh;border:0;border-radius:10px;background:transparent',
+			title: 'ZeroProxy'
+		});
+	},
+	handleSaveApply: null,
+	handleSave: null,
+	handleReset: null
+});
+ZP_LUCI_STATUS
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# 把内置的三件套放一份到 $ZP_DIR/luci/ (CLI 的 `zeroproxy ui fix` 离线修的就是它)。
+luci_builtin_cache() {
+    mkdir -p "$ZP_DIR/luci" 2>/dev/null || true
+    for _f in menu.json acl.json status.js; do
+        if ! ui_file_ok "$ZP_DIR/luci/$_f" "$( [ "$_f" = status.js ] && printf "'" || printf '{' )"; then
+            luci_builtin "$_f" > "$ZP_DIR/luci/$_f" 2>/dev/null || true
+        fi
+    done
+}
+
+# LuCI 那一整套落盘 + 收尾 (rpcd 要重新读 ACL, LuCI 要清菜单索引缓存)。返回 0 = 三件套都在。
+luci_install() {
+    [ -d /usr/share/luci/menu.d ] || return 1
+    mkdir -p /www/luci-static/resources/view/zeroproxy /usr/share/rpcd/acl.d 2>/dev/null || true
+    luci_builtin_cache
+    # 顺序: 先承载页与菜单 (点不点得开), 再 ACL (点得动点不动)。三个都走原子写。
+    ui_put "$ZP_BASE/c/ui/status.js" /www/luci-static/resources/view/zeroproxy/status.js "'" status.js || true
+    ui_put "$ZP_BASE/c/ui/menu.json" /usr/share/luci/menu.d/luci-app-zeroproxy.json '{' menu.json || true
+    ui_put "$ZP_BASE/c/ui/acl.json" /usr/share/rpcd/acl.d/luci-app-zeroproxy.json '{' acl.json || true
+    # 两道缓存都要清: rpcd 缓存 ACL, LuCI 把菜单索引缓存在 /tmp/luci-indexcache*
+    # (只 reload rpcd 不够 —— 菜单是 LuCI 自己缓存的那份索引, 这是"菜单不出现"最常见的原因)
+    /etc/init.d/rpcd reload >/dev/null 2>&1 || /etc/init.d/rpcd restart >/dev/null 2>&1 || true
+    rm -f /tmp/luci-indexcache* /tmp/luci-modulecache/* 2>/dev/null || true
+    # 最后**验一遍**: 三个都在、而且 ACL 与菜单是能读的 JSON —— 这是"点进去 403"的直接判据。
+    _ok=1
+    ui_file_ok /www/luci-static/resources/view/zeroproxy/status.js "'" || _ok=0
+    ui_file_ok /usr/share/luci/menu.d/luci-app-zeroproxy.json '{' || _ok=0
+    ui_file_ok /usr/share/rpcd/acl.d/luci-app-zeroproxy.json '{' || _ok=0
+    return $(( 1 - _ok ))
+}
+
 install_ui() {
     step "安装网页管理界面"
     # 界面令牌在 write_files 里就生成好了 (agent 的心跳要拿它上报"管理界面地址")。
@@ -4600,8 +4829,18 @@ install_ui() {
             return 0
         fi
     done
-    http_get "$ZP_BASE/c/ui/cgi" > "$_stage/cgi-bin/zeroproxy" 2>/dev/null || true
-    chmod 755 "$_stage/cgi-bin/zeroproxy"
+    # cgi 脚本: 与 LuCI 那三件套同一个道理 —— 取不到就**别动**已经装好的那一份。以前这里是
+    # `http_get … > 目标 || true`, 一次失败的请求会把一个能用的 cgi 换成 0 字节, 于是
+    # 页面(iframe 指向 /cgi-bin/zeroproxy)直接空掉 (README 8.79 那次事故的同类)。
+    _cgi_tmp="$_stage/cgi-bin/zeroproxy.new.$$"
+    if http_get "$ZP_BASE/c/ui/cgi" > "$_cgi_tmp" 2>/dev/null && [ -s "$_cgi_tmp" ]; then
+        mv "$_cgi_tmp" "$_stage/cgi-bin/zeroproxy"
+    else
+        rm -f "$_cgi_tmp"
+        [ -s /www/cgi-bin/zeroproxy ] && cp /www/cgi-bin/zeroproxy "$_stage/cgi-bin/zeroproxy" 2>/dev/null || true
+        note "面板没给出 cgi 脚本 —— 保留本机已有的那份"
+    fi
+    chmod 755 "$_stage/cgi-bin/zeroproxy" 2>/dev/null || true
     if [ ! -s "$_stage/zeroproxy/index.html" ]; then
         warn "面板没有提供界面文件 (面板版本较旧?), 跳过网页界面"
         rm -rf "$_stage"
@@ -4619,15 +4858,14 @@ install_ui() {
     _luci=0
     if [ -d /usr/share/luci/menu.d ]; then
         _luci=1
-        mkdir -p /www/luci-static/resources/view/zeroproxy /usr/share/rpcd/acl.d
-        http_get "$ZP_BASE/c/ui/status.js" > /www/luci-static/resources/view/zeroproxy/status.js 2>/dev/null || true
-        http_get "$ZP_BASE/c/ui/menu.json" > /usr/share/luci/menu.d/luci-app-zeroproxy.json 2>/dev/null || true
-        http_get "$ZP_BASE/c/ui/acl.json" > /usr/share/rpcd/acl.d/luci-app-zeroproxy.json 2>/dev/null || true
-        # 两道缓存都要清: rpcd 缓存 ACL, LuCI 把菜单索引缓存在 /tmp/luci-indexcache*
-        # (只 reload rpcd 不够 —— 菜单是 LuCI 自己缓存的那份索引, 这是"菜单不出现"
-        # 最常见的原因)
-        /etc/init.d/rpcd reload >/dev/null 2>&1 || /etc/init.d/rpcd restart >/dev/null 2>&1 || true
-        rm -f /tmp/luci-indexcache* /tmp/luci-modulecache/* 2>/dev/null || true
+        if luci_install; then
+            ok "LuCI 菜单 / 权限 / 承载页就位 (服务 → ZeroProxy)"
+        else
+            # 三件套缺一件, 那个页面就可能打不开 (最典型: ACL 读不出来 → 403)。所以这不是
+            # "小问题", 要明说 —— 而且给出下一步: `zeroproxy ui fix` 能就地修 (离线也行)。
+            warn "LuCI 那三件套没有全部就位 —— 菜单里点「服务 → ZeroProxy」可能报 403。
+  在路由器上执行 zeroproxy ui fix 可以就地修好 (内置了一份兜底, 不需要面板)。"
+        fi
     fi
 
     # 谁把页面发出去? 三条路, 按"与固件的关系"从松到紧:

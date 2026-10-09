@@ -101,6 +101,11 @@ def patch_for_local_run(script: str, root: str) -> str:
     #   * /usr/lib/debug/boot/vmlinux-<内核版本> —— 补进来的 detached BTF (社区的包装在这)。
     out = out.replace("/sys/kernel/btf/vmlinux", os.path.join(root, "sys/kernel/btf/vmlinux"))
     out = out.replace("/usr/lib/debug", os.path.join(root, "usr/lib/debug"))
+    # LuCI 那三件套的落盘路径也落到临时目录里 ([16] 那一节要验"升级不毁好文件"与 `ui fix`)。
+    out = out.replace("/usr/share/luci/menu.d", os.path.join(root, "usr/share/luci/menu.d"))
+    out = out.replace("/usr/share/rpcd/acl.d", os.path.join(root, "usr/share/rpcd/acl.d"))
+    out = out.replace("/www/luci-static", os.path.join(root, "www/luci-static"))
+    out = out.replace("[ -d /www ]", "[ -d " + os.path.join(root, "www") + " ]")
     # 本机没有 procd / systemd, 自检那一步 (启动 mihomo + 等控制口) 必然失败 ——
     # 这里停在"文件已落盘", 服务编排由真机验证; 但配置生成与 agent 逻辑照跑。
     out = out.replace(
@@ -429,10 +434,28 @@ def main() -> int:
 
         def run_script(script: str, label: str, root: str | None = None,
                        extra: dict | None = None,
-                       base: str | None = None) -> tuple[bool, str]:
+                       base: str | None = None,
+                       main_extra: str = "",
+                       main_only: str = "") -> tuple[bool, str]:
             target = root or fake_root
             path = os.path.join(tmp, f"install-{label}.sh")
             text = patch_for_local_run(script, target)
+            if main_only:
+                # 只跑指定的那几步 (不看装机全流程) —— [16] 要验的是"面板不可达时,
+                # LuCI 那三件套会不会被写坏", 而整条装机命令在面板不可达时会先 die。
+                # 同样注意 `}` 前那个分号 (少了它就是语法错, 脚本会什么都没做就退出)。
+                only_cmd = main_only.strip().rstrip(";")
+                text, n = re.subn(r'\nmain\(\) \{.*?\}\nmain "\$@"\n',
+                                  f'\nmain() {{ {only_cmd}; }}\nmain "$@"\n', text, flags=re.S)
+                assert n == 1, "没能把 main 换成要跑的那几步"
+            if main_extra:
+                # 演练默认停在"文件已落盘"(不装界面、不起服务)。需要哪一段就显式接上 ——
+                # [16] 要验的就是界面里那一小段 (`luci_install`), 于是把它接进 main。
+                # 注意那个分号: `{ ...; cmd }` 的 `}` 前面必须是 `;` 或换行, 否则 `}` 会被
+                # 当成参数 (演练里真踩过 —— 脚本语法错, 于是"什么都没发生")。
+                extra_cmd = main_extra.strip().rstrip(";")
+                text = text.replace("install_zpcore; }", f"install_zpcore; {extra_cmd}; }}", 1)
+                assert main_extra in text, "main_extra 没接上 (patch_for_local_run 的 main 拼法变了?)"
             if base:
                 # 把脚本里的"面板地址"换成本机的一个慢管子 —— 复现"家宽到海外面板
                 # 只有几十 KB/s"那条路 (见 Throttle)
@@ -455,11 +478,14 @@ def main() -> int:
 
         def run_install(label: str, panel_=None, root: str | None = None,
                         extra: dict | None = None,
-                        base: str | None = None) -> tuple[bool, str]:
+                        base: str | None = None,
+                        main_extra: str = "",
+                        main_only: str = "") -> tuple[bool, str]:
             panel_ = panel if panel_ is None else panel_
             code = panel_.pair_code(label)
             _, script, _ = panel_.req("GET", f"/c/{code}")
-            return run_script(script, label, root=root, extra=extra, base=base)
+            return run_script(script, label, root=root, extra=extra, base=base,
+                              main_extra=main_extra, main_only=main_only)
 
         print("\n[1] 首次安装")
         ok, out = run_install("first")
@@ -1627,6 +1653,103 @@ def main() -> int:
         check("看门狗: dae 连续几轮不在就自动退回标准模式 (家里不会断着)",
               "perf=0" in p_caps and os.path.exists(os.path.join(perf_root, "core.running")),
               [ln for ln in p_caps.splitlines() if ln.startswith("perf")])
+
+        # [16] LuCI 那三件套: 升级不许毁掉好文件, 坏了要能就地修 (真机事故: 升级之后 403)
+        # 现场: 以前是 `http_get ... > /usr/share/rpcd/acl.d/xxx.json || true` —— 重定向先清空
+        # 目标, 而 `|| true` 把失败咽掉。面板正好在重启 (nginx 回 502) 的那一次升级, 就把一份
+        # 好端端的 ACL 换成 0 字节 → rpcd 读不出来 → LuCI 的菜单依赖检查不过 → 点进去 403。
+        print("\n[16] LuCI 集成: 升级不清空好文件, 坏了能就地修")
+        luci_root = os.path.join(tmp, "luci-root")
+        for sub in ("www/zeroproxy", "www/cgi-bin", "usr/share/luci/menu.d", "usr/share/rpcd/acl.d"):
+            os.makedirs(os.path.join(luci_root, sub), exist_ok=True)
+        acl_dst = os.path.join(luci_root, "usr/share/rpcd/acl.d/luci-app-zeroproxy.json")
+        menu_dst = os.path.join(luci_root, "usr/share/luci/menu.d/luci-app-zeroproxy.json")
+        view_dst = os.path.join(luci_root, "www/luci-static/resources/view/zeroproxy/status.js")
+        os.makedirs(os.path.dirname(view_dst), exist_ok=True)
+        legacy = '{"luci-app-zeroproxy": {"read": {"ubus": {"session": ["get"]}}}}\n'
+        for path in (acl_dst, menu_dst):
+            with open(path, "w") as fh:
+                fh.write(legacy)
+        with open(view_dst, "w") as fh:
+            fh.write("'use strict';\n// 旧版本\n")
+
+        # 这一节要的正是界面里那一小段 (LuCI 三件套的落盘 + 校验), 所以显式把它接进 main,
+        # 否则演练会停在"文件已落盘", 那三件套根本没被写过。
+        ok_l, out_l = run_install("luci", root=luci_root, extra={"ZP_KERNEL": btf_kver},
+                                  main_extra="luci_install || true")
+        check("正常装机: 三件套都就位 (面板给什么就落什么)",
+              ok_l and os.path.getsize(acl_dst) > 0
+              and open(acl_dst, encoding="utf-8").read().lstrip().startswith("{")
+              and os.path.getsize(view_dst) > 0
+              and os.path.getsize(acl_dst) > len(legacy),   # 真的被面板那份换过 (比占位的那份大)
+              f"acl={os.path.getsize(acl_dst)}B menu={os.path.getsize(menu_dst)}B "
+              f"view={os.path.getsize(view_dst)}B")
+        cache = os.path.join(luci_root, "luci")
+        check("装机时留了一份内置兜底 (离线也能修)",
+              os.path.isdir(cache)
+              and all(os.path.getsize(os.path.join(cache, f)) > 0
+                      for f in ("menu.json", "acl.json", "status.js")),
+              sorted(os.listdir(cache)) if os.path.isdir(cache) else "(没有)")
+        check("内置兜底与仓库里那份逐字节一致 (两边漂移 = 某个固件上菜单会突然不见)",
+              open(os.path.join(cache, "menu.json"), encoding="utf-8").read()
+              == open(os.path.join(BACKEND, "zeroproxy", "client", "luci", "menu.json"),
+                      encoding="utf-8").read(),
+              f"{os.path.getsize(os.path.join(cache, 'menu.json'))}B")
+
+        # 「升级不许毁掉好文件」—— 把面板地址换成死地址 (= 升级时面板正好在重启 / 不可达),
+        # 再跑一次同一段: 已经装好的三件套必须**一个字节都不变**。这就是那次 403 的反面。
+        srv_files = os.listdir(os.path.join(luci_root, "servers"))
+        srv_path = os.path.join(luci_root, "servers", srv_files[0])
+        with open(srv_path, encoding="utf-8") as fh:
+            creds = fh.read()
+        with open(srv_path, "w") as fh:
+            fh.write(creds.replace(panels[0].base, "http://127.0.0.1:9"))
+        keep = {p: open(p, encoding="utf-8").read() for p in (acl_dst, menu_dst, view_dst)}
+        ok_l2, out_l2 = run_install("luci-offline", root=luci_root, extra={"ZP_KERNEL": btf_kver},
+                                    base="http://127.0.0.1:9",
+                                    main_only="detect_http; luci_install || true")
+        check("面板不可达时再装一次: 三件套**一个字节都没被改** (不再清空好文件)",
+              ok_l2 and all(open(p, encoding="utf-8").read() == keep[p] for p in keep),
+              [ln.strip() for ln in out_l2.splitlines() if "保留本机" in ln][:1])
+        check("并且明确说了「面板没给出, 保留本机那份」",
+              "保留本机" in out_l2, [ln.strip() for ln in out_l2.splitlines() if "保留本机" in ln][:1])
+
+        # 再把 ACL 弄成 0 字节 (那次事故的现场) 跑 `zeroproxy ui fix`: 内置兜底必须顶上。
+        with open(acl_dst, "w") as fh:
+            fh.write("")
+        cli_luci = os.path.join(luci_root, "cli-luci.sh")
+        with open(os.path.join(luci_root, "cli"), encoding="utf-8") as fh:
+            cli_text = fh.read().replace("/etc/zeroproxy", luci_root)
+        with open(cli_luci, "w") as fh:
+            fh.write(cli_text)
+        fix_offline = subprocess.run(["sh", cli_luci, "ui", "fix"], capture_output=True, text=True,
+                                     timeout=120, env={**os.environ})
+        check("面板不可达时 `ui fix` 用内置兜底把空掉的 ACL 补回来 (0 字节 → 合法 JSON)",
+              os.path.getsize(acl_dst) > 0
+              and open(acl_dst, encoding="utf-8").read().lstrip().startswith("{"),
+              fix_offline.stdout.strip().splitlines()[:2])
+
+        # 面板可达时, 弄坏的那一份要**从面板重新取**回来
+        with open(srv_path, "w") as fh:
+            fh.write(creds)
+        with open(menu_dst, "w") as fh:
+            fh.write("")
+        fix_online = subprocess.run(["sh", cli_luci, "ui", "fix"], capture_output=True, text=True,
+                                    timeout=120, env={**os.environ})
+        check("面板可达时 `ui fix` 从面板取回最新的一份 (菜单也修好)",
+              os.path.getsize(menu_dst) > 0
+              and open(menu_dst, encoding="utf-8").read().lstrip().startswith("{"),
+              fix_online.stdout.strip().splitlines()[:2])
+        check("`ui fix` 说清了它修了几份 (用户能确认)",
+              "修好" in fix_online.stdout or "本来就是好的" in fix_online.stdout,
+              fix_online.stdout.strip().splitlines()[:1])
+
+        # 已经好的文件不许被"修"动 (幂等)
+        before_run = open(acl_dst, encoding="utf-8").read()
+        subprocess.run(["sh", cli_luci, "ui", "fix"], capture_output=True, text=True, timeout=120,
+                       env={**os.environ})
+        check("已经好的文件不会被 `ui fix` 动 (幂等, 内容是逐字节相同)",
+              open(acl_dst, encoding="utf-8").read() == before_run)
     finally:
         logs = []
         for panel in panels:

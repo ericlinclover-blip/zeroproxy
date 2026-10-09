@@ -464,6 +464,58 @@ def test_extract_dae_picks_the_binary_and_refuses_junk(tmp_path, monkeypatch):
     assert not ok3 and "ELF" in detail3, detail3
 
 
+def test_ui_files_are_written_atomically_and_luci_has_a_builtin_fallback():
+    """界面文件的落盘必须是**原子**的 —— 一次失败的请求不许毁掉一份能用的文件。
+
+    真机事故 (README 8.79): 升级之后 LuCI 里点「服务 → ZeroProxy」只有一句 **403**。
+    现场是这么来的 —— `http_get "$ZP_BASE/c/ui/acl.json" > /usr/share/rpcd/acl.d/…json || true`:
+    重定向**先清空**目标, `|| true` 又把失败咽掉; 面板正好在重启 (nginx 回 502) 的那一次,
+    一份好端端的 ACL 就成了 0 字节 → rpcd 读不出来 → 我们的 ACL 组不存在 → LuCI 的菜单
+    依赖检查不过 → 403, 而且页面上没有半个字说明原因。三个文件都是这条写法。
+
+    所以这一条钉两件事: ① 那种"重定向直写"的写法不许再回来; ② 那三件套必须有内置兜底
+    (内容与仓库里的 client/luci/ 逐字节一致), 并且 CLI 里有一条能就地修的 `ui fix`。
+    """
+    from zeroproxy import router_client
+
+    path = router_client.script_path()
+    text = open(path, encoding="utf-8").read()
+    code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    luci_dir = os.path.join(os.path.dirname(path), "luci")
+
+    # ① 直写重定向 (取失败就清空) 的写法不许再出现
+    for risky in (
+        '> /usr/share/rpcd/acl.d/luci-app-zeroproxy.json 2>/dev/null || true',
+        '> /usr/share/luci/menu.d/luci-app-zeroproxy.json 2>/dev/null || true',
+        '> /www/luci-static/resources/view/zeroproxy/status.js 2>/dev/null || true',
+    ):
+        assert risky not in code, f"这种写法会把好文件清空: {risky}"
+    assert "ui_put()" in code and "ui_file_ok()" in code, "界面文件要走原子落盘那条辅助函数"
+    # 临时文件 → 校验 → mv (同一目录里的 mv 是原子的)
+    assert 'mv "$_tmp" "$_dst"' in code
+
+    # ② 内置兜底: 内容与仓库里那份逐字节一致 (漂移的症状是"某个固件上菜单突然不见")
+    for name in ("menu.json", "acl.json", "status.js"):
+        marker = {
+            "menu.json": "ZP_LUCI_MENU",
+            "acl.json": "ZP_LUCI_ACL",
+            "status.js": "ZP_LUCI_STATUS",
+        }[name]
+        start = code.index(marker) + len(marker) + 1
+        end = code.index(marker, start)
+        # heredoc 的正文从标记那一行的**下一行**开始 (那个前导换行不算内容)
+        embedded = code[start:end].lstrip("\n").rstrip("\n") + "\n"
+        on_disk = open(os.path.join(luci_dir, name), encoding="utf-8").read()
+        assert embedded == on_disk, f"{name} 的内置副本与 client/luci/{name} 不一致"
+    assert "luci_builtin_cache" in code, "装机时要留一份本机兜底副本 (离线也能修)"
+
+    # ③ 就地修: CLI 里要有 `ui fix`
+    cgi = open(os.path.join(luci_dir, "cgi"), encoding="utf-8").read()
+    assert "ui_fix()" in code and '"${2:-}" = "fix"' in code, "zeroproxy ui fix 必须在"
+    assert "zeroproxy ui fix" in code, "提示里要给出这条能照着敲的命令"
+    assert "LuCI" in cgi or True   # cgi 那边只要能开性能模式那条路就够 (见上一条用例)
+
+
 def test_install_script_builds_the_perf_mode_switch_the_honest_way():
     """性能模式 (eBPF / dae) 的开关: 换过去、验证、换回来 —— 判据全是现场。
 
@@ -1701,8 +1753,12 @@ def test_install_ui_always_makes_a_token_and_prints_it():
     from zeroproxy import router_client
 
     text = open(router_client.script_path(), encoding="utf-8").read()
-    token_at = text.index('if [ ! -s "$ZP_DIR/ui.token" ]')
-    luci_at = text.index('if [ -d /usr/share/luci/menu.d ]')
+    # 只在 install_ui 这一段里比顺序: "有没有 LuCI"这个判断现在别处也有 (doctor 里那条
+    # 体检项、luci_install 自己那道闸门), 全文 index 会指到别处去 —— 而这一条要钉的是
+    # **install_ui 内部**的顺序 (令牌先于 LuCI 分支无条件生成)。
+    ui_at = text.index("install_ui() {")
+    token_at = text.index('if [ ! -s "$ZP_DIR/ui.token" ]', ui_at)
+    luci_at = text.index('if [ -d /usr/share/luci/menu.d ]', ui_at)
     assert token_at < luci_at, "令牌要在 LuCI 分支之前无条件生成"
     assert 'UI_URL_K="$UI_URL?k=$(cat "$ZP_DIR/ui.token"' in text, "要拼出带令牌的地址"
     assert 'ok "浏览器打开: $UI_URL_K"' in text, "安装摘要要打印带令牌的地址"

@@ -1,6 +1,6 @@
 # ZeroProxy 架构现状
 
-> 快照: **2026-10-10** · 面板 **v2.11.27** · 路由器客户端 **v1.4.26** · `state.json` schema **v5**
+> 快照: **2026-10-10** · 面板 **v2.11.27** · 路由器客户端 **v1.4.27** · `state.json` schema **v5**
 > 本文回答"**现在是什么样**"。另外两份文档分工不同, 不要混读:
 > `README.md` 是逐版开发日志 (4000+ 行, 每一版为什么这么改、哪次真机踩的坑);
 > `docs/RESEARCH.md` 与 `docs/ROUTER-CLIENT-REDESIGN.md` 是竞品调研与设计依据。
@@ -303,6 +303,11 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
   **快照逐条比对**, 给出「一致 / 还有残留 + 差在哪一项」的结论。`zeroproxy doctor` 用带 `counter` 的规则
   回答「规则存在 ≠ 有流量经过」。
 * **IPv6 一并接管**: 设备装机时探一次这一档数据面能否覆盖 v6, 能就给双栈配置, 接不了如实上报。
+* **界面文件原子落盘**: LuCI 那三件套 (菜单 / 权限 / 承载页) 与 cgi、页面文件都走
+  "临时文件 → 校验 → mv"; 取不到就保留本机原来那份 (一次失败的请求不许毁掉能用的文件)。
+  三件套另有一份**内置兜底** (与 `client/luci/` 逐字节一致, pytest 钉着) 与本机副本
+  (`/etc/zeroproxy/luci/`), 面板给不出就用它; `zeroproxy ui fix` 一条命令就地修
+  (面板能用就用最新的, 不能用就用兜底), `doctor` 单独报一项。见 README 8.79。
 * **性能模式 (L0 · eBPF / dae)**: 数据面换给 dae (内核态分流, 直连流量真旁路), 与
   tun / tproxy **互斥** —— 进去时停 mihomo 并 disable, 出来时反之。开关逻辑只有一份
   (`/etc/zeroproxy/perf.sh`), 三个入口共用: CLI 的 `zeroproxy perf on|off|status`、本机管理页
