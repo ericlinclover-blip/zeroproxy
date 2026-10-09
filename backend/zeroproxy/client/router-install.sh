@@ -707,7 +707,11 @@ nft_v6_ok() {
         PROBE_WHY="内核不接受 prerouting 链"
         return 1
     fi
-    if _v6_err="$(nft add rule inet zp_probe6 c ip6 daddr ::1/128 tproxy to :1 2>&1)"; then
+    # 探针写成与生产规则**同一种形状** (`meta nfproto ipv6 … tproxy ip6 to :1`):
+    # 探的必须是真正要下发给内核的那条规则。第一版漏了家族, 在真机上直接是
+    # "Transparent proxy support requires transport protocol match" —— 那台机器会被
+    # 误判成"IPv6 接管不了", 而它明明能 (真机 GL-MT3000 / OpenWrt 24.10 / 内核 6.6 实测)。
+    if _v6_err="$(nft add rule inet zp_probe6 c meta nfproto ipv6 meta l4proto tcp tproxy ip6 to :1 2>&1)"; then
         nft delete table inet zp_probe6 2>/dev/null || true
         return 0
     fi
@@ -1409,8 +1413,16 @@ table inet zp_router {
         # counter 不是可有可无的装饰: **规则存在 ≠ 有流量经过**。接口名写错时规则照样
         # "装上", 却一个包都不命中 —— 这个计数是唯一能证明"真的接管了"的现场证据,
         # `zeroproxy doctor` 读的就是它。
-        meta l4proto tcp counter meta mark set 0x1ff tproxy to :7893 accept
-        meta l4proto udp counter meta mark set 0x1ff tproxy to :7893 accept
+        #
+        # **家族必须写出来** (`tproxy ip` / `tproxy ip6`), 不能省成 `tproxy to :7893`。
+        # 省掉之后它在 inet 表里是"未指定家族", 而这条规则要同时管 v4 与 v6 —— 真机上
+        # 试过: 加了 `ip6` 限定再省家族, nft 直接报 "conflicting protocols specified:
+        # ip6 vs. unknown. You must specify ip or ip6 family in tproxy statement"。
+        # 与其推断"未指定是不是等于两个都管", 不如写死两条 (代价是各多一条规则)。
+        meta nfproto ipv4 meta l4proto tcp counter meta mark set 0x1ff tproxy ip to :7893 accept
+        meta nfproto ipv4 meta l4proto udp counter meta mark set 0x1ff tproxy ip to :7893 accept
+        meta nfproto ipv6 meta l4proto tcp counter meta mark set 0x1ff tproxy ip6 to :7893 accept
+        meta nfproto ipv6 meta l4proto udp counter meta mark set 0x1ff tproxy ip6 to :7893 accept
     }
     chain dns {
         type nat hook prerouting priority -105; policy accept;

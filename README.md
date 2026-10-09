@@ -3336,3 +3336,68 @@ tun 仍按 1500 收包的后果是**封装后超包** —— 表现很有欺骗�
 内核默认不编 `CONFIG_DEBUG_INFO_BTF`。现在 `doctor` 会把这一档的可用性直接报出来
 (`性能 → eBPF 挡位可用/不可用` + 原因), 等有真机验证条件时再上, 而不是先塞一段没人验过的
 代码进去。
+
+### 8.58 v2.11.7 (客户端 v1.4.8): 第二台真机 (OpenWrt 24.10 / 内核 6.6) —— 探针的形状是错的
+
+拿 GL-MT3000 (OpenWrt 24.10.4 / 内核 6.6.110 / aarch64) 做了第二类真机的验证 —— 这一类
+与已经跑通的原厂 21.02 完全不是一回事: opkg 还在、firewall4/nftables 齐全、内核 6.6。
+
+#### 先体检 (这些数字是这台机器上的实测)
+
+| 项 | 实测 | 含义 |
+|---|---|---|
+| 内核 | 6.6.110 | 比 21.02 那台 (5.4) 新两个大版本 |
+| `/sys/kernel/btf/vmlinux` | **不存在** | eBPF (dae) 挡位**实锤不可用** —— 官方 OpenWrt 内核不编 BTF, 这正是我不做 dae 的理由 |
+| tun / nft_tproxy / nf_tables | 三个模块都在 | 这一档应该落在 L1 (tun) |
+| WAN | `eth0` MTU **1500** | 以太网上行, tun 保持默认 1500 |
+| 转发卸载 | `flow_offloading=1` **且** `flow_offloading_hw=1` | 硬件+软件卸载**都开着** —— 8.57 刚加的探测在这台机器上真的会咬人 |
+| 闪存 | 121 MB 可用 | 宽裕 |
+
+#### 然后抓到一个我自己的 bug (只有真机看得见)
+
+把安装脚本里那几条探测原样拿到机器上跑, 探针在这一行炸了:
+
+```
+=== tproxy 探针 ===
+  OK v4 tproxy 规则下得去
+Error: Transparent proxy support requires transport protocol match
+add rule inet zp_probe6 c ip6 daddr ::1/128 tproxy to :1
+                                           ^^^^^^^^^^^^
+  v6 失败
+```
+
+原因: `tproxy` 语句前面**必须有传输层匹配** (`meta l4proto tcp`)。v4 那条我写了, v6 那条漏了。
+后果不是"探测不准"这么轻 —— 任何**回退到 tproxy** 的机器 (有 nftables 但没有 tun 模块, 原厂
+固件里很常见) 都会因此判定 `NET_IPV6=0`, 于是面板下发 **v4-only 配置**: 局域网设备的 v6
+直接出去。**我为防泄漏加的东西, 反倒成了泄漏的原因。**
+
+顺着又发现第二层: 在 `inet` 表里, 一旦规则里出现 `ip6` 限定, `tproxy` 就**必须写明家族** ——
+省掉会报
+
+```
+Error: conflicting protocols specified: ip6 vs. unknown.
+You must specify ip or ip6 family in tproxy statement
+```
+
+而我生成的生产规则 `meta l4proto tcp … tproxy to :7893` 正是**省了家族**的那种写法。它现在能
+落地 (加了 `ip6 daddr` 限定才会报错), 但"未指定家族在 inet 表里到底管不管 v6"我在这台机器上
+没法实测 (这台 Mac 只有链路本地 v6, 当不了 v6 客户端)。
+
+**测不了就不推断**: 生产规则改成显式两个家族 (代价是各多一条规则), 探针改成与生产规则同一个
+形状。真机上 `nft -c -f` 校验与落地都通过, 落地后也是原样存下来的:
+
+```
+meta nfproto ipv4 meta l4proto tcp counter meta mark set 0x1ff tproxy ip  to :7893 accept
+meta nfproto ipv4 meta l4proto udp counter meta mark set 0x1ff tproxy ip  to :7893 accept
+meta nfproto ipv6 meta l4proto tcp counter meta mark set 0x1ff tproxy ip6 to :7893 accept
+meta nfproto ipv6 meta l4proto udp counter meta mark set 0x1ff tproxy ip6 to :7893 accept
+```
+
+教训写在这里: **探针必须与真正下发的东西同一个形状**。探一条自己拼的规则、下发另一条, 中间
+那点差异就是"探测说有、实际没有"的来源。
+
+#### 回归
+
+* `pytest` **281 项**: 探针必须写成 `meta l4proto tcp tproxy ip6 to :1` (漏了家族的旧写法
+  不许再出现), 生产规则必须是显式的 `tproxy ip` / `tproxy ip6` 两条。
+* 真机验证: 新版 ruleset 在 GL-MT3000 上 `nft -c -f` 语法通过、`nft -f` 落地通过。

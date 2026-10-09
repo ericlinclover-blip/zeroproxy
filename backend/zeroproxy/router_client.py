@@ -39,7 +39,9 @@ from .config import paths
 #:        doctor 的说明改准 —— 设备的 DNS 有 dnsmasq 与运营商两条路, 两条都按域名分流。
 #: 1.4.7: 性能那一半 —— tun MTU 按 WAN 的实际 MTU 算 (PPPoE 1494 之类不再出超包);
 #:        转发卸载探测 (它会绕过 netfilter 让 tproxy/redirect 失效); zp bench。
-SCRIPT_VERSION = "1.4.7"
+#: 1.4.8: 真机 (OpenWrt 24.10 / 内核 6.6) 抓到探针形状错了 —— v6 tproxy 要传输层匹配、
+#:        家族要写死; 生产规则改成显式 tproxy ip / tproxy ip6 各两条。
+SCRIPT_VERSION = "1.4.8"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"

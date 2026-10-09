@@ -522,7 +522,16 @@ def test_install_script_probes_capabilities_and_reports_honestly():
     assert text.count("&ipv6=$_ip6") == 2
     # IPv6 能力: 单独探一次 (v6 的 tproxy 是内核里另一件事), 覆盖不到就记原因
     assert "nft_v6_ok" in text and "compute_ipv6_cap" in text
-    assert "ip6 daddr ::1/128 tproxy to :1" in text
+    # IPv6 探针必须与生产规则**同一种形状**: 家族写死 (`tproxy ip6 to :1`)。
+    # 第一版省了家族, 真机 (GL-MT3000 / OpenWrt 24.10 / 内核 6.6) 上报的是
+    # "Transparent proxy support requires transport protocol match" —— 于是那台
+    # 明明能接管 v6 的机器被误判成"IPv6 未接管"。这类"探的东西和用的东西不是一个形状"
+    # 只有真机才看得出来, 所以在这里钉死。
+    assert "meta l4proto tcp tproxy ip6 to :1" in text
+    assert "ip6 daddr ::1/128 tproxy to :1" not in text, "别再用那个漏了家族的写法"
+    # 生产规则也要显式两个家族 (同样因为家族不能省)
+    assert "meta nfproto ipv4 meta l4proto tcp counter meta mark set 0x1ff tproxy ip to :7893 accept" in text
+    assert "meta nfproto ipv6 meta l4proto tcp counter meta mark set 0x1ff tproxy ip6 to :7893 accept" in text
     assert "ipv6=" in text and "why.ipv6=" in text
 
 
