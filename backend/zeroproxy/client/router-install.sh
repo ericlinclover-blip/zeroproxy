@@ -45,6 +45,10 @@ DEPENDENCY_NOTE=""
 ACTIVE_MODE=""
 # 面板是否提供分流数据库接口 (/c/geo)。空 = 没问过 (更新模式), true = 有
 PANEL_GEO=""
+# 面板给来的分流数据库元信息 (core_read_panel 填): 体积下限与全部可用地址。
+# 没有它们也能装 —— 退回"只走面板"的老路, 行为与本改动之前相同。
+PANEL_GEO_SIZES=""
+PANEL_GEO_MIRRORS=""
 # 非空 = 这次只能装降级配置 (面板暂时给不出分流数据库), 结尾要如实说明
 DEGRADED=""
 # 非空 = 这次靠自愈才把 TUN 建起来 (值说明改了哪一项), 结尾要告诉用户
@@ -62,9 +66,13 @@ PAIR_ERROR=""
 # 全部输出走 stderr 之外的标准输出, 但用颜色区分层级 —— 用户是在 SSH 里看,
 # 一段没有层级的大段英文输出等于没有输出。
 if [ -t 1 ]; then
+    ZP_TTY=1
     C_R="$(printf '\033[0m')"; C_B="$(printf '\033[1m')"; C_G="$(printf '\033[32m')"
     C_Y="$(printf '\033[33m')"; C_E="$(printf '\033[31m')"
 else
+    # 非 TTY (输出被重定向 / 进管道 / 落日志): 不打进度条 —— `\r` 原地刷新在文件里会
+    # 堆成一坨, 而"每 5 秒一行"那种写法在日志里照样读得出来。
+    ZP_TTY=0
     C_R=""; C_B=""; C_G=""; C_Y=""; C_E=""
 fi
 step() { printf '%s==>%s %s\n' "$C_B" "$C_R" "$*"; }
@@ -230,19 +238,52 @@ http_fetch_to() {
 # 下载失败时把面板那句话原样带出来 —— 面板的 503/502 正文就是写给用户看的中文,
 # 藏在文件里不给任何人看就等于没有。只对"小文件"这么做: 内核是 20 MB, 不可能是话。
 show_body() {
-    _f="$1"
-    [ -s "$_f" ] || return 0
-    _size="$(wc -c < "$_f" 2>/dev/null | tr -d ' ' || true)"
-    [ "${_size:-0}" -lt 4096 ] || return 0
-    sed -n '1,4p' "$_f" 2>/dev/null | sed 's/^/      /' >&2 || true
+    # 名字带 sb_ 前缀: 这个脚本没有 local, `_size` 这种大众名会**静默**污染调用方
+    # (调用方往往正好也在比大小 —— 真事, 见 geo_fetch_one 顶部的注释)。
+    _sb_f="$1"
+    [ -s "$_sb_f" ] || return 0
+    _sb_size="$(wc -c < "$_sb_f" 2>/dev/null | tr -d ' ' || true)"
+    [ "${_sb_size:-0}" -lt 4096 ] || return 0
+    sed -n '1,4p' "$_sb_f" 2>/dev/null | sed 's/^/      /' >&2 || true
 }
 
 # 下载进度: 路由器上没有任何工具会替你打这个 (uclient-fetch 全程静默), 而 20 MB 在
 # 4 Mbps 的线路上要 40 秒。中间一行输出都没有, 用户就会以为卡死了 —— 真机反馈里
 # "一直卡在下载代理内核"就是这么来的。后台小循环每 5 秒读一次文件大小, 有增长才报。
 PROGRESS_PID=""
+# 人读的字节数 (19.9 MB / 412 KB)。只用于进度条那几行, 不参与任何判断。
+zp_hsize() {
+    _b="${1:-0}"
+    if [ "$_b" -ge 1048576 ] 2>/dev/null; then
+        printf '%s.%s MB' "$((_b / 1048576))" "$(( (_b % 1048576) * 10 / 1048576 ))"
+    elif [ "$_b" -ge 1024 ] 2>/dev/null; then
+        printf '%s KB' "$((_b / 1024))"
+    else
+        printf '%s B' "$_b"
+    fi
+}
+
+# 一条会原地刷新的进度条:
+#     [██████████░░░░░░░░░░░░░░]  47%  9.4 MB / 19.9 MB  615 KB/s
+# 只在已知总量、且在 TTY 上时用它 (未知总量画不出百分比, 非 TTY 会把 \r 堆成垃圾)。
+# 宽度固定 24 格 —— 行尾不会随数字位数抖动。
+zp_bar() {
+    _label="$1"; _now="$2"; _total="$3"; _kbps="$4"
+    _pct=$(( _now * 100 / _total )) 2>/dev/null || _pct=0
+    [ "$_pct" -gt 100 ] 2>/dev/null && _pct=100
+    [ "$_pct" -lt 0 ] 2>/dev/null && _pct=0
+    _full=$(( _pct * 24 / 100 ))
+    _bar=""; _i=0
+    while [ "$_i" -lt 24 ]; do
+        if [ "$_i" -lt "$_full" ]; then _bar="${_bar}█"; else _bar="${_bar}░"; fi
+        _i=$((_i + 1))
+    done
+    printf '\r  %s [%s] %3s%%  %s / %s  %s KB/s   ' \
+        "$_label" "$_bar" "$_pct" "$(zp_hsize "$_now")" "$(zp_hsize "$_total")" "$_kbps"
+}
+
 start_progress() {
-    _file="$1"; _label="${2:-下载中}"
+    _file="$1"; _label="${2:-下载中}"; _total="${3:-0}"
     stop_progress
     (
         _ticks=0
@@ -258,9 +299,13 @@ start_progress() {
             [ -n "$_now" ] || _now=0
             _ticks=$((_ticks + 1))
             _kbps=$((_now / 1024 / (_ticks * 5)))
-            # 每 5 秒无条件报一次: 速率掉下来 (或一直是 0) 也看得见 —— 这正是
-            # "卡住"与"慢"的区别所在。
-            printf '  … %s %s KB (%s KB/s)\n' "$_label" "$((_now / 1024))" "$_kbps"
+            # 已知总量 + TTY: 画条。否则退回"每 5 秒一行"—— 每 5 秒无条件报一次, 速率
+            # 掉下来 (或一直是 0) 也看得见, 这正是"卡住"与"慢"的区别所在。
+            if [ "$ZP_TTY" = "1" ] && [ "${_total:-0}" -gt 0 ] 2>/dev/null; then
+                zp_bar "$_label" "$_now" "$_total" "$_kbps"
+            else
+                printf '  … %s %s KB (%s KB/s)\n' "$_label" "$((_now / 1024))" "$_kbps"
+            fi
             sleep 5
         done
     ) &
@@ -271,6 +316,9 @@ stop_progress() {
     kill "$PROGRESS_PID" 2>/dev/null || true
     wait "$PROGRESS_PID" 2>/dev/null || true
     PROGRESS_PID=""
+    # 进度条是 `\r` 原地刷的: 不清掉的话, 紧接着那句「✓ 完成」会叠在条子尾巴上。
+    [ "$ZP_TTY" = "1" ] && printf '\r\033[K'
+    return 0
 }
 
 json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\r\n'; }
@@ -1094,7 +1142,8 @@ core_min_rate() {
 core_download() {
     rm -f "$2"
     DL_START="$(date +%s 2>/dev/null || echo 0)"
-    start_progress "$2" "已下载"
+    # 面板给了大小就画带百分比的条; 没给 (老面板) 就退回每 5 秒一行 —— 两种都比"不动"强。
+    start_progress "$2" "已下载" "${PANEL_SIZE:-0}"
     if http_fetch_to "$1" "$2" "${3:-900}" "${4:-0}" "$CORE_RATE_WINDOW"; then
         _rc=0
     else
@@ -1122,6 +1171,10 @@ core_read_panel() {
     [ -n "$PANEL_PREFER" ] || PANEL_PREFER="panel"
     # 面板要的那一版内核 —— 用来判断本机这份是不是该换了 (见 install_core)
     PANEL_CORE_VERSION="$(json_get "$_json" core_version)"
+    # 分流数据库的元信息 (见 install_geo)。老面板没有这两个字段 —— 那时它们为空,
+    # install_geo 自动退回"只走面板"的老路。
+    PANEL_GEO_SIZES="$(json_get "$_json" geo_sizes)"
+    PANEL_GEO_MIRRORS="$(json_get "$_json" geo_mirrors)"
 }
 
 # 本机内核是不是面板要的那一版。**只看"能不能跑"是不够的**: 面板把 CORE_VERSION 抬上去
@@ -1416,14 +1469,73 @@ fetch_config() {
 # (agent.sh 里有一个同名函数 —— 两边是不同进程, 判据只能是"这两个文件在不在"。)
 geo_ok() { [ -s "$ZP_DIR/geoip.metadb" ] && [ -s "$ZP_DIR/geosite.dat" ]; }
 
+#: 两份数据的文件名 (与面板 GEO_FILES 一一对应; 名字是 mihomo 认死的, 不能改)
+GEO_FILE_LIST="geoip.metadb geosite.dat"
+#: 单份数据的总预算 (秒)。按面板给的体积算出来的"最低可接受速率"就来自它 ——
+#: 低于那个速度说明这份在预算内跑不完, 那就不该把整段预算耗在一条跑不完的路上。
+GEO_BUDGET="${ZP_GEO_BUDGET:-180}"
+
+# 面板给的 "geoip.metadb=204800;geosite.dat=2097152" 里取一份的体积下限
+geo_size_for() {
+    printf '%s' "$PANEL_GEO_SIZES" | tr ';' '\n' | sed -n "s/^$1=//p" | head -n1
+}
+
+# 面板给的 "geoip.metadb <url> <url>|geosite.dat <url> <url>" 里取一份的地址表
+geo_mirrors_for() {
+    printf '%s' "$PANEL_GEO_MIRRORS" | tr '|' '\n' | sed -n "s/^$1 //p" | head -n1
+}
+
+# 取一份分流数据库 (先试面板, 太慢就换面板同款的那份镜像表)。
+#
+# 为什么要给分流数据库也做这一套 —— 它和内核是**同一道坎**, 而原来只有一条路:
+#   真机 8.75: 内核那一步"面板直传 47 KB/s"被速率闸门判死, 换镜像后 615 KB/s;
+#   而分流数据库当时没有镜像可换, 只能干等 —— 屏幕上就是"卡在准备分流数据库不动"
+#   (旧实现还把整段输出丢进了 /dev/null, 连一行 KB 都看不到)。13 倍的差距, 不该只在
+#   内核那条路上享受。
+geo_fetch_one() {
+    # 变量名一律带 _g 前缀: 这个脚本没有 local, 而这些名字会被一遍遍复用 ——
+    # 撞名是**静默**的 (真事: show_body 里也写 _size, 于是"面板 404 → 换镜像"这条路上
+    # 体积闸门会拿 404 正文的大小去比, 一个残缺文件照样装了进去)。前缀让它撞不上。
+    _gname="$1"
+    _gtmp="$ZP_DIR/.geo.$_gname.part"
+    rm -f "$_gtmp"
+    _gneed="$(geo_size_for "$_gname")"
+    [ -n "$_gneed" ] || _gneed=1
+    # 速率闸门 (与 core_min_rate 同源): 面板知道文件多大, 于是"跑不完"是能算出来的。
+    _gmin=$(( _gneed / 1024 / GEO_BUDGET ))
+    [ "$_gmin" -ge 8 ] || _gmin=8
+    for _gurl in "$ZP_BASE/c/geo/$_gname" $(geo_mirrors_for "$_gname"); do
+        [ -n "$_gurl" ] || continue
+        start_progress "$_gtmp" "下载 $_gname" "$_gneed"
+        _ggot=0
+        if http_fetch_to "$_gurl" "$_gtmp" "$GEO_BUDGET" "$_gmin" "$CORE_RATE_WINDOW"; then
+            _ggot="$(wc -c < "$_gtmp" 2>/dev/null | tr -d ' ' || true)"
+        fi
+        stop_progress
+        # 体积闸门: 挡 404 页面 / 面板那句"还在准备"的人话 / 下了一半的文件
+        if [ "${_ggot:-0}" -ge "$_gneed" ] 2>/dev/null; then
+            mv "$_gtmp" "$ZP_DIR/$_gname"
+            ok "$_gname 就绪 ($(zp_hsize "$_ggot"))"
+            return 0
+        fi
+        # 有的是**面板写给人看的一句话** (503 正文): 原样带出来, 别让人对着空文件猜
+        show_body "$_gtmp"
+        rm -f "$_gtmp"
+    done
+    return 1
+}
+
 install_geo() {
     step "准备分流数据库 (GeoIP / GeoSite)"
-    if "$ZP_DIR/agent.sh" geo force >/dev/null 2>&1; then
-        ok "分流数据库就绪 ($(wc -c < "$ZP_DIR/geoip.metadb" 2>/dev/null | tr -d ' ') + $(wc -c < "$ZP_DIR/geosite.dat" 2>/dev/null | tr -d ' ') 字节)"
-        return 0
-    fi
+    _gfail=""
+    for _gfile in $GEO_FILE_LIST; do
+        geo_fetch_one "$_gfile" || _gfail="$_gfail $_gfile"
+    done
     if geo_ok; then
-        warn "本次刷新失败, 继续用本机已有的分流数据库"
+        [ -z "$_gfail" ] || warn "这次没取到$_gfail —— 继续用本机已有的那一份"
+        _ggsz="$(wc -c < "$ZP_DIR/geoip.metadb" 2>/dev/null | tr -d ' ' || true)"
+        _gssz="$(wc -c < "$ZP_DIR/geosite.dat" 2>/dev/null | tr -d ' ' || true)"
+        ok "分流数据库就绪 (geoip $(zp_hsize "${_ggsz:-0}") · geosite $(zp_hsize "${_gssz:-0}"))"
         return 0
     fi
     # 面板明说自己没有这个接口 = 这台面板比客户端旧。这种情况下它的配置一定带 geo 规则,

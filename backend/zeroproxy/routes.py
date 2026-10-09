@@ -3052,6 +3052,19 @@ def client_core_status(request: Request):
         #   mirror_urls  —— 面板同款镜像的**完整地址**, 逗号分隔 (客户端不拼模板)
         #   prefer       —— 面板建议先走哪条: panel / mirror (ZP_ROUTER_SOURCE 可改)
         "prefer": router_client.ROUTER_SOURCE,
+        # 分流数据库: 与内核同一个病 (面板这条路慢 → "卡在准备分流数据库不动"), 同一副药 ——
+        # 把每一份的**体积下限**与**全部可用地址**一起给过去。格式刻意做成浅层可解析的
+        # (客户端没有 jq, 只有 sed):
+        #   geo_sizes    "geoip.metadb=204800;geosite.dat=2097152"
+        #   geo_mirrors  "geoip.metadb <url> <url>|geosite.dat <url> <url>"
+        # URL 里既没有空格也没有 `|`, 所以这两个分隔符不会歧义。
+        "geo_sizes": ";".join(
+            f"{name}={router_client.geo_min_bytes(name)}" for name in router_client.GEO_FILES
+        ),
+        "geo_mirrors": "|".join(
+            name + " " + " ".join(router_client.geo_mirror_urls(name))
+            for name in router_client.GEO_FILES
+        ),
     }
     # 指定了架构时再把这一档的字段摊平在顶层: 路由器端只做浅层解析 (没有 jq),
     # 嵌套在数组里的 bytes/state 它取不到。

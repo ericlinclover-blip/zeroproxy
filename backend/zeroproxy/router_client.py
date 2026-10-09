@@ -72,7 +72,11 @@ from .config import paths
 #: 1.4.22: auto-redirect 被去掉之后, 它本该写的**防火墙放行**由 tunfw.sh 补上, 并且装完
 #:         必须验证到位才敢说这一级生效 —— 少了这一步, 局域网被整个丢掉, 而面板与路由器
 #:         双双显示"已连接" (8.74, GL-MT3600BE)。doctor 也把这一项单独报出来。
-SCRIPT_VERSION = "1.4.22"
+#: 1.4.23: 分流数据库与内核走同一条路 —— 面板 + 镜像, 带进度条、速率闸门与体积闸门;
+#:         输出不再丢进 /dev/null (旧实现最长 600 秒/份、一个字都不打, 看起来就是"卡住")。
+#:         顺手修掉一个撞名 bug: 体积闸门和 show_body 都写 `_size`, 于是"面板失败→换镜像"
+#:         这条路上闸门拿的是 404 正文的大小 (8.75)。
+SCRIPT_VERSION = "1.4.23"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"
@@ -525,7 +529,7 @@ GEO_SOURCE_TIMEOUT = 90
 #: 分流数据库的镜像顺序: 与内核同一套思路 —— 运营方自建的镜像第一, 公共反代随后,
 #: GitHub 直连最后。直连在受限出口上是"卡满超时再失败", 排第一会白吃掉整个预算
 #: (真机网络就是这样: 直连与 ghfast 都超时, 只有 gh-proxy 通)。
-GEO_MIRRORS = (
+DEFAULT_GEO_MIRRORS = (
     "https://github.i3.pub/{url}",
     "https://gh-proxy.com/{url}",
     "https://hk.gh-proxy.com/{url}",
@@ -533,6 +537,23 @@ GEO_MIRRORS = (
     "https://ghproxy.net/{url}",
     "{url}",
 )
+
+
+def _geo_mirror_list() -> tuple[str, ...]:
+    """实际使用的分流数据镜像表 (与 `_mirror_list` 同一个口子)。
+
+    `ZP_GEO_MIRRORS=https://my.mirror/{url},…` 可以整体替换。**测试必须能关掉它**:
+    否则演练里一旦面板那条路没走通, 客户端就会去够真实的 GitHub 反代 —— 一个"离线可跑"
+    的回归会变成"看网络脸色"。
+    """
+    raw = os.environ.get("ZP_GEO_MIRRORS", "").strip()
+    if not raw:
+        return DEFAULT_GEO_MIRRORS
+    custom = tuple(item.strip() for item in raw.split(",") if item.strip())
+    return custom or DEFAULT_GEO_MIRRORS
+
+
+GEO_MIRRORS = _geo_mirror_list()
 
 #: 一次下载的总时间上限。5 个镜像各 90 秒最坏是 7 分钟, 而路由器正在**同步等**这份
 #: 数据 —— 它不可能给一台面板几分钟去翻墙。到点就如实报错, 让路由器先降级装上。
@@ -550,6 +571,19 @@ def geo_min_bytes(name: str) -> int:
     if GEO_MIN_OVERRIDE > 0:
         return GEO_MIN_OVERRIDE
     return GEO_FILES[name][1]
+
+
+def geo_mirror_urls(name: str) -> list[str]:
+    """这一份分流数据库的全部可用地址 (完整 URL, 路由器端直接拿去用)。
+
+    与内核那条路**同一个理由、同一副药**: 面板这条路在有些线路上只有几十 KB/s
+    (真机 8.75: 面板直传 47 KB/s, 直连镜像 615 KB/s)。分流数据库比内核小, 但慢起来
+    一样是"卡在准备分流数据库不动"—— 而它跟内核一样, 是装机必须过的坎。
+    把地址表连同体积下限一起给它, 它就能像取内核那样先试面板、太慢就换镜像;
+    换源用的还是**面板这一份**地址表, 两边不会各写一套而走偏。
+    """
+    url = GEO_FILES[name][0]
+    return [template.format(url=url) for template in GEO_MIRRORS]
 
 
 def geo_dir() -> str:

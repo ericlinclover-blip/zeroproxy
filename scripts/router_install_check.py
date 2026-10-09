@@ -256,6 +256,9 @@ class Panel:
             "ZP_APPLY_ASYNC": "0",
             "ZP_CORE_MIN_BYTES": "16",   # 假内核只有几百字节
             "ZP_GEO_MIN_BYTES": "16",    # 分流数据库同理 (演练不下载真的 4 MB)
+            # 分流数据库的镜像表也换掉: 面板那条路万一没走通, 客户端会去够镜像 ——
+            # 演练必须离线可跑, 不能因为网络脸色而红 (与 ZP_CORE_MIRRORS 同一个理由)。
+            "ZP_GEO_MIRRORS": "http://127.0.0.1:9/{url}",
         }
         self.env.update(extra_env or {})
         self.proc = subprocess.Popen(

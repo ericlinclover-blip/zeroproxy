@@ -719,6 +719,107 @@ def test_generated_tunfw_helper_is_idempotent_and_symmetric(tmp_path):
     (home / "caps").write_text("chosen=redirect\nautoredirect=0\n")
     run("zp_tunfw_allow")
     assert rules() == 0, "不是 tun 那一档时不该动防火墙"
+
+
+def test_core_status_hands_the_router_the_geo_mirror_table(client, configured):
+    """分流数据库也要像内核那样"面板 + 镜像"两条路 —— 地址表由面板给, 客户端不拼模板。
+
+    真机 (8.75): 内核那一步"面板直传 47 KB/s"被速率闸门判死, 换镜像后 615 KB/s;
+    而分流数据库当时**只有面板一条路**, 屏幕上的表现就是"卡在准备分流数据库不动"
+    (旧实现还把整段输出丢进了 /dev/null —— 一行 KB 都看不到)。
+    """
+    from zeroproxy import router_client
+
+    data = client.get("/c/core/status?arch=arm64").json()
+    assert "geo_sizes" in data and "geo_mirrors" in data, "分流数据的大小与地址表要一起给"
+
+    # 大小: "名字=字节" 的浅层格式 (客户端没有 jq, 只有 sed)
+    sizes = dict(item.split("=", 1) for item in data["geo_sizes"].split(";") if item)
+    assert set(sizes) == set(router_client.GEO_FILES)
+    for name, raw in sizes.items():
+        assert int(raw) == router_client.geo_min_bytes(name)
+
+    # 地址表: "名字 url url|名字 url url" —— 每个文件都要有地址, 且必须是**拼好的完整 URL**
+    table = {}
+    for chunk in data["geo_mirrors"].split("|"):
+        parts = chunk.split(" ")
+        table[parts[0]] = parts[1:]
+    assert set(table) == set(router_client.GEO_FILES)
+    for name, urls in table.items():
+        assert urls == router_client.geo_mirror_urls(name), "面板给的必须与它自己用的一致"
+        # 测试环境把镜像表换成了一条死地址 (离线可跑), 所以这里只要求"至少有一条备用源";
+        # 默认那张表有 6 条, 上面那条 equality 断言已经盯住了内容。
+        assert len(urls) >= 1, "至少要有一条备用源"
+        for url in urls:
+            assert url.startswith("http"), url
+            assert "{url}" not in url, "给过去的一定是拼好的完整地址, 客户端不拼模板"
+            assert " " not in url and "|" not in url, "分隔符不能出现在 URL 里 (会被切错)"
+
+
+def test_geo_fetch_falls_back_to_mirrors_and_enforces_the_size_gate(tmp_path):
+    """分流数据库的取数: 面板那条路失败要落到镜像, 而**体积闸门必须真的生效**。
+
+    这条路径上有一个只有真跑才看得见的 bug: 闸门用的变量 `_size` 与失败分支里
+    `show_body()` 内部的 `_size` 撞了名 (这个脚本没有 local)。于是"面板失败 → 换镜像"
+    这条路上, 闸门实际拿的是 **404 正文的大小** —— 一个残缺文件照样装了进去。
+    所以这个用例必须**先让面板那条路失败**, 再送一个不够大的文件过来。
+    """
+    import functools
+    import http.server
+    import re
+    import subprocess
+    import threading
+
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+    funcs = []
+    for fn in ("zp_hsize", "start_progress", "stop_progress", "http_fetch_to",
+               "show_body", "geo_size_for", "geo_mirrors_for", "geo_fetch_one"):
+        m = re.search(rf"^{fn}\(\) \{{.*?^\}}", text, re.S | re.M)
+        assert m, f"从安装脚本里抽不到 {fn}()"
+        funcs.append(m.group(0))
+
+    srv_dir = tmp_path / "srv"
+    srv_dir.mkdir()
+    (srv_dir / "big.dat").write_bytes(b"A" * 200_000)     # 够大
+    (srv_dir / "small.dat").write_bytes(b"B" * 1_000)     # 不够大
+
+    class Quiet(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, *a):  # 别把演练日志刷满
+            pass
+
+    httpd = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), functools.partial(Quiet, directory=str(srv_dir)))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "funcs.sh").write_text("\n".join(funcs), encoding="utf-8")
+
+        def run(name: str, need: int) -> bool:
+            script = (
+                'C_R=""; ZP_TTY=0\n'
+                'step() { :; }; ok() { :; }; warn() { :; }; note() { :; }\n'
+                'progress_note() { :; }\n'
+                'HTTP=curl; TLS_OPTS=""; CORE_RATE_WINDOW=5; GEO_BUDGET=30\n'
+                f'ZP_DIR="{home}"; ZP_BASE="{base}/panel"\n'      # 面板那条路故意 404
+                f'PANEL_GEO_SIZES="{name}={need}"\n'
+                f'PANEL_GEO_MIRRORS="{name} {base}/{name}"\n'
+                f'. "{home}/funcs.sh"\n'
+                f'geo_fetch_one "{name}"\n'
+            )
+            return subprocess.run(["sh", "-c", script],
+                                  capture_output=True, text=True).returncode == 0
+
+        assert run("big.dat", 100_000) is True, "面板 404 之后落到镜像, 应当装上"
+        assert (home / "big.dat").stat().st_size == 200_000
+        # 关键那一条: 闸门必须拦住不够大的那一份 (而不是拿 404 正文的大小去比)
+        assert run("small.dat", 100_000) is False, "体积不够时必须拒绝"
+        assert not (home / "small.dat").exists(), "拒绝之后不许留下文件"
+    finally:
+        httpd.shutdown()
     # 自愈 + 阶梯降级: 都排在"把原因打出来"之后, 且只在失败分支里
     fail_at = text.index("等了 30 秒 TUN 设备仍未出现")
     heal_at = text.index("if tun_retry_without_redirect &&")
