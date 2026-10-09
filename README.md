@@ -79,7 +79,7 @@ curl -fsSL https://github.i3.pub/https://raw.githubusercontent.com/ericlinclover
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` **291 项通过 + 6 skip** (带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (105 项, 含**两台机器真跑一条链** 与**四档数据面 × IPv6 的路由器配置过真 mihomo**) + `scripts/router_install_check.py` (**110 项**, 真的用 shell 跑一遍路由器安装脚本, 内含四类机器 / 本机覆盖 / revert 比对 / zpcore 真跑) + `scripts/browser_check.cjs` (157 项) + `scripts/clients_check.cjs` (26 项, 真实浏览器点开关) + `scripts/router_ui_check.cjs` (18 项) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` **293 项通过 + 6 skip** (带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (105 项, 含**两台机器真跑一条链** 与**四档数据面 × IPv6 的路由器配置过真 mihomo**) + `scripts/router_install_check.py` (**110 项**, 真的用 shell 跑一遍路由器安装脚本, 内含四类机器 / 本机覆盖 / revert 比对 / zpcore 真跑) + `scripts/browser_check.cjs` (157 项) + `scripts/clients_check.cjs` (26 项, 真实浏览器点开关) + `scripts/router_ui_check.cjs` (18 项) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 | **看得懂的界面 (v2.6.0)** | 控制台布局: 左侧锚点导航 (带计数角标 + 滚动高亮) + 顶部指标条 (健康节点 / 落地出口 IP / 平均延迟 + 迷你折线 / 运行时长) + 节点密集表格 (名称 / 地址状态 / **握手延迟条** / **上下行双轨** / 开关与复制) + **流量卡 (双弧圆环 + 实时速率曲线 + 逐节点双色流量条)** + 链式链路拓扑 (你的设备 → 本机入口 → 落地端) + 程序更新闭环; 动效全部走 `transform`/自绘 rAF 并受 `prefers-reduced-motion` 约束 |
 
@@ -4154,3 +4154,80 @@ registry 指到 `docker.i3.pub`; ② 或者只是想让**你自己 VPS 上的 Do
   扩成同时断言 `script-src` 与 `style-src` 都不含 `'unsafe-inline'`。
 * `scripts/browser_check.cjs` 155 → **157 项** (真 Chromium): 注入的 `<style>` 执行不了;
   页面上所有带 `data-w` 的条子都已经由 `applyWidths` 赋过宽度、且至少有一条非零宽。
+
+### 8.74 v2.11.23 (客户端 v1.4.22): "面板显示已连接, 家里却全断" —— auto-redirect 的另一半
+
+真机 **GL-MT3600BE · 原厂 OpenWrt 21.02-SNAPSHOT / 内核 5.4.281**: 装完是这样 ——
+
+```
+✓ 数据面: TUN (全屋设备 + 路由器自身)
+! 等了 30 秒 TUN 设备仍未出现 …
+✓ TUN 已建立 (已按这台固件去掉 auto-redirect)
+✓ 出口连通性正常
+✓ 全屋代理已开启 —— 手机 / 电脑 / 电视连上这台路由器即可用
+```
+
+面板上设备卡是绿的「已连接 · TUN · 全屋 (含路由器自身)」, 路由器自己的网页界面也一切正常 ——
+**而家里所有设备国内国外全断**。路由器自己还能上网 (所以"出口连通性正常"是实话),
+装脚本、面板、路由器界面三处都看不出任何异常。
+
+#### 病灶: auto-redirect 被拿掉的那一半, 是**防火墙放行**
+
+8.45 决定"tun 起不来就把 `auto-redirect` 去掉再试", 并且写下了那句判断: *"全屋的本体是
+`auto-route`…少了 auto-redirect 功能不受影响"*。**这句话只对了一半**, 而缺的那一半正好是
+致命的那一半。
+
+`auto-route` 那部分确实没错: 核对 `MetaCubeX/sing-tun` (mihomo v1.19.32 用的 v0.4.27)
+`tun_linux.go`, 非 mark 模式下的兜底 ip rule 是 `invert iif lo → table` —— 局域网转发的包
+(iif = br-lan) 一样命中, 会被拖进 tun。问题在**拖进去之后**:
+
+同一个库里 `redirect_nftables_rules_openwrt.go` 干的是这件事 ——
+
+```go
+rulePath := "/etc/nftables.d/0-" + r.tableName + "-auto-redirect.nft"
+os.WriteFile(rulePath, []byte(`chain forward {
+	type filter hook forward priority filter; policy accept;
+	iifname "`+r.tunOptions.Name+`" counter accept
+	oifname "`+r.tunOptions.Name+`" counter accept
+}`), 0o644)
+shell.Exec(fw4Path, "reload").Read()
+```
+
+也就是说: **`auto-redirect` 在 OpenWrt(fw4) 上还负责写两条"放行转发进/出 tun"的 nft 规则**。
+`zp-tun` 是个没归进任何 zone 的新接口, 少了那两条, 局域网转发到它的包全被 forward 策略丢掉。
+只去掉 `auto-redirect`, 结果就是 **包进得来、出不去**: 家里全断, 而路由器自己的流量走的是
+另一条链 (output), 于是自检、`doctor`、面板状态、路由器界面 —— 每一处都还是绿的。
+
+一句话: **设备在 ≠ 流量过得去**。这正是 8.46 立下的"永不撒谎"最该守住的那个位置, 而它恰好
+漏在这里 —— TUN 那一档的自愈只验了 `ip link show zp-tun`。
+
+#### 改法
+
+* 新增 `tunfw.sh` (与 `redirect.sh` 同一个套路): `zp_tunfw_allow` 补上上游本该写的那两条
+  (**两个方向**都放行), `zp_tunfw_live` 按注释认领地查现场, `zp_tunfw_clear` 只删自己加的
+  那几个 handle。有 fw4 就走 `nft insert rule inet fw4 forward/input`; 没有 fw4 的 fw3 机器
+  退回 `iptables -I FORWARD/INPUT`。拆的时候用**有界**循环 (最多 8 条) —— `while iptables -D …`
+  靠"删不到就返回非 0"退出, 那是惯例不是契约, 卡死在卸载里比不拆更糟。
+* **只在 `autoredirect=0` 时动手** (caps 里那一格就是"上游那一步到底跑成了没有"的记录)。
+  健康的机器**一个字节都不动** —— 演练里那台"有 tun 的健康机器"输出与改动前逐字相同。
+* 安装时**必须验到位**: 补完 `zp_tunfw_live` 说在才算这一级生效; 补不上就把 `why.tun` 写清楚、
+  置 `TUN_UNUSABLE`, 然后**顺着阶梯往下走** —— 宁可降到 `redirect` (只局域网 TCP) 或"不接管",
+  也不留一个"家里全断"的状态在人家机器上。
+* 三个出口都回收 (init 停服务 / `off` / `revert` / `uninstall`), `revert` 的"与装机前逐条比对"
+  才继续成立。另外 agent 每轮顺手补一次: 直接插在 fw4 链上的规则**一次 `fw4 reload` 就没了**,
+  没有这一步, 家里会在某次网络变动之后**静默地再断一次**。
+* `doctor` 把这一项单独报出来: 不再是"设备在就算接管", 而是"防火墙放行在不在"。
+
+8.45 里那句错判也一并改掉了 —— 注释里现在写着它错在哪、以及上游源码里对应的那几行。
+
+#### 回归
+
+* `pytest` 291 → **293 项**, 新增两条:
+  * 静态审计 —— 两个方向都要放行 / fw3 要有 iptables 那条路 / 只在 `autoredirect=0` 时动手 /
+    `TUN_UNUSABLE` 与"补不上防火墙放行"必须在, 且拆的出口不止一处;
+  * **把生成出来的 `tunfw.sh` 拿假 nft 真跑一遍** —— 该动手才动手、重复调用幂等、
+    拆完干净 (`autoredirect=1` 与选了别的数据面时, 一个规则都不许加)。
+    这条是这次唯一能证明"逻辑真的对"的东西: 只断言字符串的话, 把 `allow` 和 `clear` 写反了
+    也照样绿。
+* `scripts/router_install_check.py` **110/110 项通过** (改动后重跑; 这台演练机器上 tun 那一档
+  走的是"健康机器"路径, 输出与改动前一致 —— 也就是"能跑的机器一个字节不动"这条被验证了)。

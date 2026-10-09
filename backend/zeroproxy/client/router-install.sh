@@ -49,6 +49,9 @@ PANEL_GEO=""
 DEGRADED=""
 # 非空 = 这次靠自愈才把 TUN 建起来 (值说明改了哪一项), 结尾要告诉用户
 TUN_HEALED=""
+# 1 = TUN 设备建起来了、但**局域网根本过不去** (auto-redirect 缺席又补不上防火墙放行) ——
+# 这一级不能算生效, 必须顺着阶梯往下走, 而不是留一个"家里全断"的状态
+TUN_UNUSABLE=""
 # 设备凭据与配对结果 (set -u 下必须预置: 只有在真的走过那条分支时才会被赋值)
 DEV_ID=""
 DEV_SECRET=""
@@ -1648,6 +1651,108 @@ zp_redirect_v6() { command -v ip6tables >/dev/null 2>&1 && return 0 || return 1;
 REDIRECTEOF
     chmod 755 "$ZP_DIR/redirect.sh"
 
+    # TUN 数据面的**防火墙放行**。只在 auto-redirect 没能跑成 (caps: autoredirect=0) 时才用。
+    cat > "$ZP_DIR/tunfw.sh" <<'TUNFWEOF'
+#!/bin/sh
+# ZeroProxy · TUN 数据面的防火墙放行 —— auto-redirect 被拿掉之后, 这一半必须由我们补上。
+#
+# 为什么需要它 (8.74 · 真机: GL-MT3600BE / 原厂 OpenWrt 21.02 / 内核 5.4.281):
+#   sing-tun 在 OpenWrt(fw4) 上实现 auto-redirect 时, 除了自己那张 nft 表, 还会往
+#   /etc/nftables.d/ 落一份 drop-in, 内容是:
+#       chain forward { ... iifname "<tun>" counter accept; oifname "<tun>" counter accept; }
+#   也就是**转发进/出 tun 的流量靠它放行** (上游 redirect_nftables_rules_openwrt.go)。
+#   这台固件上带 auto-redirect 时 tun 根本建不出来, 于是安装脚本走自愈把它去掉 (8.45) ——
+#   去掉之后 tun 能建出来、路由器自己也能出网, 但**局域网转发到 zp-tun 的包全部被防火墙的
+#   forward 策略丢掉**。现象正是"面板与路由器都显示已连接, 家里所有设备国内国外全断":
+#   设备在 ≠ 流量过得去。所以 auto-route 接管了局域网, 不等于它能把包送出去。
+#
+# 只在 autoredirect=0 时动手 —— 健康的机器 (upstream 自己落了那两条) 一个字节都不动。
+# 认领靠注释: 只删自己加的那几条, fw4 / 用户 / upstream 的规则一个不碰。
+ZP_TUN_NAME="${ZP_TUN_NAME:-zp-tun}"
+ZP_TUNFW_TAG="zeroproxy-zp-tun"
+
+_zp_tunfw_dir() { printf '%s' "${ZP_DIR:-/etc/zeroproxy}"; }
+_zp_caps_get() { sed -n "s/^$1=//p" "$(_zp_tunfw_dir)/caps" 2>/dev/null | head -n1; }
+
+# 该不该动手: 数据面选中了 tun, 而 upstream 的 auto-redirect 没跑成。
+zp_tunfw_needed() {
+    [ "$(_zp_caps_get chosen)" = "tun" ] || return 1
+    [ "$(_zp_caps_get autoredirect)" = "0" ] || return 1
+    return 0
+}
+
+_zp_tunfw_fw4() { command -v nft >/dev/null 2>&1 && nft list table inet fw4 >/dev/null 2>&1; }
+
+# 放行规则真的在不在 (按注释认领, 不看退出码)
+zp_tunfw_live() {
+    if _zp_tunfw_fw4; then
+        nft list chain inet fw4 forward 2>/dev/null | grep -q "$ZP_TUNFW_TAG"
+    elif command -v iptables >/dev/null 2>&1; then
+        iptables -C FORWARD -o "$ZP_TUN_NAME" -m comment --comment "$ZP_TUNFW_TAG" -j ACCEPT 2>/dev/null
+    else
+        return 1
+    fi
+}
+
+# 确保放行。返回 0 = 现在真的在; 调用方据此决定能不能说"全屋生效"。
+zp_tunfw_allow() {
+    zp_tunfw_needed || return 0
+    if _zp_tunfw_fw4; then
+        zp_tunfw_live && return 0
+        nft insert rule inet fw4 forward oifname "$ZP_TUN_NAME" counter accept comment "\"$ZP_TUNFW_TAG\"" 2>/dev/null
+        nft insert rule inet fw4 forward iifname "$ZP_TUN_NAME" counter accept comment "\"$ZP_TUNFW_TAG\"" 2>/dev/null
+        nft insert rule inet fw4 input   iifname "$ZP_TUN_NAME" counter accept comment "\"$ZP_TUNFW_TAG\"" 2>/dev/null
+        zp_tunfw_live
+        return $?
+    fi
+    if command -v iptables >/dev/null 2>&1; then
+        zp_tunfw_live && return 0
+        iptables -I FORWARD -o "$ZP_TUN_NAME" -m comment --comment "$ZP_TUNFW_TAG" -j ACCEPT 2>/dev/null
+        iptables -I FORWARD -i "$ZP_TUN_NAME" -m comment --comment "$ZP_TUNFW_TAG" -j ACCEPT 2>/dev/null
+        iptables -I INPUT   -i "$ZP_TUN_NAME" -m comment --comment "$ZP_TUNFW_TAG" -j ACCEPT 2>/dev/null
+        zp_tunfw_live
+        return $?
+    fi
+    return 1
+}
+
+# 拆掉 —— 与 allow 严格对称, 只回收自己加的那几条 (revert 的"逐条比对"靠它成立)
+zp_tunfw_clear() {
+    if _zp_tunfw_fw4; then
+        for _x in $(nft -a list chain inet fw4 forward 2>/dev/null \
+                   | sed -n "s/.*$ZP_TUNFW_TAG.*handle \([0-9][0-9]*\).*/\1/p"); do
+            nft delete rule inet fw4 forward handle "$_x" 2>/dev/null || true
+        done
+        for _x in $(nft -a list chain inet fw4 input 2>/dev/null \
+                   | sed -n "s/.*$ZP_TUNFW_TAG.*handle \([0-9][0-9]*\).*/\1/p"); do
+            nft delete rule inet fw4 input handle "$_x" 2>/dev/null || true
+        done
+    fi
+    if command -v iptables >/dev/null 2>&1; then
+        # 有界循环: 每次删掉一条, 最多删 8 条就收手。正常写法是 `while iptables -D …; do :; done`
+        # —— 它靠"删不到时 iptables 返回非 0"退出, 但那是**惯例不是契约**: 万一某个固件的
+        # iptables 删不到也回 0, 这个循环就永远转下去 (安装/卸载都会卡死在这里)。
+        _k=0
+        while [ "$_k" -lt 8 ]; do
+            iptables -D FORWARD -o "$ZP_TUN_NAME" -m comment --comment "$ZP_TUNFW_TAG" -j ACCEPT 2>/dev/null || break
+            _k=$((_k + 1))
+        done
+        _k=0
+        while [ "$_k" -lt 8 ]; do
+            iptables -D FORWARD -i "$ZP_TUN_NAME" -m comment --comment "$ZP_TUNFW_TAG" -j ACCEPT 2>/dev/null || break
+            _k=$((_k + 1))
+        done
+        _k=0
+        while [ "$_k" -lt 8 ]; do
+            iptables -D INPUT -i "$ZP_TUN_NAME" -m comment --comment "$ZP_TUNFW_TAG" -j ACCEPT 2>/dev/null || break
+            _k=$((_k + 1))
+        done
+    fi
+    return 0
+}
+TUNFWEOF
+    chmod 755 "$ZP_DIR/tunfw.sh"
+
     # 控制 agent: 每 15 秒向面板上报一次状态并取回"期望开关 + 配置版本"。
     # 面板是唯一的事实来源 —— 路由器本地改开关也是请求面板去改 (见 CLI)。
     cat > "$ZP_DIR/agent.sh" <<'AGENTEOF'
@@ -2090,6 +2195,13 @@ while true; do
     # 只接管了局域网 TCP 就不该显示成全屋 (真机 8.45 的教训)。
     DP_REPORT="$(datapath_flag)"
     COV_REPORT="$(actual_covered)"
+    # TUN + auto-redirect 没跑成时, "转发进/出 tun" 的放行规则是**易失**的 (直接插在 fw4
+    # 的链上, 一次 `fw4 reload` 就没了)。内核在跑就顺手补一次 —— 幂等, 而且**按需**:
+    # 健康机器 (autoredirect=1) 在这里一个 nft 都不会调用。少了它, 家里会静默地再断一次。
+    if [ "$DP_REPORT" = "tun" ] && core_up && [ -f "$ZP_DIR/tunfw.sh" ]; then
+        . "$ZP_DIR/tunfw.sh"
+        zp_tunfw_allow >/dev/null 2>&1 || true
+    fi
     IPV6_REPORT="$(ipv6_flag)"
     # 性能那一半 (面板卡片上要能回答"这台机器跑这个能到多少")
     MTU_REPORT="$(tun_mtu_flag)"
@@ -2210,6 +2322,10 @@ zp_apply_datapath() {
         . "$ZP_DIR/redirect.sh"
         zp_redirect_clear 2>/dev/null || true
     fi
+    if [ "$_mode" != "tun" ] && [ -f "$ZP_DIR/tunfw.sh" ]; then
+        . "$ZP_DIR/tunfw.sh"
+        zp_tunfw_clear 2>/dev/null || true
+    fi
 
     # 落当前这一套
     if [ "$_mode" = "tproxy" ]; then
@@ -2217,6 +2333,11 @@ zp_apply_datapath() {
     elif [ "$_mode" = "redirect" ] && [ -f "$ZP_DIR/redirect.sh" ]; then
         . "$ZP_DIR/redirect.sh"
         zp_redirect_apply 2>/dev/null || true
+    elif [ "$_mode" = "tun" ] && [ -f "$ZP_DIR/tunfw.sh" ]; then
+        # tun 由内核接管路由; 但 auto-redirect 没跑成时, **转发进/出 tun 要靠防火墙放行**
+        # (见 tunfw.sh 顶部) —— 少了这一步, 局域网就被丢包, 而路由器自己一切正常。
+        . "$ZP_DIR/tunfw.sh"
+        zp_tunfw_allow 2>/dev/null || true
     fi
     killall -HUP dnsmasq 2>/dev/null || true
 }
@@ -2244,6 +2365,10 @@ stop_service() {
     if [ -f "$ZP_DIR/redirect.sh" ]; then
         . "$ZP_DIR/redirect.sh"
         zp_redirect_clear 2>/dev/null || true
+    fi
+    if [ -f "$ZP_DIR/tunfw.sh" ]; then
+        . "$ZP_DIR/tunfw.sh"
+        zp_tunfw_clear 2>/dev/null || true
     fi
     killall -HUP dnsmasq 2>/dev/null || true
 }
@@ -2488,6 +2613,20 @@ doctor() {
             done
         else
             printf '  ! caps 说 %s、现场是 %s — 重跑一次安装命令让它对齐\n' "$_chosen" "$_live"
+        fi
+        # TUN 这一档还要多问一句 (8.74): "转发进/出 tun" 的防火墙放行在不在。少了它,
+        # "设备在"是真的、"流量过得去"是假的 —— 局域网整个被丢, 而上面每一行都还是绿的,
+        # 面板与路由器界面也会双双显示"已连接"。所以这一项必须单独报出来。
+        if [ "$_live" = "tun" ] && [ -f "$ZP_DIR/tunfw.sh" ]; then
+            . "$ZP_DIR/tunfw.sh"
+            if ! zp_tunfw_needed; then
+                printf '  ✓ 防火墙放行由 auto-redirect 负责 (这台机器不需要我们补)\n'
+            elif zp_tunfw_live; then
+                printf '  ✓ 已补上防火墙放行 (auto-redirect 缺席, 转发进/出 tun 靠它)\n'
+            else
+                printf '  ✗ 防火墙放行**不在** —— 局域网转发会被丢掉 (家里会全断, 而上面每行都是绿的)\n'
+                printf '      修: 重跑一次安装命令; 只想先恢复上网: zeroproxy off\n'
+            fi
         fi
         _pk="$(datapath_packets)"
         _pkts="${_pk%% *}"; _dnspkts="${_pk##* }"
@@ -2874,6 +3013,10 @@ EOF
                 . "$ZP_DIR/redirect.sh"
                 zp_redirect_clear 2>/dev/null || true
             fi
+            if [ -f "$ZP_DIR/tunfw.sh" ]; then
+                . "$ZP_DIR/tunfw.sh"
+                zp_tunfw_clear 2>/dev/null || true
+            fi
         fi
         killall -HUP dnsmasq 2>/dev/null || true
         echo "面板不可达 —— 已在本机把全屋代理设为「$1」并立即生效。"
@@ -2956,6 +3099,10 @@ EOF
         if [ -f "$ZP_DIR/redirect.sh" ]; then
             . "$ZP_DIR/redirect.sh"
             zp_redirect_clear 2>/dev/null || true
+        fi
+        if [ -f "$ZP_DIR/tunfw.sh" ]; then
+            . "$ZP_DIR/tunfw.sh"
+            zp_tunfw_clear 2>/dev/null || true
         fi
         # tun 的 auto-route 规则随内核退出自动回收; 这里只兜我们自己加过的东西
         killall -HUP dnsmasq 2>/dev/null || true
@@ -3069,6 +3216,10 @@ EOF
         if [ -f "$ZP_DIR/redirect.sh" ]; then
             . "$ZP_DIR/redirect.sh"
             zp_redirect_clear 2>/dev/null || true
+        fi
+        if [ -f "$ZP_DIR/tunfw.sh" ]; then
+            . "$ZP_DIR/tunfw.sh"
+            zp_tunfw_clear 2>/dev/null || true
         fi
         killall -HUP dnsmasq 2>/dev/null || true
         rm -rf "$ZP_DIR" /etc/init.d/zeroproxy /etc/init.d/zeroproxy-agent /etc/init.d/zeroproxy-ui /usr/bin/zeroproxy
@@ -3514,8 +3665,13 @@ downgrade_datapath() {
 #
 # 怀疑对象是 auto-redirect: 它是 sing-tun 往内核里写 nftables 规则的开关 (OpenWrt 上
 # 还要往 /etc/nftables.d/ 写文件再 `fw4 reload`), 某些固件上那一步会失败 —— 而那是
-# **致命**的: 整个 tun 都起不来, 现象就是"zp-tun 一直不出现"。全屋的本体是 auto-route
-# (ip rule + 独立路由表接管全部流量, 含局域网转发), 少了 auto-redirect 功能不受影响。
+# **致命**的: 整个 tun 都起不来, 现象就是"zp-tun 一直不出现"。
+#
+# ⚠ 去掉 auto-redirect **不等于**"功能不受影响" —— 这里原先就是这么以为的, 结果是 8.74
+# 那台机器上"全屋断网": auto-route 确实用 ip rule + 独立路由表把局域网转发也拖进了 tun
+# (这点没错), 但 **auto-redirect 在 OpenWrt 上还负责写那两条"放行转发进/出 tun"的防火墙
+# 规则** (见 tunfw.sh 顶部引的上游源码)。只去掉它, 包进得来、出不去 —— 局域网被整个丢掉,
+# 而路由器自己走的是另一条链, 所以自检一切正常。现在这一半由 tunfw.sh 补上, 且必须验证到位。
 #
 # 做法是让面板给一份不带 auto-redirect 的配置再试一次 (?tproxy=0 那条路)。跑通就把
 # 这个结论记进 caps (以后每轮重建配置都不再要它); 跑不通就原样回滚, 免得留一个没用的
@@ -3603,13 +3759,29 @@ verify() {
                 ok "TUN 已建立 (已按这台固件去掉 auto-redirect)"
             fi
         fi
+        # **设备在 ≠ 流量过得去** (8.74)。auto-redirect 被拿掉之后, upstream 原本会写的那两条
+        # "放行转发进/出 tun" 的防火墙规则就没人写了 —— 少了它们, 局域网转发被整个丢掉, 而
+        # 路由器自己与面板都一切正常: 现象是"两边都显示已连接, 家里的设备国内国外全断"。
+        # 这里补上, 并且**必须真的在** (按注释认领地查一次现场) 才敢说这一级生效。
+        if datapath_live tun && [ -f "$ZP_DIR/tunfw.sh" ]; then
+            . "$ZP_DIR/tunfw.sh"
+            if zp_tunfw_needed; then
+                if zp_tunfw_allow; then
+                    ok "已补上防火墙放行 (auto-redirect 缺席时, 转发进/出 tun 靠它)"
+                else
+                    warn "补不上防火墙放行 —— 局域网转发会被丢掉, 这一级不能算生效"
+                    CAPS_WHY_TUN="auto-redirect 缺席, 且补不上防火墙放行 (局域网会被丢包)"
+                    TUN_UNUSABLE=1
+                fi
+            fi
+        fi
     elif [ "$ACTIVE_MODE" != "none" ]; then
         wait_datapath "$ACTIVE_MODE" || true
     fi
 
     # 这一级真的没起来 → 顺着阶梯往下试。降级成功时会顺带重建配置 (不再带 tun 段),
     # 于是"这台固件建不出设备"这件事不会再拖垮整条链路。
-    if [ "$ACTIVE_MODE" != "none" ] && ! datapath_live "$ACTIVE_MODE"; then
+    if [ "$ACTIVE_MODE" != "none" ] && { ! datapath_live "$ACTIVE_MODE" || [ "$TUN_UNUSABLE" = "1" ]; }; then
         warn "当前数据面 ($ACTIVE_MODE) 没有生效 —— 顺着阶梯往下试"
         downgrade_datapath || true
     fi
@@ -3715,7 +3887,7 @@ finish() {
         printf '  IPv6     %s未接管%s —— %s\n' "$C_Y" "$C_R" "${CAPS_WHY_IPV6:-这一档数据面覆盖不到 v6}"
     fi
     if [ -n "$TUN_HEALED" ]; then
-        printf '  调整     这台固件上 auto-redirect 会让 tun 起不来, 已自动去掉 (功能不受影响)\n'
+        printf '  调整     这台固件上 auto-redirect 会让 tun 起不来, 已去掉, 并补上它本该写的防火墙放行\n'
         printf '           %s\n' "要重新试它: 把 /etc/zeroproxy/caps 里的 autoredirect 改成 1 后重跑安装命令"
     fi
     if [ -n "$DEGRADED" ]; then

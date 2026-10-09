@@ -608,6 +608,117 @@ def test_install_script_probes_capabilities_and_reports_honestly():
     # ③ 诚实: 三级都不行时不许说"已开启"; 生效判据要看现场, 不看命令退出码
     assert "透明代理未生效" in text, "三级都不行时要说实话"
     assert "datapath_live" in text, "生效与否看设备/表在不在, 不看命令退出码"
+
+
+def test_tun_firewall_allow_replaces_the_half_of_auto_redirect_we_drop():
+    """8.74: auto-redirect 被拿去之后, 它本该写的**防火墙放行**必须由我们补上。
+
+    真机 (GL-MT3600BE · 原厂 OpenWrt 21.02 / 内核 5.4.281): 带 `auto-redirect` 时 tun 建不
+    出来, 自愈把它去掉后 tun 建出来了、路由器自己也能出网 —— 但上游实现里 `auto-redirect`
+    在 OpenWrt 上还要往 `/etc/nftables.d/` 写两条**放行转发进/出 tun** 的规则
+    (`redirect_nftables_rules_openwrt.go`)。少了它们, 局域网转发被防火墙整个丢掉:
+    家里国内国外全断, 而面板与路由器界面双双显示"已连接"。所以:
+      ① 这一半要补 (两个方向 + 没有 fw4 的机器走 iptables);
+      ② 补完要按**现场**验一次, 验不过就不许说这一级生效, 要顺着阶梯往下走;
+      ③ 只在 auto-redirect 没跑成时才动手 —— 健康机器一个字节都不动。
+    """
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+
+    # ① 补的那一半在, 两个方向都有, 且没有 fw4 的 fw3 机器也有一条路
+    assert "zp_tunfw_allow" in text and "zp_tunfw_live" in text and "zp_tunfw_clear" in text
+    assert 'oifname "$ZP_TUN_NAME"' in text and 'iifname "$ZP_TUN_NAME"' in text, \
+        "转发进/出 tun 两个方向都要放行"
+    assert "iptables -I FORWARD" in text, "没有 fw4 的机器 (fw3/iptables) 也要有路"
+    # 认领靠注释: 拆的时候只删自己加的那几条, 不动 fw4 / 用户的规则
+    assert "zeroproxy-zp-tun" in text
+
+    # ② 只在需要时动手 (chosen=tun 且 autoredirect=0), 并且拆的出口不止一处
+    assert "_zp_caps_get autoredirect" in text and '"0"' in text
+    assert text.count("zp_tunfw_clear") >= 5, "安装 / init 停服务 / off / revert / 卸载 都要回收"
+
+    # ③ "设备在 ≠ 流量过得去": 补不上就不算生效, 并顺着阶梯往下 (不留"家里全断"的状态)
+    assert "TUN_UNUSABLE" in text
+    assert "补不上防火墙放行" in text and "局域网转发会被丢掉" in text
+    assert "防火墙放行" in text, "doctor 要能单独报出这一项"
+
+
+def test_generated_tunfw_helper_is_idempotent_and_symmetric(tmp_path):
+    """把生成出来的 tunfw.sh 拿假 nft 真跑一遍 —— 逻辑只写在字符串里是验不出来的。
+
+    盯三件事: 该动手时才动手 (autoredirect=1 / 选了别的数据面时一个规则都不加)、
+    重复调用是幂等的、拆完就干净 (revert 的"逐条比对"靠这个成立)。
+    """
+    import re
+    import subprocess
+
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+    m = re.search(r"cat > \"\$ZP_DIR/tunfw\.sh\" <<'TUNFWEOF'\n(.*?)\nTUNFWEOF", text, re.S)
+    assert m, "找不到 tunfw.sh 的生成块"
+
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "tunfw.sh").write_text(m.group(1), encoding="utf-8")
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "rules").write_text("")
+
+    # 假 nft: 有状态的 forward/input 两条链, `-a` 会带 handle
+    nft = fakebin / "nft"
+    nft.write_text(
+        '#!/bin/sh\n'
+        'R="${NF_STATE}/rules"\n'
+        'case "$*" in\n'
+        '  "list table inet fw4") exit 0 ;;\n'
+        '  *"insert rule inet fw4 "*) for c in forward input; do\n'
+        '        case "$*" in *" $c "*) grep -qx "$c" "$R" || echo "$c" >> "$R";; esac; done; exit 0 ;;\n'
+        '  "-a list chain inet fw4 "*) c="${6}" ;;\n'
+        '  "list chain inet fw4 "*)    c="${5}" ;;\n'
+        '  "delete rule inet fw4 "*)   c="${5}"; grep -vx "$c" "$R" > "$R.x"; mv "$R.x" "$R"; exit 0 ;;\n'
+        '  *) exit 0 ;;\n'
+        "esac\n"
+        'grep -qx "$c" "$R" && echo "  oifname \\"zp-tun\\" counter accept comment \\"zeroproxy-zp-tun\\" # handle 1"\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    nft.chmod(0o755)
+
+    env = {**os.environ, "PATH": f"{fakebin}:{os.environ['PATH']}", "ZP_DIR": str(home),
+           "NF_STATE": str(state)}
+
+    def run(expr: str) -> str:
+        out = subprocess.run(["sh", "-c", f'. "{home}/tunfw.sh"; {expr}'],
+                             capture_output=True, text=True, env=env)
+        return out.stdout.strip()
+
+    def rules() -> int:
+        return len((state / "rules").read_text().split("\n")) - 1
+
+    (home / "caps").write_text("chosen=tun\nautoredirect=0\n")
+    assert run("zp_tunfw_needed && echo y") == "y", "选了 tun 且 auto-redirect 没跑成时必须动手"
+    assert run("zp_tunfw_live && echo y") == "", "动手之前不该有放行规则"
+    assert run("zp_tunfw_allow && echo y") == "y", "补放行必须成功"
+    assert run("zp_tunfw_live && echo y") == "y", "补完要能被现场验出来"
+    assert rules() == 2, "forward 与 input 两条链各一条"
+    run("zp_tunfw_allow")
+    assert rules() == 2, "重复调用必须幂等 (否则每次心跳都往防火墙堆规则)"
+    run("zp_tunfw_clear")
+    assert rules() == 0, "拆完必须干净"
+    run("zp_tunfw_clear")
+    assert rules() == 0
+
+    (home / "caps").write_text("chosen=tun\nautoredirect=1\n")
+    run("zp_tunfw_allow")
+    assert rules() == 0, "auto-redirect 自己写了那两条时我们一个字节都不动"
+
+    (home / "caps").write_text("chosen=redirect\nautoredirect=0\n")
+    run("zp_tunfw_allow")
+    assert rules() == 0, "不是 tun 那一档时不该动防火墙"
     # 自愈 + 阶梯降级: 都排在"把原因打出来"之后, 且只在失败分支里
     fail_at = text.index("等了 30 秒 TUN 设备仍未出现")
     heal_at = text.index("if tun_retry_without_redirect &&")

@@ -373,9 +373,15 @@ def router_tun(tproxy: bool = True, mtu: int = 1500) -> dict:
     tproxy, 而那台设备的 tproxy 往往是同一个原因不可用, 最后"全屋透明代理"名存实亡
     (真机: GL.iNet 原厂 OpenWrt 21.02-SNAPSHOT / 内核 5.4.281, 见 README 8.45)。
 
-    "全屋"的本体是 `auto-route` (它用 ip rule + 独立路由表接管所有流量, 含局域网转发),
-    所以去掉 auto-redirect 不影响功能。设备在装机时探一次自己有没有 nft/tproxy, 用
-    `?tproxy=0` 告诉面板 —— 有就用, 没有就别写, 别让它把 tun 拖垮。
+    ⚠ 去掉 `auto-redirect` **不是**"不影响功能": `auto-route` 确实会把局域网转发也拖进 tun
+    (它那条 ip rule 是 `not iif lo`), 但 `auto-redirect` 在 OpenWrt 上还负责往
+    `/etc/nftables.d/` 写两条**放行转发进/出 tun** 的防火墙规则 (见上游
+    `redirect_nftables_rules_openwrt.go`)。只去掉它, 包进得来、出不去 —— 局域网被整个丢掉,
+    而路由器自身走另一条链, 于是自检全绿、面板显示已连接, 家里却全断 (8.74 真机)。
+    这一半现在由客户端的 `tunfw.sh` 补上, 且安装时必须验证到位才敢说这一级生效。
+
+    设备在装机时探一次自己有没有 nft/tproxy, 用 `?tproxy=0` 告诉面板 —— 有就用,
+    没有就别写, 别让它把 tun 拖垮。
     """
     tun = dict(ROUTER_TUN)
     # MTU 由设备按 WAN 的实际 MTU 算出来带过来 (面板不知道外面是 PPPoE 还是以太网)。
