@@ -12,7 +12,10 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/i
 网络受限时可用镜像源 (内容相同), 或指定分支 / 版本:
 
 ```bash
-# jsDelivr 镜像 (国内通常更快)
+# 自建反代 (运营方自己的, 国内最稳; 把原始地址整个拼在后面)
+curl -fsSL https://github.i3.pub/https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/install.sh | bash
+
+# jsDelivr 镜像 (备用)
 curl -fsSL https://cdn.jsdelivr.net/gh/ericlinclover-blip/zeroproxy@main/install.sh | bash
 
 # 指定版本或分支, 或改用 fork / 自建镜像
@@ -38,6 +41,8 @@ sudo bash install.sh
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/upgrade.sh | bash
+# 受限网络 (国内面板) 上换成自建反代:
+curl -fsSL https://github.i3.pub/https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/upgrade.sh | bash
 ```
 
 升级只替换程序代码, `data/state.json`(密钥 / 口令 / 订阅令牌 / 节点开关) 原样保留,
@@ -4076,3 +4081,48 @@ EXIT=1
 `scripts/router_ui_check.cjs` 47 → **51 项**: 新增一节 —— 日志里留一次"开始了但没有终态"的
 运行, 断言: 照实显示进度面板 / 「重试」自己出来 / 提示说清"很久没有新内容" / 按钮解锁。
 (阈值在演练里调成 0.8 秒、真机 45 秒; 只给演练用的旋钮, 与 `ZP_DOCTOR_PROBES` 同一个思路。)
+
+### 8.72 v2.11.21 (客户端 v1.4.21): 部署那两条路一次都没用上自建反代
+
+运营方问的是"我给过 `github.i3.pub` 与 `docker.i3.pub`, 排查一下有没有用"。逐条查完是这样:
+
+#### 已经在用的
+
+`github.i3.pub` **接进了面板分发的那两张表** —— 内核二进制与分流数据库 —— 而且按 8.52 的
+策略**排第一** (自建反代比任何公共前缀都稳), 还有一条测试盯着"自建镜像必须排第一"。
+这次实测它对 release 资产返回 `200`、对 `releases/latest/download/...` 返回 `302`, 都在
+0.8 秒内 —— 路由器的内核与分流数据走的就是它。
+
+`docker.i3.pub` **一处都没接**, 而且是**有意的**: 本项目的安装链路全程不拉容器镜像 (面板是
+systemd + 静态二进制, 路由器端也是静态二进制), 所以没有它的位置。README 8.52 那段就写着
+这句话。要用上它, 只有两条路: ① 出一套容器化的部署方式 (Dockerfile / compose), 那时把
+registry 指到 `docker.i3.pub`; ② 或者只是想让**你自己 VPS 上的 Docker** 走它 —— 那是
+`/etc/docker/daemon.json` 里的 `registry-mirrors`, 与本程序无关。**这条我按"没接"保持现状,
+等你决定要不要做容器分发。**
+
+#### 真正的缺口: 部署与升级这两条路
+
+同一个 `github.i3.pub`, 在**部署**那两条路上一次都没被用上:
+
+* `install.sh` (面板首次部署): Xray / Hysteria / **自己的 tarball** / GeoIP 分流数据
+  **全部直连 GitHub** —— 受限网络上面板就卡在这一步 (API 查询还带 `--max-time 20`, 失败后
+  拿兜底地址再去连一次 GitHub, 于是"卡住"比"失败"更常见)。
+* `upgrade.sh` (面板升级): 有镜像表, 但**第一个是直连 GitHub**, 而 `github.i3.pub`
+  **根本不在表里**。升级恰恰是用户唯一的自救通道 (面板停在旧版本时, 点更新是唯一出路) ——
+  8.52 那条注释本来就是为这件事写的, 却漏了自己的反代。
+
+#### 改法
+
+* `install.sh` 新增一张 `GH_PROXIES` 前缀表 (**自建反代排第一**, 与内核 / 分流数据两张表
+  同一套策略) + 一个 `fetch_github_file` 助手: 反代依次试、最后才直连, 拿到的必须是**非空
+  文件** (反代偶尔会回一页 HTML, 那不是我们要的东西)。Xray / Hysteria / 自己的 tarball /
+  GeoIP 四条路全部改走它; tarball 那张 URL 表也改成"每个前缀 × (SHA / tag / 分支)",
+  与 `upgrade.sh` 的顺序对齐 —— 这两处一旦走偏, 就会出现"能升级却装不上"这种最难查的组合。
+* `upgrade.sh` 的镜像表把 `github.i3.pub` 放到**第一位**。
+* 实测三条路径都通: release 资产 `200`、geo 的 `latest/download` `302`、Xray 的 zip `200`。
+
+#### 回归
+
+`pytest` 290 → **291 项**: 新增一条静态回归 —— 自建反代必须在两张表里**且排在公共前缀
+前面**、Xray / Hysteria / tarball 三条路必须走那个助手 (不许留"wget 直连 GitHub"的老写法)、
+分流数据那张表也要把自建反代排第一。`upgrade_sim.sh` 不受影响 (它把 `curl` 打桩了, 不看 URL)。

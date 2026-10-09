@@ -35,7 +35,10 @@ DEFAULT_REF = os.environ.get("ZP_UPDATE_REF", "main")
 #: 顺序很重要: jsDelivr 是 CDN, 命中缓存时会把旧版本号当"最新"返回 (实测发布后
 #: fastly.jsdelivr 仍返回上一版的号), 而 raw / gh-proxy 拿到的是仓库当前内容 ——
 #: 所以权威源在前, CDN 只作最后兜底。
+#: **自建反代排第一** (8.72): 运营方自己的反代最稳, 而且更新是用户唯一的自救通道 ——
+#: 面板停在旧版本时, 这一条是它能把新版本号读回来的唯一机会。
 _MIRRORS = (
+    "https://github.i3.pub/https://raw.githubusercontent.com/{repo}/{ref}/backend/zeroproxy/__init__.py",
     "https://raw.githubusercontent.com/{repo}/{ref}/backend/zeroproxy/__init__.py",
     "https://gh-proxy.com/https://raw.githubusercontent.com/{repo}/{ref}/backend/zeroproxy/__init__.py",
     "https://cdn.jsdelivr.net/gh/{repo}@{ref}/backend/zeroproxy/__init__.py",

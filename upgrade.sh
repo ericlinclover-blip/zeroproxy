@@ -4,6 +4,8 @@
 #
 #  用法 (服务器上, root):
 #    curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/upgrade.sh | bash
+#  受限网络上换成自建反代 (把原始地址整个拼在后面):
+#    curl -fsSL https://github.i3.pub/https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/upgrade.sh | bash
 #
 #  面板里「程序更新 → 一键更新」调用的就是这个脚本, 两者行为完全一致。
 #
@@ -43,7 +45,10 @@ GH_API="https://api.github.com"
 #: **升级脚本自己**以前只认 GitHub 直连 —— 受限网络上面板会卡在"下载新版本代码", 而
 #: 更新通道恰恰是用户唯一的自救手段 (真机上就是这样: 面板停在旧版本, 点更新没反应)。
 #: gh-proxy 这类反代对 /archive/<sha>.tar.gz 与分支 tarball 都直接透传。
-GH_MIRRORS=("$GH" "https://gh-proxy.com/$GH" "https://hk.gh-proxy.com/$GH")
+#: **自建的反代排第一**, 与面板那边内核 / 分流数据两张表的策略一致 (运营方自己的反代
+#: 比任何公共前缀都稳; README 8.52 那条)。受限线路上直连 GitHub 是"卡满超时再失败",
+#: 排前面只是白吃预算 —— 而且升级是用户唯一的自救通道, 更不能卡在这一步。
+GH_MIRRORS=("https://github.i3.pub/$GH" "$GH" "https://gh-proxy.com/$GH" "https://hk.gh-proxy.com/$GH")
 VENV="$ZP_HOME/venv"
 STATE_FILE="$ZP_HOME/data/state.json"
 STATUS_FILE="$ZP_HOME/data/update.json"

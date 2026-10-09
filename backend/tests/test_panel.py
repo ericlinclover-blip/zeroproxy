@@ -2775,9 +2775,13 @@ def test_update_mirrors_put_authoritative_sources_first():
     from zeroproxy import update
 
     hosts = [url.split("/")[2] for url in update._MIRRORS]
-    assert hosts[0] == "raw.githubusercontent.com"
-    assert hosts.index("raw.githubusercontent.com") < hosts.index("cdn.jsdelivr.net")
-    assert hosts.index("raw.githubusercontent.com") < hosts.index("fastly.jsdelivr.net")
+    # 自建反代排第一 (8.72): 它透传 raw, 拿到的同样是仓库当前内容, 属于权威源 ——
+    # 而且更新是用户唯一的自救通道, 运营方自己的反代最稳。
+    assert hosts[0] == "github.i3.pub"
+    for authoritative in ("raw.githubusercontent.com", "gh-proxy.com"):
+        assert authoritative in hosts
+        assert hosts.index(authoritative) < hosts.index("cdn.jsdelivr.net")
+        assert hosts.index(authoritative) < hosts.index("fastly.jsdelivr.net")
 
 
 # ---------------------------------------------------------------- 配置落地闭环
@@ -3412,6 +3416,34 @@ def test_upgrade_script_shipped_and_valid():
     assert "python\" -m zeroproxy.apply" in text or "-m zeroproxy.apply" in text
     assert "ZP_CHECK_ONLY" in text and "rollback" in text
     assert _bash_syntax_ok(path)
+
+
+def test_deployment_scripts_use_the_self_hosted_github_mirror():
+    """面板**部署**与**升级**这两条路必须走自建反代, 而且它排第一。
+
+    起因 (8.72): `github.i3.pub` 早就接进了面板分发的内核 / 分流数据两张表, 但部署那两条路
+    **一次都没用上** —— install.sh 的 Xray / Hysteria / 自己的 tarball / GeoIP 全在直连
+    GitHub, upgrade.sh 的镜像表里第一个也是直连。受限网络上面板就卡在这里, 而升级恰恰是
+    用户唯一的自救通道 (面板停在旧版本时, 点更新是唯一的出路)。
+    """
+    inst = open(os.path.join(REPO_ROOT, "install.sh"), encoding="utf-8").read()
+    upg = open(os.path.join(REPO_ROOT, "upgrade.sh"), encoding="utf-8").read()
+    # 自建反代必须在, 而且**排在公共前缀前面** (与内核 / 分流数据两张表同一套策略)
+    assert '"https://github.i3.pub"' in inst
+    assert inst.index('"https://github.i3.pub"') < inst.index('"https://gh-proxy.com"')
+    assert 'GH_MIRRORS=("https://github.i3.pub/$GH"' in upg, "升级那条路的镜像表也得先走自建反代"
+    # 三条下载路径都得走那个助手, 不许再留"wget 直连 GitHub"的老写法
+    assert 'fetch_github_file "$XRAY_URL"' in inst
+    assert 'fetch_github_file "$HY_URL"' in inst
+    assert 'zp_url "$p" "$GH/$ZP_REPO/archive' in inst, "自己的 tarball 也要走反代"
+    # 分流数据那张表同样 (jsdelivr 在国内时快时慢, 直连 GitHub 基本不通)
+    geo = inst.index("for GEO_MIRROR in")
+    assert inst.index("github.i3.pub/https://github.com/Loyalsoldier", geo) \
+        < inst.index("jsdelivr", geo), "分流数据也要把自建反代排第一"
+    # 面板自己「检查更新」读版本号那张表也要带上它 —— 更新是唯一的自救通道
+    from zeroproxy import update as _update
+    assert _update._MIRRORS[0].startswith("https://github.i3.pub/"), \
+        "自建反代要排在版本号检查的第一位"
 
 
 def test_install_script_never_resets_configured_deployment():

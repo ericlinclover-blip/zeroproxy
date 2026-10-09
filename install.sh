@@ -4,6 +4,8 @@
 #
 #  用法 (服务器上, root):
 #    curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/install.sh | bash
+#  受限网络上,**拿脚本这第一跳**也会被卡 —— 用自建反代把原始地址整个拼在后面:
+#    curl -fsSL https://github.i3.pub/https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/install.sh | bash
 #
 #  可覆盖的变量:
 #    ZP_REPO=owner/repo      改用 fork / 镜像仓库 (默认 ericlinclover-blip/zeroproxy)
@@ -23,6 +25,37 @@ XRAY_BIN="/usr/local/bin/xray"
 HYSTERIA_BIN="/usr/local/bin/hysteria"
 GH="https://github.com"
 GH_API="https://api.github.com"
+#: GitHub 反代前缀。**自建的反代排第一** —— 与面板那边内核 / 分流数据两张表同一套策略
+#: (运营方自己的反代比任何公共前缀都稳)。写法同 gh-proxy: 把原始地址整个拼在前缀后面。
+#: 受限线路上直连 GitHub 是"卡满超时再失败", 排前面只会白吃整个部署的时间预算 ——
+#: 这正是"服务器端部署卡在网络限制"的来源 (8.72)。
+GH_PROXIES=(
+  "https://github.i3.pub"
+  "https://gh-proxy.com"
+  "https://hk.gh-proxy.com"
+  "https://ghfast.top"
+)
+# 前缀 + 原始地址 (空前缀 = 直连)。
+zp_url() { if [ -z "$1" ]; then printf '%s' "$2"; else printf '%s/%s' "$1" "$2"; fi; }
+# 从一个 GitHub 地址取文件: 反代依次试, 最后才直连。$1=完整 GitHub 地址, $2=落地文件。
+# 拿到的必须是**非空文件**才算成 —— 反代有时会回一页 HTML (200), 那不是我们想要的东西。
+# 注意 api.github.com 不走反代 (这类反代只透传 release / archive / raw), 版本号那几次
+# 查询仍然是直连: 它们本来就带 --max-time 20, 失败可容忍 (有兜底地址)。
+fetch_github_file() {
+  local url="$1" out="$2" p
+  for p in "${GH_PROXIES[@]}" ""; do
+    rm -f "$out"
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL --connect-timeout 10 --max-time 300 -o "$out" "$(zp_url "$p" "$url")" 2>/dev/null \
+        && [ -s "$out" ] && return 0
+    else
+      wget -q --timeout=90 --tries=1 -O "$out" "$(zp_url "$p" "$url")" 2>/dev/null \
+        && [ -s "$out" ] && return 0
+    fi
+  done
+  rm -f "$out"
+  return 1
+}
 # 面板核心来源: 默认官方仓库; 远程安装时从这里拉取 tarball。
 ZP_REPO="${ZP_REPO:-ericlinclover-blip/zeroproxy}"
 ZP_DEFAULT_REF="${ZP_DEFAULT_REF:-main}"
@@ -99,8 +132,10 @@ esac
 XRAY_URL="$(printf '%s' "$XRAY_JSON" | grep -oE '"browser_download_url": *"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/' | grep -E "$XRAY_ASSET_PAT" | head -1 || true)"
 [ -n "$XRAY_URL" ] || XRAY_URL="$GH/XTLS/Xray-core/releases/download/v${XRAY_DL_VERSION}/Xray-linux-$( [ "$ARCH" = "arm64" ] && echo arm64-v8a || echo 64 ).zip"
 rm -f /tmp/xray.zip
-wget -q -O /tmp/xray.zip "$XRAY_URL" || fail "Xray 下载失败: $XRAY_URL"
-unzip -oq /tmp/xray.zip -d /usr/local/bin
+fetch_github_file "$XRAY_URL" /tmp/xray.zip \
+  || fail "Xray 下载失败 (反代与直连都没成): $XRAY_URL"
+unzip -oq /tmp/xray.zip -d /usr/local/bin \
+  || fail "Xray 压缩包解不开 (反代可能回了一页 HTML): $XRAY_URL"
 chmod +x /usr/local/bin/xray
 rm -f /tmp/xray.zip
 ok "Xray $(/usr/local/bin/xray version 2>/dev/null | head -1 || echo installed)"
@@ -112,7 +147,7 @@ HY_TAG="$(printf '%s' "$HY_JSON" | grep -oP '"tag_name":\\s*"\\Kv?[^"]+' | head 
 HY_URL="$(printf '%s' "$HY_JSON" | grep -oE '"browser_download_url": *"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/' | grep -E "hysteria-linux-${ARCH}(-v[0-9]+(\\.[0-9]+)*)?(\\.tar\\.gz)?$" | head -1 || true)"
 [ -n "$HY_URL" ] || HY_URL="$GH/apernet/hysteria/releases/download/${HY_TAG:-v1.1.5}/hysteria-linux-${ARCH}.tar.gz"
 HY_TAG="${HY_TAG#v}"; HY_TAG="${HY_TAG:-1.1.5}"
-if wget -q -O /tmp/hysteria-dl "$HY_URL"; then
+if fetch_github_file "$HY_URL" /tmp/hysteria-dl; then
   case "$HY_URL" in
     *.tar.gz)
       tar -xzf /tmp/hysteria-dl -C /tmp
@@ -155,13 +190,18 @@ fetch_zp_tarball() {
   sha="$(curl -fsSL --max-time 20 "$GH_API/repos/$ZP_REPO/commits/$ref" 2>/dev/null \
         | sed -n 's/.*"sha": *"\([0-9a-f]\{40\}\)".*/\1/p' | head -1 || true)"
   bust="?t=$(date +%s)"
-  local -a urls=()
-  [ -n "$sha" ] && urls+=("$GH/$ZP_REPO/archive/$sha.tar.gz")
-  urls+=(
-    "$GH/$ZP_REPO/archive/refs/tags/$ref.tar.gz$bust"
-    "$GH/$ZP_REPO/archive/refs/heads/$ref.tar.gz$bust"
-    "$GH_API/repos/$ZP_REPO/tarball/$ref"
-  )
+  # 每个反代前缀依次试 (自建的反代在前), 最后才是 GitHub 直连与 API tarball —— 与
+  # upgrade.sh 的 fetch_tarball 同一套顺序。这两处一旦走偏, 就会出现"能升级却装不上"
+  # 这种最难查的组合。
+  local -a urls=() p
+  for p in "${GH_PROXIES[@]}" ""; do
+    [ -n "$sha" ] && urls+=("$(zp_url "$p" "$GH/$ZP_REPO/archive/$sha.tar.gz")")
+    urls+=(
+      "$(zp_url "$p" "$GH/$ZP_REPO/archive/refs/tags/$ref.tar.gz$bust")"
+      "$(zp_url "$p" "$GH/$ZP_REPO/archive/refs/heads/$ref.tar.gz$bust")"
+    )
+  done
+  urls+=("$GH_API/repos/$ZP_REPO/tarball/$ref")
   for url in "${urls[@]}"; do
     if command -v curl >/dev/null 2>&1; then
       curl -fsSL --connect-timeout 10 --max-time 120 -o "$out" "$url" 2>"$err" || { rm -f "$out"; continue; }
@@ -247,6 +287,7 @@ fi
 info "下载 GeoIP / GeoSite 分流数据 (约 28 MB) ..."
 GEO_OK=0
 for GEO_MIRROR in \
+  "https://github.i3.pub/https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download" \
   "https://fastly.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release" \
   "https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release" \
   "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download"
