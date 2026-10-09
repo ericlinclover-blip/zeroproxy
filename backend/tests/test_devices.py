@@ -754,6 +754,10 @@ def test_install_script_only_repairs_credentials_on_a_real_refusal():
     loss_branch = parts[1].split("\n        else", 1)[0]
     assert "再跑一次" in loss_branch
     assert "重新接入" not in loss_branch and "拒绝了这台设备的凭据" not in loss_branch
+    # 失败必须说清是**哪一类** (超时 / DNS / TLS / 被拒), 不许一律写"链路丢包"
+    assert "http_why" in text and "${_cfg_why}" in loss_branch
+    assert "面板第 %s 次没回话 (%s)" in text      # agent 那份内联的分类
+    assert "超时 —— 多半是链路在丢包" in text
     # 降级配置那句不许再说"不含国内直连" —— 内联的域名层永远在 (8.68 的日志里它就在撒谎)。
     # 只查**真正的输出**: 注释里解释"以前那句是错的"是可以的。
     code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))

@@ -666,6 +666,11 @@ def main() -> int:
         check("说的是\"面板暂时联系不上\", 不是\"拒绝了凭据\"",
               "面板暂时联系不上" in out_drop and "拒绝了这台设备的凭据" not in out_drop,
               [ln.strip() for ln in out_drop.splitlines() if "凭据" in ln or "联系不上" in ln][:2])
+        # 8.67/8.68 两轮真机都把"拉配置失败"一律标成"链路丢包", 于是超时 / DNS / TLS /
+        # 面板明确拒绝 这些完全不同的原因长得一模一样, 只能靠猜。这里必须说出是哪一类。
+        check("失败信息要说清是哪一类 (不许一律说\"链路丢包\")",
+              "收到不完整的数据" in out_drop or "超时" in out_drop or "连接被中断" in out_drop,
+              [ln.strip() for ln in out_drop.splitlines() if "面板暂时联系不上" in ln][:1])
         check("**没有**去重新配对 (输出里不该出现\"重新接入\")",
               "重新接入" not in out_drop,
               [ln.strip() for ln in out_drop.splitlines() if "接入" in ln][:2])
