@@ -49,7 +49,9 @@ from .config import paths
 #: 1.4.12: update 加降级闸门 —— 面板比本机旧就停下, 不把机器降级覆盖回去。
 #: 1.4.13: 一键更新带进度条 —— 步骤清单来自安装脚本自己打印的 `==>` 小节; 完成后整页
 #:         淡出换成新版本, 不再"啪"地闪一下。
-SCRIPT_VERSION = "1.4.13"
+#: 1.4.14: 面板接口的取数加两次重试 (真机实测四成 SYN 被丢), 心跳同理; 刷新本机已有的
+#:         分流数据只等 2 分钟; 更新模式下拉不到配置时的话不再把人引向"重新配对"。
+SCRIPT_VERSION = "1.4.14"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"
@@ -549,6 +551,67 @@ def geo_stale(name: str) -> bool:
         return (time.time() - os.path.getmtime(geo_file(name))) > GEO_TTL
     except OSError:
         return True
+
+
+#: 后台取分流数据库的状态。与内核 (CORE_STATE) 同一套思路, 因为踩的是同一个坑:
+#: **不能在请求里同步去上游下** —— 面板那边最长要 200 秒, 而路由器正挂着等一个响应。
+#: 真机表现就是"点更新, 卡在「准备分流数据库」那一行动也不动"。现在: 有就立刻给,
+#: 没有就立刻回一句能读懂的话 + 503, 后台去取。
+GEO_LOCK_ASYNC = threading.Lock()
+GEO_STATE: dict[str, dict] = {}
+
+#: 上一轮取失败了就等一会儿再试 —— 免得路由器每 5 秒重试一次、把上游刷成攻击。
+GEO_RETRY_AFTER = int(os.environ.get("ZP_GEO_RETRY_AFTER", "60"))
+
+
+def geo_pending_text(name: str) -> str:
+    """给路由器端看的一句人话 (它会原样打印出来, 用户在终端/界面上读到的就是它)。"""
+    with GEO_LOCK_ASYNC:
+        entry = dict(GEO_STATE.get(name) or {})
+    if entry.get("state") == "downloading":
+        return (
+            f"面板正在从上游取 {name} (首次安装要先下约 4 MB)。这不是错误 —— "
+            "路由器先用本机已有的那份, 数据到位后会自动换回完整分流, 不用再登录路由器。"
+        )
+    if entry.get("state") == "error":
+        return f"面板取 {name} 失败: {entry.get('error') or '上游不可达'}"
+    return f"面板正在准备 {name}, 稍后再取。"
+
+
+def ensure_geo_async(name: str) -> dict:
+    """确保有一份分流数据库正在后台下载, **不阻塞**调用方。返回当前状态。"""
+    if name not in GEO_FILES:
+        return {"state": "unknown", "error": f"未知的数据文件: {name}"}
+    if geo_ready(name):
+        return {"state": "ready"}
+    with GEO_LOCK_ASYNC:
+        entry = GEO_STATE.setdefault(name, {})
+        if entry.get("state") == "downloading":
+            return dict(entry)
+        failed_at = int(entry.get("done") or 0)
+        if entry.get("state") == "error" and time.time() - failed_at < GEO_RETRY_AFTER:
+            return dict(entry)
+        entry.update(
+            {"state": "downloading", "error": "", "started": int(time.time()), "done": 0}
+        )
+    threading.Thread(target=_prefetch_geo, args=(name,), daemon=True, name=f"zp-geo-{name}").start()
+    with GEO_LOCK_ASYNC:
+        return dict(GEO_STATE.get(name) or {})
+
+
+def _prefetch_geo(name: str) -> None:
+    try:
+        ok, detail, _path = fetch_geo(name)
+    except Exception as exc:  # 后台线程不能死得无声无息: 状态会永远停在"下载中"
+        ok, detail = False, f"取 {name} 时出错了: {exc}"
+    with GEO_LOCK_ASYNC:
+        GEO_STATE.setdefault(name, {}).update(
+            {
+                "state": "ready" if ok else "error",
+                "error": "" if ok else detail,
+                "done": int(time.time()),
+            }
+        )
 
 
 def cached_geo() -> list[dict]:

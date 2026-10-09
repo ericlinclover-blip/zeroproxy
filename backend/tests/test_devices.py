@@ -362,28 +362,94 @@ def test_core_status_hands_the_router_a_usable_mirror_table(client, configured, 
     assert ready["sha256"] == hashlib.sha256(blob).hexdigest()
 
 
-def test_geo_files_are_served_and_name_whitelisted(client, configured, tmp_path, monkeypatch):
+def test_geo_files_are_served_and_name_whitelisted(client, configured, home, monkeypatch):
     """分流数据库 (GeoIP / GeoSite) 也由面板分发 —— 和内核二进制同一条思路。
 
     真机 (GL-MT3000) 现场: mihomo 在 `-t` 时去 GitHub 拉 geoip.metadb, 拉不到就
     `can't download MMDB: context deadline exceeded` → 整份配置校验失败, 装机停在
     "写入运行文件"。所以这两份数据必须由面板给 (面板去取上游, 路由器只访问面板)。
+
+    这里同时盯住"**有就立刻给**": 手上有数据时绝不能让请求等面板去上游重下 ——
+    那正是真机上"点更新卡在「准备分流数据库」不动"的来源 (见 8.64)。
     """
     from zeroproxy import router_client
 
     # 文件名是 mihomo 在 `-d` 目录里找来用的, 一个字节都不能改
     assert set(router_client.GEO_FILES) == {"geoip.metadb", "geosite.dat"}
 
-    blob = tmp_path / "geoip.metadb"
-    blob.write_bytes(b"M" * 128)
-    monkeypatch.setattr(router_client, "fetch_geo", lambda name, **kw: (True, "已缓存", str(blob)))
-
     assert client.get("/c/geo/nope").status_code == 404
     assert client.get("/c/geo/..%2fstate.json").status_code == 404
     assert client.get("/c/geo/geoip.dat").status_code == 404
+
+    # 本机有一份**已经过期**的数据: 照样当场给出去, 刷新交给后台
+    monkeypatch.setattr(router_client, "GEO_MIN_OVERRIDE", 16)
+    dst = router_client.geo_file("geoip.metadb")
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    with open(dst, "wb") as fh:
+        fh.write(b"M" * 128)
+    old = time.time() - router_client.GEO_TTL - 60
+    os.utime(dst, (old, old))
+    kicked: list[str] = []
+    monkeypatch.setattr(router_client, "ensure_geo_async", lambda name: kicked.append(name))
+
     res = client.get("/c/geo/geoip.metadb")
     assert res.status_code == 200
-    assert res.content == blob.read_bytes()
+    assert res.content == b"M" * 128
+    assert kicked == ["geoip.metadb"], "过期的那份要在后台刷新, 而不是让请求等着"
+
+
+def test_geo_endpoint_never_blocks_on_the_upstream(client, configured, home, monkeypatch):
+    """面板手上没有数据时也不能把请求挂住 —— 立刻 503 + 一句人话, 后台去取。
+
+    以前这里是同步去上游下 (最长 200 秒), 而路由器正挂着等这个响应。真机上用户看到
+    的就是"更新进度停在「准备分流数据库」那一行, 56% 不动"。协议与内核二进制完全一致:
+    503 + Retry-After, 路由器据此先用自己那份 (它本来就有), 不会被卡住。
+    """
+    from zeroproxy import router_client
+
+    monkeypatch.setattr(router_client, "GEO_MIN_OVERRIDE", 16)
+    kicked: list[str] = []
+
+    def fake_ensure(name: str) -> dict:
+        kicked.append(name)
+        with router_client.GEO_LOCK_ASYNC:
+            router_client.GEO_STATE[name] = {"state": "downloading", "error": "", "done": 0}
+        return dict(router_client.GEO_STATE[name])
+
+    monkeypatch.setattr(router_client, "ensure_geo_async", fake_ensure)
+    res = client.get("/c/geo/geosite.dat")
+    assert res.status_code == 503
+    assert res.headers.get("retry-after") == "10"
+    assert kicked == ["geosite.dat"], "后台要真的去取, 否则路由器下次来还是 503"
+    # 面板得把话说明白: 这不是错误, 路由器按"先用本机那份"处理
+    assert "geosite.dat" in res.text and "本机" in res.text
+
+
+def test_geo_prefetch_is_background_and_idempotent(home, monkeypatch):
+    """后台取数据: 不阻塞调用方, 拿到之后就只认文件 (不再抓第二次)。"""
+    from zeroproxy import router_client
+
+    monkeypatch.setattr(router_client, "GEO_MIN_OVERRIDE", 16)
+    calls: list[str] = []
+
+    def fake_fetch_geo(name: str, **kw) -> tuple[bool, str, str]:
+        calls.append(name)
+        dst = router_client.geo_file(name)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        with open(dst, "wb") as fh:
+            fh.write(b"x" * 64)
+        return True, "已缓存", dst
+
+    monkeypatch.setattr(router_client, "fetch_geo", fake_fetch_geo)
+    state = router_client.ensure_geo_async("geoip.metadb")
+    assert state["state"] in ("downloading", "ready")
+    for _ in range(100):      # 后台线程跑完
+        if router_client.geo_ready("geoip.metadb"):
+            break
+        time.sleep(0.05)
+    assert router_client.geo_ready("geoip.metadb")
+    assert router_client.ensure_geo_async("geoip.metadb")["state"] == "ready"
+    assert calls == ["geoip.metadb"], "文件已经在手上了就不该再去上游"
 
 
 def test_geo_cache_avoids_second_download(client, configured, home, monkeypatch):

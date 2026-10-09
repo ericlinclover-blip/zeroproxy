@@ -94,15 +94,35 @@ http_probe() {
     http_get "$_url" >/dev/null 2>&1
 }
 
+# 取一个接口 (文本 / JSON)。**重试两次**: 真机实测直连面板 6 次里 3 次 SYN 石沉大海,
+# 装机时"配对失败""拉不到配置"这类结论太贵, 不该由一次丢包决定。
+# 只有 GET 重试 (它是幂等的): POST 可能是"用掉一个一次性配对码", 重放等于赌第一次没生效。
 http_get() {
-    case "$HTTP" in
-        curl)
-            if [ "$TLS_OPTS" = "insecure" ]; then curl -fsSk -m 30 "$1"
-            else curl -fsS -m 30 "$1"; fi ;;
-        *)
-            if [ "$TLS_OPTS" = "insecure" ]; then "$HTTP" -q --no-check-certificate -O - "$1"
-            else "$HTTP" -q -O - "$1"; fi ;;
-    esac
+    _tries=0
+    while :; do
+        _tries=$((_tries + 1))
+        _rc=1
+        _out=""
+        case "$HTTP" in
+            curl)
+                if [ "$TLS_OPTS" = "insecure" ]; then
+                    if _out="$(curl -fsSk -m 30 "$1")"; then _rc=0; else _rc=$?; fi
+                else
+                    if _out="$(curl -fsS -m 30 "$1")"; then _rc=0; else _rc=$?; fi
+                fi ;;
+            *)
+                if [ "$TLS_OPTS" = "insecure" ]; then
+                    if _out="$("$HTTP" -q --no-check-certificate -O - "$1")"; then _rc=0; fi
+                else
+                    if _out="$("$HTTP" -q -O - "$1")"; then _rc=0; fi
+                fi ;;
+        esac
+        if [ "$_rc" = "0" ]; then printf '%s' "$_out"; return 0; fi
+        # 22 = curl -f 说的"HTTP 层面失败" (403/404/502…): 面板已经明确答复, 重试没意义
+        [ "$_rc" != "22" ] || return "$_rc"
+        [ "$_tries" -lt 3 ] || return "$_rc"
+        sleep 1
+    done
 }
 
 http_post() {
@@ -1277,8 +1297,13 @@ fetch_config() {
     if ! "$ZP_DIR/agent.sh" config > "$_tmp" 2>/dev/null; then
         rm -f "$_tmp"
         # 没有配对码 (更新模式) 时不要试图重配: 那会在面板上多出一台设备
-        [ -n "$ZP_CODE" ] || die "拉取配置失败 —— 面板拒绝了这台设备的凭据, 或面板暂时不可达。
-  请到面板「客户端」重新生成一条带配对码的安装命令来完成重新接入。"
+        #
+        # 这里的措辞很要紧 (真机 8.64): 原来一开口就是"面板可能拒绝了这台设备的凭据",
+        # 于是**一次丢包**会把用户引到"重新生成安装命令、重新配对"上去 —— 而真正的原因
+        # 只是面板那条路掉了一个包。现在把两件事分开说, 并先讲清楚"本机没被动过"。
+        [ -n "$ZP_CODE" ] || die "拉取配置失败 —— 面板暂时联系不上 (网络抖动 / 面板正忙), 或它拒绝了这台设备的凭据。
+  本机**仍在使用原来的配置**, 现有代理不受影响; 稍后再点一次「更新客户端」即可。
+  若反复失败, 再到面板「客户端」重新生成一条带配对码的安装命令来完成重新接入。"
         # 凭据被拒 (403) 是最常见的"看起来莫名其妙"的失败: 面板上把这台设备移除过,
         # 或者路由器上留的是另一台面板发的凭据。本地文件看不出问题, 只有真的去拉一次
         # 才知道 —— 所以不在这里猜, 直接用本次命令里的配对码重新接入再试。
@@ -1672,13 +1697,20 @@ ensure_geo() {
         if [ "$_force" = "force" ] || [ ! -s "$ZP_DIR/$_g" ]; then _need="$_need $_g"; fi
     done
     [ -n "$_need" ] || return 0
+    # 刷新一份**本机已经有**的数据时, 只给面板 2 分钟: 它不是"拿不到就装不上" —— 本机
+    # 那份还在用, 到点就继续往下走 (install_geo 会照实说"本次刷新失败")。本机没有副本时
+    # 才值得等满: 面板首次要去上游取 4 MB, 那是它的正常工作量。
+    _tmo=600
+    _have_all=1
+    for _g in $_need; do [ -s "$ZP_DIR/$_g" ] || _have_all=0; done
+    [ "$_have_all" = "1" ] && _tmo=120
     for _f in $(server_files); do
         _b="$(field_of "$_f" base)"
         [ -n "$_b" ] || continue
         _got=1
         for _g in $_need; do
             _tmp="$ZP_DIR/.geo-$$.part"
-            if http_get_file "$_b/c/geo/$_g" > "$_tmp" 2>/dev/null && [ -s "$_tmp" ]; then
+            if http_get_file "$_b/c/geo/$_g" "$_tmo" > "$_tmp" 2>/dev/null && [ -s "$_tmp" ]; then
                 mv "$_tmp" "$ZP_DIR/$_g"
             else
                 rm -f "$_tmp"
@@ -1802,25 +1834,69 @@ json_get_bool() {
 }
 
 http_post() {
+    # 心跳 (/c/report) 专用。它是**幂等**的 —— 报两次"我还活着"没有任何副作用, 所以丢包
+    # 值得重试: 真机上这条路的四成 SYN 是被丢掉的, 只发一次的话面板上这台设备会一直在
+    # "在线/离线"之间闪 (真机日志里那一串 `面板不可达 (第 1 次), 保持当前状态`)。
+    #
+    # 装机时那个 POST (/c/pair) **故意不在这里**: 它要用掉一个一次性配对码, 重放等于赌
+    # "第一次其实没生效" —— 那条路见安装脚本里的 http_post (不重试)。
     _url="$1"; _body="$2"
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSk -m 20 -H 'Content-Type: application/json' --data "$_body" "$_url" 2>/dev/null
-    else
-        uclient-fetch -q --no-check-certificate -O - --post-data "$_body" "$_url" 2>/dev/null \
-            || wget -q --no-check-certificate -O - --post-data "$_body" "$_url" 2>/dev/null
-    fi
+    _tries=0
+    while :; do
+        _tries=$((_tries + 1))
+        _rc=1
+        if command -v curl >/dev/null 2>&1; then
+            if curl -fsSk -m 20 -H 'Content-Type: application/json' --data "$_body" "$_url" 2>/dev/null; then
+                _rc=0
+            else _rc=$?; fi
+        elif uclient-fetch -q --no-check-certificate -O - --post-data "$_body" "$_url" 2>/dev/null; then
+            _rc=0
+        elif wget -q --no-check-certificate -O - --post-data "$_body" "$_url" 2>/dev/null; then
+            _rc=0
+        fi
+        [ "$_rc" = "0" ] && return 0
+        [ "$_rc" != "22" ] || return "$_rc"     # HTTP 层面失败 (403/404…): 面板已明确答复
+        [ "$_tries" -lt 3 ] || return "$_rc"
+        sleep 1
+    done
 }
 http_get() {
-    if command -v curl >/dev/null 2>&1; then curl -fsSk -m 30 "$1" 2>/dev/null
-    else uclient-fetch -q --no-check-certificate -O - "$1" 2>/dev/null \
-        || wget -q --no-check-certificate -O - "$1" 2>/dev/null
-    fi
+    # 面板那条路会偶尔丢一个包就整条挂住 (真机实测: 直连同一个地址, 6 次里 3 次 SYN 石沉
+    # 大海, 通的那几次是 0.15 秒)。只拉一次的话, 一次丢包就等于"拉配置失败" —— 而更新
+    # 模式下那句话会说成"面板可能拒绝了这台设备的凭据", 把人引到重新配对上, 方向全错。
+    # 所以这里重试两次 (秒级, 比让用户去查凭据便宜得多)。
+    #
+    # 唯一的例外是 HTTP 层面的失败 (404 / 502 …): curl -f 会以 22 退出 —— 那是"面板明确
+    # 说没有", 重试没有意义, 也不该把 5 秒的等待加到一次真正的错误上。
+    _tries=0
+    while :; do
+        _tries=$((_tries + 1))
+        _rc=1
+        _out=""
+        if command -v curl >/dev/null 2>&1; then
+            if _out="$(curl -fsSk -m 30 "$1" 2>/dev/null)"; then _rc=0; else _rc=$?; fi
+        elif command -v uclient-fetch >/dev/null 2>&1; then
+            if _out="$(uclient-fetch -q --no-check-certificate -O - "$1" 2>/dev/null)"; then _rc=0; fi
+        else
+            if _out="$(wget -q --no-check-certificate -O - "$1" 2>/dev/null)"; then _rc=0; fi
+        fi
+        if [ "$_rc" = "0" ]; then printf '%s' "$_out"; return 0; fi
+        [ "$_rc" != "22" ] || return "$_rc"
+        [ "$_tries" -lt 3 ] || return "$_rc"
+        sleep 1
+    done
 }
-# 大文件下载 (分流数据库 4 MB): 30 秒的接口超时对它是太紧了, 慢宽带会直接失败
+# 大文件下载 (分流数据库 4 MB)。**不重试**: 这一个是几 MB 的传输, 重试的代价远大于收益,
+# 而调用方 (ensure_geo) 本来就有"用本机已有的那份"这条退路。
+#
+# 第 2 个参数是超时秒数, 默认 600 —— 30 秒的接口超时对 4 MB 太紧, 慢宽带会直接失败。
+# 「刷新一份本机已经有的数据」时调用方会给一个短得多的值: 那种情况下超时只是"这次不刷了",
+# 不是"装不上"。
 http_get_file() {
-    if command -v curl >/dev/null 2>&1; then curl -fsSk -m 600 "$1" 2>/dev/null
-    else uclient-fetch -q --no-check-certificate -T 600 -O - "$1" 2>/dev/null \
-        || wget -q --no-check-certificate -T 600 -O - "$1" 2>/dev/null
+    _tmo="${2:-600}"
+    if command -v curl >/dev/null 2>&1; then curl -fsSk -m "$_tmo" "$1" 2>/dev/null
+    else uclient-fetch -q --no-check-certificate -T "$_tmo" -O - "$1" 2>/dev/null \
+        || wget -q --no-check-certificate -T "$_tmo" -O - "$1" 2>/dev/null
     fi
 }
 

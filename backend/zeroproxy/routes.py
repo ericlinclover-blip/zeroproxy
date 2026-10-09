@@ -3082,20 +3082,32 @@ def client_geo_file(name: str, request: Request):
     所以和内核二进制同一条思路: 面板下好、缓存好, 路由器只访问面板。
 
     名字走白名单 (只有 geoip.metadb / geosite.dat), 内容不含任何凭据。
+
+    **不在这里等上游**: 以前是同步去取 (最长 200 秒), 而路由器正挂着等这个响应 ——
+    真机上就是"点更新, 卡在「准备分流数据库」不动"。现在手上有数据就立刻给 (哪怕已经
+    过期: 分流数据不是越新越好, 陈旧的那份交给后台刷新), 一份都没有才回 503 + 一句人话
+    (与 /c/bin 完全同一个协议), 路由器据此先用自己那份, 不会卡住。
     """
     state = load_state()
     if not state["configured"]:
         return _err("面板尚未初始化", 409)
     if name not in router_client.GEO_FILES:
         return _err("没有这个数据文件", 404)
-    ok, detail, path = router_client.fetch_geo(name)
-    if not ok or not path:
-        return _err(f"分流数据库下载失败: {detail}", 502)
-    return FileResponse(
-        path,
-        media_type="application/octet-stream",
-        headers={"cache-control": "no-store"},
-        filename=name,
+    if router_client.geo_ready(name):
+        if router_client.geo_stale(name):
+            router_client.ensure_geo_async(name)   # 后台换新的, 这一次先把手上这份给出去
+        return FileResponse(
+            router_client.geo_file(name),
+            media_type="application/octet-stream",
+            headers={"cache-control": "no-store"},
+            filename=name,
+        )
+    router_client.ensure_geo_async(name)
+    return Response(
+        router_client.geo_pending_text(name) + "\n",
+        status_code=503,
+        media_type="text/plain; charset=utf-8",
+        headers={"retry-after": "10", "cache-control": "no-store"},
     )
 
 
