@@ -422,6 +422,60 @@ def test_router_profile_takes_geo_from_the_panel(client, configured):
     assert "/c/geo/" not in phone["geox-url"]["mmdb"]
 
 
+def test_router_profile_keeps_the_panel_direct(client, configured):
+    """面板自己的地址必须直连, 而且在**所有**模板 / 降级 / 骨架里都要在。
+
+    真机 8.64 的死锁: 面板域名跟着规则走了 🐟 漏网之鱼 → 路由器要连面板得先连上代理,
+    而代理的节点又在那台机器上。节点一挂, 面板上显示离线、点「更新客户端」报"取不到
+    面板的安装脚本" —— 恰恰是最需要把面板连上的时候连不上, 没有任何自救的余地。
+
+    装机命令是在**还没有任何代理**的路由器上 `wget 面板地址` 执行的, 所以"面板直连
+    可达"本来就是装机的前提。这条测试盯的是"别在后来某次改规则时把它弄丢" ——
+    丢了的代价是"更新功能平时看着好好的, 出故障时救不回来"。
+    """
+    _login(client)
+    device = _register(client, _pair_code(client)["code"])
+    sub = f"/c/sub/{device['id']}?k={device['secret']}"
+    want = f"DOMAIN-SUFFIX,{DOMAIN},DIRECT"
+
+    def first_rule(query: str = "") -> str:
+        return yaml.safe_load(client.get(sub + query).text)["rules"][0]
+
+    assert first_rule() == want
+    # 降级配置 (拿不到分流数据库) 也要有: 它不依赖任何数据库
+    assert first_rule("&geo=0") == want
+    # 多服务器模式的骨架
+    assert first_rule("&format=skeleton") == want
+    # direct 模板只有一条 MATCH —— 更不能漏
+    assert first_rule("&rules=direct") == want
+    # 排在 GEOSITE 广告拦截之前: 规则是**从上往下**匹配的, 掉到后面就等于没写
+    assert yaml.safe_load(client.get(sub).text)["rules"][1].startswith("GEOSITE,category-ads-all")
+
+    # 手机 / 电脑那份订阅不带面板地址 —— 它们能自己关掉代理去更新, 不该凭空多一条规则
+    path = configured["subscription_url"].split("testserver")[-1]
+    phone_rules = yaml.safe_load(client.get(path + "?format=clash").text)["rules"]
+    assert not any("DIRECT" in r for r in phone_rules)
+
+
+def test_panel_address_rule_handles_ip_and_junk():
+    """面板地址是裸 IP (bootstrap 阶段) 时用 IP 规则; 空值 / 乱码不产生规则。"""
+    from zeroproxy import share_links
+
+    assert share_links.management_direct_rules("https://hk.example.com:8899") == [
+        "DOMAIN-SUFFIX,hk.example.com,DIRECT"
+    ]
+    # 大小写 / 末尾斜杠 / 带路径都不影响
+    assert share_links.management_direct_rules("https://HK.Example.COM:8899/c/geo") == [
+        "DOMAIN-SUFFIX,hk.example.com,DIRECT"
+    ]
+    # 裸 IP 用 IP-CIDR: 域名规则匹配不上 IP 形式的 base
+    assert share_links.management_direct_rules("http://103.192.178.100:8899") == [
+        "IP-CIDR,103.192.178.100/32,DIRECT,no-resolve"
+    ]
+    assert share_links.management_direct_rules("") == []
+    assert share_links.management_direct_rules("不是地址") == []
+
+
 def test_router_profile_degrades_when_panel_has_no_geo_data(client, configured):
     """面板暂时给不出分流数据库时, 配置里不能留任何 geo 规则。
 

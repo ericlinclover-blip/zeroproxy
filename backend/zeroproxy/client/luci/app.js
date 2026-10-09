@@ -190,18 +190,131 @@ $('refresh').onclick = async () => {
   }
 };
 
-/* 一键更新客户端。**后台进行** (脚本会替换自己, 而且要下载 20 MB 内核), 所以这里只负责
-   提交并说清楚"稍后刷新"。跑完之后版本号会变 —— 那个数字就在标题下面那行。 */
+/* ---------------- 一键更新 + 进度 ----------------
+ *
+ * 步骤清单**来自安装脚本自己打印的 `==>` 小节** —— 前端只数走到第几段, 不猜、也不编一个
+ * 假的百分比 (面板上那张"升级进度"卡片是同一个思路)。状态一律从 `update-log` 里读:
+ * 有 `EXIT=` 就是跑完了, 没有就是在跑 —— 所以刷新页面也能接着显示。
+ */
+const UPDATE_STEPS = [
+  ['检查环境', '检查环境'],
+  ['接入账号', '接入账号'],
+  ['探测网络数据面能力', '探测数据面能力'],
+  ['下载代理内核', '下载代理内核'],
+  ['写入运行文件', '写入运行文件'],
+  ['准备分流数据库', '分流数据库'],
+  ['准备本地控制面', '本地控制面'],
+  ['安装网页管理界面', '管理界面'],
+  ['启动并自检', '启动与自检'],
+];
+let updTimer = null;
+let updLeaving = false;
+
+function updParse(text) {
+  const out = { step: -1, name: '', exit: null, from: '', to: '', live: '' };
+  String(text || '').split('\n').forEach((raw) => {
+    const line = raw.replace(/\r/g, '').trim();
+    if (!line) return;
+    const ver = line.match(/^面板版本 v([\d.]+) \(本机 v([\d.]+)\)/);
+    if (ver) { out.to = ver[1]; out.from = ver[2]; return; }
+    const ex = line.match(/^EXIT=(\d+)/);
+    if (ex) { out.exit = parseInt(ex[1], 10); return; }
+    const st = line.match(/^==>\s*(.*)$/);
+    if (st) {
+      out.name = st[1];
+      out.step = UPDATE_STEPS.findIndex((p) => st[1].indexOf(p[0]) >= 0);
+      return;
+    }
+    out.live = line;   // 最后一行有内容的输出 —— 就是"此刻在做什么"
+  });
+  return out;
+}
+
+function updRender(text) {
+  const s = updParse(text);
+  const total = UPDATE_STEPS.length;
+  const box = $('upd');
+  const running = s.exit === null;
+  // 正在第 k 段 = 前 k 段已完成; 起步给一点点, 免得一动不动像卡住
+  let pct = s.step >= 0 ? Math.round((s.step / total) * 100) : 0;
+  if (running) pct = Math.max(pct, 3);
+  if (s.exit === 0) pct = 100;
+  if (s.exit !== null && s.exit !== 0) pct = Math.max(pct, 5);
+
+  box.className = 'upd ' + (running ? 'running' : (s.exit === 0 ? 'done' : 'fail'));
+  $('upd-fill').style.width = pct + '%';
+  $('upd-pct').textContent = pct + '%';
+  $('upd-ico').textContent = running ? '↻' : (s.exit === 0 ? '✓' : '!');
+
+  const ver = (s.from && s.to) ? ('v' + s.from + ' → v' + s.to) : '';
+  if (running) {
+    $('upd-title').textContent = '正在更新客户端';
+    $('upd-sub').textContent = [ver, s.name || '准备开始'].filter(Boolean).join(' · ');
+  } else if (s.exit === 0) {
+    $('upd-title').textContent = '更新完成';
+    $('upd-sub').textContent = [ver, '正在加载新版本…'].filter(Boolean).join(' · ');
+  } else {
+    $('upd-title').textContent = '更新失败 (退出码 ' + s.exit + ')';
+    $('upd-sub').textContent = '点「看完整日志」能看到卡在哪一步; 重试不会影响现有配置';
+  }
+
+  const active = running ? s.step : total;
+  $('upd-steps').innerHTML = UPDATE_STEPS.map((p, i) => {
+    const st = i < active ? 'ok' : (i === active ? 'doing' : '');
+    const ic = i < active ? '✓' : (i === active ? '⟳' : '○');
+    return `<li class="${st}"><span class="ic">${ic}</span><span>${esc(p[1])}</span></li>`;
+  }).join('');
+  $('upd-live').textContent = s.live || '';
+  // 「重试 / 看完整日志」只在**失败**时出现: 跑得好好的时候摆一个"重试"只会让人手痒,
+  // 而跑完就更不需要了。
+  $('upd-actions').hidden = !(s.exit !== null && s.exit !== 0);
+
+  if (s.exit === 0 && !updLeaving) {
+    // 先让人看清"完成了", 再整页淡出换新版 —— 那一跳不该是"啪"地闪一下
+    updLeaving = true;
+    updStop();
+    setTimeout(() => {
+      document.body.classList.add('zp-leaving');
+      setTimeout(() => location.reload(), 420);
+    }, 1500);
+  }
+}
+
+async function updPoll() {
+  try {
+    updRender(unesc((await call('update-log')).message));
+  } catch (e) {
+    /* 更新期间界面文件正在被替换, 偶尔取不到是正常的 —— 下一轮再问 */
+  }
+}
+function updStart() {
+  if (updTimer) return;
+  updTimer = setInterval(updPoll, 1000);
+  updPoll();
+}
+function updStop() {
+  if (updTimer) { clearInterval(updTimer); updTimer = null; }
+}
+
 $('update').onclick = async () => {
   if (!confirm('从面板拉取最新客户端并重跑一次安装？\n\n过程中代理会短暂重启；配置、凭据、订阅都不受影响。')) return;
   const btn = $('update');
   btn.disabled = true;
-  $('update-hint').textContent = '已提交，正在后台更新…';
+  $('update-hint').textContent = '';
+  $('update-hint').style.color = '';
   try {
-    const r = await call('update');
-    $('update-hint').textContent = unesc(r.message).split('\n')[0]
-      + ' (约一分钟, 完成后刷新本页看版本号)';
-    toast('更新已开始');
+    const msg = unesc((await call('update')).message || '');
+    if (/^\s*面板版本 v/.test(msg)) {
+      $('upd').hidden = false;
+      updRender(msg);
+      updStart();
+      toast('更新已开始');
+    } else {
+      // 闸门拦下 (面板还是旧版) 之类的"没有开始": 如实说, 不显示进度条
+      $('update-hint').textContent = msg.trim();
+      $('update-hint').style.color = 'var(--warn)';
+      toast('没有开始更新');
+    }
   } catch (e) {
     $('update-hint').textContent = e.message;
     $('update-hint').style.color = 'var(--err)';
@@ -209,6 +322,20 @@ $('update').onclick = async () => {
     btn.disabled = false;
   }
 };
+$('upd-retry').onclick = () => { $('upd').hidden = true; updLeaving = false; $('update').click(); };
+$('upd-more').onclick = () => { document.querySelector('details').open = true; };
+
+// 刷新页面 / 换设备打开时, 如果更新还在跑, 接着显示进度 (不依赖"点过那个按钮")
+(async () => {
+  try {
+    const msg = unesc((await call('update-log')).message || '');
+    if (updParse(msg).exit === null && msg.indexOf('==>') >= 0) {
+      $('upd').hidden = false;
+      updRender(msg);
+      updStart();
+    }
+  } catch (e) { /* 老固件上没有这个动作时静默 */ }
+})();
 
 document.querySelector('details').addEventListener('toggle', async (ev) => {
   if (!ev.target.open) return;

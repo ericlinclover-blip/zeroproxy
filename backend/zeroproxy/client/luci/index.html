@@ -21,6 +21,10 @@
          --shadow:0 1px 3px rgba(0,0,0,.5),0 20px 48px -20px rgba(0,0,0,.8); }
 }
 *{box-sizing:border-box}
+/* `hidden` 属性必须真的能藏住东西: 它的 display:none 来自浏览器默认样式, 而任何一条
+   `.row{display:flex}` 这种类规则都会**盖过它** —— 于是"带 hidden 的元素照样显示"。
+   (这个页面上真踩过: 更新失败才该出现的按钮, 在跑得好好的时候也在。) */
+[hidden]{display:none!important}
 body{margin:0;padding:18px;background:var(--bg);color:var(--text);
      font:14px/1.55 -apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif}
 .wrap{max-width:760px;margin:0 auto;display:grid;gap:14px}
@@ -78,6 +82,58 @@ details summary:hover{color:var(--accent)}
        padding:9px 16px;border-radius:999px;font-size:12.5px;opacity:0;pointer-events:none;transition:.24s var(--ease)}
 #toast.on{opacity:1;transform:translate(-50%,0)}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+
+/* ---- 更新进度 ---- *
+   与面板那张"升级进度"卡片同一套思路: 步骤清单来自安装脚本自己打印的 `==>` 小节,
+   前端只负责数到第几段、把它画出来 —— 不猜、也不编一个假的百分比。
+   进出页面各有一段淡入 / 淡出: 更新完成后整页会换成新版本, 那一跳不该是"啪"地闪一下。 */
+body{transition:opacity .38s var(--ease)}
+body.zp-leaving{opacity:0;pointer-events:none}
+@keyframes zp-in{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
+.wrap{animation:zp-in .34s var(--ease)}
+.upd{margin:12px 0 4px;padding:14px 16px;border:1px solid var(--border);border-radius:12px;
+     background:var(--card2);animation:zp-in .3s var(--ease)}
+.upd-top{display:flex;align-items:center;gap:10px}
+.upd-ico{width:28px;height:28px;border-radius:9px;display:grid;place-items:center;font-size:14px;
+     background:color-mix(in srgb,var(--accent) 14%,transparent);color:var(--accent);flex:none}
+.upd.done .upd-ico{background:color-mix(in srgb,var(--ok) 16%,transparent);color:var(--ok)}
+.upd.fail .upd-ico{background:color-mix(in srgb,var(--err) 15%,transparent);color:var(--err)}
+.upd.running .upd-ico{animation:upd-spin 1.6s linear infinite}
+@keyframes upd-spin{to{transform:rotate(360deg)}}
+.upd-title{font-weight:650;font-size:13.5px;letter-spacing:-.01em}
+.upd-pct{font-family:var(--mono);font-size:13px;font-weight:650;color:var(--accent);
+     min-width:46px;text-align:right;font-variant-numeric:tabular-nums}
+.upd.done .upd-pct{color:var(--ok)}
+.upd.fail .upd-pct{color:var(--err)}
+.upd-bar{margin-top:11px;height:9px;border-radius:999px;background:var(--border-soft);
+     overflow:hidden;position:relative}
+.upd-bar i{display:block;height:100%;width:0;border-radius:999px;
+     background:linear-gradient(90deg,var(--accent),color-mix(in srgb,var(--accent) 50%,#7dd3fc));
+     transition:width .55s var(--ease),background .3s var(--ease)}
+/* 进行中: 一道扫光沿着进度条走 —— 慢速下载那一段不至于让人以为卡住了 */
+.upd.running .upd-bar i{background-image:linear-gradient(90deg,var(--accent),
+     color-mix(in srgb,var(--accent) 50%,#7dd3fc),
+     color-mix(in srgb,var(--accent) 70%,#ffffff)),
+     linear-gradient(90deg,var(--accent),color-mix(in srgb,var(--accent) 50%,#7dd3fc));
+     background-size:180% 100%,100% 100%;animation:upd-shine 1.5s linear infinite}
+@keyframes upd-shine{from{background-position:180% 0,0 0}to{background-position:-80% 0,0 0}}
+.upd.done .upd-bar i,.upd.done.running .upd-bar i{background:var(--ok);animation:none;background-size:auto}
+.upd.fail .upd-bar i,.upd.fail.running .upd-bar i{background:var(--err);animation:none;background-size:auto}
+.upd-steps{list-style:none;margin:12px 0 0;padding:0;display:grid;gap:6px}
+.upd-steps li{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--sub);
+     transition:color .25s var(--ease)}
+.upd-steps li .ic{width:14px;text-align:center;font-size:11px;opacity:.55;flex:none}
+.upd-steps li.doing{color:var(--text);font-weight:600}
+.upd-steps li.doing .ic{color:var(--accent);opacity:1}
+.upd-steps li.ok{color:var(--text)}
+.upd-steps li.ok .ic{color:var(--ok);opacity:1}
+.upd-live{margin-top:11px;padding-top:9px;border-top:1px dashed var(--border-soft);
+     font-family:var(--mono);font-size:11.5px;color:var(--sub);
+     white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.upd-actions{margin-top:11px}
+@media (prefers-reduced-motion:reduce){
+  body,.wrap,.upd,.upd-ico,.upd-bar i{animation:none!important;transition:none!important}
+}
 </style>
 </head>
 <body>
@@ -108,6 +164,25 @@ details summary:hover{color:var(--accent)}
       <button class="btn small" id="update" title="从面板拉最新客户端并重跑一次安装 (后台进行, 约一分钟; 配置与凭据保留)">更新客户端</button>
       <button class="btn small" id="refresh">重新拉取节点</button></div>
     <div class="fs-xs muted" id="update-hint" style="margin-bottom:8px"></div>
+
+    <div class="upd" id="upd" hidden>
+      <div class="upd-top">
+        <div class="upd-ico" id="upd-ico">↻</div>
+        <div class="grow">
+          <div class="upd-title" id="upd-title">正在更新客户端</div>
+          <div class="fs-xs muted" id="upd-sub">从面板拉取最新版本…</div>
+        </div>
+        <div class="upd-pct" id="upd-pct">0%</div>
+      </div>
+      <div class="upd-bar"><i id="upd-fill"></i></div>
+      <ol class="upd-steps" id="upd-steps"></ol>
+      <div class="upd-live" id="upd-live"></div>
+      <div class="row upd-actions" id="upd-actions" hidden>
+        <button class="btn small" id="upd-retry">重试</button>
+        <button class="btn small" id="upd-more">看完整日志</button>
+      </div>
+    </div>
+
     <div id="servers"><div class="empty">正在读取…</div></div>
   </div>
 

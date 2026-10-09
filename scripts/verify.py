@@ -15,6 +15,9 @@
         python3 scripts/verify.py
 
 环境变量全部可选: 缺少哪个就跳过对应步骤 (面板本身的流程仍然会跑)。
+    ZP_MIHOMO_GEO_DIR=/path/to/geo 里的 geosite.dat + geoip.metadb 会铺进 mihomo 的
+    工作目录 —— 与真机上安装脚本做的事一致。不给它, mihomo 会自己去 GitHub 拉, 于是
+    "配置能不能被内核吃下去"会变成"这个网络能不能连上 GitHub"。
 """
 from __future__ import annotations
 
@@ -50,6 +53,45 @@ def record(name: str, ok: bool, detail: str = "") -> None:
 def last_line(text: str, fallback: str = "无输出") -> str:
     lines = (text or "").strip().splitlines()
     return lines[-1][:150] if lines else fallback
+
+
+def seed_mihomo_geo(data_dir: Path) -> str:
+    """把分流数据库铺进 mihomo 的工作目录, 返回一句"从哪儿来的"说明。
+
+    真机上这件事是安装脚本做的: 面板下发 geosite.dat / geoip.metadb, 路由器只访问面板
+    一个地址 (见 router_client.GEO_FILES 上面那段)。而这里原来是**什么都不铺** ——
+    mihomo 引用到 GEOIP / GEOSITE 时自己去 GitHub 拉。于是"这份配置能不能被真内核吃
+    下去"就取决于当前网络到不到得了 GitHub: 到不了的时候 8 条配置全红, 看着像配置坏了,
+    实际上一条都没被校验过 (实测现象: `can't download GeoSite.dat: read: connection
+    reset by peer`)。
+
+    铺进去之后, 校验结果才只反映配置本身。数据来源按顺序找: ZP_MIHOMO_GEO_DIR →
+    ZP_GEODATA_DIR → <repo>/data/client/geo (面板下发给路由器的那份缓存) →
+    <repo>/data/geo。都没有就照旧让 mihomo 自己去下 —— 但那句"没铺上"要说出来。
+    """
+    sources = [
+        os.environ.get("ZP_MIHOMO_GEO_DIR", ""),
+        os.environ.get("ZP_GEODATA_DIR", ""),
+        str(ROOT / "data" / "client" / "geo"),
+        str(ROOT / "data" / "geo"),
+    ]
+    # 文件名不能改: mihomo 在 -d 目录里按名字找 (大小写不敏感)。GEOSITE 认 geosite.dat,
+    # GEOIP 认 geoip.metadb / geoip.db / Country.mmdb (GEO_FILES 上面有同样的说明)。
+    wanted = ("geosite.dat", "geoip.metadb", "geoip.db", "Country.mmdb")
+    data_dir.mkdir(parents=True, exist_ok=True)
+    for src in sources:
+        if not src:
+            continue
+        src_dir = Path(src)
+        if not (src_dir / "geosite.dat").exists():
+            continue
+        for name in wanted:
+            if (src_dir / name).exists() and not (data_dir / name).exists():
+                shutil.copyfile(src_dir / name, data_dir / name)
+        # geosite 有了、geoip 还是缺: mihomo 照样会去下 MMDB, 报一句免得看着像配置坏了
+        have_ip = any((data_dir / n).exists() for n in wanted[1:])
+        return f"{src} (geosite ✓, geoip {'✓' if have_ip else '✗'})"
+    return ""
 
 
 def port_open(port: int, timeout: float = 1.0, host: str = "127.0.0.1") -> bool:
@@ -254,6 +296,12 @@ def main() -> int:
     if mihomo_bin or singbox_bin:
         print("\n[2b] 客户端解析校验")
     if mihomo_bin:
+        seeded = seed_mihomo_geo(home / "mihomo-data")
+        if seeded:
+            record("铺好 mihomo 的分流数据库", True, seeded)
+        else:
+            print("  … 没有本地的 geosite.dat / geoip.metadb 可铺, mihomo 会自己去 GitHub 拉")
+            print("    (连不上会看到 can't download GeoSite.dat —— 那是网络, 不是配置)")
         for tpl in ("smart", "global", "direct"):
             path = home / f"clash-{tpl}.yaml"
             path.write_text(client.get(f"{sub_path}?format=clash&rules={tpl}").text, encoding="utf-8")

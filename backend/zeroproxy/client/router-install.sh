@@ -2677,11 +2677,27 @@ EOF
         # 面板 2.11.9 / 本机 1.4.11, 点按钮之后页面报"未知操作: update" —— 因为覆盖回来的
         # 旧 cgi 里没有那个动作分支。
         _tmp="$ZP_DIR/.update-script"
-        if command -v curl >/dev/null 2>&1; then
-            curl -fsSk -m 60 "$_base/c/install.sh" -o "$_tmp" 2>/dev/null || true
-        else
-            uclient-fetch -q --no-check-certificate -O "$_tmp" "$_base/c/install.sh" 2>/dev/null || true
-        fi
+        # 面板那条路会**偶尔丢一个包就整条挂住**: 真机上同一个地址连 6 次, 3 次是 0.15 秒,
+        # 3 次 SYN 石沉大海、一直挂到我给的超时 (40% 左右)。只拉一次的话, 用户按下按钮、
+        # 界面上什么都没发生, 最后报出来却是"面板不可达" —— 而实际情况是"再试一次就行"。
+        # 所以这里试三次 (每次 25 秒上限, 与原来 60 秒的总预算同量级)。半个文件也要清掉:
+        # 下一轮若还失败, 留着上一轮的残片会让"脚本有没有拿到"的判断失真。
+        _try=0; _got=0
+        while [ "$_try" -lt 3 ]; do
+            _try=$((_try + 1))
+            rm -f "$_tmp"
+            _rc=1
+            if command -v curl >/dev/null 2>&1; then
+                if curl -fsSk -m 25 "$_base/c/install.sh" -o "$_tmp" 2>/dev/null; then _rc=0; fi
+            else
+                if uclient-fetch -q --no-check-certificate -T 25 -O "$_tmp" "$_base/c/install.sh" 2>/dev/null; then _rc=0; fi
+            fi
+            # 只有 curl/uclient-fetch 自己说"传完了"才算拿到 —— 被掐断的那次也会留下
+            # 半个文件, 而半份脚本里的版本号照样能被 sed 抠出来, 拿去跑就是另一回事了。
+            if [ "$_rc" = "0" ] && [ -s "$_tmp" ]; then _got=1; break; fi
+            sleep 1
+        done
+        [ "$_got" = "1" ] || rm -f "$_tmp"
         _panel_ver=""
         if [ -s "$_tmp" ]; then
             _panel_ver="$(sed -n 's/^ZP_CLIENT_VERSION="\(.*\)"/\1/p' "$_tmp" | head -n1)"

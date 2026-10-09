@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import base64
 import json
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import yaml
 
@@ -719,6 +719,36 @@ def _groups_for(names: list[str], tpl: str) -> list[dict]:
     return groups
 
 
+def management_direct_rules(base: str) -> list[str]:
+    """面板自己的地址必须**直连** —— 它是管理面, 不是一条"分流偏好"。
+
+    为什么非这样不可 (真机 8.64): 面板域名跟着规则走 🐟 漏网之鱼时, "更新客户端"这条通路
+    就成了"要连上面板, 得先连上代理; 而代理的节点正好也在面板那台机器上"。节点一挂,
+    路由器连面板都连不上 —— 面板上显示离线、点更新报"取不到面板的安装脚本", 而这一刻
+    **恰恰最需要**把面板连上、拉一份配置把自己救回来。死锁。
+
+    面板直连可达不是"要不要"的问题, 而是装机的前提: 用户拿到的那行命令就是在**还没有
+    任何代理**的路由器上 `wget 面板地址` 执行的。既然装机时能直连, 之后就不该把它塞进
+    代理里。
+
+    规则里写死 `DIRECT` (而不是走 🎯 全球直连 那个可切换的组): 管理面不该跟着用户"把
+    国内流量也代理掉"的偏好走 —— 那条路要被用户切到节点上, 又会回到上面那个死锁。
+
+    只取地址里的**主机名**, 不记具体 IP: 面板换 IP、挂 CDN 都不用改这条规则。
+    """
+    try:
+        host = (urlsplit(base).hostname or "").strip().lower()
+    except ValueError:
+        return []
+    if not host:
+        return []
+    # 裸 IP 的 base (bootstrap 阶段的面板 ip:port): 域名规则匹配不上, 用 IP 规则。
+    # no-resolve: 目的地址已经是 IP, 不需要再查一次 DNS。
+    if host.replace(".", "").isdigit():
+        return [f"IP-CIDR,{host}/32,DIRECT,no-resolve"]
+    return [f"DOMAIN-SUFFIX,{host},DIRECT"]
+
+
 def clash_profile(
     state: dict,
     template: str | None = None,
@@ -822,6 +852,12 @@ def clash_profile(
         rules += [f"GEOIP,LAN,{G_DIRECT},no-resolve", f"MATCH,{G_SELECT}"]
     else:  # direct: 不依赖任何 geo 数据 (无需下载), 只做广告拦截与手动切换
         rules = [f"MATCH,{G_FINAL}"]
+
+    # 管理面 (面板自己) 的直连规则放在**最前面**: 上面哪一档模板都不该把"连面板"这件事
+    # 交给代理 —— 见 management_direct_rules。只有路由器端有 base (手机/电脑那份订阅
+    # 不带面板地址, 也就没有这条): 路由器上没有第二条路可以走, 面板连不上就什么都修不了。
+    if router and base:
+        rules = management_direct_rules(base) + rules
 
     # 分流数据库下载地址: mihomo 默认从 GitHub 拉取, 在受限网络下会超时
     # (实测: 首次拉取失败会导致整个订阅加载失败)。这里改成可用镜像,

@@ -42,7 +42,22 @@ function makeMock() {
     client: "1.0.0",
     servers: [{ key: "hkk_i3_pub_8899", base: "https://hkk.i3.pub:8899", id: "dv056b52958542564a" }],
     log: "zeroproxy-agent: 配置已更新并重载",
+    // 一键更新的模拟: 每问一次 update-log 就"长"一段, 最后一段带 EXIT=0。
+    // 真实的日志格式就是安装脚本自己打印的那些 `==>` 小节, 所以这里照抄了一份。
+    updAt: 0,
+    updGuard: false,
   };
+  const HEAD = "面板版本 v1.9.9 (本机 v1.9.8) —— 开始更新。\n";
+  const UPD_LOG = [
+    "",
+    HEAD + "==> 检查环境\n  ✓ 设备: GL.iNet GL-MT3000 · arm64 · OpenWrt 24.10.4 (内核 6.6.110)\n  ✓ 面板可达",
+    HEAD + "==> 接入账号\n  ✓ 已接入过 (设备 dv056b52958542564a), 先沿用原有凭据",
+    HEAD + "==> 探测网络数据面能力\n  ✓ 数据面: TUN (全屋设备 + 路由器自身)\n  · IPv6 一并接管",
+    HEAD + "==> 下载代理内核 (mihomo · arm64)\n  … 已下载 8192 KB (930 KB/s)",
+    HEAD + "==> 写入运行文件\n==> 准备分流数据库 (GeoIP / GeoSite)\n  ✓ 分流数据库就绪",
+    HEAD + "==> 准备本地控制面 (可选件)\n  ✓ 本地控制面已是最新: zpcore 1.2.1\n" +
+          "==> 安装网页管理界面\n  ✓ 管理界面已装好\n==> 启动并自检\n  ✓ 内核已启动\n  ✓ TUN 已建立\nEXIT=0",
+  ];
   const json = (res, body) => {
     res.writeHead(200, { "Content-Type": "application/json; charset=utf-8" });
     res.end(JSON.stringify(body));
@@ -85,6 +100,20 @@ function makeMock() {
           return json(res, { ok: true, message: `已请求面板把总开关设为「${payload.on ? "on" : "off"}」` });
         }
         if (action === "refresh") return json(res, { ok: true, message: "完成" });
+        if (action === "update") {
+          if (state.updGuard) {
+            return json(res, { ok: true, message:
+              "面板上是 v1.9.7，这台机器已经是 v1.9.8 —— 那不是升级。\n" +
+              "  面板那边可能还没更新完: 先在面板点「检查更新 → 一键更新」, 再回来点这个按钮。" });
+          }
+          state.updAt = 1;
+          return json(res, { ok: true, message: HEAD + "已开始更新 (后台进行, 约 1 分钟; 配置与凭据保留)。" });
+        }
+        if (action === "update-log") {
+          // 每问一次就往前走一格, 到最后一格 (带 EXIT=0) 就停在那里
+          if (state.updAt > 0 && state.updAt < UPD_LOG.length - 1) state.updAt += 1;
+          return json(res, { ok: true, message: UPD_LOG[state.updAt] });
+        }
         if (action === "log") return json(res, { ok: true, log: state.log });
         return json(res, { ok: false, error: "未知操作" });
       });
@@ -197,6 +226,57 @@ async function main() {
       /未接管/.test(noneSub) && !/全屋透明代理/.test(noneSub), noneSub);
     check("把探测到的原因一起显示出来 (不用回终端猜)",
       /Operation not supported/.test(noneSub), noneSub);
+
+    console.log("\n[8] 一键更新: 进度条 + 完成后的跳转");
+    await page.click("#update");            // confirm 由上面的 dialog 处理器自动接受
+    await page.waitForSelector("#upd:not([hidden])", { timeout: 8000 });
+    check("点了更新之后出现进度面板", await page.locator("#upd").isVisible());
+    check("标题写着老版本 → 新版本", /v1\.9\.8 → v1\.9\.9/.test(await page.locator("#upd-sub").innerText()),
+      await page.locator("#upd-sub").innerText());
+    // 进度会随日志推进 (模拟器每问一次就长一格)
+    await page.waitForFunction(
+      () => parseInt(document.getElementById("upd-pct").textContent, 10) >= 30, null, { timeout: 10000 });
+    check("进度条随步骤推进 (>=30%)", true, await page.locator("#upd-pct").innerText());
+    const stepStates = () => page.$$eval("#upd-steps li", (ls) => ({
+      ok: ls.filter((l) => l.className === "ok").length,
+      doing: ls.filter((l) => l.className === "doing").length,
+      todo: ls.filter((l) => !l.className).length,
+    }));
+    const mid = await stepStates();
+    check("步骤清单同时有 已完成 / 进行中 / 待执行",
+      mid.ok > 0 && mid.doing === 1 && mid.todo > 0, JSON.stringify(mid));
+    check("实时行显示当前在做什么", (await page.locator("#upd-live").innerText()).length > 0,
+      await page.locator("#upd-live").innerText());
+    await page.screenshot({ path: path.join(SHOT_DIR, "router-update-progress.png") });
+
+    await page.waitForFunction(
+      () => /更新完成/.test(document.getElementById("upd-title").textContent), null, { timeout: 20000 });
+    // 等进度条那条 0.55s 的过渡跑完再截图 —— 否则拍到的是"正在填满"的中途,
+    // 看起来像没填 (第一次就是这么误判的)。
+    await page.waitForTimeout(700);
+    await page.screenshot({ path: path.join(SHOT_DIR, "router-update-done.png") });
+    check("完成后标题变成「更新完成」", true);
+    check("完成后是 100%", (await page.locator("#upd-pct").innerText()) === "100%");
+    check("完成后提示正在加载新版本",
+      /正在加载新版本/.test(await page.locator("#upd-sub").innerText()));
+    check("完成后按钮区隐藏 (进行中才需要重试/看日志)",
+      await page.locator("#upd-actions").isHidden());
+    check("侧栏步骤全部打勾",
+      (await stepStates()).todo === 0 && (await stepStates()).doing === 0);
+    // 停一下让人看清"完成", 再整页换新版本: 刷新后进度面板应当收起来
+    await page.waitForFunction(
+      () => document.getElementById("upd").hidden === true, null, { timeout: 20000 });
+    check("约两秒后自动换成新版本页面 (刷新完进度面板收起)", true);
+
+    console.log("\n[9] 被降级闸门拦下时, 不显示假的进度");
+    server.zpState.updGuard = true;
+    await page.click("#update");
+    await page.waitForFunction(
+      () => /那不是升级/.test(document.getElementById("update-hint").textContent), null, { timeout: 8000 });
+    check("把 CLI 的原话写在提示里", true,
+      (await page.locator("#update-hint").innerText()).split("\n")[0]);
+    check("没有开始更新就不显示进度条", await page.locator("#upd").isHidden());
+    server.zpState.updGuard = false;
 
     // 浏览器自己会请求 /favicon.ico 之类, 那是模拟器的事, 不算页面问题
     const real = errors.filter((e) => !/favicon|404 \(Not Found\)/.test(e));
