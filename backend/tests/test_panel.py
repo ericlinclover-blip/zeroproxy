@@ -10,7 +10,7 @@ import shutil
 import pytest
 
 from conftest import DOMAIN, PASSWORD, USERNAME
-from zeroproxy import config, crypto, xray_config
+from zeroproxy import config, crypto, share_links, xray_config
 
 
 # ---------------------------------------------------------------- 初始化
@@ -362,6 +362,42 @@ def test_clash_templates(client, configured):
     direct = yaml.safe_load(_sub(client, configured, extra="&rules=direct").text)
     assert direct["rules"] == ["MATCH,🐟 漏网之鱼"]
     assert direct["proxy-groups"][-1]["proxies"][0] == "DIRECT"
+
+
+def test_groups_carry_entry_health_judgement():
+    """策略组必须带**健康判定** —— "哪条入口能通"要由内核自己判, 不能等人去点。
+
+    起因是一次真机故障: 一台入口 IP 被按比例丢包 (新建连接约 37% 直接超时), 而
+    `♻️ 自动选择` 是 300 秒才探一次的 url-test, 落地组还是不探速的 select ——
+    面板上一切绿灯, 全屋的表现却是"网页开一半、App/视频一直转圈", 设备越多越明显。
+
+    修法两条:
+      * `♻️ 自动选择`: 周期 300 → 60 秒, 且 lazy=false (没被选中也照测);
+      * 落地组: 有**两条以上**链时用 url-test (多入口冗余的意义就在这里 —— 一台入口
+        被丢包时自动切到另一条), 只有一条链 / 没有链时保持 select (与从前一致)。
+    """
+    two = ["ZeroProxy 链式 · 美国", "ZeroProxy 链式 · 香港", "ZeroProxy VLESS Reality"]
+    groups = {g["name"]: g for g in share_links._groups_for(two, "smart")}
+
+    auto = groups[share_links.G_AUTO]
+    assert auto["type"] == "url-test"
+    assert auto["interval"] == 60, "300 秒太慢: 入口按比例丢包时五分钟里全屋都卡着"
+    assert auto["lazy"] is False, "lazy 时不选中就不探, 等于没有健康判据"
+
+    landing = groups[share_links.G_LANDING]
+    assert landing["type"] == "url-test", "两条以上链时必须能自动避开坏入口"
+    assert landing["proxies"] == ["ZeroProxy 链式 · 美国", "ZeroProxy 链式 · 香港"]
+    assert landing["interval"] == 60 and landing["lazy"] is False
+
+    # 只有一条链: 没有选择余地, 保持 select, 行为与从前完全一致
+    one = {g["name"]: g for g in share_links._groups_for(["ZeroProxy 链式 · 美国"], "smart")}
+    assert one[share_links.G_LANDING]["type"] == "select"
+    assert one[share_links.G_LANDING]["proxies"][-1] == share_links.G_SELECT
+
+    # 没有任何链式节点: 兜底成员必须是"节点选择", 否则组会空掉 (mihomo 直接拒绝加载)
+    none = {g["name"]: g for g in share_links._groups_for(["ZeroProxy VLESS Reality"], "smart")}
+    assert none[share_links.G_LANDING]["type"] == "select"
+    assert none[share_links.G_LANDING]["proxies"] == [share_links.G_SELECT]
 
 
 def test_cn_app_direct_layer_survives_without_geo_data(client, configured):

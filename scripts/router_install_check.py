@@ -858,6 +858,16 @@ def main() -> int:
               "按域名分流" in doctor and "不是故障" in doctor
               and "设备可能没把路由器当 DNS" not in doctor,
               [ln.strip() for ln in doctor.splitlines() if "DNS" in ln or "域名分流" in ln][:2])
+        # 入口连通性: 面板与内核都只看"这一条连接成没成", 看不到比例 —— 真机上"入口 IP
+        # 被按比例丢包"就是这么被漏掉的 (七项全绿, 只报了一句方向相反的"面板不可达")。
+        # 演练机上的入口端口 (127.0.0.1:8443 这类) 是关着的 → 必须**如实报 ✗**,
+        # 不许因为"探测不出来"就当正常。
+        entry_lines = [ln.strip() for ln in doctor.splitlines()
+                       if ("次被拒" in ln or "次超时" in ln or "全部成功" in ln)]
+        check("doctor: 逐条报出入口的新建连接成功率, 连不上的入口如实判 ✗",
+              "入口连通性" in doctor and bool(entry_lines)
+              and all("✗" in ln for ln in entry_lines),
+              entry_lines[:2])
 
         # [9] 健康机器: tun / nft 都在的普通 OpenWrt → 阶梯应当仍然选 L1
         print("\n[9] 健康机器 (tun + nftables 都在): 阶梯选 tun, 行为与以前一致")

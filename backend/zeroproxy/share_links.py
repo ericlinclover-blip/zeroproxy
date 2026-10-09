@@ -699,14 +699,35 @@ def _groups_for(names: list[str], tpl: str) -> list[dict]:
     groups: list[dict] = []
     if names:
         groups.append(
-            {"name": G_AUTO, "type": "url-test", "url": HEALTH_URL, "interval": 300, "proxies": names}
+            {
+                "name": G_AUTO,
+                "type": "url-test",
+                "url": HEALTH_URL,
+                # 300 秒太慢: 入口被按比例丢包时, 面板与内核都只看单条连接的结果, 五分钟才
+                # 重新判一次, 这段时间全屋都卡着。60 秒 + lazy:false (没被选中也照测) 才够
+                # 快; tolerance 是别为一点延迟抖动来回换节点。
+                "interval": 60,
+                "lazy": False,
+                "tolerance": 50,
+                "proxies": names,
+            }
         )
-    # 落地组: 成员是链式节点 (中转→落地)。没有链式节点时兜底成员就是"节点选择",
-    # 于是行为与从前完全一致 —— 没配落地的用户无感。
+    # 落地组: 成员是链式节点 (中转→落地)。
+    # 有**两条以上**链时用 url-test 而不是 select —— 入口冗余的意义就在这一步: 一台入口
+    # 被按比例丢包 / 被墙时自动切到能通的那条 (同一落地的另一台入口, 或另一条链)。
+    # 只有一条链时没有选择余地, 保持 select; 没有链式节点时兜底成员是"节点选择",
+    # 没配落地的用户行为与从前完全一致。
     landing = [n for n in names if "链式" in n]
+    if len(landing) >= 2:
+        landing_group = {
+            "name": G_LANDING, "type": "url-test", "url": HEALTH_URL,
+            "interval": 60, "lazy": False, "tolerance": 50, "proxies": landing,
+        }
+    else:
+        landing_group = {"name": G_LANDING, "type": "select", "proxies": landing + [G_SELECT]}
     groups += [
         {"name": G_SELECT, "type": "select", "proxies": select_members},
-        {"name": G_LANDING, "type": "select", "proxies": landing + [G_SELECT]},
+        landing_group,
         {"name": G_DIRECT, "type": "select", "proxies": ["DIRECT", G_SELECT]},
         {"name": G_ADS, "type": "select", "proxies": ["REJECT", "DIRECT"]},
         {
@@ -800,7 +821,10 @@ def clash_profile(
     # 出问题时能直接拿它去跑, 不用先做文本替换。
     if skeleton:
         groups = [
-            {"name": G_AUTO, "type": "url-test", "url": HEALTH_URL, "interval": 300, "use": []},
+            {
+                "name": G_AUTO, "type": "url-test", "url": HEALTH_URL,
+                "interval": 60, "lazy": False, "tolerance": 50, "use": [],
+            },
             # 注意成员顺序: mihomo 组装 select 组时**先把内联 proxies 放前面**, provider
             # 的节点跟在后面, 而 select 的默认值就是第一个成员。这里若只写 [DIRECT],
             # 多服务器模式的默认选择就变成"直连"—— 真机表现: 节点全在, 但所有流量直连、
@@ -809,9 +833,17 @@ def clash_profile(
             # 落地组: 从各 provider 的节点里挑名字含"链式"的 (多服务器模式的节点名
             # 带面板域名前缀, 但"链式"这个标记保留)。filter 匹配不到任何节点时,
             # 兜底成员"节点选择"保证这个组永远可用。
+            #
+            # 用 url-test 而不是 select: 多服务器模式正是"同一个落地挂了两台入口"的
+            # 样子, 哪一台能通必须由内核自己判 —— 一台入口被按比例丢包时, 人不会去
+            # 手点一下, 而 url-test 会切过去。(组里套组 mihomo 接受, 已用真内核 -t 验过。)
             {
                 "name": G_LANDING,
-                "type": "select",
+                "type": "url-test",
+                "url": HEALTH_URL,
+                "interval": 60,
+                "lazy": False,
+                "tolerance": 50,
                 "use": [],
                 "filter": "(?i)链式",
                 "proxies": [G_SELECT],

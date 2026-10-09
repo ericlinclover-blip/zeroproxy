@@ -2185,6 +2185,8 @@ ZP_VERSION="__ZP_CLIENT_VERSION__"
 # 症状是变量为空、URL 变成 http:///connections、然后静默显示"没有连接")。
 ZP_MIXED=7890
 ZP_API=127.0.0.1:9090
+# doctor 的"入口连通性"要照着配置里每个节点去连 —— 同一个坑: 这个路径也得在这里定义。
+ZP_CONF="$ZP_DIR/config.yaml"
 SERVERS="$ZP_DIR/servers"
 FIRST="$(ls "$SERVERS"/*.json 2>/dev/null | head -n1)"
 
@@ -2242,6 +2244,77 @@ sniffed_hosts() {
     _conn="$(curl -s -m 5 "http://$ZP_API/connections" 2>/dev/null || true)"
     [ -n "$_conn" ] || return 1
     printf '%s' "$_conn" | grep -oE '"(host|sniffHost)"[ ]*:[ ]*"[^"]{1,}"' | wc -l | tr -d ' '
+}
+
+# 一次 TCP 新建连接, 并区分三种结局 —— 这是"入口按比例丢包"唯一看得见的证据。
+#
+# 为什么非做不可: 内核与面板都只看"这一条连接成没成", 看不到"十次里有几次没成"。于是
+# 一个入口 IP 被运营商/GFW 按比例丢弃时, 面板上绿灯、内核日志里全是 warning, 而用户的
+# 表现是"网页开一半、App/视频一直转圈"。真机实测过: 同一台路由器直连入口面板 20 次里
+# 12 次 SYN 石沉大海 (装机时那条"重试两次"的注释就是被这件事逼出来的), 而 `doctor`
+# 七项全绿, 只报了一句"面板不可达"——方向完全指错了。
+#
+# 判据用 curl 的 time_connect: 连不上时它是 0.000000, 连上了 (那怕随后 TLS/协议不合而
+# 失败) 才是正数 —— 所以它能干净地区分"端口通了"与"端口没通", 不依赖任何协议。
+# 输出四种之一: ok / timeout / refused / err (notool = 这台固件上没有可用的探测工具)。
+tcp_once() {
+    _th="$1"; _tp="$2"
+    if command -v curl >/dev/null 2>&1; then
+        # --noproxy '*': 不让环境里的 *_proxy 变量把这几个探测改道 —— 探测必须量的是
+        # "这台机器自己到入口的那一跳", 被代理变量接走就什么都没测到。
+        _tc="$(curl -sk --noproxy '*' -o /dev/null -m 4 --connect-timeout 2 -w '%{time_connect}' \
+            "https://$_th:$_tp/" 2>/dev/null)"
+        _trc=$?
+        if [ -n "$_tc" ] && awk -v t="$_tc" 'BEGIN{exit !(t+0 > 0)}' 2>/dev/null; then
+            printf 'ok'
+        elif [ "$_trc" = "7" ]; then
+            printf 'refused'
+        elif [ "$_trc" = "28" ]; then
+            printf 'timeout'
+        else
+            printf 'err'
+        fi
+        return 0
+    fi
+    if command -v nc >/dev/null 2>&1; then
+        if nc -w 2 "$_th" "$_tp" </dev/null >/dev/null 2>&1; then printf 'ok'; else printf 'timeout'; fi
+        return 0
+    fi
+    printf 'notool'
+}
+
+# 连续探测同一个入口 N 次, 打印 "ok timeout refused err total"。
+# 次数可以由 ZP_DOCTOR_PROBES 调 (演练把它压低, 真机默认 5 次 —— 3 次在 37% 丢包下
+# 有 1/4 的概率一次都不丢, 会漏报)。
+entry_probe() {
+    _eh="$1"; _ep2="$2"; _en="${3:-5}"
+    _eok=0; _eto=0; _erf=0; _eer=0; _ei=0
+    while [ "$_ei" -lt "$_en" ]; do
+        _ei=$((_ei + 1))
+        case "$(tcp_once "$_eh" "$_ep2")" in
+            ok) _eok=$((_eok + 1)) ;;
+            timeout) _eto=$((_eto + 1)) ;;
+            refused) _erf=$((_erf + 1)) ;;
+            *) _eer=$((_eer + 1)) ;;
+        esac
+    done
+    printf '%s %s %s %s %s\n' "$_eok" "$_eto" "$_erf" "$_eer" "$_en"
+}
+
+# 配置里每个节点落在哪台机器的哪个端口 —— 这就是客户端真正要连的"入口"。
+# 只取 TCP 节点: hysteria2 那一档只有 UDP 端口, 拿 TCP 去连必然是"连不上", 会假报故障。
+# 同一个 host:port 只探一次 (5 个节点常常全在同一台机器上)。
+entry_endpoints() {
+    awk '
+        /^  type: /{ t=$2 }
+        /^  server: /{ s=$2 }
+        /^  port: /{
+            if (t != "hysteria2" && s != "") {
+                k = s ":" $2
+                if (!(k in seen)) { seen[k]=1; print k }
+            }
+        }
+    ' "$ZP_CONF" 2>/dev/null
 }
 
 # curl 的 speed_download (字节/秒) → 人话。分开写是因为 doctor 与 bench 都要用。
@@ -2401,6 +2474,45 @@ doctor() {
     printf '    想测这台机器自己能跑多快: zeroproxy bench\n'
 
     echo
+    echo "入口连通性"
+    # 这一项回答的是"这台路由器**新建**连接连得上入口吗, 成不成比例" —— 面板与内核都只看
+    # 单条连接的结果, 看不到比例, 所以它是唯一能提前暴露"入口被按比例丢包"的地方。
+    if ! command -v curl >/dev/null 2>&1 && ! command -v nc >/dev/null 2>&1; then
+        printf '  · 这台固件上既没有 curl 也没有 nc, 跳过（而"入口按比例丢包"正是最容易漏的一环）\n'
+    elif [ -z "$(entry_endpoints 2>/dev/null)" ]; then
+        printf '  · 配置里还没有可探测的节点（还没配对 / 还没拉到配置）\n'
+    else
+        _ebad=0; _eto_all=0; _erf_all=0
+        for _eep in $(entry_endpoints 2>/dev/null | head -n 3); do
+            _eh="${_eep%:*}"; _epn="${_eep##*:}"
+            _er="$(entry_probe "$_eh" "$_epn" "${ZP_DOCTOR_PROBES:-5}")"
+            _eok="${_er%% *}"; _erest="${_er#* }"
+            _eto="${_erest%% *}"; _erest="${_erest#* }"
+            _erf="${_erest%% *}"; _erest="${_erest#* }"
+            _eerr="${_erest%% *}"; _en="${_erest##* }"
+            if [ "$_eok" = "$_en" ]; then
+                printf '  ✓ %s 连续 %s 次新建连接全部成功\n' "$_eep" "$_en"
+            elif [ "$_eto" -gt 0 ]; then
+                _ebad=1; _eto_all=$((_eto_all + _eto)); _erf_all=$((_erf_all + _erf))
+                printf '  ✗ %s 连续 %s 次新建连接只成了 %s 次（%s 次超时）\n' "$_eep" "$_en" "$_eok" "$_eto"
+            else
+                _ebad=1; _erf_all=$((_erf_all + _erf))
+                printf '  ✗ %s 连不上（%s/%s 次被拒）\n' "$_eep" "$_erf" "$_en"
+            fi
+        done
+        if [ "$_ebad" = "1" ]; then
+            if [ "$_eto_all" -gt 0 ]; then
+                printf '      这一跳在**按比例丢包**。面板和内核都只看"这条连接成没成", 看不到比例,\n'
+                printf '      所以界面上一切正常, 表现却是"网页开一半、App/视频一直转圈", 设备越多越明显;\n'
+                printf '      国内流量走直连不受影响 —— "国内正常、国外不行"正是它的典型样子。\n'
+                printf '      下一步: 换这个入口的 IP/服务器, 或加一条备用入口（换 IP / 加中转 / 挂 CDN）。\n'
+            else
+                printf '      端口被拒 ≠ 丢包: 先确认入口机器上的服务在跑、端口没被安全组/防火墙拦。\n'
+            fi
+        fi
+    fi
+
+    echo
     echo "出口"
     if command -v curl >/dev/null 2>&1; then
         if curl -fsS -m 12 -x "http://127.0.0.1:$ZP_MIXED" -o /dev/null \
@@ -2418,11 +2530,27 @@ doctor() {
     for _f in $(servers); do
         _b="$(field_of "$_f" base)"
         _key="$(key_of "$_b")"
-        if command -v curl >/dev/null 2>&1 \
-            && curl -fsSk -m 8 -o /dev/null "$_b/api/status" 2>/dev/null; then
-            printf '  ✓ %s 可达\n' "$_key"
-        else
+        if ! command -v curl >/dev/null 2>&1; then
+            printf '  · 这台固件上没有 curl，跳过面板连通性测试\n'
+            continue
+        fi
+        # 同样要**连探几次**: 面板与节点常常在同一台机器上, 一次性探测在"按比例丢包"的
+        # 入口上大概率照样成功, 报出来的"可达"就是假绿 (真机上它和节点一起丢, 只是那条
+        # 提示写着"面板不可达", 把根因指到了面板身上)。
+        _pok=0; _pn="${ZP_DOCTOR_PROBES:-5}"; _pi=0
+        while [ "$_pi" -lt "$_pn" ]; do
+            _pi=$((_pi + 1))
+            if curl -fsSk -m 6 -o /dev/null "$_b/api/status" 2>/dev/null; then
+                _pok=$((_pok + 1))
+            fi
+        done
+        if [ "$_pok" = "$_pn" ]; then
+            printf '  ✓ %s 可达（%s/%s）\n' "$_key" "$_pok" "$_pn"
+        elif [ "$_pok" = "0" ]; then
             printf '  ! %s 不可达（代理照常工作；本机开关会自动落到本机覆盖）\n' "$_key"
+        else
+            printf '  ! %s 时通时不通（%s/%s 次）—— 面板和节点常在同一台机器上,\n' "$_key" "$_pok" "$_pn"
+            printf '      若上面"入口连通性"那一项也在丢, 就是同一个根因, 别只当成面板的小毛病\n'
         fi
     done
     if [ -s "$ZP_DIR/local.override" ]; then
