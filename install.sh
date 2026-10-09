@@ -73,9 +73,23 @@ fail() { printf '\033[1;31m[ZeroProxy]\033[0m %s\n' "$*"; exit 1; }
 DISTRO="${ID:-unknown}"
 case "$DISTRO" in
   ubuntu|debian|kali|linuxmint) info "系统: $PRETTY_NAME" ;;
+  openwrt|immortalwrt|lede|*wrt*|*openwrt*)
+    # 这台机器是**路由器**, 而这个脚本装的是**面板** (服务器侧: nginx / systemd / certbot /
+    # Python venv) —— 路由器上装不了, 也没有意义 (面板要一台有公网地址的服务器)。
+    # 不说清楚的话, 用户在这一步拿到的是 "dpkg: command not found" 这种句子 (真机截图里
+    # 就有), 然后以为程序坏了。路由器那一侧要装的是**客户端**, 由面板生成一行命令。
+    fail "这台机器是 OpenWrt 路由器 (${PRETTY_NAME:-$DISTRO}), 而 install.sh 是**面板 (服务器端)**的部署脚本。
+  面板要装在服务器上 (Ubuntu / Debian, 有公网 IP 或域名), 不是装在路由器上。
+  路由器端 (客户端) 请用面板「客户端」页生成的那一行命令安装, 形如:
+        wget -qO- https://<你的面板地址>/c/<配对码> | sh
+  还没有面板就先在服务器上跑这条命令把它装好, 然后回到路由器执行上面那一行。"
+    ;;
   *) warn "未测试的发行版: $DISTRO, 继续尝试 (apt 系)..." ;;
 esac
-ARCH="$(dpkg --print-architecture)"   # amd64 / arm64
+# 2>/dev/null + || true: 少数 (非 apt 系) 系统上没有 dpkg, 而 set -e 下命令替换失败会
+# 直接把脚本干掉 —— 那时用户看到的是一行 `dpkg: command not found`, 看不出是哪一步、
+# 也不知道该换什么命令 (真机截图里就是这一句)。
+ARCH="$(dpkg --print-architecture 2>/dev/null || true)"   # amd64 / arm64
 [ -n "$ARCH" ] || ARCH="$(uname -m)"
 
 # ---------------- 2. 内核优化: BBR + 拥塞控制 (Role.md 交付物 2) ----------------

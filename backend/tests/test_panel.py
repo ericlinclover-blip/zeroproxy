@@ -3463,6 +3463,25 @@ def test_install_script_never_resets_configured_deployment():
     assert _bash_syntax_ok(path)
 
 
+def test_install_script_says_it_is_not_for_routers():
+    """在路由器上跑 install.sh 要说人话, 而不是 `dpkg: command not found`。
+
+    真机截图里就是这个: 用户在 OpenWrt 25.12 的路由器上执行了**面板**的部署命令, 脚本在
+    第 78 行撞上 dpkg 后死掉 (`curl: (23) Failure writing output to destination`),
+    全程没有一句话告诉他"该装的是路由器端那一行命令"。这个脚本装的是面板 (nginx /
+    systemd / certbot / venv), 路由器上装不了 —— 那就明说, 并给出正确的入口。
+    """
+    path = os.path.join(REPO_ROOT, "install.sh")
+    text = open(path, encoding="utf-8").read()
+    assert "openwrt" in text and "这台机器是 OpenWrt 路由器" in text, "识别到路由器要明说"
+    assert "/c/<配对码>" in text or "/c/<" in text, "要给出路由器端真正该用的那条命令"
+    assert "wget -qO- " in text, "路由器端的入口是面板生成的那一行 (wget -qO- ... | sh)"
+    # dpkg 只在 apt 系存在: 命令替换失败会把 set -e 的脚本直接干掉, 于是报错变成一行
+    # `dpkg: command not found` (看不出哪一步、也不知道换什么)。
+    assert "dpkg --print-architecture 2>/dev/null" in text, "dpkg 不在时不许把脚本直接带走"
+    assert _bash_syntax_ok(path)
+
+
 def test_upgrade_sim_harness_is_valid():
     """一键升级的回归演练脚本 (macOS/Linux 都能跑, 不需要 root/systemd)。"""
     path = os.path.join(REPO_ROOT, "scripts", "upgrade_sim.sh")

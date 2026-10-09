@@ -92,6 +92,10 @@ def patch_for_local_run(script: str, root: str) -> str:
         "true",
     )
     out = re.sub(r'\[ -r /etc/openwrt_release \] \|\| die "[^"]*"', "true", out, flags=re.S)
+    # 固件标识 (DISTRIB_RELEASE 决定包管理器: 25.12 起是 apk) 也换到临时目录里的假文件 ——
+    # 25.12 / apk 那一节就是在这上面做文章的 (见 [12])。放在上面那条 re.sub 之后:
+    # 先让它按原样匹配掉 "没有 OpenWrt 就 die" 那句, 再改路径。
+    out = out.replace("/etc/openwrt_release", os.path.join(root, "openwrt_release"))
     # 本机没有 procd / systemd, 自检那一步 (启动 mihomo + 等控制口) 必然失败 ——
     # 这里停在"文件已落盘", 服务编排由真机验证; 但配置生成与 agent 逻辑照跑。
     out = out.replace(
@@ -1173,6 +1177,147 @@ def main() -> int:
         check("revert 保留了配置与凭据 (那是 uninstall 的事)",
               os.path.exists(os.path.join(fake_root, "agent.sh"))
               and os.path.exists(os.path.join(fake_root, "config.yaml")))
+
+        # [12] OpenWrt 25.12: 包管理器从 opkg 换成了 apk (真机 GL-MT3600BE · 25.12.5 ·
+        # 内核 6.12.94, README 8.76)。这一节把三件不同的事各跑一遍:
+        #   (A) 25.12 + apk: 该用 apk, 且 `apk -U add` 报 UNTRUSTED 时要退到
+        #       --allow-untrusted (dae 的家用安装脚本就是这么干的) —— 装上了就不许再喊疼;
+        #   (B) 源里没有这个内核的 kmod (厂商固件的常态): 不许再试 --allow-untrusted
+        #       (那不是签名问题), 但**必须**把原话与下一步命令说出来;
+        #   (C) 固件报 25.x 却只有 opkg (dae 那边叫 QWRT 那类迁移态): 按 opkg 走并说明。
+        print("\n[12] OpenWrt 25.12 / apk: 装模块、说清为什么装不上、迁移态固件")
+        apk_tools = os.path.join(tmp, "apktools")
+        opkg_tools = os.path.join(tmp, "opkgtools")
+        os.makedirs(apk_tools, exist_ok=True)
+        os.makedirs(opkg_tools, exist_ok=True)
+
+        def _write_tool(where: str, name: str, body: str) -> None:
+            path = os.path.join(where, name)
+            with open(path, "w") as fh:
+                fh.write("#!/bin/sh\n" + body)
+            os.chmod(path, 0o755)
+
+        def _fw_release(root: str, release: str) -> None:
+            """给这台模拟机写一份 /etc/openwrt_release (路径已被换进临时目录)。"""
+            os.makedirs(root, exist_ok=True)
+            with open(os.path.join(root, "openwrt_release"), "w") as fh:
+                fh.write("DISTRIB_ID='openwrt'\n"
+                         f"DISTRIB_RELEASE='{release}'\n"
+                         "DISTRIB_ARCH='aarch64_cortex-a53'\n"
+                         "DISTRIB_TARGET='mediatek/filogic'\n")
+
+        # (A) 25.12 + apk, 源没有签名密钥 (自建 / 厂商源的常态)
+        apk_log_a = os.path.join(tmp, "apk-a.log")
+        _write_tool(
+            apk_tools, "apk",
+            f'echo "apk $*" >> "{apk_log_a}"\n'
+            'case "$*" in\n'
+            '  "-U add kmod-tun")\n'
+            '    echo "ERROR: kmod-tun-6.12.94-r1.apk: UNTRUSTED signature" >&2\n'
+            "    exit 3 ;;\n"
+            '  "add --allow-untrusted kmod-tun")\n'
+            '    echo "OK: 2 MiB in 4 packages"\n'
+            "    exit 0 ;;\n"
+            "esac\n"
+            "exit 0\n",
+        )
+        a_root = os.path.join(tmp, "apk-root-a")
+        _fw_release(a_root, "25.12.5")
+        ok_a, out_a = run_install(
+            "openwrt-2512-apk", root=a_root,
+            extra={"PATH": apk_tools + os.pathsep + os.environ.get("PATH", "")},
+        )
+        a_caps = open(os.path.join(a_root, "caps"), encoding="utf-8").read()
+        check("25.12 上包管理器认成 apk, 固件版本记进 caps",
+              ok_a and "pkgmgr=apk" in a_caps and "fw=25.12.5" in a_caps and "fwgen=25" in a_caps,
+              [ln for ln in a_caps.splitlines() if ln.split("=")[0] in ("fw", "fwgen", "pkgmgr")])
+        check("安装输出里写清用的是 apk (不是让用户去猜)",
+              "包管理器 apk" in out_a,
+              [ln.strip() for ln in out_a.splitlines() if "apk" in ln][:2])
+        a_log = open(apk_log_a, encoding="utf-8").read().splitlines() if os.path.exists(apk_log_a) else []
+        check("apk 路径: `apk -U add` 一条命令 (刷新索引 + 安装), 不再多一次 apk update",
+              a_log[:1] == ["apk -U add kmod-tun"], a_log)
+        check("签名不可信时退到 --allow-untrusted (dae 的做法), 且只退这一步",
+              a_log == ["apk -U add kmod-tun", "apk add --allow-untrusted kmod-tun"], a_log)
+        a_deps = [ln for ln in a_caps.splitlines() if ln.startswith("deps_why=")]
+        check("退一步装上了就不许再喊疼 (没有失败记录, caps 的 deps_why 空着)",
+              "内核模块没装上" not in out_a and a_deps == ["deps_why="], a_deps)
+
+        # (B) 25.12 + apk, 但源里没有这台内核的 kmod (厂商固件: 内核与官方源对不上)
+        apk_log_b = os.path.join(tmp, "apk-b.log")
+        _write_tool(
+            apk_tools, "apk",
+            f'echo "apk $*" >> "{apk_log_b}"\n'
+            'echo "ERROR: unable to select packages: kmod-tun (no such package)" >&2\n'
+            "exit 3\n",
+        )
+        b_root = os.path.join(tmp, "apk-root-b")
+        _fw_release(b_root, "25.12.5")
+        ok_b, out_b = run_install(
+            "openwrt-2512-nokmod", root=b_root,
+            extra={"PATH": apk_tools + os.pathsep + os.environ.get("PATH", "")},
+        )
+        b_log = open(apk_log_b, encoding="utf-8").read().splitlines() if os.path.exists(apk_log_b) else []
+        b_caps = open(os.path.join(b_root, "caps"), encoding="utf-8").read()
+        check("源里没有这个包时**不再**试 --allow-untrusted (那不是签名问题)",
+              b_log == ["apk -U add kmod-tun"] and not any("--allow-untrusted" in ln for ln in b_log),
+              b_log)
+        check("装不上要说原话, 不是只留一句「缺 kmod-tun」",
+              ok_b and "内核模块没装上" in out_b and "no such package" in out_b,
+              [ln.strip() for ln in out_b.splitlines() if "内核模块没装上" in ln][:1])
+        check("原因一路记进 caps (doctor / 面板读的是同一份)",
+              "deps_why=kmod-tun:" in b_caps,
+              [ln for ln in b_caps.splitlines() if ln.startswith("deps_why=")][:1])
+        check("结尾给的下一步是**这台机器能用**的那条命令",
+              "apk -U add kmod-tun kmod-nft-tproxy" in out_b,
+              [ln.strip() for ln in out_b.splitlines() if "apk -U add" in ln][:1])
+        check("把 25.12 那一层原因说出来: kmod 来自与内核版本绑定的源",
+              "与内核版本绑定" in out_b)
+
+        # (C) 固件报 25.x, 里面却还是 opkg (厂商迁移态)
+        opkg_log = os.path.join(tmp, "opkg.log")
+        _write_tool(
+            opkg_tools, "opkg",
+            f'echo "opkg $*" >> "{opkg_log}"\n'
+            'case "$1" in\n'
+            "  update) echo \"Updated list of available packages\"; exit 0 ;;\n"
+            "esac\n"
+            'echo "pkg_hash_check_unresolved: cannot find dependency kernel for kmod-tun" >&2\n'
+            "exit 1\n",
+        )
+        c_root = os.path.join(tmp, "root-c-25x-opkg")
+        _fw_release(c_root, "25.12.5")
+        ok_c, out_c = run_install(
+            "openwrt-2512-opkg", root=c_root,
+            extra={"PATH": opkg_tools + os.pathsep + os.environ.get("PATH", "")},
+        )
+        c_caps = open(os.path.join(c_root, "caps"), encoding="utf-8").read()
+        c_log = open(opkg_log, encoding="utf-8").read().splitlines() if os.path.exists(opkg_log) else []
+        check("25.x 但只有 opkg 时按 opkg 走 (不硬套 apk), 并把这件事说出来",
+              ok_c and "pkgmgr=opkg" in c_caps and "按 opkg 走" in out_c,
+              [ln.strip() for ln in out_c.splitlines() if "opkg" in ln][:2])
+        check("走 opkg 时就用 opkg 的命令 (update + install), 一次都不碰 apk",
+              c_log[:2] == ["opkg update", "opkg install kmod-tun"]
+              and not any("apk" in ln for ln in c_log), c_log)
+        check("给用户的下一步也按 opkg 来 (不指一条这台机器上没有的命令)",
+              "opkg install kmod-tun kmod-nft-tproxy" in out_c
+              and "apk -U add" not in out_c,
+              [ln.strip() for ln in out_c.splitlines() if "kmod-tun kmod-nft-tproxy" in ln][:1])
+
+        # 这两条命令是装完之后**唯一的**现场排障入口 —— 它们读的是同一份 caps。
+        cli_2512 = os.path.join(c_root, "cli-check-2512.sh")
+        with open(os.path.join(c_root, "cli"), encoding="utf-8") as fh:
+            cli_text = fh.read().replace("/etc/zeroproxy", c_root).replace("/etc/init.d/zeroproxy", "true")
+        with open(cli_2512, "w") as fh:
+            fh.write(cli_text)
+        st = subprocess.run(["sh", cli_2512, "status"], capture_output=True, text=True)
+        doc = subprocess.run(["sh", cli_2512, "doctor"], capture_output=True, text=True)
+        check("zeroproxy status 报出固件与包管理器 (出问题时第一眼要看的两项)",
+              "包管理器 opkg" in st.stdout and "25.12.5" in st.stdout,
+              [ln.strip() for ln in st.stdout.splitlines() if "固件" in ln][:1])
+        check("doctor 把「内核模块没装上」连同补装命令一起报出来",
+              "内核模块没装上" in doc.stdout and "opkg install kmod-tun kmod-nft-tproxy" in doc.stdout,
+              [ln.strip() for ln in doc.stdout.splitlines() if "补装" in ln][:1])
     finally:
         logs = []
         for panel in panels:

@@ -43,6 +43,19 @@ ARCH=""
 HTTP_CODE=""
 DEPENDENCY_NOTE=""
 ACTIVE_MODE=""
+#: 固件版本与包管理器。OpenWrt 25.12 起包管理器从 opkg 换成了 apk, 而真机上存在**两代
+#: 混着出现**的组合 (厂商固件报 25.x 却只有 opkg; backport 的 24.10 里塞了 apk) ——
+#: 版本号与"命令在不在"两条判据都要留。选错的后果是整段依赖安装静默跳过: 安装过程全绿,
+#: 而 TUN 建不出来、tproxy 回退也没有 nft 规则 (README 8.76)。
+FW_RELEASE=""
+FW_GEN=""
+PKG_MGR=""
+PKG_MGR_NOTE=""
+#: 内核模块没装上的原因。pkg_install 把命令**第一行原话**记进 DEPS_WHY, 调用方攒进
+#: DEPS_FAILED (一行一条 `包名: 原因`) —— 结尾摘要与 doctor 都读它, 于是"为什么没装成"
+#: 有现场证据, 而不是只留一句"缺 kmod-tun"让人去猜。
+DEPS_WHY=""
+DEPS_FAILED=""
 # 面板是否提供分流数据库接口 (/c/geo)。空 = 没问过 (更新模式), true = 有
 PANEL_GEO=""
 # 面板给来的分流数据库元信息 (core_read_panel 填): 体积下限与全部可用地址。
@@ -412,9 +425,48 @@ detect_env() {
     HOSTNAME_NOW="$(uci get system.@system[0].hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || echo router)"
     # 注意 `|| true`: 在 `set -e` 下, 带命令替换的赋值会继承子命令的退出码 ——
     # sed 读不到文件 (测试机/非标准环境) 会把整个脚本静默干掉, 一行输出都没有。
-    OS_NAME="OpenWrt $(sed -n "s/^DISTRIB_RELEASE=['\"]\(.*\)['\"].*/\1/p" /etc/openwrt_release 2>/dev/null || true)"
-    [ "$OS_NAME" != "OpenWrt " ] || OS_NAME="OpenWrt"
+    FW_RELEASE="$(sed -n "s/^DISTRIB_RELEASE=['\"]\(.*\)['\"].*/\1/p" /etc/openwrt_release 2>/dev/null || true)"
+    if [ -n "$FW_RELEASE" ]; then OS_NAME="OpenWrt $FW_RELEASE"; else OS_NAME="OpenWrt"; fi
     KERNEL="$(uname -r)"
+    detect_pkgmgr
+}
+
+# ---------------------------------------------------------------- 固件世代 / 包管理器
+# 固件世代 = 主版本号 (21.02 → 21, 24.10 → 24, 25.12.5 → 25)。要区分的是"哪一代" ——
+# 它同时决定包管理器与内核模块从哪个源来 (25.12 起 kmod 在"与内核版本绑定"的源里);
+# 补丁号对这两件事没有帮助, 所以只取主版本。
+fw_generation() {
+    printf '%s' "$1" | sed -n 's/^\([0-9][0-9]*\)\..*/\1/p'
+}
+
+# 该用哪个包管理器。**版本号给倾向, 命令给事实** —— 两条一起看, 缺一不可:
+#   * 只按版本号: 厂商固件的迁移态会把包格式判错 (dae 的安装脚本专门处理过这一类:
+#     固件报 25.x, 里面却还是 opkg), 于是命令行一条都跑不动;
+#   * 只按 command -v: 两个都在的机器上会选错 (为了迁移把 opkg 留成 shim 的固件确实存在)。
+# 所以 25.x 优先 apk、24.10 及更早优先 opkg; 不一致时**按命令走并把这件事说出来**;
+# 一个都没有就如实记 none —— 依赖装不了, 但后面每一级的探测照做 (模块可能本来就在)。
+detect_pkgmgr() {
+    FW_GEN="$(fw_generation "$FW_RELEASE" || true)"
+    PKG_MGR_NOTE=""
+    if [ -n "$FW_GEN" ] && [ "$FW_GEN" -ge 25 ] 2>/dev/null; then
+        if command -v apk >/dev/null 2>&1; then
+            PKG_MGR=apk
+        elif command -v opkg >/dev/null 2>&1; then
+            PKG_MGR=opkg
+            PKG_MGR_NOTE="固件是 ${FW_RELEASE:-25.x}, 但本机只有 opkg (厂商固件的迁移态) —— 按 opkg 走"
+        else
+            PKG_MGR=none
+            PKG_MGR_NOTE="固件是 ${FW_RELEASE:-25.x}, 但 apk / opkg 都不在"
+        fi
+    elif command -v opkg >/dev/null 2>&1; then
+        PKG_MGR=opkg
+    elif command -v apk >/dev/null 2>&1; then
+        PKG_MGR=apk
+        PKG_MGR_NOTE="固件是 ${FW_RELEASE:-未知}, 但本机只有 apk (backport / 自编译) —— 按 apk 走"
+    else
+        PKG_MGR=none
+        PKG_MGR_NOTE="精简固件?"
+    fi
 }
 
 # 本机是否已经有一个**跑得起来**的内核? 判据要和 install_core 的复用判据一致:
@@ -435,7 +487,30 @@ lan_ip() {
 
 preflight() {
     step "检查环境"
-    ok "设备: $MODEL · $ARCH · $OS_NAME (内核 $KERNEL)"
+    # 包管理器与固件世代一起报 —— 它决定了后面"内核模块能不能补上", 而这一句是用户
+    # 出问题时最先会截图的那一行。
+    ok "设备: $MODEL · $ARCH · $OS_NAME · ${PKG_MGR:-?} (内核 $KERNEL)"
+
+    # 固件世代决定了这台机器的软件源能不能用, 两代的坑不一样:
+    #   24.10 及更早: 官方 24.10 已于 2026-09 EOL, 源随时可能下线 —— 主动提示升级
+    #     (设计文档 §1.3 要求的那一条)。
+    #   25.12 及更新: 内核模块在"与内核版本绑定"的源里, 厂商固件常常对不上 —— 先说清楚,
+    #     免得"模块装不上"被当成安装脚本的毛病。
+    case "$PKG_MGR" in
+        apk)
+            note "包管理器 apk (OpenWrt 25.12 起)。内核模块 (kmod-tun / kmod-nft-tproxy) 来自"
+            note "  与内核版本绑定的那个源 —— 厂商固件的内核常与它不符, 那时会如实告诉你" ;;
+        opkg)
+            case "${FW_GEN:-}" in
+                24) warn "OpenWrt 24.10 已于 2026-09 停止维护 (EOL): 官方源随时可能下线, 补内核模块
+  会越来越靠运气。有条件请升到 25.12 后重跑这条安装命令 (设备凭据与配置都保留)。" ;;
+            esac ;;
+        none) warn "本机没有 apk / opkg (${PKG_MGR_NOTE:-两个都不在}) —— 缺的内核模块只能手动补" ;;
+    esac
+    # 版本号与命令不一致时 (厂商迁移态 / backport), 那句话在这里落地 —— 上面已经按事实选了。
+    if [ -n "$PKG_MGR_NOTE" ] && [ "$PKG_MGR" != "none" ]; then
+        note "$PKG_MGR_NOTE"
+    fi
 
     # 空间: 只有"这一轮真的要装内核"时才需要 90 MB (20 MB 的 gz + 解压后约 57 MB);
     # 内核已经在而且能跑时, 本轮只多写几 MB 的分流数据库 —— 重跑安装命令 (= 升级客户端
@@ -565,23 +640,60 @@ EOF
 #
 # 所以判据不是"安装命令成没成功", 而是**能力到底在不在**: 两个都试着装 (装不上就算了),
 # 各自验证一次, 再按"这件事到底重要不重要"决定用什么口气说话。
+#
+# 两代包管理器的脾气不一样, 各按各的来 (apk 一侧的写法照 OpenWrt 官方的 opkg→apk
+# cheatsheet 与 dae 的家用安装脚本, 见 README 8.76):
+#   * apk (25.12+): `apk -U add` = 刷新索引 + 安装, 一条命令干完 opkg 的两条 (索引不新鲜
+#     时 `apk add` 会拿一份过期的 packages.adb 去找包)。
+#   * apk **要求包签名可验证**; 自建 / 厂商源常常没有签名密钥, 于是报 "UNTRUSTED
+#     signature" —— dae 那边就是在这里退一步用 --allow-untrusted。**只在报错确实是
+#     签名类时**退这一步: 别的错 (源里没有这个包 / 依赖不满足) 退也没用, 只会盖住真原因。
+#   * opkg (24.10 及更早): 老样子。源对不上内核时它会失败 —— 那是源的事, 不是语法的事。
 pkg_install() {
-    if command -v apk >/dev/null 2>&1; then
-        apk add "$1" >/dev/null 2>&1
-    elif command -v opkg >/dev/null 2>&1; then
-        opkg install "$1" >/dev/null 2>&1
-    else
-        return 127
-    fi
+    _pkg="$1"
+    DEPS_WHY=""
+    case "$PKG_MGR" in
+        apk)
+            _apk_err="$(apk -U add "$_pkg" 2>&1)" && return 0
+            case "$_apk_err" in
+                *UNTRUSTED*|*untrusted*|*signature*|*Signature*|*BAD*SIGN*|*BADCKSUM*)
+                    _apk_err2="$(apk add --allow-untrusted "$_pkg" 2>&1)" && return 0
+                    DEPS_WHY="签名不可信, 退到 --allow-untrusted 也没成: $(err_line "${_apk_err2:-$_apk_err}")" ;;
+                *) DEPS_WHY="$(err_line "${_apk_err:-apk 没说话}")" ;;
+            esac
+            return 1 ;;
+        opkg)
+            _opkg_err="$(opkg install "$_pkg" 2>&1)" && return 0
+            DEPS_WHY="$(err_line "${_opkg_err:-opkg 没说话}")"
+            return 1 ;;
+        *)
+            DEPS_WHY="本机没有包管理器"
+            return 127 ;;
+    esac
 }
 pkg_update() {
-    if command -v apk >/dev/null 2>&1; then
-        apk update >/dev/null 2>&1
-    elif command -v opkg >/dev/null 2>&1; then
-        opkg update >/dev/null 2>&1
-    else
-        return 127
-    fi
+    case "$PKG_MGR" in
+        apk)  apk update >/dev/null 2>&1 ;;
+        opkg) opkg update >/dev/null 2>&1 ;;
+        *)    return 127 ;;
+    esac
+}
+
+# 一条"这个包没装成 + 为什么"的流水 (一行一条, 攒进 DEPS_FAILED)。
+# 装不上照样继续 —— 但**不许悄悄过去**: 结尾摘要与 doctor 会把这一串原样带出来,
+# 于是"这台机器缺内核模块"和"为什么缺"不再需要用户截图去猜。
+deps_fail() {  # $1=包名, $2=原因
+    _df="$1: ${2:-未知原因}"
+    if [ -n "$DEPS_FAILED" ]; then DEPS_FAILED="$DEPS_FAILED; $_df"; else DEPS_FAILED="$_df"; fi
+}
+
+# 补内核模块该敲哪条命令 —— 按这台机器真正的包管理器来。
+deps_hint() {
+    case "$PKG_MGR" in
+        apk)  printf 'apk -U add kmod-tun kmod-nft-tproxy   (报了 UNTRUSTED 就再加 --allow-untrusted)' ;;
+        opkg) printf 'opkg install kmod-tun kmod-nft-tproxy' ;;
+        *)    printf '本机没有 apk / opkg —— 内核模块只能从固件里补' ;;
+    esac
 }
 
 # 数据面能力阶梯, 装机时**每一级都真做一次**, 结论写进 /etc/zeroproxy/caps。
@@ -914,12 +1026,19 @@ write_caps() {
 # 格式仍是一行一个 key=value (路由器上没有 jq, 用 sed 取就够)。新增的 chosen / covered
 # 回答的是"这台机器现在到底走哪条路、覆盖到哪", 而 why.* 回答"别的路为什么不行" ——
 # 安装输出、CLI、agent 上报、面板显示读的都是这一份, 不允许各处各写一遍。
+# fw / fwgen / pkgmgr / deps_why 是 25.12 那一轮加的: 固件世代决定包管理器与内核模块
+# 从哪个源来, deps_why 是"内核模块为什么没装上"的原话 —— doctor 与安装摘要都读它们,
+# 于是"这台固件缺什么"不必再靠用户截图去猜。
 caps_write() {
     _ar="${1:-1}"
     mkdir -p "$ZP_DIR" 2>/dev/null || true
     _oneline() { printf '%s' "$1" | tr -d '\r\n'; }
     {
         printf 'schema=2\n'
+        printf 'fw=%s\n' "$(_oneline "$FW_RELEASE")"
+        printf 'fwgen=%s\n' "$(_oneline "$FW_GEN")"
+        printf 'pkgmgr=%s\n' "$PKG_MGR"
+        printf 'deps_why=%s\n' "$(_oneline "$DEPS_FAILED")"
         printf 'tun=%s\n' "$NET_TUN"
         printf 'nft=%s\n' "$NET_NFT"
         printf 'tproxy=%s\n' "$NET_TPROXY"
@@ -987,12 +1106,28 @@ ladder_below() {
 install_deps() {
     step "探测网络数据面能力"
     # 软件源不可用 / 源对不上内核, 在路由器上都很常见, 不算致命 —— 模块可能本来就在。
-    pkg_update || true
-    pkg_install kmod-tun || true
+    # 但**为什么装不上要说出来**: 25.12 的内核模块来自"与内核版本绑定"的那个源
+    # (.../kmods/<内核版本>-<构建哈希>/), 厂商固件的内核与它对不上时, 这条记录是唯一
+    # 能解释"模块怎么都装不上"的现场证据。
+    if [ "$PKG_MGR" = "none" ]; then
+        note "本机没有包管理器 (${PKG_MGR_NOTE:-apk / opkg 都不在}) —— 缺的内核模块只能手动补"
+    elif [ "$PKG_MGR" = "opkg" ]; then
+        # opkg 要"先更新索引再装"两条命令; apk 那边不需要 —— `apk -U add` 自己会刷新
+        # (官方 cheatsheet 就是拿它替代 `opkg update && opkg install` 那两条的),
+        # 少一次索引往返在慢线路上是实打实的时间。
+        pkg_update || true
+    fi
+    # 装包失败先记在手边, **等探测完了再决定要不要报** —— 模块本来就在 (或已编进内核) 时,
+    # "apk add 没成功"是无关紧要的 (源离线 / 架构的 kmod 不在源里都可能), 说出来只会吓人。
+    if pkg_install kmod-tun; then _tun_why=""; else _tun_why="$DEPS_WHY"; fi
     modprobe tun 2>/dev/null || true
 
     # 每一级都真做一次。探测只做可撤销的动作 (建设备再删 / 加规则再撤), 不改任何东西。
-    if tun_ok; then NET_TUN=1; else CAPS_WHY_TUN="$PROBE_WHY"; fi
+    if tun_ok; then NET_TUN=1; else
+        CAPS_WHY_TUN="$PROBE_WHY"
+        # 这一级真的不行、而包也没装上 → 这条记录才有意义 (它就是根因)
+        [ -z "$_tun_why" ] || deps_fail kmod-tun "$_tun_why"
+    fi
     if nft_ok; then NET_NFT=1; else CAPS_WHY_TPROXY="$PROBE_WHY"; fi
     if [ "$NET_NFT" = "1" ]; then
         if tproxy_ok; then
@@ -1000,9 +1135,13 @@ install_deps() {
         else
             CAPS_WHY_TPROXY="$PROBE_WHY"
             # 模块可能只是没装/没加载: 补一次再试 (装不上就算了, 不算致命)
-            pkg_install kmod-nft-tproxy || true
+            if pkg_install kmod-nft-tproxy; then _tp_why=""; else _tp_why="$DEPS_WHY"; fi
             modprobe nft_tproxy 2>/dev/null || true
-            if tproxy_ok; then NET_TPROXY=1; CAPS_WHY_TPROXY=""; fi
+            if tproxy_ok; then
+                NET_TPROXY=1; CAPS_WHY_TPROXY=""
+            else
+                [ -z "$_tp_why" ] || deps_fail kmod-nft-tproxy "$_tp_why"
+            fi
         fi
     fi
     if redirect_ok; then NET_REDIRECT=1; else CAPS_WHY_REDIRECT="$PROBE_WHY"; fi
@@ -1046,6 +1185,13 @@ install_deps() {
             if [ -n "$CAPS_WHY_TUN" ]; then note "tun: $CAPS_WHY_TUN"; fi
             if [ -n "$CAPS_WHY_TPROXY" ]; then note "tproxy: $CAPS_WHY_TPROXY"; fi
             if [ -n "$CAPS_WHY_REDIRECT" ]; then note "redirect: $CAPS_WHY_REDIRECT"; fi
+            # 三条路都没通, 而内核模块又没装成 —— 那就是根因, 原话摆出来 (结尾还会给命令)
+            if [ -n "$DEPS_FAILED" ]; then
+                note "内核模块没装上: $DEPS_FAILED"
+                # 就在看到"未生效"的同一屏里给出这台机器能用的那条命令 —— 用户要截图时
+                # 这一行才是能被照着执行的东西。
+                note "  补装: $(deps_hint)"
+            fi
             note "本机的代理端口一直可用 (局域网设备手动把代理填成 $(lan_ip):$ZP_MIXED)"
             ;;
     esac
@@ -2525,6 +2671,16 @@ ZP_API=127.0.0.1:9090
 # doctor 的"入口连通性"要照着配置里每个节点去连 —— 同一个坑: 这个路径也得在这里定义。
 ZP_CONF="$ZP_DIR/config.yaml"
 SERVERS="$ZP_DIR/servers"
+
+# 补内核模块该敲哪条命令 —— 按这台机器**真正的**包管理器来 (25.12 起是 apk; 装机时
+# 探到的结果记在 caps 里)。doctor 与 status 都从这里取, 不各写一份。
+deps_hint() {
+    case "$(sed -n 's/^pkgmgr=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)" in
+        apk)  printf 'apk -U add kmod-tun kmod-nft-tproxy   (报了 UNTRUSTED 就再加 --allow-untrusted)' ;;
+        opkg) printf 'opkg install kmod-tun kmod-nft-tproxy' ;;
+        *)    printf '本机没有 apk / opkg —— 内核模块只能从固件里补' ;;
+    esac
+}
 FIRST="$(ls "$SERVERS"/*.json 2>/dev/null | head -n1)"
 
 field_of() { sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" | head -n1; }
@@ -2696,6 +2852,21 @@ doctor() {
     echo "ZeroProxy 路由器端体检"
     echo "────────────────────────────────────────────"
     echo
+    echo "固件"
+    _fw="$(sed -n 's/^fw=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    _pm="$(sed -n 's/^pkgmgr=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    printf '  · %s · 包管理器 %s\n' "${_fw:+OpenWrt }${_fw:-未知版本}" "${_pm:-未知}"
+    # 内核模块这一步失败过没有 —— 这是"这台固件为什么起不来"最常见的根因, 单独报出来
+    # 并附上按本机包管理器写好的那条命令 (25.12 起是 apk, 24.10 及更早是 opkg)。
+    _dw="$(sed -n 's/^deps_why=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    if [ -n "$_dw" ]; then
+        printf '  ! 内核模块没装上: %s\n' "$_dw"
+        printf '      补装: %s\n' "$(deps_hint)"
+    else
+        printf '  ✓ 内核模块这一步没有失败记录 (kmod-tun / kmod-nft-tproxy)\n'
+    fi
+
+    echo
     echo "内核"
     if [ "$(running)" = yes ]; then
         printf '  ✓ 服务在跑：%s\n' "$("$ZP_DIR/mihomo" -v 2>/dev/null | head -n1)"
@@ -2723,6 +2894,8 @@ doctor() {
                 _w="$(sed -n "s/^why.$_lv=//p" "$ZP_DIR/caps" 2>/dev/null | head -n1)"
                 [ -n "$_w" ] && printf '      %s: %s\n' "$_lv" "$_w"
             done
+            # 上面那几条原因多半指向"缺 kmod" —— 直接把补装命令给出来 (按本机包管理器)
+            [ -n "$_dw" ] && printf '      下一步: %s\n' "$(deps_hint)"
         else
             printf '  ! caps 说 %s、现场是 %s — 重跑一次安装命令让它对齐\n' "$_chosen" "$_live"
         fi
@@ -2960,6 +3133,15 @@ case "${1:-status}" in
         ;;
     status)
         echo "内核:  $( [ "$(running)" = yes ] && echo 运行中 || echo 已停止 )"
+        # 固件与包管理器 (装机时记进 caps): "内核模块能不能补"全看这两项, 出问题时
+        # 第一个该看的就是这一行。
+        _fw="$(sed -n 's/^fw=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+        _pm="$(sed -n 's/^pkgmgr=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+        if [ -n "$_fw" ] || [ -n "$_pm" ]; then
+            printf '固件:  %s%s\n' \
+                "$( [ -n "$_fw" ] && printf 'OpenWrt %s' "$_fw" || printf '未知版本' )" \
+                "$( [ -n "$_pm" ] && printf ' · 包管理器 %s' "$_pm" )"
+        fi
         echo "服务器 ($(servers | wc -l | tr -d ' ') 台):"
         for _f in $(servers); do
             printf '  %-16s %s\n' "$(key_of "$(field_of "$_f" base)")" "$(field_of "$_f" base)"
@@ -3974,12 +4156,20 @@ finish() {
             done
             printf '  下一步任选一条:\n'
             printf '    1) 补内核模块后重跑这条安装命令:\n'
-            printf '         opkg install kmod-tun kmod-nft-tproxy    (OpenWrt 25.12 及更新: apk add ...)\n'
+            printf '         %s\n' "$(deps_hint)"
+            if [ -n "$DEPS_FAILED" ]; then
+                printf '       上次装的时候它是这么说的 (原话): %s\n' "$DEPS_FAILED"
+            fi
+            if [ "$PKG_MGR" = "apk" ]; then
+                printf '       25.12 起内核模块在**与内核版本绑定**的源里: 厂商固件的内核与它不符时,\n'
+                printf '       源里根本没有这台机器的 kmod —— 那就只能等固件更新或刷官方固件。\n'
+            fi
             printf '    2) 换成带 TUN / nftables 支持的固件 (原厂精简固件常常都缺)\n'
             printf '  路由器本机的代理端口一直可用 (http://%s:%s), 只是没有接管局域网设备。\n' "$(lan_ip)" "$ZP_MIXED"
             ;;
     esac
     printf '  设备名   %s\n' "$MODEL"
+    printf '  固件     %s · 包管理器 %s\n' "$OS_NAME" "${PKG_MGR:-未知}"
     case "${ACTIVE_MODE:-none}" in
         tun)      printf '  模式     TUN 全屋透明代理 (含路由器自身)\n' ;;
         tproxy)   printf '  模式     tproxy 全屋透明代理 (本机自身流量除外)\n' ;;

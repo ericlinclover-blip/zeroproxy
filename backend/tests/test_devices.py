@@ -1781,6 +1781,48 @@ def test_install_script_handles_openwrt_25_and_never_hangs_on_the_core():
         )
 
 
+def test_install_script_picks_the_right_package_manager_per_firmware():
+    """25.12 的包管理器是 apk, 24.10 及更早是 opkg —— 但**版本号与命令要一起看**。
+
+    真机上存在两代混着出现的组合 (厂商固件报 25.x 却只有 opkg —— dae 的家用安装脚本
+    专门处理过这一类; backport 的 24.10 里塞了 apk 的也有), 于是:
+      * 只按版本号判 → 与固件实际能装的包格式对不上, 命令一条都跑不动;
+      * 只按 `command -v` 判 → 两个都在的机器上选错。
+
+    apk 还有它自己的两条脾气 (照 OpenWrt 官方 cheatsheet 与 dae 的安装脚本):
+    `-U` 一条命令干完 update + install; 自建 / 厂商源没有签名密钥时报 UNTRUSTED
+    signature, 要靠 --allow-untrusted 才能装上 —— 但**只在这类错误上退这一步**,
+    别的错 (源里没有这个包) 退也没用, 只会把真正的原因盖住。
+    """
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+    code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+
+    # 两代都认 (旧行为保留)
+    assert "apk add" in code and "opkg install" in code
+    # apk 那一侧: 一条命令 (索引 + 安装), 以及签名不可信时的退路
+    assert "apk -U add" in code, "apk 要一条命令刷新索引 + 安装 (cheatsheet 的 -U)"
+    assert "--allow-untrusted" in code, "自建 / 厂商源没有签名密钥时要能退这一步"
+    assert "UNTRUSTED" in code, "只在签名类错误上退 --allow-untrusted, 别的错不许退"
+    # 判据: 固件版本 + 实际命令, 两条一起看; 不一致时按命令走并说明
+    assert "DISTRIB_RELEASE" in code and "PKG_MGR" in code
+    assert "按 opkg 走" in code and "按 apk 走" in code, "版本与命令不一致时要按命令走并说清楚"
+    assert "pkgmgr=" in code and "fw=" in code and "fwgen=" in code, "固件与包管理器要落进 caps"
+
+    # 装不上不许沉默: 原话 + 这台机器能用的那条补装命令 (按包管理器分岔)
+    assert "deps_why=" in code, "内核模块为什么没装上要记进 caps (doctor / status 读它)"
+    assert "内核模块没装上" in code and "补装:" in code
+    assert "apk -U add kmod-tun kmod-nft-tproxy" in code and \
+        "opkg install kmod-tun kmod-nft-tproxy" in code, "补装命令要按本机包管理器给"
+    # 25.12 这一层特有的事实, 必须说出来 (否则"模块装不上"会被当成脚本的毛病)
+    assert "与内核版本绑定" in code, "25.12 的 kmod 来自与内核版本绑定的源"
+    # 24.10 已 EOL (2026-09): 主动提示升级 (设计文档 §1.3)
+    assert "24.10" in text and "停止维护" in text
+    # 装完之后的两个现场入口: status 报固件与包管理器, doctor 报"模块没装上 + 怎么补"
+    assert "包管理器 %s" in code, "zeroproxy status 要报出固件与包管理器"
+
+
 @pytest.mark.parametrize("name", ["index.html", "app.js", "cgi", "menu.json", "acl.json", "status.js"])
 def test_ui_files_are_served(client, configured, name):
     """路由器管理界面的文件由面板分发 (路由器只负责落盘, 于是界面更新=重跑安装命令)。"""

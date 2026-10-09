@@ -1,6 +1,6 @@
 # ZeroProxy 架构现状
 
-> 快照: **2026-10-09** · 面板 **v2.11.22** · 路由器客户端 **v1.4.21** · `state.json` schema **v5**
+> 快照: **2026-10-09** · 面板 **v2.11.25** · 路由器客户端 **v1.4.24** · `state.json` schema **v5**
 > 本文回答"**现在是什么样**"。另外两份文档分工不同, 不要混读:
 > `README.md` 是逐版开发日志 (4000+ 行, 每一版为什么这么改、哪次真机踩的坑);
 > `docs/RESEARCH.md` 与 `docs/ROUTER-CLIENT-REDESIGN.md` 是竞品调研与设计依据。
@@ -79,7 +79,7 @@ zeroproxy/
 │       ├── cli.py                  # 终端快捷管理 z
 │       ├── update.py               # 面板自更新 (版本检查 / 拉起 upgrade.sh / 回读进度)
 │       └── client/                 # 路由器端制品
-│           ├── router-install.sh   # 路由器装机脚本 (~3 750 行, 面板渲染后下发)
+│           ├── router-install.sh   # 路由器装机脚本 (~4 220 行, 面板渲染后下发)
 │           ├── agent/              # zpcore: Go 控制面 (源码 + dist/ 制品)
 │           └── luci/               # 路由器管理界面 (页面 + cgi; zpcore 复用同一套页面)
 ├── scripts/                        # 验证脚本 (见 §15)
@@ -275,7 +275,7 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
 
 用户拿到的是面板生成的一行命令: `wget -qO- https://<面板>/c/<配对码> | sh`。
 
-* **`client/router-install.sh`** (~3 750 行) 做四件事, 顺序不能变:
+* **`client/router-install.sh`** (~4 220 行) 做四件事, 顺序不能变:
   ① 用一次性配对码换设备凭据 → ② 装内核 (按架构取 mihomo 静态二进制 + kmod-tun) →
   ③ 落四个文件 (config.yaml / init 脚本 / 控制 agent / 运维 CLI) → ④ 起服务并**自检**
   (自检不过就退回 tproxy 方案, 而不是假装成功)。幂等: 重复执行 = 重装/升级。
@@ -283,6 +283,13 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
   每一级都**真做一次**再判定 (建个设备再删、加条规则再撤), 结论连同「为什么不行」的内核原话写进
   `caps`; 起不来的自动往下让位。这让 OpenWrt 21.02 / 内核 5.4 那一代原厂精简固件第一次有了可用的路
   (局域网 TCP), 而不是只能报「未生效」。
+* **两代包管理器**: OpenWrt 25.12 起是 `apk`, 24.10 及更早是 `opkg` —— 判据是**固件世代 +
+  实际命令**两条一起看 (厂商固件报 25.x 却只有 opkg 的迁移态也走对), apk 一侧用 `apk -U add`
+  一条命令, 只在签名类错误上退 `--allow-untrusted` (dae 的家用安装脚本的做法)。内核模块没装成时
+  把命令**原话**与这台机器能用的补装命令一起说出来, `fw` / `pkgmgr` / `deps_why` 落进 `caps` ——
+  于是 `zeroproxy status|doctor` 报的就是同一份现场。25.12 官方镜像里 tun / nft-tproxy 两个 kmod
+  **都不预装**, 而它们来自与内核版本绑定的源 (厂商内核常对不上), 这条事实在输出里写明。
+  24.10 已 EOL (2026-09): 装机时主动提示升级。
 * **`client/agent/` = `zpcore`** (Go 静态二进制): 自带 HTTP 服务、自己校验令牌、**只绑局域网地址**
   (找不到局域网地址就拒绝启动而不是退成 `0.0.0.0`)。存在的原因是「能不能打开管理界面」取决于固件
   (uhttpd / nginx+fcgiwrap / 无 cgi / busybox 缺 httpd applet, 四种各踩过一次真机), 而用户改不了固件。
@@ -336,6 +343,8 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
 * **`install.sh`** (Ubuntu/Debian): BBR + 内核参数 → 依赖 (git/curl/wget/unzip/nginx/certbot) →
   Xray + Hysteria 2 二进制 → venv → nginx 引导配置 → systemd → 防火墙 → 引导令牌 → 打印 `https://<IP>:8899/?token=…`。
   GitHub 取文件走**多前缀表** (自建反代排第一, 最后才直连; 拿到的必须是非空文件)。
+  识别到 OpenWrt 会**当场停下**并说明「面板装在服务器上, 路由器端用面板生成的那一行命令」——
+  在路由器上跑它以前只会留下一句 `dpkg: command not found` (真机截图)。
 * **`upgrade.sh`**: 备份代码与 `state.json` → 换代码 → 按现有 `state.json` 重新落地配置 → 任一步失败**自动回滚**。
   只换程序代码, 密钥 / 订阅令牌 / 节点开关原样保留, **订阅地址不变**。
   面板内升级由 `systemd-run --no-block` 放进独立 cgroup (面板自身重启不打断), 进度落在
@@ -356,9 +365,9 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
 
 | 脚本 | 覆盖 |
 |---|---|
-| `backend/tests/` (pytest) | **291 通过 + 6 skip** (无真实内核二进制时跳过)。dry-run 全流程 + 安全边界 + 状态迁移 |
+| `backend/tests/` (pytest) | **297 通过 + 6 skip** (无真实内核二进制时跳过)。dry-run 全流程 + 安全边界 + 状态迁移 |
 | `scripts/verify.py` | 用真实 Xray/Hysteria/mihomo/sing-box 校验生成的配置与订阅 (含**两台机器真跑一条链**) |
-| `scripts/router_install_check.py` | 真的用 shell 跑一遍路由器安装脚本: 四类机器 / 本机覆盖 / revert 比对 / zpcore 真跑 |
+| `scripts/router_install_check.py` | **125 项**。真的用 shell 跑一遍路由器安装脚本: 五类机器 (含 OpenWrt 25.12 / apk 三态) / 本机覆盖 / revert 比对 / zpcore 真跑 |
 | `scripts/browser_check.cjs` | **157 项**, 真 Chromium 走「初始化 → 仪表盘」全流程 + 交互 + CSP + 截图 |
 | `scripts/clients_check.cjs` | 真实浏览器点客户端开关 |
 | `scripts/router_ui_check.cjs` | 路由器本地界面 (含「没有更新记录时不许凭空长出进度面板」这类判据) |
@@ -372,7 +381,7 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
 
 ## 16. 已知技术债 / 待办
 
-* **超长单文件**: `routes.py` (3293 行) / `router-install.sh` (~3750 行) / `scripts/browser_check.cjs` (~82 KB)。
+* **超长单文件**: `routes.py` (3293 行) / `router-install.sh` (~4 220 行) / `scripts/browser_check.cjs` (~82 KB)。
   注释密度很高、内部有分区, 但单文件到这个体量, 后续定位成本会持续上升。
 * **文档重叠**: README (逐版日志) 与本文、`docs/` 三份之间有信息重叠; README 面向历史, 本文面向现状,
   长期需要保持本文随代码更新 (否则又会退回「过期快照」)。

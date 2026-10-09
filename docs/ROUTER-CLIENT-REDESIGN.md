@@ -80,6 +80,10 @@
 * **OpenWrt 25.12 已是当前稳定版**, 内核 6.12.74, 包管理器从 `opkg` 换成 **`apk`**;
   **24.10 的 EOL 是 2026-09** —— 也就是说本项目"24.10 及更早用 opkg"的措辞已经过期, 现在是
   "25.12 用 apk, 24.10 及更早用 opkg", 且 24.10 用户应当被**主动提示升级**。
+  客户端这一侧已落地 (README 8.76): 判据取"固件世代 + 实际命令"两条 (厂商固件报 25.x 却只有
+  opkg 的迁移态也走对), apk 用 `-U` 一条命令、只在签名类错误上退 `--allow-untrusted`;
+  两个 kmod 在 25.12 官方镜像里**都不预装**, 且来自与内核版本绑定的源 —— 装不上时输出里
+  会说明是哪一种原因, 24.10 则在装机预检时就提示升级。
   ([release notes](https://openwrt.org/releases/25.12/notes-25.12.0), [announce](https://lists.openwrt.org/pipermail/openwrt-announce/2026-March/000081.html))
 * **Nikki 把门槛写死成 `OpenWrt ≥24.10 + 内核 ≥5.13 + firewall4`** —— 它放弃兼容, 换取实现干净。
   这是"现代方案"的代价: 原厂 GL.iNet (21.02 / 内核 5.4) 这类机器直接不在支持范围。
@@ -465,8 +469,8 @@ Trojan 本项目已有; 需要补的是:
 
 | 固件 / 系统 | 内核 | 包管理 | init | 可用数据面 | UI 路径 | 备注 |
 |---|---|---|---|---|---|---|
-| OpenWrt 25.12 | 6.12 | apk | procd | L0/L1/L2 | 本地 UI + LuCI | 默认目标 |
-| OpenWrt 24.10 | 6.6 | opkg | procd | L0(部分)/L1/L2 | 本地 UI + LuCI | **EOL, 主动提示升级** |
+| OpenWrt 25.12 | 6.12 | apk | procd | L0/L1/L2 | 本地 UI + LuCI | 默认目标; kmod 不预装, 由 `apk` 从**与内核版本绑定**的源装 |
+| OpenWrt 24.10 | 6.6 | opkg | procd | L0(部分)/L1/L2 | 本地 UI + LuCI | **EOL, 装机时主动提示升级** |
 | OpenWrt 23.05 | 5.15 | opkg | procd | L1/L2 | 本地 UI + LuCI | |
 | OpenWrt 22.03 | 5.10 | opkg | procd | L1/L2 | 本地 UI + LuCI | firewall4 起点 |
 | OpenWrt 21.02 | 5.4 | opkg | procd | **L3/L4** | 本地 UI | fw3 + iptables, 无 nf_tables |
