@@ -45,7 +45,8 @@ from .config import paths
 #:        choose_datapath(它会写 caps) 之后才算, 算完没人再落盘; 出口测试加重试。
 #: 1.4.10: LuCI 会话判定修好 (旧写法在这台 ubus 上只会打印用法 —— 于是"从 LuCI 菜单
 #:         点进来"一直是未授权); zpcore 也认 LuCI 会话; 路由器端加一键更新。
-SCRIPT_VERSION = "1.4.10"
+#: 1.4.11: update 动作补进 cgi —— 页面由 cgi 发, 只加 CLI 与 zpcore 是不够的。
+SCRIPT_VERSION = "1.4.11"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"

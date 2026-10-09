@@ -187,6 +187,12 @@ case "$action" in
     refresh)
         run_cli refresh
         ;;
+    update|update-log)
+        # 页面上的「更新客户端」按钮走这里 —— LuCI 菜单那个页面是用 cgi 发的 (端口 80),
+        # 所以 update 必须在这个 case 里也有一份。**只加在 CLI 与 zpcore 上是不够的**:
+        # 真机上点下去就是"未知操作: update" (因为那个页面根本没走 zpcore)。
+        run_cli "$action"
+        ;;
     log)
         lines="$(logread -e zeroproxy 2>/dev/null | tail -n 60)"
         header

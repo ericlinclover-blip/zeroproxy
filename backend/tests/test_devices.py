@@ -984,6 +984,40 @@ def test_one_click_update_is_wired_everywhere():
     assert '"update"' in serve and '"update-log"' in serve
 
 
+def test_every_action_the_page_calls_is_served_by_every_ui_server():
+    """页面上按的每一个动作, **每一处能发出这个页面的服务**都得认识它。
+
+    真机上就是这么栽的: 一键更新加在了 CLI 与 zpcore 上, 唯独漏了 cgi —— 而 LuCI 菜单
+    那个页面是用 cgi 发的 (端口 80), 于是点下去得到的是"未知操作: update"。
+    前端只有一份 (app.js), 三处后端的动作集合必须都覆盖它。
+    """
+    import os
+    import re
+
+    from zeroproxy import router_client
+
+    js, _media, _name = router_client.ui_file("app.js")
+    called = set(re.findall(r"call\(\s*['\"](\w[\w-]*)['\"]", js))
+    assert called, "从 app.js 里应当能抠出它调用的动作名"
+
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(router_client.__file__))))
+    cgi = open(os.path.join(repo, "backend", "zeroproxy", "client", "luci", "cgi"),
+               encoding="utf-8").read()
+    # case 标签固定缩进 4 空格 (嵌套的那几个更深, 不会误入)
+    cgi_actions: set[str] = set()
+    for group in re.findall(r"^\s{4}(\w[\w-]*(?:\|\w[\w-]*)*)\)\s*$", cgi, re.M):
+        cgi_actions.update(group.split("|"))
+    assert "status" in cgi_actions and "update" in cgi_actions, cgi_actions
+    assert not (called - cgi_actions), f"cgi 不认识的页面动作: {sorted(called - cgi_actions)}"
+
+    serve = open(os.path.join(repo, "backend", "zeroproxy", "client", "agent", "serve.go"),
+                 encoding="utf-8").read()
+    z_actions: set[str] = set()
+    for group in re.findall(r"case ((?:\"[^\"]+\"(?:,\s*)?)+):", serve):
+        z_actions.update(re.findall(r'"([^"]+)"', group))
+    assert not (called - z_actions), f"zpcore 不认识的页面动作: {sorted(called - z_actions)}"
+
+
 def test_revert_compares_against_the_install_baseline(tmp_path):
     """`zeroproxy revert` 不是"我们相信自己的拆卸代码", 而是**逐条比对**装机前的快照。
 
