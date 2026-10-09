@@ -918,6 +918,72 @@ def test_local_override_lets_the_router_be_switched_without_the_panel():
     assert '"override":"\'"$OVERRIDE"\'"' in text
 
 
+def test_luci_session_accepts_a_real_session_the_way_ubus_actually_works():
+    """从 LuCI 菜单点进来必须能打开 —— 判据得按**这台机器上 ubus 的真实行为**写。
+
+    真机 (GL-MT3000 / OpenWrt 24.10) 实测:
+      * `ubus -S <sid> call session get` —— 新版 ubus 的 `-S` 是"简化输出(给脚本用)",
+        **不接受参数**, 于是它只打印一屏用法, 判定永远失败。旧固件上没人发现, 是因为
+        那台 (GL.iNet 21.02 原厂) 根本没有 LuCI, 这条代码路径从来没被走到过。
+      * `ubus call session get '{"ubus_rpc_session":"<sid>"}'` —— **有效会话**返回 JSON,
+        **无效会话**打印 "Command failed … (Not found)"。两者的**退出码都是 0**, 所以
+        只能看文本。
+    """
+    import os
+    import re
+
+    from zeroproxy import router_client, routes
+
+    repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(router_client.__file__))))
+    _cgi, _media, _name = router_client.ui_file("cgi")
+    cgi = open(os.path.join(repo, "backend", "zeroproxy", "client", "luci", "cgi"),
+               encoding="utf-8").read()
+    # 只看真正的命令行: 注释里解释"别再用 ubus -S"当然会提到它
+    cgi_code = "\n".join(ln for ln in cgi.splitlines() if not ln.lstrip().startswith("#"))
+    assert "ubus -S" not in cgi_code, "那个写法在这台 ubus 上只会打印用法 (见测试注释)"
+    assert 'ubus call session get "{\\"ubus_rpc_session\\":\\"$sid\\"}"' in cgi
+    assert "Command failed" in cgi, "无效会话是打印文本、退出码仍是 0, 必须看文本"
+    assert "sysauth" in cgi, "会话 cookie 的名字"
+    # 单值不能用 jstr: 它给每行结尾补一个字面的 \n, 用在 base/version 上会多出一个尾随
+    # 换行 (真机实测 "base":"https://hk.i3.pub:8899\n")。多行的回执/日志才用它。
+    assert "jval_s() {" in cgi
+    assert 'jval_s "$base"' in cgi and 'jval_s "$ver"' in cgi
+    assert 'jstr "$base"' not in cgi, "单值别用 jstr"
+
+    # zpcore 也要认: 从 LuCI 菜单点进来的 iframe 带不上令牌, 用户能做的只有先登录
+    serve = open(os.path.join(repo, "backend", "zeroproxy", "client", "agent", "serve.go"),
+                 encoding="utf-8").read()
+    assert "luciSession(" in serve and "sysauth" in serve
+    assert "isSessionID" in serve, "会话 id 是从 cookie 来的, 拼进 JSON 前先卡一道"
+    assert 'run(probeTimeout, "ubus", "call", "session", "get"' in serve
+    assert "Command failed" in serve
+
+
+def test_one_click_update_is_wired_everywhere():
+    """路由器端的一键更新: CLI 真的去更新、后台跑、写日志; 界面有按钮; zpcore 透传它。
+
+    为什么必须**后台**跑: 这个脚本会替换 `/usr/bin/zeroproxy` 自己 (正在运行的文件), 而且
+    要下载 20 MB 内核 —— 前台跑既容易半途出岔子, 又会让界面转一分钟。
+    为什么走**更新模式**: 那条命令不带配对码, 所以不会在面板上多出设备。
+    """
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+    assert "update-log)" in text and "update)" in text
+    assert "/c/install.sh" in text, "更新走的是面板的固定更新命令"
+    assert 'update.log' in text and "logger -t zeroproxy" in text
+    # 后台: 提交后立刻回话, 过程写文件
+    assert ") &" in text.split("update)")[1].split("update-log)")[0]
+    # 界面上的按钮 + zpcore 的透传
+    page, _m, _n = router_client.ui_file("index.html")
+    assert 'id="update"' in page and "更新客户端" in page
+    js, _m2, _n2 = router_client.ui_file("app.js")
+    assert "$('update').onclick" in js and "call('update')" in js
+    serve = open(os.path.join(os.path.dirname(os.path.abspath(router_client.__file__)),
+                              "client", "agent", "serve.go"), encoding="utf-8").read()
+    assert '"update"' in serve and '"update-log"' in serve
+
+
 def test_revert_compares_against_the_install_baseline(tmp_path):
     """`zeroproxy revert` 不是"我们相信自己的拆卸代码", 而是**逐条比对**装机前的快照。
 

@@ -105,7 +105,9 @@ details summary:hover{color:var(--accent)}
 
   <div class="card">
     <div class="tile"><h2>服务器</h2><span class="grow"></span>
+      <button class="btn small" id="update" title="从面板拉最新客户端并重跑一次安装 (后台进行, 约一分钟; 配置与凭据保留)">更新客户端</button>
       <button class="btn small" id="refresh">重新拉取节点</button></div>
+    <div class="fs-xs muted" id="update-hint" style="margin-bottom:8px"></div>
     <div id="servers"><div class="empty">正在读取…</div></div>
   </div>
 

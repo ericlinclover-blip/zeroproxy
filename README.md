@@ -3445,3 +3445,72 @@ provider 是内核启动后异步拉的, 第一次连接常常赶在节点健康
   结尾必须有一次兜底落盘。
 * 真机: 重跑安装后 `caps` 是 `wan_mtu=1500` / `offload=1` / `chosen=tun` / `covered=full` /
   `ipv6=1`; `doctor` 八项全绿; `bench` 量出上面那三个数。
+
+### 8.60 v2.11.9 (客户端 v1.4.10): "从 LuCI 菜单点进来"一直是未授权 —— 那条判定从写下来就是错的
+
+用户在路由器后台 (LuCI 的 服务 → ZeroProxy) 打开管理页, 看到的是**未授权**。
+
+#### 根因: 用错了 ubus 的选项
+
+LuCI 菜单那一页是个 iframe, 指向 `/cgi-bin/zeroproxy` —— 它**带不上令牌**, 靠的是"你已登录
+路由器后台"这件事本身。cgi 里那条判定写的是:
+
+```sh
+ubus -S "$sid" call session get '{}' | grep -q '"ubus_rpc_session"' && ok=1
+```
+
+在新版 ubus 上 `-S` 是 **"简化输出 (给脚本用)"**, 它**不接受参数** —— 于是这条命令只是打印
+一屏用法, `grep` 永远不中, 判定永远失败。真机上造一个会话实测:
+
+```
+ubus -S "$SID" call session get     → Usage: ubus [<options>] <command> [arguments...]
+```
+
+**为什么一直没暴露**: 上一台真机 (GL.iNet 21.02 原厂固件) **没有 LuCI**, 这条代码路径从来
+没被走到过; 而 21.02 上用的一直是令牌那条路。
+
+正确的判据 (真机实测出来的):
+
+```
+ubus call session get '{"ubus_rpc_session":"<有效会话>"}'   → {"values":{}}   (JSON)
+ubus call session get '{"ubus_rpc_session":"<假会话>"}'     → Command failed … (Not found)
+```
+
+注意**两种情况退出码都是 0** —— 只能看文本里有没有 `Command failed`。
+
+#### 顺带两件
+
+**zpcore 也要认 LuCI 会话。** 从 LuCI 菜单点进来的 iframe 带不上令牌, 用户能做的只有"先登录
+路由器后台"。只认令牌的话, 将来界面由 zpcore 发时这一页照样是未授权。现在两边同一套语义。
+
+**cgi 里单值字段的尾巴上多了一个换行。** 这是真机调试时看到的:
+
+```
+"base":"https://hk.i3.pub:8899\n", "client":"1.4.9\n"
+```
+
+`jstr()` 是给**多行的 CLI 输出**准备的 (它把每行结尾变成字面的 `\n`, JSON 解出来是真换行,
+前端再按换行切分)。用在 `base` / `version` / 服务器键这种单值上, 值尾巴就多一个换行 ——
+界面看不出来, 但值是错的, 排障时对不上。加了 `jval_s()` (只转义, 不补换行) 给单值用。
+
+#### 新功能: 路由器端的一键更新
+
+以前更新要在路由器上粘一条命令, 现在管理页的「服务器」卡上多了一个 **「更新客户端」** 按钮
+(LuCI 页面与 zpcore 页面同一份前端, 两边都有)。
+
+背后是 `zeroproxy update`: 从面板拉 `/c/install.sh` 重跑一遍 (走**更新模式**, 不带配对码,
+所以**不会在面板上多出设备**)。三个刻意的决定:
+
+* **后台跑** —— 这个脚本会替换 `/usr/bin/zeroproxy` 这个正在运行的文件, 而且它要下载
+  20 MB 内核; 与其让界面转一分钟, 不如"提交后立刻回话、稍后刷新看版本号";
+* **过程留痕** —— 写 `$ZP_DIR/update.log`, 结束时往 syslog 丢一句结论 (页面上的「最近日志」
+  读的就是 syslog), 另有 `zeroproxy update-log` 直接看全量输出;
+* **按钮上写清代价** —— 确认框里明说"过程中代理会短暂重启; 配置、凭据、订阅都不受影响"。
+
+#### 回归
+
+* `pytest` 281 → **283 项**: cgi 里不许再出现 `ubus -S` (只看真正的命令行)、必须是
+  `session get` + 看 `Command failed`、zpcore 也要认 `sysauth` 会话、单值不许用 `jstr`、
+  以及一键更新在 CLI / 页面 / zpcore 三处都接通。
+* 真机验证: 用一个**真的 ubus 会话**跑 cgi, 拿到 `{"ok":true,...}`; 假会话与不带凭据仍然
+  被拒; 单值字段不再带尾随换行。

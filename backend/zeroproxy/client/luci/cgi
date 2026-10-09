@@ -60,7 +60,18 @@ if [ -n "$tok" ] && { [ "$qk" = "$tok" ] || [ "$ck" = "$tok" ]; }; then ok=1; fi
 if [ -z "$ok" ]; then
     sid="$(printf '%s' "${HTTP_COOKIE:-}" | tr ';' '\n' | sed -n 's/^ *sysauth[^=]*=\(.*\)$/\1/p' | head -n1)"
     if [ -n "$sid" ] && command -v ubus >/dev/null 2>&1; then
-        ubus -S "$sid" call session get '{}' 2>/dev/null | grep -q '"ubus_rpc_session"' && ok=1
+        # 用会话 id 去问一次: **有效会话**返回 JSON (可能没有 values), **无效会话**打印
+        # "Command failed … (Not found)" —— 注意 ubus 这两种情况的退出码都是 0, 只能看文本。
+        #
+        # 别再用 `ubus -S <sid> call …`: 新版 ubus 的 `-S` 是"简化输出 (给脚本用)", 它
+        # **不接受参数** —— 那条命令只会打印一屏用法, 于是判定永远失败, 而"从 LuCI 菜单
+        # 点进来"这条路一直是未授权 (真机 GL-MT3000 / OpenWrt 24.10 实测)。旧固件上没人
+        # 发现, 是因为那台没有 LuCI。
+        _sess="$(ubus call session get "{\"ubus_rpc_session\":\"$sid\"}" 2>&1)"
+        case "$_sess" in
+            ""|*"Command failed"*) ;;
+            *) ok=1 ;;
+        esac
     fi
 fi
 
@@ -98,6 +109,13 @@ jval() {
 }
 # 把任意文本塞进 JSON 字符串 (换行转义成 \n, 由前端还原)
 jstr() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\r' | awk '{printf "%s\\n", $0}'; }
+
+# **单值**用这个: 同样转义, 但不追加那个尾随换行。
+# jstr 是给"多行的 CLI 输出"准备的 —— 它把每行结尾变成字面的 \n, JSON 解出来就是真换行,
+# 前端再按换行切分 (动作回执、日志)。用在 base / version / 服务器键这种单值上, 结果是
+# 值尾巴上多一个换行 (真机实测: "base":"https://hk.i3.pub:8899\n" —— 界面看不出来, 但
+# 值是错的, 排障时对不上)。
+jval_s() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\r\n'; }
 
 # 动作名: /cgi-bin/zeroproxy/add → add (PATH_INFO 或 REQUEST_URI 里取最后一段)
 action="$act"
@@ -146,11 +164,11 @@ case "$action" in
             base="$(sed -n 's/.*"base"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n1)"
             did="$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n1)"
             key="$(basename "$f" .json)"
-            items="${items:+$items,}{\"key\":\"$(jstr "$key")\",\"base\":\"$(jstr "$base")\",\"id\":\"$(jstr "$did")\"}"
+            items="${items:+$items,}{\"key\":\"$(jval_s "$key")\",\"base\":\"$(jval_s "$base")\",\"id\":\"$(jval_s "$did")\"}"
         done
         header
         printf '{"ok":true,"core":"%s","mode":"%s","covered":"%s","why":"%s","ipv6":"%s","client":"%s","servers":[%s]}\n' \
-            "$core" "$mode" "$covered" "$(jstr "$why")" "$ipv6" "$(jstr "$ver")" "$items"
+            "$core" "$mode" "$covered" "$(jstr "$why")" "$ipv6" "$(jval_s "$ver")" "$items"
         ;;
     add)
         url="$(jval url)"

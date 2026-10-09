@@ -2659,8 +2659,36 @@ EOF
         echo "配置与凭据都还在。重新启用: 跑一次面板上的更新命令 (wget -qO- <面板>/c/install.sh | sh)"
         ;;
     update)
-        echo "重新执行面板上的安装命令即可升级 (配置与凭据会保留)"
+        # 一键更新: 从面板拉最新的安装脚本并重跑 (走**更新模式** —— 不带配对码, 不会在面板上
+        # 多出设备)。界面上那个按钮调的就是它。
+        #
+        # **后台跑**两个理由: ① 它会替换 /usr/bin/zeroproxy 这个正在运行的文件, 前台跑容易
+        # 半途出岔子; ② 它要下载 20 MB 内核, 与其让界面转一分钟, 不如"提交后立刻回话、
+        # 稍后刷新"。过程写进 $ZP_DIR/update.log, 结束时往 syslog 丢一句结论 (界面上的
+        # 「最近日志」读的就是 syslog)。
+        [ -n "$FIRST" ] || { echo "还没有接入任何服务器"; exit 1; }
+        _base="$(field_of "$FIRST" base)"
+        _log="$ZP_DIR/update.log"
+        : > "$_log" 2>/dev/null || true
+        (
+            if command -v curl >/dev/null 2>&1; then
+                curl -fsSk -m 600 "$_base/c/install.sh" 2>>"$_log" | sh >>"$_log" 2>&1
+            else
+                uclient-fetch -q --no-check-certificate -O - "$_base/c/install.sh" \
+                    2>>"$_log" | sh >>"$_log" 2>&1
+            fi
+            _rc=$?
+            echo "EXIT=$_rc" >> "$_log"
+            if [ "$_rc" = "0" ]; then
+                logger -t zeroproxy "客户端更新完成 (刷新本页看版本号)"
+            else
+                logger -t zeroproxy "客户端更新失败 (退出码 $_rc), 详情: zeroproxy update-log"
+            fi
+        ) &
+        echo "已开始更新 (后台进行, 约 1 分钟; 配置与凭据保留)。"
+        echo "  完成后刷新本页看客户端版本号; 详情: zeroproxy update-log 或本页「最近日志」"
         ;;
+    update-log) cat "$ZP_DIR/update.log" 2>/dev/null || echo "(还没有更新记录)" ;;
     uninstall)
         # 先停 agent 再停内核: 反过来的话 agent 会在内核停掉后立刻把它拉起来
         /etc/init.d/zeroproxy-agent stop >/dev/null 2>&1 || true
@@ -2678,7 +2706,7 @@ EOF
         rm -rf "$ZP_DIR" /etc/init.d/zeroproxy /etc/init.d/zeroproxy-agent /etc/init.d/zeroproxy-ui /usr/bin/zeroproxy
         echo "已卸载。这台设备在面板上仍然存在, 请在面板「客户端」里一并移除。"
         ;;
-    *) echo "用法: zeroproxy [doctor|status|ui|servers|add <链接>|drop <键>|refresh|geo|on|off|local-auto|revert|bench|log|uninstall]" ;;
+    *) echo "用法: zeroproxy [doctor|status|ui|servers|add <链接>|drop <键>|refresh|geo|on|off|local-auto|revert|bench|update|update-log|log|uninstall]" ;;
 esac
 CLIEOF
     chmod 755 "$ZP_CLI"

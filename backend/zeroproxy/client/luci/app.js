@@ -190,6 +190,26 @@ $('refresh').onclick = async () => {
   }
 };
 
+/* 一键更新客户端。**后台进行** (脚本会替换自己, 而且要下载 20 MB 内核), 所以这里只负责
+   提交并说清楚"稍后刷新"。跑完之后版本号会变 —— 那个数字就在标题下面那行。 */
+$('update').onclick = async () => {
+  if (!confirm('从面板拉取最新客户端并重跑一次安装？\n\n过程中代理会短暂重启；配置、凭据、订阅都不受影响。')) return;
+  const btn = $('update');
+  btn.disabled = true;
+  $('update-hint').textContent = '已提交，正在后台更新…';
+  try {
+    const r = await call('update');
+    $('update-hint').textContent = unesc(r.message).split('\n')[0]
+      + ' (约一分钟, 完成后刷新本页看版本号)';
+    toast('更新已开始');
+  } catch (e) {
+    $('update-hint').textContent = e.message;
+    $('update-hint').style.color = 'var(--err)';
+  } finally {
+    btn.disabled = false;
+  }
+};
+
 document.querySelector('details').addEventListener('toggle', async (ev) => {
   if (!ev.target.open) return;
   $('log').textContent = '加载中…';

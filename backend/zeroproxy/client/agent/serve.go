@@ -137,7 +137,44 @@ func authorized(w http.ResponseWriter, r *http.Request, cfg serveConfig) bool {
 			return true
 		}
 	}
+	// 第四样: 一个有效的 **LuCI 会话**。为什么 zpcore 也要认它 —— 从 LuCI 菜单点进来的
+	// 那个 iframe 是浏览器自己发的请求, **带不上令牌**; 用户能做的只有"先登录路由器后台"。
+	// 只认令牌的话, LuCI 固件上这一页永远显示未授权 (真机 GL-MT3000 / OpenWrt 24.10 实测)。
+	return luciSession(r)
+}
+
+// luciSession 拿 `sysauth*` cookie 去问 ubus: 有效会话返回 JSON, 无效会话打印
+// "Command failed … (Not found)"。**两种情况退出码都是 0**, 所以只能看文本。
+func luciSession(r *http.Request) bool {
+	for _, cookie := range r.Cookies() {
+		if !strings.HasPrefix(cookie.Name, "sysauth") {
+			continue
+		}
+		sid := strings.TrimSpace(cookie.Value)
+		if !isSessionID(sid) {
+			continue
+		}
+		out, _ := run(probeTimeout, "ubus", "call", "session", "get",
+			fmt.Sprintf(`{"ubus_rpc_session":%q}`, sid))
+		if out != "" && !strings.Contains(out, "Command failed") {
+			return true
+		}
+	}
 	return false
+}
+
+// 会话 id 是 32 位十六进制。先自己卡一道再拼进 JSON —— 它是从 cookie 里来的。
+func isSessionID(sid string) bool {
+	if len(sid) != 32 {
+		return false
+	}
+	for i := 0; i < len(sid); i++ {
+		c := sid[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return false
+		}
+	}
+	return true
 }
 
 func constantEq(a, b string) bool {
@@ -171,7 +208,8 @@ func handleAction(w http.ResponseWriter, r *http.Request, cfg serveConfig, actio
 			return
 		}
 		writeJSON(w, http.StatusOK, simpleResp{OK: true, Log: tailLines(out, 60)})
-	case "add", "drop", "toggle", "refresh":
+	// update / update-log 也走 CLI: 一处实现、两个入口 (SSH 与网页)。
+	case "add", "drop", "toggle", "refresh", "update", "update-log":
 		payload, err := readBody(r)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, simpleResp{Error: err.Error()})
@@ -230,6 +268,10 @@ func cliArgs(action string, payload map[string]any) ([]string, error) {
 		return []string{"off"}, nil
 	case "refresh":
 		return []string{"refresh"}, nil
+	case "update":
+		return []string{"update"}, nil
+	case "update-log":
+		return []string{"update-log"}, nil
 	}
 	return nil, fmt.Errorf("未知操作")
 }

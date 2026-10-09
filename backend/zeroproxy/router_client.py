@@ -43,7 +43,9 @@ from .config import paths
 #:        家族要写死; 生产规则改成显式 tproxy ip / tproxy ip6 各两条。
 #: 1.4.9: 真机 (GL-MT3000) 上抓到 caps 里 wan_mtu 空着 / offload=0 —— 这两个值在
 #:        choose_datapath(它会写 caps) 之后才算, 算完没人再落盘; 出口测试加重试。
-SCRIPT_VERSION = "1.4.9"
+#: 1.4.10: LuCI 会话判定修好 (旧写法在这台 ubus 上只会打印用法 —— 于是"从 LuCI 菜单
+#:         点进来"一直是未授权); zpcore 也认 LuCI 会话; 路由器端加一键更新。
+SCRIPT_VERSION = "1.4.10"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"
@@ -724,7 +726,7 @@ def summary() -> dict:
 # 与内核唯一的区别: zpcore 是我们自己的东西, 没有上游可下载, 所以产物跟着**仓库**走
 # (scripts/build-agent.sh 生成到 client/agent/dist/), 不是 data/ 缓存。它是可选件 ——
 # 面板没准备某一档时, 那台路由器自动退回原来的界面路径, 装机不会失败。
-AGENT_VERSION = os.environ.get("ZP_AGENT_VERSION", "1.2.0")
+AGENT_VERSION = os.environ.get("ZP_AGENT_VERSION", "1.2.1")
 
 #: 小于这个大小的一律不当二进制 (一份正常的 zpcore.gz 约 2.5 MB)。演练里可以用
 #: ZP_AGENT_MIN_BYTES 调低。
