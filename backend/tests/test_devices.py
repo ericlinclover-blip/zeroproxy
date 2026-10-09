@@ -1557,6 +1557,19 @@ def test_panel_version_is_bumped_when_the_readme_says_so():
         f"README 最后一段写的是 v{sections[-1]}, 而 __version__ 是 {__version__} —— "
         "改了面板代码就要动版本号, 否则用户点「检查更新」永远显示已是最新"
     )
+    # 客户端版本动了, **面板版本也必须动** —— 因为客户端脚本也是面板分发的:
+    # 面板发 `/c/<配对码>` 与 `/c/install.sh` 用的就是仓库里那份 client/router-install.sh。
+    # 只抬客户端版本会造出一个谁也说不清的状态: 面板跑的是新代码、报着旧版本号, 而
+    # 「检查更新」还说"已是最新" —— 用户无从判断该不该点 (真机上就这么卡过一次)。
+    pairs = re.findall(r"^### 8\.\d+ v([0-9][0-9.]*) \(客户端 v([0-9][0-9.]*)\)", readme, re.M)
+    assert len(pairs) >= 2, "变更记录里应当带「(客户端 v…)」"
+    prev_panel, prev_client = pairs[-2]
+    last_panel, last_client = pairs[-1]
+    if last_client != prev_client:
+        assert last_panel != prev_panel, (
+            f"客户端从 v{prev_client} 抬到了 v{last_client}, 而面板版本还是 v{last_panel} —— "
+            "客户端脚本也是面板分发的, 面板版本不动的话「检查更新」看不到新版, 用户找不到入口"
+        )
 
 
 def test_local_override_lets_the_router_be_switched_without_the_panel():
