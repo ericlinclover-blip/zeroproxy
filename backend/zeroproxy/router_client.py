@@ -41,7 +41,9 @@ from .config import paths
 #:        转发卸载探测 (它会绕过 netfilter 让 tproxy/redirect 失效); zp bench。
 #: 1.4.8: 真机 (OpenWrt 24.10 / 内核 6.6) 抓到探针形状错了 —— v6 tproxy 要传输层匹配、
 #:        家族要写死; 生产规则改成显式 tproxy ip / tproxy ip6 各两条。
-SCRIPT_VERSION = "1.4.8"
+#: 1.4.9: 真机 (GL-MT3000) 上抓到 caps 里 wan_mtu 空着 / offload=0 —— 这两个值在
+#:        choose_datapath(它会写 caps) 之后才算, 算完没人再落盘; 出口测试加重试。
+SCRIPT_VERSION = "1.4.9"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"

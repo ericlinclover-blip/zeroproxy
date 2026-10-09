@@ -908,11 +908,15 @@ install_deps() {
     if redirect_ok; then NET_REDIRECT=1; else CAPS_WHY_REDIRECT="$PROBE_WHY"; fi
     if ebpf_ok; then NET_EBPF=1; else CAPS_WHY_EBPF="$PROBE_WHY"; fi
 
-    # 选中哪一级, 并把 chosen / covered / ipv6 / why.* 一起落进 caps (全链路共用这一份)
-    choose_datapath
-    # WAN 的 MTU 与转发卸载 (性能那一半: 大包别死在路上 / 别让卸载把代理绕过去)
+    # WAN 的 MTU 与转发卸载 (性能那一半: 大包别死在路上 / 别让卸载把代理绕过去)。
+    # **必须在 choose_datapath 之前算完**: choose_datapath → set_datapath → write_caps,
+    # 那一刻就把 caps 写死了。放在它后面算, 值算出来了却没人再写一次 —— 真机上表现为
+    # caps 里 `wan_mtu=` 是空的、`offload=0`, 而安装输出明明说"转发卸载开着"。
     compute_tun_mtu
     NET_OFFLOAD="$(offload_state)"
+    # 选中哪一级, 并把 chosen / covered / ipv6 / wan_mtu / tun_mtu / offload / why.* 一起
+    # 落进 caps (全链路共用这一份)
+    choose_datapath
 
     case "$DATAPATH" in
         tun)
@@ -967,6 +971,9 @@ install_deps() {
         note "IPv6 未接管: ${CAPS_WHY_IPV6:-这一档数据面覆盖不到 v6}"
         note "  这台机器上, 局域网设备的 IPv6 会直接出去 —— 面板上也会这么标"
     fi
+    # 兜底再写一次: 上面任何一步新加的探测值都在这一下落地。**顺序错了也不会静默丢值**
+    # —— 真机上吃过一次亏 (算完没落盘, caps 里空着, 而输出里是对的)。
+    write_caps
 }
 
 # ---------------------------------------------------------------- 内核二进制
@@ -2294,8 +2301,11 @@ doctor() {
     if [ -n "$_tun" ]; then
         if [ -n "$_wan" ] && [ "$_wan" != "1500" ]; then
             printf '  ✓ WAN MTU %s（PPPoE?）→ tun 按 %s 收包，封装后不会成超包\n' "$_wan" "$_tun"
+        elif [ -z "$_wan" ]; then
+            # 取不到 ≠ 以太网。老实说取不到, 别替它下结论 (真机上就是这么显示成"以太网直连"的)
+            printf '  · 取不到 WAN 的 MTU（这台机器上没有默认路由?）→ tun 保持 %s\n' "$_tun"
         else
-            printf '  · WAN MTU %s → tun %s（以太网直连, 用默认值）\n' "${_wan:-未知}" "$_tun"
+            printf '  · WAN MTU %s → tun %s（以太网直连, 用默认值）\n' "$_wan" "$_tun"
         fi
     fi
     _off="$(sed -n 's/^offload=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
@@ -2590,8 +2600,16 @@ EOF
         _pk="$(bench_kbps "$_pr")"
         printf '%s\n' "$(bench_text "$_pr")"
         if [ "${_dk:-0}" -gt 0 ] 2>/dev/null && [ "${_pk:-0}" -gt 0 ] 2>/dev/null; then
-            printf '  代理开销 %s%%（经代理 / 直连）\n' \
-                "$(awk -v a="$_pk" -v b="$_dk" 'BEGIN{printf "%d", (1-a/b)*100}')"
+            # 别写"代理开销 -10%": 负的开销读起来像 bug。经代理比直连还快是**正常**的 ——
+            # 差的是两条线的走向 (经代理那趟是"到节点再到面板"), 节点到面板的线路好的时候
+            # 就会更快 (GL-MT3000 实测: 直连 7.7 MB/s, 经代理 8.6 MB/s, 面板与节点都在香港)。
+            if [ "$_pk" -lt "$_dk" ] 2>/dev/null; then
+                printf '  经代理比直连慢 %s%%\n' \
+                    "$(awk -v a="$_pk" -v b="$_dk" 'BEGIN{printf "%d", (1-a/b)*100}')"
+            else
+                printf '  经代理比直连快 %s%%（节点到面板的线路比直连好, 不是异常）\n' \
+                    "$(awk -v a="$_pk" -v b="$_dk" 'BEGIN{printf "%d", (a/b-1)*100}')"
+            fi
         fi
         if [ "${_pk:-0}" -le 0 ] 2>/dev/null; then
             printf '    （经代理那一趟没量到数 —— 内核在跑吗? 看 zeroproxy status）\n'
@@ -3219,12 +3237,26 @@ verify() {
     fi
     # 真实出口测试: 经代理端口请求一次, 只作为信息展示 —— 节点全关时失败是正常的。
     # 用 curl 是因为 busybox 的 wget 不支持 -x (代理), 没有 curl 就跳过这一步。
+    #
+    # **要重试**: provider 是内核启动后异步拉的, 第一次连接常常赶在节点健康检查之前 ——
+    # 装完立刻测就是"未通过", 而一分钟后再手动测是好的 (GL-MT3000 与 GL-MT3600BE 两台
+    # 真机都这样)。第一次失败就警告, 用户看到的是"装完报错"。
     if command -v curl >/dev/null 2>&1; then
-        if curl -fsS -m 12 -x "http://127.0.0.1:$ZP_MIXED" -o /dev/null \
-            "http://www.gstatic.com/generate_204" 2>/dev/null; then
+        _t=0
+        _exit_ok=0
+        while [ "$_t" -lt 3 ]; do
+            if curl -fsS -m 12 -x "http://127.0.0.1:$ZP_MIXED" -o /dev/null \
+                "http://www.gstatic.com/generate_204" 2>/dev/null; then
+                _exit_ok=1
+                break
+            fi
+            _t=$((_t + 1))
+            if [ "$_t" -lt 3 ]; then sleep 3; fi
+        done
+        if [ "$_exit_ok" = "1" ]; then
             ok "出口连通性正常"
         else
-            warn "出口测试未通过 (节点可能全部关闭, 或节点本身不通) — 不影响安装"
+            warn "出口测试连续 3 次未通过 (节点可能全部关闭, 或节点本身不通) — 不影响安装"
         fi
     fi
 }

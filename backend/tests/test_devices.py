@@ -776,6 +776,19 @@ def test_install_script_probes_the_wan_for_mtu_and_offload():
     # 转发卸载: 只探测 + 报出来, **不去改用户的防火墙**
     assert "offload_state() {" in text and "flow_offloading" in text
     assert "offload=" in text
+    # **顺序**: 这两个值必须在 choose_datapath **之前**算完。choose_datapath → set_datapath
+    # → write_caps 会把 caps 写死; 放在它后面算, 值算出来了却没人再写一次 —— 真机上就是
+    # caps 里 `wan_mtu=` 空的、`offload=0`, 而安装输出明明说"转发卸载开着"。
+    import re
+    body = re.search(r"^install_deps\(\) \{.*?\n\}", text, re.S | re.M).group(0)
+    # 只看真正的命令行: 注释里解释"为什么必须在它之前"当然会提到那个名字
+    code = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("#"))
+    assert code.index("compute_tun_mtu") < code.index("choose_datapath"), \
+        "MTU 与卸载要在 choose_datapath(它会写 caps) 之前算完"
+    assert code.index("offload_state") < code.index("choose_datapath")
+    # 再加一道兜底: 结尾无条件再写一次 caps, 顺序错了也不会静默丢值
+    assert code.rstrip().removesuffix("}").rstrip().endswith("write_caps"), \
+        "install_deps 结尾要有一次兜底落盘"
     # **不改用户的防火墙设置** (那是他自己的选择): 只看真正的命令行, 注释里提到 fw4 是可以的
     code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
     assert "uci set firewall" not in code and "uci commit" not in code
