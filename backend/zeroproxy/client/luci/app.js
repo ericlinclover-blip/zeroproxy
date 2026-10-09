@@ -203,6 +203,9 @@ const UPDATE_STEPS = [
   ['下载代理内核', '下载代理内核'],
   ['写入运行文件', '写入运行文件'],
   ['准备分流数据库', '分流数据库'],
+  // 拉配置要连面板, 是整条安装里最容易卡住的一步 —— 以前它没有 `==>`, 于是清单里没有
+  // 它, 失败时就变成"九步全绿 + 失败 56%"那一幕, 谁看都对不上。
+  ['拉取配置', '拉取配置'],
   ['准备本地控制面', '本地控制面'],
   ['安装网页管理界面', '管理界面'],
   ['启动并自检', '启动与自检'],
@@ -269,13 +272,23 @@ function updRender(text) {
     $('upd-sub').textContent = '面板上没有比本机更新的客户端, 或面板暂时取不到 —— 配置没有被改动';
   } else {
     $('upd-title').textContent = '更新失败 (退出码 ' + s.exit + ')';
-    $('upd-sub').textContent = '点「看完整日志」能看到卡在哪一步; 重试不会影响现有配置';
+    // 说清**卡在哪一步**: 十有八九是面板那条链路掉了个包, 而重试一次就过了 —— 这句话
+    // 比"更新失败"本身有用得多 (真机上用户就是靠它才不用去重新配对)。
+    const where = s.step >= 0 ? `卡在「${UPDATE_STEPS[s.step][1]}」; ` : '';
+    $('upd-sub').textContent = where + '点「重试」通常就过了; 这次没有动到现有配置';
   }
 
+  // 失败 / 没有开始时**不把后面几步也打勾** —— 那正是真机截图上那一幕: 九步全绿配一个
+  // "更新失败 56%"。停在哪个已知小节就把它标成失败, 后面的老实显示"还没做"。
+  const stopped = (!running && s.exit !== 0 && !s.skip) ? s.step : -1;
   const active = running ? s.step : total;
   $('upd-steps').innerHTML = UPDATE_STEPS.map((p, i) => {
-    const st = i < active ? 'ok' : (i === active ? 'doing' : '');
-    const ic = i < active ? '✓' : (i === active ? '⟳' : '○');
+    let st = '', ic = '○';
+    if (stopped >= 0) {
+      if (i < stopped) { st = 'ok'; ic = '✓'; }
+      else if (i === stopped) { st = 'bad'; ic = '✕'; }
+    } else if (i < active) { st = 'ok'; ic = '✓'; }
+    else if (i === active) { st = 'doing'; ic = '⟳'; }
     return `<li class="${st}"><span class="ic">${ic}</span><span>${esc(p[1])}</span></li>`;
   }).join('');
   $('upd-live').textContent = s.live || '';
@@ -348,6 +361,9 @@ $('update').onclick = async () => {
   try {
     const msg = unesc((await call('update')).message || '');
     if (/^\s*面板版本 v/.test(msg)) {
+      // 后端确认"已经开始"了 —— 从这一刻起日志就是这个进程的: CLI 一动手就会先清空
+      // 日志再落一行, 所以此刻那份旧内容已经被覆盖, 可以放心认了。
+      updArmed = true;
       updRender(msg);
       toast('更新已开始');
     } else {
@@ -363,6 +379,8 @@ $('update').onclick = async () => {
     // 进度面板**不收起**, 也先不说"失败了": 面板那条路会重试, 而 agent 的动作超时是 90
     // 秒 —— "报错了但更新其实在跑"在真机上出现过。让它继续按日志说话, 同时把这句实情
     // 写在上面, 用户至少知道现在是什么状态、该看哪里。
+    // 也arm: 请求本身出错不等于它没动手, 而日志才是唯一的事实来源。
+    updArmed = true;
     $('update-hint').textContent = '没能确认更新有没有开始: ' + e.message + '（下面继续按路由器自己的日志显示）';
     $('update-hint').style.color = 'var(--warn)';
   }

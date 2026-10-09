@@ -49,8 +49,10 @@ function makeMock() {
     // 一键更新那条路的另外两种现场 (都来自真机):
     //   updSlow  —— 后端要先去面板取脚本 (会重试三次, 最坏几十秒) 才回话;
     //   updSkip  —— 这次**没有开始** (取不到面板的脚本), 日志里落一个 SKIP=1 终态。
+    //   updFail  —— 跑到"拉取配置"那一步失败 (真机上最常见的那次失败, 见 8.66)。
     updSlow: false,
     updSkip: false,
+    updFail: false,
     updOverride: "",
     // 日志里还躺着**上一次**更新的"更新完成" (真机上点确认那一刻看到的就是这个) ——
     // 界面不许把它当成本次的结果, 否则会假报完成并自动刷新。
@@ -63,7 +65,8 @@ function makeMock() {
     HEAD + "==> 接入账号\n  ✓ 已接入过 (设备 dv056b52958542564a), 先沿用原有凭据",
     HEAD + "==> 探测网络数据面能力\n  ✓ 数据面: TUN (全屋设备 + 路由器自身)\n  · IPv6 一并接管",
     HEAD + "==> 下载代理内核 (mihomo · arm64)\n  … 已下载 8192 KB (930 KB/s)",
-    HEAD + "==> 写入运行文件\n==> 准备分流数据库 (GeoIP / GeoSite)\n  ✓ 分流数据库就绪",
+    HEAD + "==> 写入运行文件\n==> 准备分流数据库 (GeoIP / GeoSite)\n  ✓ 分流数据库就绪\n" +
+          "==> 拉取配置\n  ✓ 配置已写入 /etc/zeroproxy/config.yaml",
     HEAD + "==> 准备本地控制面 (可选件)\n  ✓ 本地控制面已是最新: zpcore 1.2.1\n" +
           "==> 安装网页管理界面\n  ✓ 管理界面已装好\n==> 启动并自检\n  ✓ 内核已启动\n  ✓ TUN 已建立\nEXIT=0",
   ];
@@ -117,6 +120,25 @@ function makeMock() {
               "取不到面板的安装脚本 (面板不可达?) —— 这次没有开始更新。\nSKIP=1";
             return json(res, { ok: true, message:
               "取不到面板的安装脚本 (面板不可达?) —— 稍后再试, 或看 zeroproxy update-log" });
+          }
+          if (state.updFail) {
+            // 真机上最常见的那次失败: 前九步都过去了, 卡在"拉取配置"(面板丢包)。
+            // 这份日志是从真机的 update.log 抄下来的, 一字未改 —— 界面必须能把
+            // "卡在哪一步"指出来, 而不是九步全绿配一个"失败 56%"。
+            state.updOverride = HEAD +
+              "==> 检查环境\n  ✓ 设备: GL.iNet GL-MT3000 · arm64 · OpenWrt 24.10.4 (内核 6.6.110)\n" +
+              "==> 接入账号\n  ✓ 已接入过 (设备 dv056b52958542564a), 先沿用原有凭据\n" +
+              "==> 探测网络数据面能力\n  ✓ 数据面: TUN (全屋设备 + 路由器自身)\n" +
+              "==> 下载代理内核 (mihomo · arm64)\n  ✓ 内核已存在且可执行 (版本 v1.19.32), 跳过下载\n" +
+              "==> 写入运行文件\n" +
+              "==> 准备分流数据库 (GeoIP / GeoSite)\n  ✓ 分流数据库就绪 (397455 + 4254934 字节)\n" +
+              "==> 拉取配置\n" +
+              "安装失败: 拉取配置失败 —— 面板暂时联系不上 (网络抖动 / 面板正忙), 或它拒绝了这台设备的凭据。\n" +
+              "  本机**仍在使用原来的配置**, 现有代理不受影响。\n" +
+              "  只有在**反复**失败之后, 才需要回面板「客户端」重新生成一条带配对码的安装命令重新接入。\n" +
+              "  现在先做这一件: 再点一次「更新客户端」—— 这条路上掉一个包就长这样, 重试一次通常就过了。\n" +
+              "EXIT=1";
+            return json(res, { ok: true, message: HEAD + "已开始更新 (后台进行, 约 1 分钟)。" });
           }
           if (state.updGuard) {
             return json(res, { ok: true, message:
@@ -350,6 +372,55 @@ async function main() {
     check("刷新之后也不会恢复成一个转不完的假进度",
       await page.locator("#upd").isHidden());
     server.zpState.updSkip = false;
+
+    console.log("\n[11] 失败时要说清卡在哪一步 (真机截图上曾是「九步全绿 + 更新失败 56%」)");
+    // 这份日志是从真机的 update.log 抄下来的: 前面几步都过了, 卡在"拉取配置"(面板丢包)。
+    server.zpState.updFail = true;
+    await page.click("#update");
+    await page.waitForFunction(
+      () => /更新失败/.test(document.getElementById("upd-title").textContent), null, { timeout: 8000 });
+    const stepsNow = await page.$$eval("#upd-steps li",
+      (ls) => ls.map((l) => ({ cls: l.className, txt: l.innerText.trim() })));
+    const badIdx = stepsNow.findIndex((x) => x.cls === "bad");
+    check("卡住的那一步单独标出来, 且正是「拉取配置」",
+      badIdx >= 0 && stepsNow.filter((x) => x.cls === "bad").length === 1
+      && /拉取配置/.test(stepsNow[badIdx].txt), JSON.stringify(stepsNow[badIdx] || {}));
+    check("它前面的步骤是「已完成」, 后面的一步都没打勾 (不再假装全做完了)",
+      stepsNow.slice(0, badIdx).every((x) => x.cls === "ok")
+      && stepsNow.slice(badIdx + 1).every((x) => x.cls !== "ok" && x.cls !== "bad"),
+      JSON.stringify(stepsNow.map((x) => x.cls)));
+    check("提示里点名卡在哪一步", /卡在「拉取配置」/.test(await page.locator("#upd-sub").innerText()),
+      await page.locator("#upd-sub").innerText());
+    check("实时行落在能立刻做的那一句上 (不是吓人的「重新配对」)",
+      /再点一次「更新客户端」/.test(await page.locator("#upd-live").innerText()),
+      await page.locator("#upd-live").innerText());
+    check("失败时给出「重试」", await page.locator("#upd-retry").isVisible());
+    // 失败态的三行字都比别处长 (点名步骤 / 该做什么)。手机宽度下最怕的就是它把页面撑宽 ——
+    // 撑宽之后整页会横向滚动, 截图里就是"左边被切掉"的样子。
+    const overflow = await page.evaluate(() => {
+      const w = window.innerWidth;
+      const wide = [];
+      const nowrap = [];
+      document.querySelectorAll("body *").forEach((el) => {
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.right > w + 1) {
+          wide.push(`${el.id || el.className || el.tagName}@${Math.round(r.right)}`);
+        }
+        const cs = getComputedStyle(el);
+        if (cs.whiteSpace === "nowrap" || el.tagName === "PRE") {
+          nowrap.push(`${el.id || el.className || el.tagName}:${cs.whiteSpace}:${Math.round(el.scrollWidth)}`);
+        }
+      });
+      return {
+        scrollW: document.documentElement.scrollWidth, innerW: w,
+        scrollX: window.scrollX, wide: wide.slice(0, 6), nowrap: nowrap.slice(0, 8),
+      };
+    });
+    check("失败态没有把页面撑出横向滚动 (手机上不会左右跑)",
+      overflow.scrollW <= overflow.innerW + 1 && overflow.scrollX === 0, JSON.stringify(overflow));
+    await page.waitForTimeout(700);          // 等那条 0.55s 的进度条过渡跑完再拍
+    await page.screenshot({ path: path.join(SHOT_DIR, "router-update-failed.png") });
+    server.zpState.updFail = false;
 
     // 浏览器自己会请求 /favicon.ico 之类, 那是模拟器的事, 不算页面问题
     const real = errors.filter((e) => !/favicon|404 \(Not Found\)/.test(e));

@@ -29,7 +29,10 @@ body{margin:0;padding:18px;background:var(--bg);color:var(--text);
      font:14px/1.55 -apple-system,"PingFang SC","Microsoft YaHei",system-ui,sans-serif}
 .wrap{max-width:760px;margin:0 auto;display:grid;gap:14px}
 .card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
-      box-shadow:var(--shadow);padding:16px 18px}
+      box-shadow:var(--shadow);padding:16px 18px;
+      /* 网格项默认 min-width:auto —— 卡片里只要有一行 nowrap 的长字, 整张卡 (连带整页)
+         就会被顶宽, 手机上就得左右拖。这一条是"整页不许横向滚动"的地基。 */
+      min-width:0}
 h1{margin:0 0 2px;font-size:17px;letter-spacing:-.02em}
 h2{margin:0;font-size:13.5px;font-weight:650}
 .tile{display:flex;align-items:center;gap:10px;margin-bottom:12px;flex-wrap:wrap}
@@ -132,9 +135,15 @@ body.zp-leaving{opacity:0;pointer-events:none}
 .upd-steps li.doing .ic{color:var(--accent);opacity:1}
 .upd-steps li.ok{color:var(--text)}
 .upd-steps li.ok .ic{color:var(--ok);opacity:1}
+/* 失败时停在哪一步: 打叉的那一行才是"卡住的地方", 后面的保持"还没做" */
+.upd-steps li.bad{color:var(--text);font-weight:600}
+.upd-steps li.bad .ic{color:var(--err);opacity:1}
 .upd-live{margin-top:11px;padding-top:9px;border-top:1px dashed var(--border-soft);
      font-family:var(--mono);font-size:11.5px;color:var(--sub);
-     white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+     /* 换成"换行"而不是"一行 + 省略号": 这一行常常是**唯一**告诉用户"现在在等什么 /
+        该做什么"的地方 (失败时最后一行就是"再点一次更新客户端") —— 把它的尾巴省略掉,
+        等于把最有用的一句藏起来。 */
+     white-space:pre-wrap;overflow-wrap:anywhere}
 .upd-actions{margin-top:11px}
 @media (prefers-reduced-motion:reduce){
   body,.wrap,.upd,.upd-ico,.upd-bar i{animation:none!important;transition:none!important}

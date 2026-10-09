@@ -71,6 +71,9 @@ warn() { printf '%s  !%s %s\n' "$C_Y" "$C_R" "$*" >&2; }
 # —— 例如有 TUN 的机器上 tproxy 模块装不上。那件事是真的, 但把它写成 "!" 会让人以为
 # 安装出了问题 (真机反馈里就是这么被读的)。
 note() { printf '  · %s\n' "$*"; }
+# "还在等"的那句话 —— **必须走 stderr**: http_get 的 stdout 是被调用方用 $(…) 接走的
+# (那是配置/接口的正文), 往 stdout 多写一个字就把正文弄坏了。
+progress_note() { printf '  · %s\n' "$*" >&2; }
 die()  { printf '\n%s安装失败:%s %s\n' "$C_E" "$C_R" "$*" >&2; exit 1; }
 
 # ---------------------------------------------------------------- HTTP
@@ -94,9 +97,17 @@ http_probe() {
     http_get "$_url" >/dev/null 2>&1
 }
 
-# 取一个接口 (文本 / JSON)。**重试两次**: 真机实测直连面板 6 次里 3 次 SYN 石沉大海,
-# 装机时"配对失败""拉不到配置"这类结论太贵, 不该由一次丢包决定。
-# 只有 GET 重试 (它是幂等的): POST 可能是"用掉一个一次性配对码", 重放等于赌第一次没生效。
+# 取一个接口 (文本 / JSON)。真机实测直连面板 6 次里 3 次 SYN 石沉大海 —— 一次丢包不该
+# 变成"配对失败""拉不到配置"这种很贵的结论, 所以要重试。只有 GET 重试 (它是幂等的):
+# POST 可能是"用掉一个一次性配对码", 重放等于赌第一次没生效。
+#
+# 两个参数的选择都是有依据的, 别再往回调:
+#   * **每次超时 10 秒** (原来是 30): 丢包时那一次会一直等到超时 —— 30 秒 × 几次就是
+#     用户看到的"更新非常慢"。这里的正文都很小 (配置 ~17 KB、脚本 ~19 KB、界面文件
+#     ~10-24 KB), 面板实测 63 KB/s 也就 0.4 秒, 10 秒留了二十倍余量。
+#   * **重试到 5 次** (原来是 3): 一次更新要拉好几个接口, 每次都有失败概率 —— 3 次在
+#     五成的丢包率下单次就要失败 12.5%, 几个接口乘起来"这次更新又失败"的概率接近一半。
+#     5 次把它压到 3%。
 http_get() {
     _tries=0
     while :; do
@@ -106,9 +117,9 @@ http_get() {
         case "$HTTP" in
             curl)
                 if [ "$TLS_OPTS" = "insecure" ]; then
-                    if _out="$(curl -fsSk -m 30 "$1")"; then _rc=0; else _rc=$?; fi
+                    if _out="$(curl -fsSk -m 10 "$1")"; then _rc=0; else _rc=$?; fi
                 else
-                    if _out="$(curl -fsS -m 30 "$1")"; then _rc=0; else _rc=$?; fi
+                    if _out="$(curl -fsS -m 10 "$1")"; then _rc=0; else _rc=$?; fi
                 fi ;;
             *)
                 if [ "$TLS_OPTS" = "insecure" ]; then
@@ -120,8 +131,10 @@ http_get() {
         if [ "$_rc" = "0" ]; then printf '%s' "$_out"; return 0; fi
         # 22 = curl -f 说的"HTTP 层面失败" (403/404/502…): 面板已经明确答复, 重试没意义
         [ "$_rc" != "22" ] || return "$_rc"
-        [ "$_tries" -lt 3 ] || return "$_rc"
-        sleep 1
+        [ "$_tries" -lt 5 ] || return "$_rc"
+        # 让"在等"看得见: 丢包时这一次是白等到超时的, 界面上要有句话说明在干什么。
+        progress_note "面板第 ${_tries} 次没回话 (链路丢包), 正在重试…"
+        sleep "$_tries"
     done
 }
 
@@ -1294,16 +1307,20 @@ fetch_config() {
     _tmp="$_dest.new"
     # 配置怎么生成只有一份实现: agent 的 `config` 模式 (单服务器用面板给的整份配置,
     # 多服务器用骨架 + 本地挂 provider)。安装脚本不再自己拼配置, 免得两处走偏。
-    if ! "$ZP_DIR/agent.sh" config > "$_tmp" 2>/dev/null; then
+    # stderr **放行** (不再 2>/dev/null): agent 重试时那句"面板第 N 次没回话"要能落到更新
+    # 日志里 —— 卡在这一步时用户至少看得见它在重试, 而不是一条不动的进度条。
+    if ! "$ZP_DIR/agent.sh" config > "$_tmp"; then
         rm -f "$_tmp"
         # 没有配对码 (更新模式) 时不要试图重配: 那会在面板上多出一台设备
         #
         # 这里的措辞很要紧 (真机 8.64): 原来一开口就是"面板可能拒绝了这台设备的凭据",
         # 于是**一次丢包**会把用户引到"重新生成安装命令、重新配对"上去 —— 而真正的原因
         # 只是面板那条路掉了一个包。现在把两件事分开说, 并先讲清楚"本机没被动过"。
+        # 最后一行要是**能立刻做的事**: 界面上的"实时行"显示的就是最后一行。
         [ -n "$ZP_CODE" ] || die "拉取配置失败 —— 面板暂时联系不上 (网络抖动 / 面板正忙), 或它拒绝了这台设备的凭据。
-  本机**仍在使用原来的配置**, 现有代理不受影响; 稍后再点一次「更新客户端」即可。
-  若反复失败, 再到面板「客户端」重新生成一条带配对码的安装命令来完成重新接入。"
+  本机**仍在使用原来的配置**, 现有代理不受影响。
+  只有在**反复**失败之后, 才需要回面板「客户端」重新生成一条带配对码的安装命令重新接入。
+  现在先做这一件: 再点一次「更新客户端」—— 这条路上掉一个包就长这样, 重试一次通常就过了。"
         # 凭据被拒 (403) 是最常见的"看起来莫名其妙"的失败: 面板上把这台设备移除过,
         # 或者路由器上留的是另一台面板发的凭据。本地文件看不出问题, 只有真的去拉一次
         # 才知道 —— 所以不在这里猜, 直接用本次命令里的配对码重新接入再试。
@@ -1314,7 +1331,7 @@ fetch_config() {
   请回面板「客户端」重新生成一条安装命令, 再在路由器上跑一次。"
         fi
         ok "已重新接入: $DEV_NAME ($DEV_ID)"
-        "$ZP_DIR/agent.sh" config > "$_tmp" 2>/dev/null \
+        "$ZP_DIR/agent.sh" config > "$_tmp" \
             || die "重新接入后仍然拉不到配置, 请回面板确认已有可用节点"
     fi
     # 单服务器模式带内联 proxies, 多服务器模式带 proxy-providers: 共同锚点是策略组
@@ -1864,17 +1881,19 @@ http_get() {
     # 面板那条路会偶尔丢一个包就整条挂住 (真机实测: 直连同一个地址, 6 次里 3 次 SYN 石沉
     # 大海, 通的那几次是 0.15 秒)。只拉一次的话, 一次丢包就等于"拉配置失败" —— 而更新
     # 模式下那句话会说成"面板可能拒绝了这台设备的凭据", 把人引到重新配对上, 方向全错。
-    # 所以这里重试两次 (秒级, 比让用户去查凭据便宜得多)。
+    # 所以这里重试 (秒级, 比让用户去查凭据便宜得多)。次数与超时和安装脚本里的那份对齐:
+    # 每次 10 秒、最多 5 次 —— 丢包时那一次会白等到超时, 30 秒 × 几次就是用户看到的
+    # "更新非常慢"; 而拉配置这份正文只有十几 KB, 10 秒已经是二十倍余量。
     #
     # 唯一的例外是 HTTP 层面的失败 (404 / 502 …): curl -f 会以 22 退出 —— 那是"面板明确
-    # 说没有", 重试没有意义, 也不该把 5 秒的等待加到一次真正的错误上。
+    # 说没有", 重试没有意义, 也不该把等待加到一次真正的错误上。
     _tries=0
     while :; do
         _tries=$((_tries + 1))
         _rc=1
         _out=""
         if command -v curl >/dev/null 2>&1; then
-            if _out="$(curl -fsSk -m 30 "$1" 2>/dev/null)"; then _rc=0; else _rc=$?; fi
+            if _out="$(curl -fsSk -m 10 "$1" 2>/dev/null)"; then _rc=0; else _rc=$?; fi
         elif command -v uclient-fetch >/dev/null 2>&1; then
             if _out="$(uclient-fetch -q --no-check-certificate -O - "$1" 2>/dev/null)"; then _rc=0; fi
         else
@@ -1882,8 +1901,10 @@ http_get() {
         fi
         if [ "$_rc" = "0" ]; then printf '%s' "$_out"; return 0; fi
         [ "$_rc" != "22" ] || return "$_rc"
-        [ "$_tries" -lt 3 ] || return "$_rc"
-        sleep 1
+        [ "$_tries" -lt 5 ] || return "$_rc"
+        # 走 stderr: 这个函数的 stdout 是配置正文本身。
+        printf '  · 面板第 %s 次没回话 (链路丢包), 正在重试…\n' "$_tries" >&2
+        sleep "$_tries"
     done
 }
 # 大文件下载 (分流数据库 4 MB)。**不重试**: 这一个是几 MB 的传输, 重试的代价远大于收益,
@@ -2891,19 +2912,22 @@ EOF
         # 所以这里试三次 (每次 25 秒上限, 与原来 60 秒的总预算同量级)。半个文件也要清掉:
         # 下一轮若还失败, 留着上一轮的残片会让"脚本有没有拿到"的判断失真。
         _try=0; _got=0
-        while [ "$_try" -lt 3 ]; do
+        while [ "$_try" -lt 4 ]; do
             _try=$((_try + 1))
             rm -f "$_tmp"
             _rc=1
             if command -v curl >/dev/null 2>&1; then
-                if curl -fsSk -m 25 "$_base/c/install.sh" -o "$_tmp" 2>/dev/null; then _rc=0; fi
+                if curl -fsSk -m 10 "$_base/c/install.sh" -o "$_tmp" 2>/dev/null; then _rc=0; fi
             else
-                if uclient-fetch -q --no-check-certificate -T 25 -O "$_tmp" "$_base/c/install.sh" 2>/dev/null; then _rc=0; fi
+                if uclient-fetch -q --no-check-certificate -T 10 -O "$_tmp" "$_base/c/install.sh" 2>/dev/null; then _rc=0; fi
             fi
             # 只有 curl/uclient-fetch 自己说"传完了"才算拿到 —— 被掐断的那次也会留下
             # 半个文件, 而半份脚本里的版本号照样能被 sed 抠出来, 拿去跑就是另一回事了。
             if [ "$_rc" = "0" ] && [ -s "$_tmp" ]; then _got=1; break; fi
-            sleep 1
+            # 让界面那句"正在取面板的安装脚本"有进展可看: 这一步的每一次重试都要等到超时,
+            # 静悄悄等几十秒正是"点了没反应"的来源之一。
+            echo "  · 面板第 $_try 次没回话 (链路丢包), 正在重试…" >> "$_log" 2>/dev/null || true
+            sleep "$_try"
         done
         [ "$_got" = "1" ] || rm -f "$_tmp"
         _panel_ver=""
@@ -2999,6 +3023,11 @@ CLIEOF
     install_geo
     # 配置在所有运行文件就位之后才生成 (agent 的 config 模式要用到 agent.sh 自己);
     # 生成失败时那条自愈路径还能用本次命令里的配对码重新接入。
+    #
+    # 这一步**单独报一节**: 拉配置要连面板, 是整条安装里最容易卡住的地方 (真机上就是
+    # 卡在这里失败的), 而它原来没有任何 `==>` —— 界面上的进度清单里没有这一步, 于是
+    # 用户看到的是"九步全绿 + 失败 56%", 完全对不上。
+    step "拉取配置"
     fetch_config "$ZP_CONF" || config_failure
     ok "配置已写入 $ZP_CONF"
     ok "已写入 $ZP_INIT / $ZP_AGENT_INIT / $ZP_DIR/agent.sh / $ZP_CLI"
