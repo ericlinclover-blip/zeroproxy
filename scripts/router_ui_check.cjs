@@ -204,6 +204,9 @@ async function main() {
     );
     const ctx = await browser.newContext({ viewport: { width: 460, height: 900 } });
     const page = await ctx.newPage();
+    // "日志多久没动就算卡住"那个阈值在真机上是 45 秒 —— 演练把它调小, 这样这一条能在
+    // 一两秒内验完 (与 ZP_DOCTOR_PROBES 同一个思路: 只给演练用的旋钮)。
+    await page.addInitScript(() => { window.ZP_UPD_SILENT_MS = "800"; });
     const errors = [];
     page.on("pageerror", (e) => errors.push(e.message));
     page.on("console", (m) => { if (m.type() === "error") errors.push(m.text()); });
@@ -438,6 +441,27 @@ async function main() {
     check("「更新客户端」按钮没被锁住 (还能点)",
       await page.locator("#update").isEnabled(), await page.locator("#update").innerText());
     server.zpState.updNoLog = false;
+
+    console.log("\n[13] 上一次跑到一半断了: 进度条不许一直转 —— 要给「重试」");
+    // 日志里留着一次"开始了、但永远没有终态"的运行 (真机: 更新到一半断电/重启/被杀)。
+    // 页面必须自己发现"它已经很久没动了", 并把出口摆出来 —— 否则就是那条既没成功
+    // 也不停的进度条。
+    server.zpState.updOverride = "面板版本 v1.9.9 (本机 v1.9.8) —— 开始更新。\n"
+      + "==> 检查环境\n  ✓ 面板可达\n==> 接入账号\n";
+    await page.reload();
+    await page.waitForSelector(".srv");
+    await page.waitForFunction(
+      () => document.getElementById("upd").hidden === false, null, { timeout: 5000 });
+    check("断掉的那次运行照实显示成进度面板", await page.locator("#upd").isVisible());
+    await page.waitForFunction(
+      () => document.getElementById("upd-retry").hidden === false, null, { timeout: 6000 });
+    check("卡住之后「重试」自己出来", await page.locator("#upd-retry").isVisible());
+    check("提示里说清是「很久没有新内容」",
+      /没有新内容/.test(await page.locator("#update-hint").innerText()),
+      await page.locator("#update-hint").innerText());
+    check("「更新客户端」按钮也解锁 (不再是点不动的「更新中…」)",
+      await page.locator("#update").isEnabled(), await page.locator("#update").innerText());
+    server.zpState.updOverride = "";
 
     // 浏览器自己会请求 /favicon.ico 之类, 那是模拟器的事, 不算页面问题
     const real = errors.filter((e) => !/favicon|404 \(Not Found\)/.test(e));

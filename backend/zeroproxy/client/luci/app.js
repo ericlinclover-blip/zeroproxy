@@ -215,6 +215,15 @@ let updLeaving = false;
 /* 已经看见**本次**更新的输出了。在那之前, 日志里可能还躺着上一次更新留下的 "EXIT=0" ——
  * 拿它当真, 页面就会在刚点完确认时跳去"更新完成"并自动刷新, 而实际上什么都没开始。 */
 let updArmed = false;
+/* "进度条一直在转、什么也不说"是这一页最难看的失败方式。除了"没有更新记录"那种假在跑
+ * (8.70 修掉的那个), 还有一种是真的: 上一次更新跑到一半断了 (路由器重启 / 断电 / 进程被
+ * 杀), 日志里留下一个永远没有终态的开头 —— 页面就会一直显示"正在更新"。
+ * 给它一个出口: 日志**很久没有新内容**就把「重试」放出来, 并把话说清楚。
+ * 真机上 45 秒没动静就算断了 (安装脚本每走一步都往日志里写字); 演练把阈值调小。 */
+const UPD_SILENT_MS = parseInt((window.ZP_UPD_SILENT_MS || '45000'), 10);
+let updLastChange = 0;    // 日志最后一次"有新内容"的时刻
+let updLastMsg = null;
+let updSilentNote = false;
 
 function updParse(text) {
   const out = { step: -1, name: '', exit: null, skip: false, from: '', to: '', live: '' };
@@ -304,9 +313,13 @@ function updRender(text) {
   $('upd-live').textContent = s.live || '';
   // 跑完之后收起按钮区; 但**更新中**也要留一个「看完整日志」的口子 —— 真卡住时那是唯一
   // 能自救的入口。「重试」则只在没在跑的时候出现: 跑得好好的摆一个"重试"只会让人手痒。
+  // 日志很久没有新内容 = 这一次多半已经断了: 把「重试」放出来、按钮解锁, 并在提示行里
+  // 说清 —— 否则用户面对的就是一条永远在转的进度条 (既没成功, 也不停)。
+  const silent = running && updLastChange > 0 && (Date.now() - updLastChange) > UPD_SILENT_MS;
   $('upd-actions').hidden = s.exit === 0;
-  $('upd-retry').hidden = running;
-  updBtnBusy(running);
+  $('upd-retry').hidden = running && !starting && !silent;
+  updBtnBusy(running && !silent);
+  updSilentHint(silent);
 
   if (s.exit === 0 && !updLeaving) {
     // 先让人看清"完成了", 再整页淡出换新版 —— 那一跳不该是"啪"地闪一下
@@ -323,6 +336,8 @@ async function updPoll() {
   try {
     const msg = unesc((await call('update-log')).message || '');
     const s = updParse(msg);
+    // 记下"日志最后一次动"的时刻 —— 卡住判定 (updRender 里的 silent) 靠它。
+    if (msg !== updLastMsg) { updLastMsg = msg; updLastChange = Date.now(); }
     // 还没看到**本次**的输出之前, 日志里那句可能是上一次留下的 —— 尤其是一份带 EXIT=0
     // 的"更新完成": 照它渲染, 页面会在刚点完确认时就假报完成并自动刷新。CLI 一动手就会
     // 先清空日志并落一行, 所以这里等到"有内容且没有终态"再认。
@@ -359,10 +374,28 @@ function updStarting() {
   updRender('==> 正在取面板的安装脚本');
 }
 
-$('update').onclick = async () => {
+/* 卡住时的提示: 只在"确实卡住了 / 已经恢复"的那一瞬间改这一行, 不去踩别的提示。 */
+function updSilentHint(on) {
+  const el = $('update-hint');
+  if (!el) return;
+  if (on) {
+    if (updSilentNote) return;
+    updSilentNote = true;
+    el.textContent = '更新日志已经 ' + Math.round(UPD_SILENT_MS / 1000)
+      + ' 秒没有新内容了 —— 这一次多半已经中断。点「重试」重新开始 (不会影响现有配置)。';
+    el.style.color = 'var(--warn)';
+  } else if (updSilentNote) {
+    updSilentNote = false;
+    el.textContent = '';
+    el.style.color = '';
+  }
+}
+
+async function runUpdate() {
   if (!confirm('从面板拉取最新客户端并重跑一次安装？\n\n过程中代理会短暂重启；配置、凭据、订阅都不受影响。')) return;
   updArmed = false;
   updLeaving = false;
+  updLastChange = 0; updLastMsg = null; updSilentNote = false;
   $('update-hint').textContent = '';
   $('update-hint').style.color = '';
   // 先给反馈: 进度面板立刻亮出来 (不确定态), 之后由 update-log 驱动成真实进度。
@@ -394,8 +427,16 @@ $('update').onclick = async () => {
     $('update-hint').textContent = '没能确认更新有没有开始: ' + e.message + '（下面继续按路由器自己的日志显示）';
     $('update-hint').style.color = 'var(--warn)';
   }
+}
+$('update').onclick = runUpdate;
+// 「重试」直接调更新那条路, 而不是去"点"那个按钮 —— 按钮在"看起来在跑"时是禁用状态,
+// 点它等于什么都没发生 (真机上那条永远在转的进度条, 就是这么点也点不动的)。
+$('upd-retry').onclick = () => {
+  $('upd').hidden = true;
+  updLeaving = false;
+  updLastChange = 0; updLastMsg = null; updSilentNote = false;
+  runUpdate();
 };
-$('upd-retry').onclick = () => { $('upd').hidden = true; updLeaving = false; $('update').click(); };
 $('upd-more').onclick = () => { document.querySelector('details').open = true; };
 
 // 刷新页面 / 换设备打开时, 如果更新还在跑, 接着显示进度 (不依赖"点过那个按钮")
