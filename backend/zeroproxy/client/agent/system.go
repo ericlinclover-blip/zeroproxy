@@ -105,6 +105,11 @@ func isLANIP(ip string) bool {
 // 与安装脚本的 datapath_live / agent.sh 的 actual_covered 是同一条判据, 三处必须一致,
 // 否则面板、路由界面、CLI 会各说各话。
 func liveMode() (mode string, covered string) {
+	// 性能模式排第一: 它开着的时候 mihomo 是停的 (下面几条都不会命中), 但顺序上先说清楚 ——
+	// "谁在接管"是界面上最该回答的问题。判据同样是现场: dae 进程在不在。
+	if daeRunning() {
+		return "ebpf", "full"
+	}
 	if ok(probeTimeout, "ip", "link", "show", "zp-tun") {
 		return "tun", "full"
 	}
@@ -115,6 +120,52 @@ func liveMode() (mode string, covered string) {
 		return "redirect", "lan_tcp"
 	}
 	return "none", "none"
+}
+
+// daeRunning 判断性能模式的内核 (dae) 在不在 —— 直接翻 /proc, 不起进程。
+// 为什么不用 pidof: 这个函数在每一次界面轮询里都会被走到 (表盘要按状态刷新), 而路由器上
+// fork 是要花钱的; 读 /proc 一次就够, 而且对"进程名被截断"这类固件差异更稳。
+func daeRunning() bool {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if name == "" || name[0] < '0' || name[0] > '9' {
+			continue
+		}
+		comm, err := os.ReadFile(filepath.Join("/proc", name, "comm"))
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(comm)) == "dae" {
+			return true
+		}
+	}
+	return false
+}
+
+// wanBytes 是 WAN 口的收+发字节数。界面那块表盘的转速就是它算出来的 —— 真流量才有转速,
+// 拿不到就是 0 (表针贴怠速), 绝不假装在动。
+func wanBytes() int64 {
+	dev := ""
+	if out, good := run(probeTimeout, "sh", "-c",
+		"ip route show default 2>/dev/null | awk 'NR==1{print $5}'"); good {
+		dev = trimSpace(out)
+	}
+	if dev == "" {
+		return 0
+	}
+	rx, _ := strconv.ParseInt(readTrimmed("/sys/class/net/"+dev+"/statistics/rx_bytes"), 10, 64)
+	tx, _ := strconv.ParseInt(readTrimmed("/sys/class/net/"+dev+"/statistics/tx_bytes"), 10, 64)
+	return rx + tx
+}
+
+// perfFile 读性能模式目录里的一个小文件 (state / why / exit_ip / progress)。读不到就是空 ——
+// 界面据此显示"未开启", 而不是显示一个错的东西。
+func perfFile(dir, name string) string {
+	return readTrimmed(filepath.Join(dir, "perf", name))
 }
 
 // datapathPackets 是数据面上真的过了多少包 —— **规则存在 ≠ 有流量**。接口名写错时规则

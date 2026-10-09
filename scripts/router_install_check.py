@@ -1451,6 +1451,182 @@ def main() -> int:
         check("doctor 报出「BTF 已自动补上」以及它在哪",
               "BTF 已自动补上" in doc_btf.stdout and "usr/lib/debug/boot" in doc_btf.stdout,
               [ln.strip() for ln in doc_btf.stdout.splitlines() if "eBPF" in ln][:1])
+
+        # [15] 性能模式 (eBPF / dae): 能进能出, 进不去就退回来
+        # 这一节验的是那个"跑车仪表盘"背后真正的东西: 数据面在 mihomo 与 dae 之间**换过去**。
+        # 四样假件: 假 dae (会说 validate / run)、假 mihomo 服务、假 dae 服务、假出口探针
+        # (返回 ip=… —— 真机上那是 Cloudflare 的 trace)。
+        # 要钉住的三件事: ① 能进 (caps / 服务 / 出口都对得上); ② 出口不通时**自动退回**,
+        # 不能把家里留在断网状态; ③ 退出之后回到原来那一档。
+        print("\n[15] 性能模式 (eBPF / dae): 能进能出, 进不去就退回来")
+        perf_root = os.path.join(tmp, "perf-root")
+        os.makedirs(perf_root, exist_ok=True)
+        _fw_release(perf_root, "25.12.5")
+        # 假 BTF: 这一档的前提 (内核 6.12.94 + BTF 都在)
+        os.makedirs(os.path.join(perf_root, "sys/kernel/btf"), exist_ok=True)
+        with open(os.path.join(perf_root, "sys/kernel/btf/vmlinux"), "wb") as fh:
+            fh.write(b"kernel-provided-btf")
+
+        def _fake_init(path_body: str) -> None:
+            with open(path_body, "w") as fh:
+                fh.write("#!/bin/sh\n" + (
+                    'case "$1" in\n'
+                    f'  running) [ -f "{os.path.join(perf_root, "core.running")}" ] && exit 0 || exit 1 ;;\n'
+                    f'  start|restart|reload) touch "{os.path.join(perf_root, "core.running")}"; exit 0 ;;\n'
+                    f'  stop) rm -f "{os.path.join(perf_root, "core.running")}"; exit 0 ;;\n'
+                    "  enable|disable) exit 0 ;;\n"
+                    "esac\nexit 0\n"
+                ))
+            os.chmod(path_body, 0o755)
+
+        perf_tools = os.path.join(tmp, "perftools")
+        os.makedirs(perf_tools, exist_ok=True)
+
+        def _write_fake_dae(where: str) -> None:
+            """假 dae: 会 validate / run。run 起来之后就一直挂着 (真实 daemon 那样)。"""
+            with open(where, "w") as fh:
+                fh.write(
+                    "#!/bin/sh\n"
+                    'case "$1" in\n'
+                    "  validate) exit 0 ;;\n"
+                    "  run) while :; do sleep 30; done ;;\n"
+                    "esac\nexit 0\n"
+                )
+            os.chmod(where, 0o755)
+
+        # 面板: 缓存一份假 dae (.gz)。真机上面板会去上游取并重新压成 .gz。
+        perf_cache = os.path.join(panels[0].home, "data", "client", "perf")
+        os.makedirs(perf_cache, exist_ok=True)
+        with gzip.open(os.path.join(perf_cache, f"dae-arm64-{router_client.PERF_VERSION}.gz"), "wb") as fh:
+            fh.write(b"#!fake-dae\n" + b"x" * 512)
+
+        # 假出口探针: 真机上是 Cloudflare 的 trace, 这里一个本地小服务返回同样的格式
+        probe = FakeMirror(b"ip=203.0.113.9\n")
+        ok_p, out_p = run_install(
+            "perf", root=perf_root,
+            extra={"PATH": perf_tools + os.pathsep + os.environ.get("PATH", ""),
+                   "ZP_KERNEL": btf_kver, "ZP_ROOT": perf_root,
+                   "ZP_PERF_PROBE": f"http://127.0.0.1:{probe.port}/cdn-cgi/trace"},
+        )
+        p_caps = open(os.path.join(perf_root, "caps"), encoding="utf-8").read()
+        check("这台机器被判定为「可以开性能模式」(perf_cap=1)",
+              ok_p and "perf_cap=1" in p_caps,
+              [ln for ln in p_caps.splitlines() if ln.startswith("perf")])
+        check("装机输出里就告诉了用户这一档能不能开",
+              "性能模式" in out_p and ("可以开" in out_p or "开不了" in out_p),
+              [ln.strip() for ln in out_p.splitlines() if "性能模式" in ln][:1])
+        perf_progress = os.path.join(perf_root, "perf", "progress")
+        # 两个假服务必须在**装完之后**再写: 安装脚本自己会往 <root>/initd 落一份真的
+        # mihomo init 脚本 (带 /etc/rc.common 那种 shebang), 而本机 (macOS) 执行它时退出码
+        # 是 0 —— 那会让"标准模式还开着没有"永远为真。所以演练用一份自己控制的:
+        # core.running 在 = mihomo 在跑。
+        _fake_init(os.path.join(perf_root, "initd"))          # 假 mihomo 服务
+        with open(os.path.join(perf_root, "initd-perf"), "w") as fh:
+            # 假 dae 服务: start 起一个"daemon", running 看它还活着没有 (真机上是 procd)
+            fh.write("#!/bin/sh\n" + (
+                'case "$1" in\n'
+                f'  start|restart) "$ZP_ROOT/perf/dae" run -c "$ZP_ROOT/perf/dae.dae" & echo $! > "$ZP_ROOT/perf/dae.pid"; exit 0 ;;\n'
+                f'  stop) [ -f "$ZP_ROOT/perf/dae.pid" ] && kill "$(cat "$ZP_ROOT/perf/dae.pid")" 2>/dev/null; rm -f "$ZP_ROOT/perf/dae.pid"; exit 0 ;;\n'
+                f'  running) [ -f "$ZP_ROOT/perf/dae.pid" ] && kill -0 "$(cat "$ZP_ROOT/perf/dae.pid")" 2>/dev/null && exit 0; exit 1 ;;\n'
+                "  enable|disable) exit 0 ;;\n"
+                "esac\nexit 0\n"
+            ))
+        os.chmod(os.path.join(perf_root, "initd-perf"), 0o755)
+        # 装机那一刻这台"机器"上标准模式是开着的 (真机上就是 tun 在跑) —— 这样"换过去之后
+        # mihomo 停了"才有得比。
+        with open(os.path.join(perf_root, "core.running"), "w") as fh:
+            fh.write("1\n")
+
+        # 把假 dae 放进 perf 目录, 装一遍 CLI 补丁 (install 里已经写好 perf.sh)
+        os.makedirs(os.path.join(perf_root, "perf"), exist_ok=True)
+        _write_fake_dae(os.path.join(perf_root, "perf", "dae"))
+        cli_perf = os.path.join(perf_root, "cli-perf.sh")
+        with open(os.path.join(perf_root, "cli"), encoding="utf-8") as fh:
+            cli_text = fh.read().replace("/etc/zeroproxy", perf_root)
+        with open(cli_perf, "w") as fh:
+            fh.write(cli_text)
+
+        def _run_cli(*args, timeout=120):
+            return subprocess.run(
+                ["sh", cli_perf, *args], capture_output=True, text=True, timeout=timeout,
+                env={**os.environ, "ZP_ROOT": perf_root, "ZP_KERNEL": btf_kver,
+                     "ZP_PERF_VERIFY_TRIES": "2",   # 演练里没有真节点, 别干等 45 秒
+                     "ZP_PERF_PROBE": f"http://127.0.0.1:{probe.port}/cdn-cgi/trace"},
+            )
+
+        # 1) 真正切过去 (CLI 没有 TTY → 后台跑, 进度写文件; 界面就是照它画进度的)
+        entered = _run_cli("perf", "on")
+        for _ in range(60):                     # 最多等 ~30 秒
+            prog = ""
+            p_path = os.path.join(perf_root, "perf", "progress")
+            if os.path.exists(p_path):
+                prog = open(p_path, encoding="utf-8").read()
+            if "DONE=" in prog:
+                break
+            time.sleep(0.5)
+        p_caps = open(os.path.join(perf_root, "caps"), encoding="utf-8").read()
+        check("切换是后台跑的, 进度落在文件里 (界面据此画动画)",
+              "已开始切换" in entered.stdout and "DONE=" in prog,
+              prog.strip())
+        check("真的切过去了: caps 记 perf=1 且 chosen=ebpf",
+              "perf=1" in p_caps and "chosen=ebpf" in p_caps,
+              [ln for ln in p_caps.splitlines() if ln.startswith(("perf=", "chosen="))])
+        check("dae 真的在跑, mihomo 已经停了 (两个数据面互斥)",
+              subprocess.run(["sh", os.path.join(perf_root, "initd-perf"), "running"],
+                             env={**os.environ, "ZP_ROOT": perf_root}).returncode == 0
+              and not os.path.exists(os.path.join(perf_root, "core.running")))
+        exit_file = os.path.join(perf_root, "perf", "exit_ip")
+        exit_ip = open(exit_file, encoding="utf-8").read().strip() if os.path.exists(exit_file) else ""
+        check("验证用的是**真实出口** (探针给的 IP 被记下来)", exit_ip == "203.0.113.9", exit_ip or "(没记)")
+        st = _run_cli("perf", "status")
+        check("zeroproxy perf status 说清「已开启」与出口",
+              "已开启" in st.stdout and "203.0.113.9" in st.stdout,
+              [ln.strip() for ln in st.stdout.splitlines()[:2]])
+        doc2 = _run_cli("doctor")
+        check("doctor 里有一条「性能模式正在生效」+ 现场证据",
+              "性能模式" in doc2.stdout and "正在生效" in doc2.stdout,
+              [ln.strip() for ln in doc2.stdout.splitlines() if "性能模式" in ln][:1])
+
+        # 2) 出口不通时必须**自动退回** —— 家里不能被留在断网状态
+        probe.close()
+        _run_cli("perf", "off")
+        p_caps = open(os.path.join(perf_root, "caps"), encoding="utf-8").read()
+        check("熄火之后回到原来那一档 (perf=0, chosen 不再是 ebpf)",
+              "perf=0" in p_caps and "chosen=ebpf" not in p_caps,
+              [ln for ln in p_caps.splitlines() if ln.startswith(("perf=", "chosen="))])
+        check("mihomo 又被拉起来了", os.path.exists(os.path.join(perf_root, "core.running")))
+        failed_run = _run_cli("perf", "on")   # 探针已经关了 → 出口验证必然失败
+        for _ in range(60):
+            prog = open(os.path.join(perf_root, "perf", "progress"), encoding="utf-8").read()
+            if "DONE=1" in prog:
+                break
+            time.sleep(0.5)
+        p_caps = open(os.path.join(perf_root, "caps"), encoding="utf-8").read()
+        check("出口验不过时**自动退回**: perf=0, 并且说明是为什么",
+              "DONE=1" in prog and "perf=0" in p_caps and "出不去" in p_caps,
+              [ln for ln in p_caps.splitlines() if ln.startswith("perf")])
+        check("退回之后 dae 不在了、mihomo 回来了 (没有留在断网状态)",
+              not os.path.exists(os.path.join(perf_root, "perf", "dae.pid"))
+              and os.path.exists(os.path.join(perf_root, "core.running")))
+        check("退回过程写进了进度文件 (界面上看得见)",
+              "退回" in prog or "已回到标准模式" in prog,
+              [ln.strip() for ln in prog.splitlines() if "退回" in ln or "回到标准" in ln][:1])
+
+        # 3) 看门狗: 说好在用, 而 dae 已经不在了 → 连续三轮之后自动退回
+        _run_cli("perf", "on")           # 探针还是关的, 所以先手工把它置成"在用"
+        time.sleep(1)
+        with open(os.path.join(perf_root, "perf", "state"), "w") as fh:
+            fh.write("on\n")
+        with open(os.path.join(perf_root, "perf", "dae.pid"), "w") as fh:
+            fh.write("999999\n")
+        for _ in range(4):
+            subprocess.run(["sh", os.path.join(perf_root, "agent.sh"), "once"], capture_output=True,
+                           text=True, timeout=60,
+                           env={**os.environ, "ZP_ROOT": perf_root})
+        p_caps = open(os.path.join(perf_root, "caps"), encoding="utf-8").read()
+        check("看门狗: dae 连续几轮不在就自动退回标准模式 (家里不会断着)",
+              "perf=0" in p_caps and os.path.exists(os.path.join(perf_root, "core.running")),
+              [ln for ln in p_caps.splitlines() if ln.startswith("perf")])
     finally:
         logs = []
         for panel in panels:

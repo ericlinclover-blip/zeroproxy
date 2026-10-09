@@ -419,6 +419,149 @@ def test_btf_endpoint_never_hangs_and_says_exactly_what_to_do(client, configured
     assert res.status_code == 404, res.text
 
 
+# ---------------------------------------------------------------- 性能模式 (dae / eBPF)
+
+def _dae_archive(tmp_path, entries: dict[str, bytes]) -> str:
+    """按上游的形态造一份 tar.xz (演练里不下载真的 10 MB)。"""
+    import io
+    import tarfile
+
+    path = tmp_path / "dae.tar.xz"
+    with tarfile.open(path, "w:xz") as tf:
+        for name, blob in entries.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(blob)
+            tf.addfile(info, io.BytesIO(blob))
+    return str(path)
+
+
+def test_extract_dae_picks_the_binary_and_refuses_junk(tmp_path, monkeypatch):
+    """上游的目录结构不是契约 —— 取错文件必须在这里挡住。
+
+    上游发的是 `dae-linux-<arch>.tar.xz`, 里面放什么、放几层目录都不是我们能指望的, 所以按
+    "名字正好是 dae 的优先, 否则取最大的那个"来找, 最后只认 ELF —— 否则发到路由器上就是
+    chmod +x 之后一句 Exec format error (真机上学过一次)。
+    """
+    from zeroproxy import router_client
+
+    monkeypatch.setattr(router_client, "PERF_MIN_BYTES", 16)
+    elf = b"\x7fELF" + b"\x00" * 64
+    dest = str(tmp_path / "out.bin")
+
+    # 1) 有 dae: 选它, 哪怕旁边有个更大的文件
+    arch1 = _dae_archive(tmp_path, {"dae": elf, "geoip.dat": b"x" * 4096, "README.md": b"hi"})
+    ok1, detail1 = router_client._extract_dae(arch1, dest)
+    assert ok1 and open(dest, "rb").read() == elf, detail1
+
+    # 2) 没有叫 dae 的: 取最大的那个 (上游换了目录结构也还能用)
+    arch2 = _dae_archive(tmp_path, {"sbin/other": elf, "README.md": b"hi"})
+    ok2, detail2 = router_client._extract_dae(arch2, dest)
+    assert ok2 and open(dest, "rb").read() == elf, detail2
+
+    # 3) 上游给的是一页 HTML (反代很爱回这个): 拒绝, 而不是发一个"能 chmod 不能跑"的文件
+    arch3 = _dae_archive(tmp_path, {"index.html": b"<!DOCTYPE html>" + b"x" * 4096})
+    ok3, detail3 = router_client._extract_dae(arch3, dest)
+    assert not ok3 and "ELF" in detail3, detail3
+
+
+def test_install_script_builds_the_perf_mode_switch_the_honest_way():
+    """性能模式 (eBPF / dae) 的开关: 换过去、验证、换回来 —— 判据全是现场。
+
+    这一档与 tun / tproxy **互斥** (两套都在抢流量), 而它开着的时候 mihomo 是停的 ——
+    也就是说 dae 一挂家里就断网。所以三条硬规矩必须写在代码里, 而不是靠人记得:
+      ① 进去之前用 `dae validate` 校验配置 (配置错就不动现在的数据面);
+      ② 进去之后**验证流量真的过得去** (出口探针), 不是"进程起来了"就算成功;
+      ③ 任何一步失败都退回原来的模式, 并且有一只看门狗盯着"dae 还在不在"。
+    """
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+    code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+
+    for needed in ("zp_perf_enter", "zp_perf_leave", "zp_perf_live", "zp_perf_tick", "zp_perf_prepare"):
+        assert needed in code, f"perf.sh 里缺 {needed}"
+    assert "dae" in code and " validate -c " in code, "进去之前要 dae validate 过一遍配置"
+    assert "zp_perf_exit_ip" in code and "ZP_PERF_PROBE" in code, "要验证出口真的通"
+    assert "退回原来的模式" in code and "dae 起来了, 但流量出不去" in code, "验不过必须退回来"
+    # 看门狗: 说好在用而 dae 不在, 连续三轮就退回 (家里不能断着)
+    assert "_n\" -ge 3" in code and "已自动退回标准模式" in code
+    # 与标准模式互斥 (避免两个数据面同时抢包)
+    assert '"$ZP_INIT" stop' in code and '"$ZP_INIT" disable' in code
+    assert "ZP_INIT=/etc/init.d/zeroproxy" in code and "ZP_PERF_INIT=/etc/init.d/zeroproxy-perf" in code
+    # caps 里的那几个字段是界面 / 面板 / 诊断读的同一份
+    for key in ("perf_cap=", "perf=", "perf_why="):
+        assert f"printf '{key}" in code or f"s/^{key}" in code, f"caps 要记 {key}"
+    # 界面那一路: 表盘脚本 (perf.js) 由面板分发, 两个动作 (perf-on / perf-off) 两个入口
+    # (cgi 与 zpcore) 都要有 —— "只加在 CLI 上是不够的" 这个坑真机踩过 (README 8.61)。
+    luci = os.path.join(os.path.dirname(router_client.script_path()), "luci")
+    cgi = open(os.path.join(luci, "cgi"), encoding="utf-8").read()
+    assert "perf-on|perf-off" in cgi and "perf.js" in cgi, "cgi 那条路也要能开性能模式"
+    assert os.path.exists(os.path.join(luci, "perf.js")), "那块表盘的脚本要在"
+    assert "perf.js" in open(os.path.join(luci, "index.html"), encoding="utf-8").read()
+
+
+def test_dae_config_speaks_daes_language_and_skips_what_it_cannot_dial(client, configured):
+    """性能模式的配置是 dae **自己的一套语言** —— 单独渲染, 并如实跳过它拨不了的节点。
+
+    dae 支持 VLESS (含 Reality) / Trojan / Hysteria2, 但没有 XHTTP 传输 —— 那一个节点必须
+    被排除, 而且要**写出来** (少一个节点这件事不该只活在代码里)。面板地址走直连, 与 mihomo
+    那边同一条理由: 管理面不能依赖代理。
+    """
+    _login(client)
+    device = _register(client, _pair_code(client)["code"])
+    base = f"/c/perf/config?id={device['id']}&k={device['secret']}"
+    body = client.get(f"{base}&lan=br-lan").text
+
+    for block in ("global {", "node {", "group {", "dns {", "routing {"):
+        assert block in body, block
+    assert "lan_interface: br-lan" in body and "wan_interface: auto" in body
+    assert "policy: min_moving_avg" in body and "fallback: proxy" in body
+    assert f"domain(suffix: {DOMAIN}) -> direct" in body, "面板地址要直连"
+    assert "vless://" in body and "trojan://" in body and "hysteria2://" in body
+    assert "# 跳过: vless-xhttp" in body, "dae 拨不了的节点要如实写出来"
+    assert "vless-xhttp:" not in body, "跳过的节点不许出现在 node 段里"
+
+    # geo=0 是降级: 引用分流数据的规则**整条去掉** (dae 读不到数据文件是起不来, 不是跳过规则)
+    degraded = client.get(f"{base}&geo=0").text
+    assert "geosite:" not in degraded and "geoip:cn" not in degraded
+    assert "geoip:private" in degraded, "私有地址那条不依赖数据文件, 要留着"
+
+    # 设备专属配置: 凭据不对就是 403
+    assert client.get("/c/perf/config?id=x&k=y").status_code == 403
+
+
+def test_perf_binary_endpoint_answers_instead_of_hanging(client, configured, monkeypatch):
+    """性能模式内核 (dae): 没缓存时**立刻**回一句人话 + 503, 缓存好了直接发。
+
+    与 /c/bin 完全同一个协议 —— 首次点「性能模式」时面板要去上游取约 10 MB, 而用户正看着
+    界面等: 那就回一句"面板正在准备", 让界面把真实进度显示出来, 而不是把它挂住。
+    """
+    from zeroproxy import router_client
+
+    router_client.PERF_STATE.clear()
+    assert client.get("/c/perf/pdp11").status_code == 404
+    res = client.get("/c/perf/arm64")
+    assert res.status_code == 503, res.text
+    assert res.headers.get("retry-after") == "5"
+    assert "面板正在准备" in res.text or "面板取" in res.text, res.text
+
+    blob = b"\x1f\x8b" + b"d" * 4096
+    monkeypatch.setattr(router_client, "PERF_MIN_BYTES", 16)
+    path = router_client.perf_file("arm64")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as fh:
+        fh.write(blob)
+    ok = client.get("/c/perf/arm64")
+    assert ok.status_code == 200 and ok.content == blob
+
+
+def test_perf_geo_endpoint_whitelists_and_degrades_honestly(client, configured):
+    """dae 的分流数据 (v2ray 格式) 直接复用面板为 Xray 下好的那两份: 白名单 + 说清有没有。"""
+    assert client.get("/c/perf/geo/whatever.dat").status_code == 404
+    res = client.get("/c/perf/geo/geoip.dat")
+    assert res.status_code == 503 and "分流数据" in res.text, res.text
+
+
 def test_btf_fetch_downloads_through_the_mirrors_then_caches(client, configured, monkeypatch):
     """清单 → 镜像下载 → 落盘缓存; 第二次直接命中缓存 (不再问上游)。"""
     from zeroproxy import router_client
@@ -1970,7 +2113,7 @@ def test_install_script_auto_fixes_missing_kernel_btf():
     assert 'KERNEL="${ZP_KERNEL:-$(uname -r)}"' in code
 
 
-@pytest.mark.parametrize("name", ["index.html", "app.js", "cgi", "menu.json", "acl.json", "status.js"])
+@pytest.mark.parametrize("name", ["index.html", "app.js", "perf.js", "cgi", "menu.json", "acl.json", "status.js"])
 def test_ui_files_are_served(client, configured, name):
     """路由器管理界面的文件由面板分发 (路由器只负责落盘, 于是界面更新=重跑安装命令)。"""
     res = client.get(f"/c/ui/{name}")

@@ -1,6 +1,6 @@
 # ZeroProxy 架构现状
 
-> 快照: **2026-10-10** · 面板 **v2.11.26** · 路由器客户端 **v1.4.25** · `state.json` schema **v5**
+> 快照: **2026-10-10** · 面板 **v2.11.27** · 路由器客户端 **v1.4.26** · `state.json` schema **v5**
 > 本文回答"**现在是什么样**"。另外两份文档分工不同, 不要混读:
 > `README.md` 是逐版开发日志 (4000+ 行, 每一版为什么这么改、哪次真机踩的坑);
 > `docs/RESEARCH.md` 与 `docs/ROUTER-CLIENT-REDESIGN.md` 是竞品调研与设计依据。
@@ -269,6 +269,9 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
 `POST /c/report` 心跳 · `GET /c/core/status` · `GET /c/geo/{name}` 分流数据库 · `GET /c/ui/{name}` 本地界面资源 ·
 `GET /c/bench/{mb}` 内建基准 · `GET /c/btf?kver=&arch=&fmt=` 内核 BTF 包 (按内核 minor 系列 +
 架构挑, 缓存后分发; 上游 `kenzok8/vmlinux-btf`, 也可手工放进 `data/client/btf/`)。
+性能模式 (eBPF / dae): `GET /c/perf/{arch}` 内核 (匿名, 与 `/c/bin` 同性质) ·
+`GET /c/perf/config?id=&k=` 设备专属 dae 配置 · `GET /c/perf/geo/{name}` 那份 v2ray 格式的
+分流数据 (与 Xray 复用同一份; 白名单两个名字)。
 
 ---
 
@@ -300,6 +303,14 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
   **快照逐条比对**, 给出「一致 / 还有残留 + 差在哪一项」的结论。`zeroproxy doctor` 用带 `counter` 的规则
   回答「规则存在 ≠ 有流量经过」。
 * **IPv6 一并接管**: 设备装机时探一次这一档数据面能否覆盖 v6, 能就给双栈配置, 接不了如实上报。
+* **性能模式 (L0 · eBPF / dae)**: 数据面换给 dae (内核态分流, 直连流量真旁路), 与
+  tun / tproxy **互斥** —— 进去时停 mihomo 并 disable, 出来时反之。开关逻辑只有一份
+  (`/etc/zeroproxy/perf.sh`), 三个入口共用: CLI 的 `zeroproxy perf on|off|status`、本机管理页
+  那块跑车仪表盘、以及 agent 心跳里的**看门狗** (说好在用而 dae 不在, 连续 3 轮自动退回)。
+  三条硬规矩: 进去前 `dae validate` 校验配置、进去后用**出口探针**验证流量真的过得去、
+  任何一步失败都退回原来的模式。dae 与它的配置由面板分发 (`/c/perf/*`, 与内核 / 分流数据
+  同一套); 节点内联成分享链接, dae 不支持的 XHTTP 被排除并写进配置头部。`caps` 记
+  `perf_cap` / `perf` / `perf_why`; `ZP_PERF=0` 可关。
 * **内核 BTF 自动补齐**: 不带 `CONFIG_DEBUG_INFO_BTF` 的固件没有 `/sys/kernel/btf/vmlinux`,
   CO-RE eBPF (dae 那一类, 也是"性能档"的候选) 就用不了。检测到缺失时自动补: 先问本机软件源
   (`vmlinux-btf`), 再问面板 (`/c/btf` —— 面板按 minor 系列 + 架构挑包、缓存、发下来, 与内核
@@ -374,12 +385,12 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
 
 | 脚本 | 覆盖 |
 |---|---|
-| `backend/tests/` (pytest) | **303 通过 + 6 skip** (无真实内核二进制时跳过)。dry-run 全流程 + 安全边界 + 状态迁移 |
+| `backend/tests/` (pytest) | **309 通过 + 6 skip** (无真实内核二进制时跳过)。dry-run 全流程 + 安全边界 + 状态迁移 |
 | `scripts/verify.py` | 用真实 Xray/Hysteria/mihomo/sing-box 校验生成的配置与订阅 (含**两台机器真跑一条链**) |
-| `scripts/router_install_check.py` | **135 项**。真的用 shell 跑一遍路由器安装脚本: 六类机器 (含 OpenWrt 25.12 / apk 三态 / 缺 BTF 与自带 BTF 两种机器) / 本机覆盖 / revert 比对 / zpcore 真跑 |
+| `scripts/router_install_check.py` | **149 项**。真的用 shell 跑一遍路由器安装脚本: 七类机器 (含 OpenWrt 25.12 / apk 三态 / BTF 两种现场 / 性能模式的进-出-回退) / 本机覆盖 / revert 比对 / zpcore 真跑 |
 | `scripts/browser_check.cjs` | **157 项**, 真 Chromium 走「初始化 → 仪表盘」全流程 + 交互 + CSP + 截图 |
 | `scripts/clients_check.cjs` | 真实浏览器点客户端开关 |
-| `scripts/router_ui_check.cjs` | 路由器本地界面 (含「没有更新记录时不许凭空长出进度面板」这类判据) |
+| `scripts/router_ui_check.cjs` | **62 项**。路由器本地界面 (含「没有更新记录时不许凭空长出进度面板」这类判据, 以及性能模式那块表盘: 真实浏览器里点一次, 看刻度/进度/表针/出口/熄火) |
 | `scripts/geo_slow_check.cjs` | 长任务前端行为 (默认约 3 分钟的真下载) |
 | `scripts/upgrade_sim.sh` | 真跑 `upgrade.sh` (桩掉 root/systemd), 覆盖成功与回滚两条路径 |
 | `scripts/build-agent.sh` | 构建 `zpcore` 并注入版本号到 `client/agent/dist/` |
@@ -394,6 +405,7 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
   注释密度很高、内部有分区, 但单文件到这个体量, 后续定位成本会持续上升。
 * **文档重叠**: README (逐版日志) 与本文、`docs/` 三份之间有信息重叠; README 面向历史, 本文面向现状,
   长期需要保持本文随代码更新 (否则又会退回「过期快照」)。
-* **eBPF 数据面**: 刻意不做 (换内核 = 另一套配置语言与 geo 格式, 且需 OpenWrt 默认不带的 BTF);
-  现阶段由 `zeroproxy doctor` 报出这一档的可用性。
+* **eBPF 数据面 (性能模式)**: 已实现 (L0 = dae, 见 §11 那条), 仍然是**用户按需开启**的一档 ——
+  它与 tun/tproxy 互斥、开着时没有第二个数据面兜底, 所以默认不动它。真机上还没有验过
+  (dae 真的加载 eBPF / 出口验证 / 回退后的连通性), 这一点写在 README 8.78 的最后一段。
 * **真机回归**: 自动化能覆盖的都覆盖了, 但「每种固件一台真机」仍然只能人工做 (见 `docs/ROUTER-CLIENT-REDESIGN.md` Phase 5)。

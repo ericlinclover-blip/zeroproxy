@@ -41,18 +41,27 @@ async function call(path, body) {
 }
 
 function render(state) {
+  // 性能模式那块表盘先画 (它自己有独立的轮询与动画)。放在最前面是因为下面几条分支会
+  // 提前 return (比如"还没有接入任何服务器"), 而表盘跟服务器列表没关系。
+  if (window.zpPerf) window.zpPerf.render(state);
   // 说的是**现场验过的**模式与覆盖范围, 不是"我们打算用什么": 内核在跑但一级都没接管
   // 时, 这里要明确写"未接管", 而不是含混地写"全屋透明代理" (真机 8.45 的教训)。
   const MODE_TEXT = {
+    ebpf: '内核态 eBPF 分流 (直连流量真旁路)',
     tun: 'TUN 全屋透明代理 (含路由器自身)',
     tproxy: 'tproxy 全屋透明代理 (路由器自身除外)',
     redirect: 'iptables REDIRECT — 仅局域网 TCP, 不含 UDP',
     none: '未接管 — 只有本机代理端口可用',
   };
   const modeText = MODE_TEXT[state.mode] || MODE_TEXT.none;
-  $('sub').textContent = state.core === 'running'
-    ? `内核运行中 · ${modeText}`
-    : '内核已停止 — 全屋按普通方式上网';
+  // 性能模式那一档没有 mihomo 内核在跑 (数据面是 dae), 所以"内核运行中"那句话会前后矛盾 ——
+  // 单独一条, 说的是"现在谁在接管"; 其余档位照旧。
+  const perfOn = !!(state.perf && state.perf.state === 'on' && state.perf.live === '1');
+  $('sub').textContent = perfOn
+    ? `性能模式运行中 · ${modeText}${state.perf.exit_ip ? ' · 出口 ' + state.perf.exit_ip : ''}`
+    : state.core === 'running'
+      ? `内核运行中 · ${modeText}`
+      : '内核已停止 — 全屋按普通方式上网';
   if (state.core === 'running' && state.mode === 'none' && state.why) {
     $('sub').textContent += ` · ${state.why}`;
   }
@@ -63,14 +72,17 @@ function render(state) {
   }
   // 规则在 ≠ 有流量: 接口名写错时规则照样装得上, 却一个包都不命中。0 包要写出来,
   // 但那也可能只是"刚开机" —— 所以措辞是"还没有", 不是"坏了"。
-  if (state.core === 'running' && state.mode !== 'none' && state.packets === 0) {
+  // (性能模式没有 mihomo 的规则计数器, 那一档由表盘上的实时转速说话。)
+  if (state.core === 'running' && state.mode !== 'none' && state.mode !== 'ebpf' && state.packets === 0) {
     $('sub').textContent += ' · 规则上还没有流量经过';
-  } else if (state.core === 'running' && state.packets > 0) {
+  } else if (state.core === 'running' && state.mode !== 'ebpf' && state.packets > 0) {
     $('sub').textContent += ` · 已有 ${state.packets} 个包经过`;
   }
   $('mode').textContent = state.client ? `客户端 v${state.client}` : '';
 
-  const on = state.core === 'running';
+  // 总开关说的是"这台机器现在有没有在提供代理" —— 性能模式下 mihomo 是停着的, 但代理
+  // 明明是开着的, 所以两个数据面都要算进来 (否则表盘亮着、总开关却是"关", 自相矛盾)。
+  const on = perfOn || state.core === 'running';
   $('toggle').checked = on;
   $('toggle-txt').textContent = on ? '开' : '关';
 

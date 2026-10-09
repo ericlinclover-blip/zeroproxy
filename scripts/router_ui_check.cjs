@@ -59,6 +59,12 @@ function makeMock() {
     // 日志里还躺着**上一次**更新的"更新完成" (真机上点确认那一刻看到的就是这个) ——
     // 界面不许把它当成本次的结果, 否则会假报完成并自动刷新。
     updStale: false,
+    // 性能模式那块表盘的现场。默认"能开、没开" —— 与一台 25.12 且已补上 BTF 的机器一致。
+    perf: { cap: "1", state: "off", live: "0", why: "", exit_ip: "", busy: "0", progress: "" },
+    perfAt: 0,
+    //: WAN 口的收+发字节数。表盘的转速就是它算的 —— 打开之后每次轮询往前走一点,
+    //: 这样"针跟着真实流量动"这件事在演练里也验得了。
+    wan: 0,
   };
   const HEAD = "面板版本 v1.9.9 (本机 v1.9.8) —— 开始更新。\n";
   const UPD_LOG = [
@@ -82,11 +88,12 @@ function makeMock() {
     const authed = /sysauth/.test(req.headers.cookie || "");
     if (url.pathname.startsWith("/cgi-bin/")) {
       // 与 cgi 一致: 页面与脚本本身不需要登录, 数据接口才要
-      if (url.searchParams.get("file") === "app.js") {
+      const want = url.searchParams.get("file");
+      if (want === "app.js" || want === "perf.js") {
         res.writeHead(200, { "Content-Type": "text/javascript; charset=utf-8" });
-        res.end(fs.readFileSync(path.join(LUCi_DIR, "app.js"))); return;
+        res.end(fs.readFileSync(path.join(LUCi_DIR, want))); return;
       }
-      if (!action && url.searchParams.get("file") !== "app.js") {
+      if (!action && !want) {
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
         res.end(fs.readFileSync(path.join(LUCi_DIR, "index.html"))); return;
       }
@@ -95,7 +102,38 @@ function makeMock() {
       req.on("data", (c) => (body += c));
       req.on("end", () => {
         const payload = body ? JSON.parse(body) : {};
-        if (action === "status") return json(res, { ok: true, ...state });
+        if (action === "status") {
+          // 切换是"分几拍"完成的 (真机上就是一拍一拍来的): 前 ~0.9 秒在取内核, 之后校验+
+          // 切换, 大约 2.2 秒后生效。界面必须把这几拍画成进度, 而不是一步跳过 ——
+          // 这就是那段"进入中"动画的依据。
+          const p = state.perf || {};
+          if (p.state === "on" && p.live === "0" && state.perfAt) {
+            const dt = Date.now() - state.perfAt;
+            if (dt > 900) p.progress = "正在准备性能模式…|  · 取性能模式内核 (dae · arm64)…|  · 配置已校验通过";
+            if (dt > 1600) p.progress = "…|  · 切换数据面 (停标准模式 → 起 dae)…|  · dae 在跑, 正在验证流量真的过得去…";
+            if (dt >= 2200) {
+              state.perf = { ...p, live: "1", busy: "0", exit_ip: "203.0.113.7", progress: "DONE=0" };
+              state.mode = "ebpf";
+              state.core = "stopped";
+            }
+          }
+          // 开着的时候让"流量"往前走: 每轮询 ~900 KB, 表针就该跟着抬起来
+          if ((state.perf || {}).live === "1") state.wan = (state.wan || 0) + 900 * 1024;
+          return json(res, { ok: true, ...state });
+        }
+        if (action === "perf-on") {
+          state.perfAt = Date.now();
+          state.perf = { cap: "1", state: "on", live: "0", why: "", exit_ip: "", busy: "1",
+                         progress: "正在准备性能模式…" };
+          return json(res, { ok: true, message: "已开始切换到性能模式 (后台进行, 约一分钟; 界面会显示进度)" });
+        }
+        if (action === "perf-off") {
+          state.perfAt = 0;
+          state.perf = { cap: "1", state: "off", live: "0", why: "", exit_ip: "", busy: "0", progress: "DONE=0" };
+          state.mode = "tun";
+          state.core = "running";
+          return json(res, { ok: true, message: "已开始切回标准模式" });
+        }
         if (action === "add") {
           if (!/^https?:\/\/.+\/c\/.+/.test(payload.url || "")) {
             return json(res, { ok: false, error: "这看起来不是一个面板链接" });
@@ -462,6 +500,68 @@ async function main() {
     check("「更新客户端」按钮也解锁 (不再是点不动的「更新中…」)",
       await page.locator("#update").isEnabled(), await page.locator("#update").innerText());
     server.zpState.updOverride = "";
+
+    console.log("\n[14] 性能模式: 那块跑车仪表盘 (真的点一次)");
+    // 刻度与数字是 perf.js 用 SVG 画出来的 —— 它们存在, 就说明那个脚本真的被加载、
+    // 被 cgi 发出来了 (而不是浏览器把 index.html 当成了 js)。
+    check("仪表盘的刻度是脚本画出来的 (perf.js 真的加载了)",
+      (await page.locator("#perf-ticks line").count()) === 9
+      && (await page.locator("#perf-ticks text").count()) === 5,
+      `${await page.locator("#perf-ticks line").count()} 条刻度 / ${await page.locator("#perf-ticks text").count()} 个数字`);
+
+    // 开不了的机器: 表盘上要写清"为什么", 而且按钮点不动 —— 不许给一个点了没反应的按钮。
+    server.zpState.perf = { cap: "0", state: "off", live: "0", why: "内核 5.4.281 低于 5.17",
+                            exit_ip: "", busy: "0", progress: "" };
+    await page.reload();
+    await page.waitForSelector(".srv");
+    check("开不了的时候: 表盘写清原因, 按钮点不动",
+      /不可用/.test(await page.locator("#perf-pill").innerText())
+      && /5\.4\.281/.test(await page.locator("#perf-cap").innerText())
+      && await page.locator("#perf-btn").isDisabled(),
+      await page.locator("#perf-cap").innerText());
+
+    // 能开的机器: 点一下 "启动引擎", 看那几拍是不是真的被画出来
+    server.zpState.perf = { cap: "1", state: "off", live: "0", why: "", exit_ip: "", busy: "0", progress: "" };
+    server.zpState.wan = 0;
+    await page.reload();
+    await page.waitForSelector(".srv");
+    // SVG <text> 没有 innerText —— 统一走 textContent 读表盘上的数字。
+    const rpmText = () => page.locator("#perf-rpm").evaluate((el) => el.textContent);
+    check("没开的时候: 表针贴怠速 (0)",
+      (await rpmText()).trim() === "0", await rpmText());
+    await page.click("#perf-btn");
+    await page.waitForFunction(() => /进入中/.test(document.getElementById("perf-pill").textContent), null, { timeout: 5000 });
+    check("点击后立刻进入「进入中」并禁用按钮 (不能连点)",
+      await page.locator("#perf-btn").isDisabled(), await page.locator("#perf-btn").innerText());
+    await page.waitForFunction(() => document.querySelectorAll("#perf-segs i.on").length >= 1, null, { timeout: 5000 });
+    const segsMid = await page.locator("#perf-segs i.on").count();
+    const rpmMid = parseFloat(await rpmText());
+    check("切换过程中五段进度真的在往前走 (取自后端写的进度原话)",
+      segsMid >= 1 && segsMid < 5, `${segsMid}/5 段`);
+    check("表针在动 (进入过程里就有转速)", rpmMid > 0, `${rpmMid} rpm`);
+
+    await page.waitForFunction(() => /已开启/.test(document.getElementById("perf-pill").textContent), null, { timeout: 8000 });
+    check("生效后: 状态是「已开启」并报出验证过的出口",
+      /203\.0\.113\.7/.test(await page.locator("#perf-cap").innerText()),
+      await page.locator("#perf-cap").innerText());
+    check("五段进度全亮 (绿灯: 一路走到生效)", (await page.locator("#perf-segs i.on").count()) === 5);
+    check("按钮变成「熄火」", /熄火/.test(await page.locator("#perf-btn").innerText()),
+      await page.locator("#perf-btn").innerText());
+    // 转速必须跟着**真实流量**走: 让模拟器多推一点字节, 表针就该抬起来
+    const rpmBefore = parseFloat(await rpmText());
+    server.zpState.wan += 6 * 1024 * 1024;
+    await page.waitForFunction((prev) => parseFloat(document.getElementById("perf-rpm").textContent) !== prev,
+      rpmBefore, { timeout: 8000 });
+    const rpmAfter = parseFloat(await rpmText());
+    check("表针跟着真实流量走 (WAN 字节数涨了, 转速就变)",
+      rpmAfter !== rpmBefore, `${rpmBefore} → ${rpmAfter} rpm`);
+    await page.screenshot({ path: path.join(SHOT_DIR, "router-ui-perf.png") });
+
+    await page.click("#perf-btn");
+    await page.waitForFunction(() => /未开启/.test(document.getElementById("perf-pill").textContent), null, { timeout: 6000 });
+    check("「熄火」把状态切回未开启 (同一个按钮的两个方向)",
+      /未开启/.test(await page.locator("#perf-pill").innerText())
+      && /启动引擎/.test(await page.locator("#perf-btn").innerText()));
 
     // 浏览器自己会请求 /favicon.ico 之类, 那是模拟器的事, 不算页面问题
     const real = errors.filter((e) => !/favicon|404 \(Not Found\)/.test(e));

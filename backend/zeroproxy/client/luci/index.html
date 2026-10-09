@@ -84,6 +84,43 @@ details summary:hover{color:var(--accent)}
 #toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,20px);background:var(--text);color:var(--bg);
        padding:9px 16px;border-radius:999px;font-size:12.5px;opacity:0;pointer-events:none;transition:.24s var(--ease)}
 #toast.on{opacity:1;transform:translate(-50%,0)}
+
+/* ---------------------------------------------------------------- 性能模式 (跑车仪表盘)
+   这台路由器上唯一一个"想让人愿意点一下"的地方 —— 但每一帧动画都必须对应一个**真实**
+   的东西: 转速是这台机器此刻的流量, 进度条是切换到了哪一步, 红灯区是"已经确认流量真的
+   从节点出去了"。花哨不许离开事实。 */
+.perf{--needle:#e11d48;--boost:#22d3ee}
+.perf.live{--needle:#fb2c53}
+#perf-gauge{display:block;width:100%;max-width:330px;margin:2px auto 0;height:auto}
+.pg-track{fill:none;stroke:var(--border);stroke-width:15;stroke-linecap:round}
+.pg-fill{fill:none;stroke:url(#pg-arc);stroke-width:15;stroke-linecap:round;opacity:.9}
+.pg-red{fill:none;stroke:var(--err);stroke-width:4;opacity:.5}
+.pg-tick{stroke:var(--border);stroke-width:2}
+.pg-tick.major{stroke:var(--sub);stroke-width:2.5}
+.pg-tick.lit{stroke:var(--boost);stroke-width:2.5}
+.pg-num{fill:var(--sub);font:600 9px var(--mono)}
+.pg-needle line{stroke:var(--needle);stroke-width:3.4;stroke-linecap:round}
+.pg-needle circle{fill:var(--needle)}
+.perf.idle .pg-needle line,.perf.idle .pg-needle circle{opacity:.5}
+.perf.idle .pg-needle line{stroke:var(--sub)}
+.perf.idle .pg-needle circle{fill:var(--sub)}
+.perf.booting .pg-needle{filter:drop-shadow(0 0 7px color-mix(in srgb,var(--needle) 65%,transparent))}
+.pg-read{fill:var(--text);font:700 21px var(--mono);letter-spacing:-.5px}
+.pg-unit{fill:var(--sub);font:600 8.5px var(--mono)}
+.gauge-cap{text-align:center;font-size:12.5px;font-weight:600;margin-top:-4px;min-height:18px}
+.segs{display:flex;gap:6px;margin:12px auto 0;max-width:330px}
+.segs i{flex:1;height:4px;border-radius:2px;background:var(--border);transition:background .3s var(--ease),box-shadow .3s var(--ease)}
+.segs i.on{background:var(--boost);box-shadow:0 0 9px color-mix(in srgb,var(--boost) 55%,transparent)}
+.segs i.bad{background:var(--err);box-shadow:none}
+.perf-btn.firing{animation:pg-crank .4s var(--ease)}
+.perf-btn.done{animation:pg-boost .55s var(--ease)}
+@keyframes pg-crank{0%{transform:scale(1)}35%{transform:scale(.94)}70%{transform:scale(1.03)}100%{transform:scale(1)}}
+@keyframes pg-boost{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--boost) 55%,transparent)}
+                    100%{box-shadow:0 0 0 16px color-mix(in srgb,var(--boost) 0%,transparent)}}
+@media (prefers-reduced-motion:reduce){
+  .perf-btn.firing,.perf-btn.done{animation:none}
+  .pg-needle{transition:transform .18s linear}
+}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 
 /* ---- 更新进度 ---- *
@@ -173,6 +210,40 @@ body.zp-leaving{opacity:0;pointer-events:none}
     </div>
   </div>
 
+  <div class="card perf idle" id="perf-card">
+    <div class="tile">
+      <h2>性能模式</h2>
+      <span class="grow"></span>
+      <span class="pill off" id="perf-pill"><span class="dot"></span>未开启</span>
+    </div>
+    <svg id="perf-gauge" viewBox="0 0 260 172" role="img" aria-label="性能模式转速表">
+      <defs>
+        <linearGradient id="pg-arc" x1="0" y1="1" x2="1" y2="0">
+          <stop offset="0" stop-color="#38bdf8"/>
+          <stop offset=".5" stop-color="#22d3ee"/>
+          <stop offset="1" stop-color="#a3e635"/>
+        </linearGradient>
+      </defs>
+      <path class="pg-track" d="M30 130 A100 100 0 0 1 230 130"/>
+      <path class="pg-red" d="M213.2 74.4 A100 100 0 0 1 230 130"/>
+      <path class="pg-fill" id="perf-arc" d="M30 130 A100 100 0 0 1 230 130"
+            style="stroke-dasharray:314.2;stroke-dashoffset:314.2"/>
+      <g id="perf-ticks"></g>
+      <g class="pg-needle" id="perf-needle">
+        <line x1="130" y1="130" x2="231" y2="130"/>
+        <circle cx="130" cy="130" r="5.5"/>
+      </g>
+      <text class="pg-read" id="perf-rpm" x="130" y="104" text-anchor="middle">0</text>
+      <text class="pg-unit" x="130" y="115" text-anchor="middle">RPM ×1000</text>
+    </svg>
+    <div class="gauge-cap" id="perf-cap">正在读取…</div>
+    <div class="segs" id="perf-segs"><i></i><i></i><i></i><i></i><i></i></div>
+    <div class="row" style="margin-top:12px;align-items:center">
+      <button class="btn primary perf-btn" id="perf-btn">启动引擎</button>
+      <div class="fs-xs muted" id="perf-sub" style="flex:1;min-width:180px"></div>
+    </div>
+  </div>
+
   <div class="card">
     <div class="tile"><h2>服务器</h2><span class="grow"></span>
       <button class="btn small" id="update" title="从面板拉最新客户端并重跑一次安装 (后台进行, 约一分钟; 配置与凭据保留)">更新客户端</button>
@@ -222,6 +293,8 @@ body.zp-leaving{opacity:0;pointer-events:none}
 </div>
 <div id="toast"></div>
 <!-- 走 cgi 取脚本: nginx+fcgiwrap 的固件上静态目录不一定在浏览器能到的地方 -->
+<!-- perf.js 必须排在 app.js 前面: app.js 一加载就会画一次状态, 而那张表的绘制在 perf.js 里 -->
+<script src="/cgi-bin/zeroproxy?file=perf.js"></script>
 <script src="/cgi-bin/zeroproxy?file=app.js"></script>
 </body>
 </html>

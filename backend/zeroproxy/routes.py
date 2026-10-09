@@ -41,6 +41,7 @@ from . import (
     chain_quic,
     config,
     crypto,
+    dae_config,
     devices,
     geodata,
     router_client,
@@ -2918,6 +2919,107 @@ def client_install_script_pinned(request: Request):
         body,
         media_type="text/x-shellscript; charset=utf-8",
         headers={"cache-control": "no-store"},
+    )
+
+
+@router.get("/c/perf/config")
+def client_perf_config(request: Request, id: str = "", k: str = "", lan: str = "",
+                       tpl: str = "", geo: int = 1):
+    """设备专属的 **dae 配置** (性能模式的数据面)。
+
+    为什么由面板渲染: dae 的配置语言与 mihomo 的 YAML 没有对应关系 (见 dae_config), 而
+    节点集合、分流模板、面板直连这些事实都在面板手里 —— 设备只负责把它落盘。
+
+    `lan` 是设备报上来的局域网接口: dae 不会自己猜局域网口 (只有 wan 能 auto), 猜错就等于
+    没接管。`geo=0` 是设备侧"我还没拿到分流数据": 那时不给任何引用 geoip/geosite 的规则
+    (dae 读不到数据文件不是"跳过规则", 而是起不来)。
+    """
+    with config.locked():
+        state = load_state()
+        if not state["configured"]:
+            return _err("面板尚未初始化", 409)
+        device = devices.find(state, id)
+        if not devices.check_secret(device, k):
+            return _err("设备凭据无效", 403)
+        # 接口名只允许 [A-Za-z0-9._-]: 它会原样进配置文件, 不接受任何别的字符。
+        ifaces = ",".join(
+            part for part in (chunk.strip() for chunk in (lan or "").split(","))
+            if part and all(ch.isalnum() or ch in "._-" for ch in part)
+        )[:120]
+        body, skipped = dae_config.render(
+            state,
+            share_links.panel_base_url(request, state),
+            lan_interface=ifaces or "br-lan",
+            template=(tpl or "").strip().lower() or None,
+            geo=bool(geo),
+        )
+        if devices.touch(state, device, {"ip": _client_ip(request)}):
+            save_state(state)
+    if skipped:
+        # 如实写进配置头部 (dae 忽略注释, 但人看得见) —— 少一个节点这件事不该只活在代码里
+        body = "\n".join(f"# 跳过: {name}" for name in skipped) + "\n" + body
+    return Response(
+        body,
+        media_type="text/plain; charset=utf-8",
+        headers={"cache-control": "no-store"},
+    )
+
+
+@router.get("/c/perf/geo/{name}")
+def client_perf_geo(name: str, request: Request):
+    """性能模式 (dae) 要的分流数据: v2ray 格式的 geoip.dat / geosite.dat。
+
+    面板本来就为 Xray 下好了这两份 (同一份格式), 这里直接复用 —— 路由器不必再去 GitHub,
+    与内核 / 分流数据库同一条分发思路。名字走白名单 (只有这两个), 内容不含任何凭据。
+    """
+    state = load_state()
+    if not state["configured"]:
+        return _err("面板尚未初始化", 409)
+    if name not in geodata.MIN_BYTES:
+        return _err("没有这个数据文件", 404)
+    if not geodata.present():
+        return _err(
+            f"面板还没有准备好分流数据 ({name})。面板后台会自己更新, 也可以到面板上点一次"
+            "「更新分流数据」后重试 —— 在此之前这台设备会拿到一份不含 geo 规则的降级配置。",
+            503,
+        )
+    return FileResponse(
+        geodata.file_path(name),
+        media_type="application/octet-stream",
+        headers={"cache-control": "no-store"},
+        filename=name,
+    )
+
+
+@router.get("/c/perf/{arch}")
+def client_perf_binary(arch: str, request: Request):
+    """性能模式内核 (dae, .gz)。匿名可达 —— 与 /c/bin 同性质: 一个代理内核, 不含任何凭据。
+
+    与内核那条完全同一个协议: 没缓存就**立刻**回 503 + Retry-After + 一句人话, 同时后台
+    开取 —— 客户端据此打印真实进度, 而不是挂在这里等 (8.41 的规矩)。
+
+    **注册顺序**: 这条只有一个通配段, 必须排在 `/c/perf/config` 与 `/c/perf/geo/{name}`
+    后面 —— 否则 "config" 会被当成架构名 (真跑一次就报"不支持的架构")。
+    """
+    state = load_state()
+    if not state["configured"]:
+        return _err("面板尚未初始化", 409)
+    if arch not in router_client.PERF_ASSET:
+        return _err("不支持的架构", 404)
+    if router_client.perf_ready(arch):
+        path = router_client.perf_cached_file(arch)
+        return FileResponse(
+            path,
+            media_type="application/gzip",
+            headers={"cache-control": "no-store"},
+            filename=os.path.basename(path),
+        )
+    router_client.ensure_perf_async(arch)
+    return Response(
+        router_client.perf_pending_text(arch) + "\n",
+        status_code=503,
+        media_type="text/plain; charset=utf-8",
+        headers={"retry-after": "5", "cache-control": "no-store"},
     )
 
 

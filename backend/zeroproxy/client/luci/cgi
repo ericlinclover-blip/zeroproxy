@@ -81,11 +81,14 @@ fi
 # 直接 403), 而 /cgi-bin/ 一定通 (LuCI 自己就走这条路)。
 # 页面代码不含任何机密, 所以这一段不需要登录。
 want="$(printf '%s' "$QS" | tr '&' '\n' | sed -n 's/^file=//p' | head -n1)"
-if [ "$want" = "app.js" ]; then
-    printf 'Content-Type: text/javascript; charset=utf-8\r\nCache-Control: no-store\r\n\r\n'
-    cat "$PAGE_DIR/app.js" 2>/dev/null
-    exit 0
-fi
+# 白名单: 只有这两个脚本名 (perf.js 是那块性能模式表盘)。写死而不是拼路径 —— 这个
+# 端点不需要授权就能访问, 拼路径等于开一个任意文件读取。
+case "$want" in
+    app.js|perf.js)
+        printf 'Content-Type: text/javascript; charset=utf-8\r\nCache-Control: no-store\r\n\r\n'
+        cat "$PAGE_DIR/$want" 2>/dev/null
+        exit 0 ;;
+esac
 act="$(printf '%s' "$QS" | tr '&' '\n' | sed -n 's/^a=//p' | head -n1)"
 if [ -z "$act" ] && [ -z "$want" ]; then
     printf 'Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n\r\n'
@@ -144,11 +147,15 @@ case "$action" in
         # 固件上存在但内核建不出设备 (真机: 原厂 5.4.281), 那时报 TUN 就是骗人。
         # covered 是"到底接管到哪": 只接管了局域网 TCP 就不能显示成全屋。
         mode="none"
-        if ip link show zp-tun >/dev/null 2>&1; then mode="tun"
+        # 性能模式 (eBPF / dae) 排第一: 它开着的时候 mihomo 是停的, tun 那条判断根本不会命中,
+        # 但顺序上先说清楚——"谁在接管"是这一屏最该回答的问题。
+        if [ -n "$(pidof dae 2>/dev/null)" ]; then mode="ebpf"
+        elif ip link show zp-tun >/dev/null 2>&1; then mode="tun"
         elif nft list table inet zp_router >/dev/null 2>&1; then mode="tproxy"
         elif iptables -t nat -L zp_router >/dev/null 2>&1; then mode="redirect"
         fi
         covered="none"
+        [ "$mode" = "ebpf" ] && covered="full"
         [ "$mode" = "tun" ] && covered="full"
         [ "$mode" = "tproxy" ] && covered="lan"
         [ "$mode" = "redirect" ] && covered="lan_tcp"
@@ -156,6 +163,28 @@ case "$action" in
         why="$(sed -n 's/^why.tun=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
         # IPv6 能不能一并接管: 接不了要显示出来 (局域网设备的 v6 会直接出去)
         ipv6="$(sed -n 's/^ipv6=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+        # 性能模式那几张牌: 能不能开 (cap) / 现在开着吗 (state + 现场 live) / 为什么开不了 /
+        # 出口 IP / 正在切换时的最后几行进度。界面上的仪表盘就是照这几个值画的。
+        perf_cap="$(sed -n 's/^perf_cap=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+        perf_state="$(sed -n '1p' "$ZP_DIR/perf/state" 2>/dev/null | tr -d '\r\n')"
+        perf_why="$(sed -n '1p' "$ZP_DIR/perf/why" 2>/dev/null | tr -d '\r\n')"
+        perf_exit="$(sed -n '1p' "$ZP_DIR/perf/exit_ip" 2>/dev/null | tr -d '\r\n')"
+        # "正在切" = 说好在切 (state=on) 而 dae 还没起来, 或者进度文件里还没有终态。
+        # 界面据此把"进入中"那段动画放下去, 而不是干等。
+        perf_busy="0"
+        if [ -f "$ZP_DIR/perf/progress" ] && ! grep -q '^DONE=' "$ZP_DIR/perf/progress" 2>/dev/null; then
+            perf_busy="1"
+        fi
+        perf_prog="$(tail -n 3 "$ZP_DIR/perf/progress" 2>/dev/null | tr '\n' '|')"
+        # WAN 口的收+发字节数: 表盘上那根针的转速就是它算出来的 —— 真流量才有转速,
+        # 拿不到就退回 0 (表针贴怠速), 绝不假装在动。
+        wan=0
+        _wdev="$(ip route show default 2>/dev/null | awk 'NR==1{print $5}' | head -n1)"
+        if [ -n "$_wdev" ] && [ -r "/sys/class/net/$_wdev/statistics/rx_bytes" ]; then
+            _rx="$(cat "/sys/class/net/$_wdev/statistics/rx_bytes" 2>/dev/null || echo 0)"
+            _tx="$(cat "/sys/class/net/$_wdev/statistics/tx_bytes" 2>/dev/null || echo 0)"
+            wan=$(( ${_rx:-0} + ${_tx:-0} ))
+        fi
         ver=""
         [ -f "$ZP_DIR/version" ] && ver="$(cat "$ZP_DIR/version" 2>/dev/null)"
         items=""
@@ -167,8 +196,11 @@ case "$action" in
             items="${items:+$items,}{\"key\":\"$(jval_s "$key")\",\"base\":\"$(jval_s "$base")\",\"id\":\"$(jval_s "$did")\"}"
         done
         header
-        printf '{"ok":true,"core":"%s","mode":"%s","covered":"%s","why":"%s","ipv6":"%s","client":"%s","servers":[%s]}\n' \
-            "$core" "$mode" "$covered" "$(jstr "$why")" "$ipv6" "$(jval_s "$ver")" "$items"
+        printf '{"ok":true,"core":"%s","mode":"%s","covered":"%s","why":"%s","ipv6":"%s","client":"%s","wan":"%s","servers":[%s],' \
+            "$core" "$mode" "$covered" "$(jstr "$why")" "$ipv6" "$(jval_s "$ver")" "$wan" "$items"
+        printf '"perf":{"cap":"%s","state":"%s","why":"%s","exit_ip":"%s","busy":"%s","progress":"%s"}}\n' \
+            "$perf_cap" "$perf_state" "$(jstr "$perf_why")" "$(jval_s "$perf_exit")" \
+            "$perf_busy" "$(jstr "$perf_prog")"
         ;;
     add)
         url="$(jval url)"
@@ -186,6 +218,11 @@ case "$action" in
         ;;
     refresh)
         run_cli refresh
+        ;;
+    perf-on|perf-off)
+        # 界面上的那个开关 (跑车仪表盘) 走这里。CLI 自己判断有没有 TTY: 这里没有, 所以它会
+        # 后台跑、把进度写进 perf/progress, 界面轮询 status 就能画出"进入中"的动画。
+        run_cli perf "${action#perf-}"
         ;;
     update|update-log)
         # 页面上的「更新客户端」按钮走这里 —— LuCI 菜单那个页面是用 cgi 发的 (端口 80),

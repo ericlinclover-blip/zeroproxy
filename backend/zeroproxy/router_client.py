@@ -89,7 +89,10 @@ from .config import paths
 #:         装上后按 cilium/ebpf 与 libbpf 的那张候选表**验证真的就位**才算数。
 #:         只在"内核 >=5.17 且系列在 6.6 / 6.12 内"时才动手 (不然白占闪存);
 #:         补不上就说清哪一种原因, 以及它只影响未来的性能档 (8.77)。
-SCRIPT_VERSION = "1.4.25"
+#: 1.4.26: **性能模式真的能开**: 数据面换给 dae (eBPF 内核态分流), 与 tun / tproxy 互斥;
+#:         进去前 `dae validate` 校验、进去后探针验出口、任何一步失败都退回原来的模式,
+#:         另有一只看门狗盯着"dae 还在不在"。本机界面上那块跑车仪表盘就是它的入口 (8.78)。
+SCRIPT_VERSION = "1.4.26"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"
@@ -1045,8 +1048,290 @@ def btf_fetch(kver: str, arch: str, ext: str, *, deadline: float | None = None) 
     return False, "; ".join(errors)[-300:], ""
 
 
-# ---------------------------------------------------------------- 安装脚本
+# ---------------------------------------------------------------- 性能模式内核 (dae)
+# 性能模式 (L0) 用 dae 做数据面: eBPF 在内核里分流, 直连流量真旁路, 不走用户态。
+# 它的前提是内核 >=5.17 + BTF (缺 BTF 时客户端会自己补, 见 README 8.77), 所以面板这一侧
+# 只负责**把 dae 发下去** —— 与 mihomo 内核完全同一套: 面板去上游取、缓存好, 路由器只访问
+# 面板一个地址 (装机时它还没有任何代理可用)。
+#
+# 上游发布的是 `dae-linux-<arch>.tar.xz` (里面是 dae 二进制 + 它的示例配置)。**面板负责
+# 解包并重新压成 .gz** —— 因为路由器那边只有 busybox: gzip 一定有, 而 xz / unzip 不保证
+# (mihomo 内核走的就是 .gz 那条路, 客户端一个字节都不用改)。
+PERF_VERSION = os.environ.get("ZP_PERF_VERSION", "v2.1.1")
 
+#: 我们的架构键 → 上游资产名。dae 的命名与 mihomo 不同 (x86_64 / mips32 / mips32le …)。
+PERF_ASSET: dict[str, str] = {
+    "arm64": "dae-linux-arm64.tar.xz",
+    "armv6": "dae-linux-armv6.tar.xz",
+    "armv7": "dae-linux-armv7.tar.xz",
+    "amd64": "dae-linux-x86_64.tar.xz",
+    "mips": "dae-linux-mips32.tar.xz",
+    "mipsle": "dae-linux-mips32le.tar.xz",
+    "mips64": "dae-linux-mips64.tar.xz",
+    "mips64le": "dae-linux-mips64le.tar.xz",
+}
+
+#: 解出来的 dae 二进制至少这么大 (真实的约 25-30 MB)。挡"上游给了一层错误页"这类事故。
+PERF_MIN_BYTES = int(os.environ.get("ZP_PERF_MIN_BYTES", str(6 << 20)))
+#: 一次取 dae 的总时限。它比内核小 (10 MB 的 tar.xz), 但同样是"有上限的等待"。
+PERF_DEADLINE = int(os.environ.get("ZP_PERF_DEADLINE", "300"))
+PERF_SOURCE_TIMEOUT = int(os.environ.get("ZP_PERF_SOURCE_TIMEOUT", "60"))
+PERF_DIRECT_BUDGET = int(os.environ.get("ZP_PERF_DIRECT_BUDGET", "25"))
+
+PERF_LOCK = threading.Lock()
+PERF_STATE: dict[str, dict] = {}
+PERF_RETRY_AFTER = int(os.environ.get("ZP_PERF_RETRY_AFTER", "20"))
+
+
+def perf_dir() -> str:
+    return os.path.join(paths()["data_dir"], "client", "perf")
+
+
+def perf_file(arch: str) -> str:
+    return os.path.join(perf_dir(), f"dae-{arch}-{PERF_VERSION}.gz")
+
+
+def perf_ready(arch: str) -> bool:
+    """缓存里有没有一份能用的 dae (.gz)。
+
+    手工放进去的也算 (运维在面板取不到上游时的兜底): 只要文件名里带 `dae` 与这个架构,
+    体积过关就用它 —— 与内核那个"手动放压缩包"的兜底同款。
+    """
+    path = perf_file(arch)
+    try:
+        if os.path.getsize(path) >= (PERF_MIN_BYTES // 4):
+            return True
+    except OSError:
+        pass
+    try:
+        names = os.listdir(perf_dir())
+    except OSError:
+        return False
+    for name in names:
+        if not name.endswith(".gz") or "dae" not in name or arch not in name:
+            continue
+        try:
+            if os.path.getsize(os.path.join(perf_dir(), name)) >= (PERF_MIN_BYTES // 4):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def perf_cached_file(arch: str) -> str:
+    """返回实际要发出去的那一份 (优先精确版本号那个文件名)。"""
+    path = perf_file(arch)
+    if os.path.exists(path):
+        return path
+    try:
+        names = sorted(os.listdir(perf_dir()))
+    except OSError:
+        return path
+    for name in names:
+        if name.endswith(".gz") and "dae" in name and arch in name:
+            return os.path.join(perf_dir(), name)
+    return path
+
+
+def perf_asset_url(arch: str) -> str:
+    name = PERF_ASSET.get(arch)
+    if not name:
+        raise ValueError(f"不支持的架构: {arch}")
+    return f"https://github.com/daeuniverse/dae/releases/download/{PERF_VERSION}/{name}"
+
+
+def cached_perf() -> list[dict]:
+    return [
+        {"arch": arch, "label": ARCH_LABEL.get(arch, arch), "size": os.path.getsize(perf_cached_file(arch))}
+        for arch in PERF_ASSET
+        if perf_ready(arch)
+    ]
+
+
+def _extract_dae(archive_path: str, dest_bin: str) -> tuple[bool, str]:
+    """从上游的 tar.xz 里取出 dae 二进制。
+
+    上游的目录结构**不是**契约 (它自己也可能改), 所以按"文件名正好是 dae 的优先, 否则取
+    最大的那个文件"来找, 并且最后只认 ELF —— 取错文件在这里挡住, 总比发到路由器上
+    "chmod +x 后一执行就报 Exec format error"要好 (真机上学过一次)。
+    """
+    import tarfile
+
+    member = None
+    try:
+        with tarfile.open(archive_path, "r:xz") as tf:
+            for item in tf:
+                if not item.isfile():
+                    continue
+                if os.path.basename(item.name) == "dae":
+                    member = item
+                    break
+                if member is None or item.size > member.size:
+                    member = item
+            if member is None:
+                return False, "压缩包里没有文件"
+            handle = tf.extractfile(member)
+            if handle is None:
+                return False, f"读不到压缩包里的 {member.name}"
+            with open(dest_bin, "wb") as fh:
+                while True:
+                    chunk = handle.read(1 << 20)
+                    if not chunk:
+                        break
+                    fh.write(chunk)
+    except (tarfile.TarError, OSError, EOFError) as exc:
+        return False, f"解包失败: {exc}"
+    size = os.path.getsize(dest_bin)
+    if size < PERF_MIN_BYTES:
+        return False, f"解出来的文件只有 {size // 1024} KB (不像 dae)"
+    with open(dest_bin, "rb") as fh:
+        if fh.read(4) != b"\x7fELF":
+            return False, "解出来的不是 ELF 可执行文件"
+    return True, f"{os.path.basename(member.name)} · {size // 1024 // 1024} MB"
+
+
+def fetch_perf(arch: str, *, deadline: float | None = None) -> tuple[bool, str, str]:
+    """取 dae: 上游 tar.xz → 解出二进制 → 压成 .gz 落盘。返回 (ok, 说明, 路径)。"""
+    if arch not in PERF_ASSET:
+        return False, f"不支持的架构: {arch}", ""
+    dst = perf_file(arch)
+    if perf_ready(arch):
+        return True, "已缓存", perf_cached_file(arch)
+
+    if deadline is None:
+        deadline = time.time() + PERF_DEADLINE
+    os.makedirs(perf_dir(), exist_ok=True)
+    tar_path = dst + ".tar.xz"
+    bin_path = dst + ".bin"
+    url = perf_asset_url(arch)
+    errors: list[str] = []
+    try:
+        downloaded = False
+        for template in MIRRORS:
+            left = deadline - time.time()
+            if left <= 2:
+                errors.append(f"总时间超限 ({PERF_DEADLINE}s)")
+                break
+            source = template.format(url=url)
+            tmp = tar_path + ".part"
+            try:
+                request = urllib.request.Request(source, headers={"User-Agent": UA})
+                with urllib.request.urlopen(request, timeout=_budget_for(template, left, PERF_SOURCE_TIMEOUT)) as resp:
+                    status = getattr(resp, "status", 200)
+                    if status is not None and status != 200:
+                        errors.append(f"{source} HTTP {status}")
+                        continue
+                    size = 0
+                    with open(tmp, "wb") as fh:
+                        while True:
+                            if time.time() > deadline:
+                                raise TimeoutError(f"总时间超限 ({PERF_DEADLINE}s)")
+                            chunk = resp.read(1 << 18)
+                            if not chunk:
+                                break
+                            fh.write(chunk)
+                            size += len(chunk)
+                if size < (PERF_MIN_BYTES // 2):
+                    errors.append(f"{source} 体积异常 ({size} 字节)")
+                    continue
+                os.replace(tmp, tar_path)
+                downloaded = True
+                break
+            except (urllib.error.URLError, OSError, TimeoutError) as exc:
+                errors.append(f"{source} {exc}")
+            finally:
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+        if not downloaded:
+            return False, "; ".join(errors)[-300:], ""
+
+        ok, detail = _extract_dae(tar_path, bin_path)
+        if not ok:
+            return False, detail, ""
+        # 重新压成 .gz: 路由器上只有 busybox, gzip 一定有而 xz 不保证。
+        import gzip
+
+        with open(bin_path, "rb") as src, gzip.open(dst, "wb") as out:
+            while True:
+                chunk = src.read(1 << 20)
+                if not chunk:
+                    break
+                out.write(chunk)
+        return True, f"已就绪 ({detail})", dst
+    finally:
+        for leftover in (tar_path, bin_path):
+            if os.path.exists(leftover):
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
+
+
+def perf_state(arch: str) -> dict:
+    if perf_ready(arch):
+        try:
+            size = os.path.getsize(perf_cached_file(arch))
+        except OSError:
+            size = 0
+        return {"arch": arch, "state": "ready", "detail": "面板已缓存", "bytes": size, "error": ""}
+    entry = PERF_STATE.get(arch) or {}
+    return {
+        "arch": arch,
+        "state": entry.get("state") or "missing",
+        "detail": entry.get("detail") or "",
+        "bytes": int(entry.get("bytes") or 0),
+        "error": entry.get("error") or "",
+    }
+
+
+def perf_pending_text(arch: str) -> str:
+    st = perf_state(arch)
+    if st["state"] == "error":
+        return f"面板取性能模式内核失败: {st['error'] or st['detail']}"
+    if st["state"] == "downloading":
+        return (
+            f"面板正在准备 {arch} 的性能模式内核 (dae {PERF_VERSION}, 首次要从上游取约 10 MB)。"
+            f"这不是错误 —— 稍后会自动重试。"
+        )
+    return "面板正在准备性能模式内核, 稍后会自动重试。"
+
+
+def ensure_perf_async(arch: str) -> dict:
+    """确保有一份 dae 正在取, **不阻塞**调用方 (与内核那条路同一个理由)。"""
+    if arch not in PERF_ASSET:
+        return {"arch": arch, "state": "unknown", "detail": f"不支持的架构: {arch}",
+                "bytes": 0, "error": f"不支持的架构: {arch}"}
+    if perf_ready(arch):
+        return perf_state(arch)
+    with PERF_LOCK:
+        entry = PERF_STATE.setdefault(arch, {})
+        if entry.get("state") == "downloading":
+            return perf_state(arch)
+        if entry.get("state") == "error" and time.time() - float(entry.get("done") or 0) < PERF_RETRY_AFTER:
+            return perf_state(arch)
+        entry.update({"state": "downloading", "detail": "正在从上游下载", "bytes": 0,
+                      "error": "", "started": int(time.time()), "done": 0})
+    threading.Thread(target=_prefetch_perf, args=(arch,), daemon=True, name=f"zp-perf-{arch}").start()
+    return perf_state(arch)
+
+
+def _prefetch_perf(arch: str) -> None:
+    try:
+        ok, detail, _path = fetch_perf(arch)
+    except Exception as exc:  # 后台线程不能死得无声无息
+        ok, detail = False, f"取性能模式内核时出错了: {exc}"
+    with PERF_LOCK:
+        entry = PERF_STATE.setdefault(arch, {})
+        entry["state"] = "ready" if ok else "error"
+        entry["detail"] = detail
+        entry["error"] = "" if ok else detail
+        entry["done"] = int(time.time())
+
+
+# ---------------------------------------------------------------- 安装脚本
 def script_path() -> str:
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "client", "router-install.sh")
 
@@ -1057,6 +1342,9 @@ def script_path() -> str:
 UI_FILES: dict[str, tuple[str, str]] = {
     "index.html": ("index.html", "text/html; charset=utf-8"),
     "app.js": ("app.js", "text/javascript; charset=utf-8"),
+    # 性能模式那块仪表盘 (跑车表盘 + 进入动画)。单独一个文件: 那是一整段独立的动画与
+    # 状态机, 塞进 app.js 只会让两个都难读。
+    "perf.js": ("perf.js", "text/javascript; charset=utf-8"),
     "cgi": ("cgi", "text/plain; charset=utf-8"),
     "menu.json": ("menu.json", "application/json; charset=utf-8"),
     "acl.json": ("acl.json", "application/json; charset=utf-8"),
@@ -1130,7 +1418,12 @@ def summary() -> dict:
 # 与内核唯一的区别: zpcore 是我们自己的东西, 没有上游可下载, 所以产物跟着**仓库**走
 # (scripts/build-agent.sh 生成到 client/agent/dist/), 不是 data/ 缓存。它是可选件 ——
 # 面板没准备某一档时, 那台路由器自动退回原来的界面路径, 装机不会失败。
-AGENT_VERSION = os.environ.get("ZP_AGENT_VERSION", "1.2.1")
+#: 本地控制面 (zpcore) 的版本。**改了 agent/ 下的 Go 就必须抬它** (并重跑
+#: scripts/build-agent.sh 把 dist/ 里的制品换掉): 面板按版本号挑文件, 不换版本的话
+#: 路由器会一直拿到旧二进制, 而"界面少了一块表盘 / 少一种模式"这种问题在真机上极难看出来。
+#: 1.2.2: 认性能模式 (dae) 这一档 —— mode=ebpf / covered=full, status 多一组 perf 字段
+#:        与 WAN 字节数, 并多分发一个 perf.js (那块跑车仪表盘)。
+AGENT_VERSION = os.environ.get("ZP_AGENT_VERSION", "1.2.2")
 
 #: 小于这个大小的一律不当二进制 (一份正常的 zpcore.gz 约 2.5 MB)。演练里可以用
 #: ZP_AGENT_MIN_BYTES 调低。

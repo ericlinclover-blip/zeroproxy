@@ -34,8 +34,26 @@ type statusResp struct {
 	//: 数据面上真的过了多少包。规则在但 0 包 = 没人被接管 (多半是接口名不对),
 	//: 这个数字是界面上唯一能一眼看出来的"真的接管了"的证据。
 	Packets int           `json:"packets"`
+	//: WAN 口的收+发字节数。界面那块性能模式表盘的转速就是它算出来的 (真流量才有转速)。
+	//: 与原 cgi 同一个字段名, 老页面拿到它也不会用坏 (它只读自己认识的键)。
+	WAN     int64         `json:"wan"`
 	Client  string        `json:"client"`
+	//: 性能模式 (内核态 eBPF / dae) 那几个值 —— 表盘按它们画。与原 cgi 逐字段一致。
+	Perf    perfResp      `json:"perf"`
 	Servers []serverEntry `json:"servers"`
+}
+
+// perfResp 是性能模式那几张牌。字段名与 cgi 里那一份**必须一样** (两个入口, 一套语义):
+// cap=能不能开 / state=意图 / live=现场 / why=上一次的结论 / exit_ip=验证过的出口 /
+// busy=正在切换 / progress=切换到了哪一步 (CLI 写下的原话)。
+type perfResp struct {
+	Cap      string `json:"cap"`
+	State    string `json:"state"`
+	Live     string `json:"live"`
+	Why      string `json:"why"`
+	ExitIP   string `json:"exit_ip"`
+	Busy     string `json:"busy"`
+	Progress string `json:"progress"`
 }
 
 type simpleResp struct {
@@ -53,6 +71,8 @@ const maxBody = 64 << 10
 var staticFiles = map[string]string{
 	"index.html": "text/html; charset=utf-8",
 	"app.js":     "text/javascript; charset=utf-8",
+	// 性能模式那块表盘 (仪表盘 + 动画)。与 app.js 同一条分发路径: 面板下发、路由器只落盘。
+	"perf.js": "text/javascript; charset=utf-8",
 }
 
 func serve(cfg serveConfig) error {
@@ -85,12 +105,15 @@ func route(w http.ResponseWriter, r *http.Request, cfg serveConfig) {
 		serveStatic(w, cfg, "index.html")
 	case "/app.js":
 		serveStatic(w, cfg, "app.js")
+	case "/perf.js":
+		serveStatic(w, cfg, "perf.js")
 	case "/cgi-bin/zeroproxy":
 		// 页面与脚本本身**不需要授权** (代码里不含任何机密, 授权只在数据接口上),
 		// 这与原来的 cgi 完全一致 —— 否则用户第一眼看到的是浏览器弹的登录框。
 		query := r.URL.Query()
-		if query.Get("file") == "app.js" {
-			serveStatic(w, cfg, "app.js")
+		// 脚本名走白名单 (与原 cgi 一致): 这个分支不需要授权, 拼路径等于开任意文件读取。
+		if want := query.Get("file"); want == "app.js" || want == "perf.js" {
+			serveStatic(w, cfg, want)
 			return
 		}
 		action := query.Get("a")
@@ -209,7 +232,9 @@ func handleAction(w http.ResponseWriter, r *http.Request, cfg serveConfig, actio
 		}
 		writeJSON(w, http.StatusOK, simpleResp{OK: true, Log: tailLines(out, 60)})
 	// update / update-log 也走 CLI: 一处实现、两个入口 (SSH 与网页)。
-	case "add", "drop", "toggle", "refresh", "update", "update-log":
+	// perf-on / perf-off 是页面上那块性能模式表盘的两个动作 —— 同样转发给 CLI (切数据面
+	// 的规矩全在 perf.sh 里: 校验配置 → 换 → 验证出口 → 失败退回)。
+	case "add", "drop", "toggle", "refresh", "update", "update-log", "perf-on", "perf-off":
 		payload, err := readBody(r)
 		if err != nil {
 			writeJSON(w, http.StatusBadRequest, simpleResp{Error: err.Error()})
@@ -272,6 +297,12 @@ func cliArgs(action string, payload map[string]any) ([]string, error) {
 		return []string{"update"}, nil
 	case "update-log":
 		return []string{"update-log"}, nil
+	// 表盘上的那个按钮: 进 = perf on, 出 = perf off。CLI 里没有 TTY 时会**后台跑**并把
+	// 进度写进 perf/progress, 界面轮询状态就能把"进入中"那段动画一气画完。
+	case "perf-on":
+		return []string{"perf", "on"}, nil
+	case "perf-off":
+		return []string{"perf", "off"}, nil
 	}
 	return nil, fmt.Errorf("未知操作")
 }
@@ -305,8 +336,43 @@ func currentStatus(cfg serveConfig) statusResp {
 		// IPv6 是泄漏面: 探不到就必须显示出来 (目标网站会看到真实的 v6 地址)
 		IPv6:    caps["ipv6"],
 		Packets: datapathPackets(mode),
+		WAN:     wanBytes(),
 		Client:  readTrimmed(filepath.Join(cfg.dir, "version")),
+		Perf:    currentPerf(cfg),
 		Servers: readServers(cfg.dir),
+	}
+}
+
+// currentPerf 把性能模式的状态汇总成界面上那几张牌。
+//
+// "正在切换"的判据: 进度文件存在且还没有终态行 (DONE=…)。CLI 是这么写的 (见安装在
+// perf.sh 里的 zp_perf_enter), 这里只是把它读出来 —— 前端不猜, 后端也不编。
+func currentPerf(cfg serveConfig) perfResp {
+	progress := perfFile(cfg.dir, "progress")
+	busy := "0"
+	if progress != "" && !strings.Contains(progress, "DONE=") {
+		busy = "1"
+	}
+	live := "0"
+	if daeRunning() {
+		live = "1"
+	}
+	caps := readCaps(cfg.dir)
+	// 进度只取最后几行: 界面上的标题栏放不下整份日志, 而且前面那几行是"取内核"的旧闻。
+	tail := progress
+	if lines := strings.Split(progress, "\n"); len(lines) > 3 {
+		tail = strings.Join(lines[len(lines)-3:], "|")
+	} else {
+		tail = strings.ReplaceAll(progress, "\n", "|")
+	}
+	return perfResp{
+		Cap:      caps["perf_cap"],
+		State:    perfFile(cfg.dir, "state"),
+		Live:     live,
+		Why:      perfFile(cfg.dir, "why"),
+		ExitIP:   perfFile(cfg.dir, "exit_ip"),
+		Busy:     busy,
+		Progress: tail,
 	}
 }
 

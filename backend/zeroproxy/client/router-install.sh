@@ -24,6 +24,8 @@ ZP_DEV="$ZP_DIR/device.json"
 ZP_BIN="$ZP_DIR/mihomo"
 ZP_INIT=/etc/init.d/zeroproxy
 ZP_AGENT_INIT=/etc/init.d/zeroproxy-agent
+#: 性能模式内核 (dae) 自己的服务 —— 与 mihomo 分成两个服务, 因为两者互斥 (见 perf.sh)
+ZP_PERF_INIT=/etc/init.d/zeroproxy-perf
 # 固件自己的 Web 服务发不出页面时用的兜底 httpd (见 install_ui)
 ZP_INIT_UI=/etc/init.d/zeroproxy-ui
 ZP_CLI=/usr/bin/zeroproxy
@@ -58,6 +60,9 @@ PKG_MGR_NOTE=""
 #: 有现场证据, 而不是只留一句"缺 kmod-tun"让人去猜。
 DEPS_WHY=""
 DEPS_FAILED=""
+#: 性能模式 (eBPF / dae): cap=能不能进 (装机时探的), why=不能进的原因
+PERF_CAP=""
+PERF_WHY=""
 # 面板是否提供分流数据库接口 (/c/geo)。空 = 没问过 (更新模式), true = 有
 PANEL_GEO=""
 # 面板给来的分流数据库元信息 (core_read_panel 填): 体积下限与全部可用地址。
@@ -1080,6 +1085,39 @@ ebpf_ok() {
 
 btf_ok() { [ -n "$(btf_find)" ]; }
 
+# ---------------------------------------------------------------- 性能模式 (eBPF / dae)
+# L0 那一档: 数据面交给 dae, eBPF 在内核里分流, 直连流量**真旁路** (不过用户态)。
+# 它与 tun / tproxy 是**互斥**的 —— 两套都在抢同一批流量, 所以它是一个"能进能出"的开关,
+# 而不是叠在现有数据面上的一层 (进去 = 停 mihomo, 出来 = 起 mihomo)。
+#
+# 只在真的能进时才让按钮可点 (界面据此显示"能"或"为什么不能"):
+#   * 内核 >=5.17 且带 BTF —— 正是 ebpf_ok 在判的事 (BTF 缺了会自动补, 见 btf_ensure);
+#   * ZP_PERF=0 可以整个关掉这一档 (给"我就想用 tun"的人一个开关)。
+# 取 dae 与它的配置是**点按钮时**才做的事 (不占闪存, 也不用为用不到的人下载 10 MB)。
+perf_cap_probe() {
+    PERF_CAP=0
+    PERF_WHY=""
+    if [ "${ZP_PERF:-1}" = "0" ]; then
+        PERF_WHY="已按 ZP_PERF=0 关闭"
+    elif [ "$NET_EBPF" = "1" ]; then
+        PERF_CAP=1
+    else
+        PERF_WHY="${CAPS_WHY_EBPF:-内核条件不满足}"
+    fi
+}
+
+#: 性能模式现在**是不是在用** (读它自己的状态文件)。注意这是"意图 + 上次结论", 现场由
+#: agent 与本地界面另判 (dae 进程还在不在) —— 与 tun/tproxy 那套 chosen/covered 同一个分工。
+_perf_flag() {
+    if [ "$(sed -n '1p' "$ZP_DIR/perf/state" 2>/dev/null)" = "on" ]; then printf '1'; else printf '0'; fi
+}
+
+#: 为什么进不去 / 为什么退回来了。优先用 perf 自己记下的原话 (那才是现场), 其次用探测结论。
+perf_why_now() {
+    _pw="$(sed -n '1p' "$ZP_DIR/perf/why" 2>/dev/null || true)"
+    if [ -n "$_pw" ]; then printf '%s' "$_pw"; else printf '%s' "${PERF_WHY:-}"; fi
+}
+
 # 内核能不能按 IPv6 目标做 tproxy (nft 的 inet 表天然同时看 v4/v6, 但"支持 v6 的 tproxy"
 # 是内核里的另一件事 —— 老内核上有过只编了 v4 的情况)。探针同样用完就撤。
 nft_v6_ok() {
@@ -1228,6 +1266,11 @@ caps_write() {
         printf 'btf_how=%s\n' "$BTF_HOW"
         printf 'btf_path=%s\n' "$(_oneline "$BTF_PATH")"
         printf 'why.btf=%s\n' "$(_oneline "$BTF_WHY")"
+        # 性能模式 (eBPF / dae): cap=能不能进 (装机时探的), perf=现在是不是在用它,
+        # why=为什么进不去 (或为什么退回来了)。界面上的那个开关读的就是这三个。
+        printf 'perf_cap=%s\n' "${PERF_CAP:-0}"
+        printf 'perf=%s\n' "$(_perf_flag)"
+        printf 'perf_why=%s\n' "$(_oneline "$(perf_why_now)")"
         printf 'tun=%s\n' "$NET_TUN"
         printf 'nft=%s\n' "$NET_NFT"
         printf 'tproxy=%s\n' "$NET_TPROXY"
@@ -1255,6 +1298,9 @@ set_datapath() {
         tun)      DATAPATH="tun"; COVERED="full" ;;
         tproxy)   DATAPATH="tproxy"; COVERED="lan" ;;
         redirect) DATAPATH="redirect"; COVERED="lan_tcp" ;;
+        # 性能模式 (eBPF / dae): 核心里分流, 局域网与路由器自身都接管 —— 覆盖是 full,
+        # 但它**不是 mihomo 的一档** (进去时 mihomo 是停着的, 见 perf.sh)。
+        ebpf)     DATAPATH="ebpf"; COVERED="full" ;;
         *)        DATAPATH="none"; COVERED="none" ;;
     esac
     # IPv6 能力是"选中哪一级"的函数 (tun 天然能覆盖 v6, redirect 要看有没有 ip6tables),
@@ -1266,7 +1312,10 @@ set_datapath() {
 # 从已探到的能力里挑一级 (顺序即优先级)。注意"探到"不等于"起得来" —— 8.45 那台机器
 # 探测说 TUN 可用, 实际建不出设备, 所以 verify() 还会再验一次并按阶梯往下降。
 choose_datapath() {
-    if [ "$NET_TUN" = "1" ]; then set_datapath tun
+    # 性能模式在用的时候, "选哪一级"这个问题已经由 dae 回答了 (而且是用户点的) —— 重跑
+    # 安装命令 (= 升级客户端) 不该把它悄悄换回 tun。
+    if [ "$(_perf_flag)" = "1" ]; then set_datapath ebpf
+    elif [ "$NET_TUN" = "1" ]; then set_datapath tun
     elif [ "$NET_TPROXY" = "1" ]; then set_datapath tproxy
     elif [ "$NET_REDIRECT" = "1" ]; then set_datapath redirect
     else set_datapath none
@@ -1338,6 +1387,9 @@ install_deps() {
     # 见 btf_ensure 顶部): 先问本机软件源, 再问面板, 两个都拿不到就把原因说清楚。
     btf_ensure || true
     if ebpf_ok; then NET_EBPF=1; else CAPS_WHY_EBPF="$PROBE_WHY"; fi
+    # 性能模式 (eBPF / dae) 能不能进 —— 只看 eBPF 那一档的前提是否齐; 真正的切换在
+    # `zeroproxy perf on` (点界面上的按钮) 时做, 这里只探能力。
+    perf_cap_probe
 
     # WAN 的 MTU 与转发卸载 (性能那一半: 大包别死在路上 / 别让卸载把代理绕过去)。
     # **必须在 choose_datapath 之前算完**: choose_datapath → set_datapath → write_caps,
@@ -1394,6 +1446,13 @@ install_deps() {
         note "eBPF 性能档不可用: $(ebpf_detail)"
         # 把影响面说清楚: 这句话长得像"装坏了", 而它其实只关系到未来的性能模式。
         note "  这一档只影响未来的「直连旁路」性能模式 —— 当前的 ${DATAPATH:-数据面} 不受影响"
+    fi
+    # 性能模式 (eBPF / dae) 一句话: 能不能开。开关在面板 / 本机界面上, 装机这一步只报告
+    # 这台机器有没有那个底子 —— 免得用户找了一圈才发现"这台固件根本开不了"。
+    if [ "${PERF_CAP:-0}" = "1" ]; then
+        note "性能模式: 可以开 (内核态 eBPF / dae) —— 面板与本机界面上那个开关一键切换"
+    else
+        note "性能模式: 这台机器开不了 (${PERF_WHY:-内核条件不满足})"
     fi
     if [ -n "$WAN_MTU" ] && [ "$TUN_MTU" != "1500" ]; then
         note "WAN 的 MTU 是 $WAN_MTU (PPPoE?), tun 按 $TUN_MTU 收包 —— 免得封装之后成超包"
@@ -1953,6 +2012,8 @@ write_files() {
     # 不写这一行的话界面上"客户端 v…"那一格永远是空的 —— 真机上就是这样, 无害但会让人
     # 以为版本没装上。
     printf '%s' "$ZP_CLIENT_VERSION" > "$ZP_DIR/version"
+    # 架构也落盘: CLI 的 `zeroproxy perf on` 要按它去面板取性能模式内核 (dae)。
+    printf '%s' "$ARCH" > "$ZP_DIR/arch"
 
     # tproxy 回退方案用的 nft 规则 (只在 TUN 不可用时由 init 脚本加载)。
     # 优先级用数字而不是符号名 (dstnat/mangle): 数字在各版本 nft 上行为一致。
@@ -2206,6 +2267,407 @@ zp_tunfw_clear() {
 TUNFWEOF
     chmod 755 "$ZP_DIR/tunfw.sh"
 
+    # 性能模式 (eBPF / dae) 的开关逻辑。**一处实现, 三个入口**: CLI 的 `zeroproxy perf ...`、
+    # agent 的看门狗 (dae 挂了要自动退回)、以及本机界面 (它把按钮动作转发给 CLI)。
+    #
+    # 三条硬规矩 (为什么值得单独一个文件):
+    #   1. 进去之前先把配置校验一遍 (`dae validate`) —— 配置是错的, 就不该动现在的数据面;
+    #   2. 进去之后必须**验证流量真的过得去** (境外地址够得到), 而不是"进程起来了"就算成功;
+    #   3. 任何一步失败都**退回原来的模式** —— 家里不能因为点了一个按钮就断网。
+    cat > "$ZP_DIR/perf.sh" <<'PERFEOF'
+#!/bin/sh
+# ZeroProxy 性能模式 (eBPF / dae)。
+#
+# 这一档与 tun / tproxy **互斥**: 两套都在抢同一批流量, 所以这里是"换过去 / 换回来",
+# 不是"叠一层"。进去之后 mihomo 是停着的 —— 这一点也是验证的关键: 这时候流量还能通,
+# 就只能是通过 dae 通的。
+ZP_DIR=/etc/zeroproxy
+ZP_PERF_DIR="$ZP_DIR/perf"
+ZP_PERF_BIN="$ZP_PERF_DIR/dae"
+ZP_PERF_CONF="$ZP_PERF_DIR/dae.dae"
+ZP_PERF_LOG="$ZP_PERF_DIR/dae.log"
+ZP_PERF_STATE="$ZP_PERF_DIR/state"
+ZP_PERF_WHY="$ZP_PERF_DIR/why"
+ZP_PERF_EXIT="$ZP_PERF_DIR/exit_ip"
+ZP_PERF_PREV="$ZP_PERF_DIR/prev_chosen"
+ZP_PERF_INIT=/etc/init.d/zeroproxy-perf
+ZP_INIT=/etc/init.d/zeroproxy
+#: 出口探测目标: 必须是一个"只有走代理才回得来"的境外地址 (用它证明流量真的过了节点)。
+#: 可以在环境里覆盖 (比如换成自己的地址)。
+ZP_PERF_PROBE="${ZP_PERF_PROBE:-https://www.cloudflare.com/cdn-cgi/trace}"
+
+log() { logger -t zeroproxy-perf "$*"; }
+
+zp_perf_state() { sed -n '1p' "$ZP_PERF_STATE" 2>/dev/null | tr -d '\r\n'; }
+zp_perf_set_state() { mkdir -p "$ZP_PERF_DIR"; printf '%s\n' "$1" > "$ZP_PERF_STATE"; }
+zp_perf_why() { sed -n '1p' "$ZP_PERF_WHY" 2>/dev/null | tr -d '\r\n'; }
+zp_perf_why_set() { mkdir -p "$ZP_PERF_DIR"; printf '%s\n' "$1" | tr -d '\r\n' > "$ZP_PERF_WHY"; }
+
+# dae **现在**在不在 —— 判据是现场 (进程 / 服务), 不是"我们下过一条命令"。
+zp_perf_live() {
+    [ -n "$(pidof dae 2>/dev/null)" ] && return 0
+    "$ZP_PERF_INIT" running >/dev/null 2>&1
+}
+
+# mihomo 在不在 (验证"这时候的连通性是 dae 挣来的"要用它)
+zp_perf_mihomo_live() { "$ZP_INIT" running >/dev/null 2>&1; }
+
+# 局域网接口。dae 不会自己猜局域网口 (只有 wan 能 auto), 所以这个值必须问出来。
+zp_perf_lan() {
+    _d="$(uci -q get network.lan.device 2>/dev/null || uci -q get network.lan.ifname 2>/dev/null || true)"
+    [ -n "$_d" ] || _d=br-lan
+    printf '%s' "$_d"
+}
+
+# 面板凭据 (第一个面板)。dae 的节点是**面板渲染好**的, 所以这里只需要地址与设备凭据。
+zp_perf_panel() {
+    _f="$(ls "$ZP_DIR/servers"/*.json 2>/dev/null | head -n1)"
+    [ -n "$_f" ] || _f="$ZP_DIR/device.json"
+    [ -f "$_f" ] || return 1
+    _b="$(sed -n 's/.*"base"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$_f" | head -n1)"
+    _id="$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$_f" | head -n1)"
+    _sec="$(sed -n 's/.*"secret"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$_f" | head -n1)"
+    [ -n "$_b" ] && [ -n "$_id" ] && [ -n "$_sec" ] || return 1
+    printf '%s %s %s' "$_b" "$_id" "$_sec"
+}
+
+# 取一个地址存成文件。503 是"面板正在准备" (它要先去上游取), 按它的意思等一会儿再来 ——
+# 与内核 / 分流数据那条协议完全一样。返回 0 = 拿到了 200。
+zp_perf_get() {  # $1=url $2=目标 $3=超时 $4=最多试几次
+    _url="$1"; _dst="$2"; _tmo="${3:-60}"; _tries="${4:-10}"; _i=0
+    while [ "$_i" -lt "$_tries" ]; do
+        _i=$((_i + 1))
+        _code=""
+        if command -v curl >/dev/null 2>&1; then
+            _code="$(curl -fsSkL -m "$_tmo" -o "$_dst" -w '%{http_code}' "$_url" 2>/dev/null || true)"
+        else
+            uclient-fetch -q --no-check-certificate -T "$_tmo" -O "$_dst" "$_url" >/dev/null 2>&1 || true
+            if [ -s "$_dst" ]; then _code=200; fi
+        fi
+        case "$_code" in
+            200) return 0 ;;
+            503) printf '  · 面板正在准备这一档 (第 %s 次)…\n' "$_i"; sleep 5 ;;
+            *)   return 1 ;;
+        esac
+    done
+    return 1
+}
+
+# 出口 IP —— **唯一**能证明"流量真的过去了"的东西。
+# 注意它必须是境外地址: 国内地址按分流规则走直连, dae 通不通都是直连的答案。
+zp_perf_exit_ip() {
+    _body=""
+    _err=""
+    if command -v curl >/dev/null 2>&1; then
+        _body="$(curl -fsSk -m 8 "$ZP_PERF_PROBE" 2>&1)" || _err="$(printf '%s' "$_body" | head -n1 | cut -c1-120)"
+    else
+        _body="$(uclient-fetch -q --no-check-certificate -O - "$ZP_PERF_PROBE" 2>&1)" \
+            || _err="$(printf '%s' "$_body" | head -n1 | cut -c1-120)"
+    fi
+    _ip="$(printf '%s' "$_body" | sed -n 's/^ip=\([0-9a-fA-F:.]*\)$/\1/p' | head -n1)"
+    if [ -z "$_ip" ]; then
+        # 把"为什么没验成"记下来: 这句话要出现在失败提示里 —— 真机上"流量出不去"可能是
+        # 节点不通 / DNS 没起来 / 探针地址被墙, 三者下一步完全不同, 不能只留一句猜测。
+        printf '%s\n' "${_err:-探针没有返回可解析的出口地址}" > "$ZP_PERF_DIR/probe_err" 2>/dev/null || true
+        return 1
+    fi
+    rm -f "$ZP_PERF_DIR/probe_err" 2>/dev/null || true
+    printf '%s' "$_ip"
+}
+
+# 记下 caps 里的两个字段 (界面读的就是它们)。**只改这两行**, 别的字段一个字节都不碰。
+zp_perf_caps() {  # $1=0/1  $2=原因
+    [ -f "$ZP_DIR/caps" ] || : > "$ZP_DIR/caps"
+    _tmp="$ZP_DIR/caps.perf"
+    grep -v '^perf=\|^perf_why=' "$ZP_DIR/caps" > "$_tmp" 2>/dev/null || : > "$_tmp"
+    printf 'perf=%s\n' "$1" >> "$_tmp"
+    printf 'perf_why=%s\n' "$(printf '%s' "$2" | tr -d '\r\n')" >> "$_tmp"
+    mv "$_tmp" "$ZP_DIR/caps"
+}
+
+# 把 caps 里的 chosen / covered 换成另一档 (进去 / 出来都要用)。覆盖范围的映射只有这一处。
+zp_perf_set_chosen() {
+    _c="$1"
+    case "$_c" in
+        tun)      _cov=full ;;
+        tproxy)   _cov=lan ;;
+        redirect) _cov=lan_tcp ;;
+        ebpf)     _cov=full ;;
+        *)        _cov=none ;;
+    esac
+    [ -f "$ZP_DIR/caps" ] || return 0
+    _tmp="$ZP_DIR/caps.chosen"
+    grep -v '^chosen=\|^covered=' "$ZP_DIR/caps" > "$_tmp" 2>/dev/null || : > "$_tmp"
+    printf 'chosen=%s\n' "$_c" >> "$_tmp"
+    printf 'covered=%s\n' "$_cov" >> "$_tmp"
+    mv "$_tmp" "$ZP_DIR/caps"
+}
+
+# 准备 (取二进制 / 分流数据 / 配置, 并校验配置)。幂等: 已经有的不重复取。
+# 返回 0 = 一切都齐了 (接下来可以切数据面); 非 0 = 别动现在的数据面。
+zp_perf_prepare() {
+    mkdir -p "$ZP_PERF_DIR"
+    _panel="$(zp_perf_panel)" || { printf '  没有面板凭据 (device.json / servers)\n'; return 1; }
+    set -- $_panel
+    _base="$1"; _id="$2"; _sec="$3"
+    _n="$(ls "$ZP_DIR/servers"/*.json 2>/dev/null | wc -l | tr -d ' ')"
+    if [ "${_n:-0}" -gt 1 ]; then
+        printf '  · 多面板: 性能模式用第一台 (%s) 的节点\n' "$_base"
+    fi
+
+    # 1) dae 二进制 (点按钮时才取 —— 用不到的人不该为它占 30 MB 闪存)
+    if [ ! -x "$ZP_PERF_BIN" ]; then
+        _arch="$(sed -n '1p' "$ZP_DIR/arch" 2>/dev/null | tr -d '\r\n')"
+        [ -n "$_arch" ] || _arch=arm64
+        printf '  · 取性能模式内核 (dae · %s)…\n' "$_arch"
+        if zp_perf_get "$_base/c/perf/$_arch" "$ZP_PERF_DIR/dae.gz" 300 12; then
+            # 判定"是不是 gzip"只用 gzip -t (busybox 一定有) —— 与内核那一步同一条路
+            if gzip -t "$ZP_PERF_DIR/dae.gz" >/dev/null 2>&1; then
+                gzip -dc "$ZP_PERF_DIR/dae.gz" > "$ZP_PERF_BIN" 2>/dev/null || true
+            fi
+            rm -f "$ZP_PERF_DIR/dae.gz"
+            chmod 755 "$ZP_PERF_BIN" 2>/dev/null || true
+        fi
+        if [ ! -x "$ZP_PERF_BIN" ]; then
+            printf '  面板没能给出性能模式内核 (dae) —— 到面板上确认它取得到上游\n'
+            printf '%s\n' "取 dae 失败"
+            return 1
+        fi
+    fi
+
+    # 2) 分流数据 (v2ray 格式的 geoip.dat / geosite.dat)。取不到不是失败: 退回一份不含 geo
+    #    规则的配置 (少一层分流优化, 但能用) —— 与 mihomo 那边的降级同一个道理。
+    _geo=1
+    for _g in geoip.dat geosite.dat; do
+        if [ ! -s "$ZP_PERF_DIR/$_g" ]; then
+            printf '  · 取分流数据 (%s)…\n' "$_g"
+            zp_perf_get "$_base/c/perf/geo/$_g" "$ZP_PERF_DIR/$_g" 180 4 || _geo=0
+        fi
+        [ -s "$ZP_PERF_DIR/$_g" ] || _geo=0
+    done
+    if [ "$_geo" != "1" ]; then
+        rm -f "$ZP_PERF_DIR/geoip.dat" "$ZP_PERF_DIR/geosite.dat"
+        printf '  · 面板还没有分流数据 —— 用降级配置 (国内直连与广告拦截这一档先不要)\n'
+    fi
+
+    # 3) 配置 (由面板渲染: 节点 / 分流模板 / 面板直连都在它手里)
+    _lan="$(zp_perf_lan)"
+    _url="$_base/c/perf/config?id=$_id&k=$_sec&lan=$_lan&geo=$_geo"
+    printf '  · 取 dae 配置 (局域网口: %s)…\n' "$_lan"
+    if ! zp_perf_get "$_url" "$ZP_PERF_CONF.new" 30 2 || [ ! -s "$ZP_PERF_CONF.new" ]; then
+        printf '  面板没有给出 dae 配置\n'; return 1
+    fi
+    # 拿到的东西必须像一份 dae 配置 (不是一页错误页)
+    if ! grep -q '^global {' "$ZP_PERF_CONF.new" 2>/dev/null; then
+        printf '  面板给回来的不是 dae 配置 (第一行: %s)\n' "$(sed -n '1p' "$ZP_PERF_CONF.new" 2>/dev/null | cut -c1-60)"
+        rm -f "$ZP_PERF_CONF.new"
+        return 1
+    fi
+    mv "$ZP_PERF_CONF.new" "$ZP_PERF_CONF"
+
+    # 4) 校验 (`dae validate` 会把路由规则与 DNS 路由都跑一遍) —— 校验不过就不动数据面
+    if ! _out="$("$ZP_PERF_BIN" validate -c "$ZP_PERF_CONF" 2>&1)"; then
+        printf '  配置没通过 dae 的校验, 不动现在的数据面:\n'
+        printf '%s\n' "$_out" | head -n 3 | sed 's/^/    /'
+        printf '%s\n' "配置校验失败: $(printf '%s' "$_out" | head -n 1)"
+        return 1
+    fi
+    printf '  · 配置已校验通过\n'
+    return 0
+}
+
+# 进性能模式。成功 = 数据面真的换过去了 (daemon 在跑 + 流量真的出得去)。
+zp_perf_enter() {
+    if [ "$(zp_perf_state)" = "on" ] && zp_perf_live; then
+        printf '性能模式已经开着 (出口 %s)\n' "$(cat "$ZP_PERF_EXIT" 2>/dev/null)"
+        return 0
+    fi
+    _cap="$(sed -n 's/^perf_cap=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    if [ "$_cap" != "1" ]; then
+        printf '这台机器进不了性能模式: %s\n' "$(sed -n 's/^perf_why=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+        printf '  (需要内核 >=5.17 且带 BTF —— BTF 缺了重跑安装命令会自动补上)\n'
+        return 1
+    fi
+    printf '准备性能模式…\n'
+    if ! zp_perf_prepare; then
+        zp_perf_why_set "准备阶段失败 (见上)"
+        zp_perf_caps 0 "准备阶段失败"
+        return 1
+    fi
+
+    # 记下"原来那一档": 退出来的时候要回到它 (而不是回到"默认")
+    _prev="$(sed -n 's/^chosen=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    [ -n "$_prev" ] || _prev=none
+    printf '%s\n' "$_prev" > "$ZP_PERF_PREV"
+
+    printf '切换数据面 (停标准模式 → 起 dae)…\n'
+    zp_perf_set_state on
+    "$ZP_INIT" stop >/dev/null 2>&1 || true
+    "$ZP_INIT" disable >/dev/null 2>&1 || true
+    zp_perf_set_chosen ebpf
+    rm -f "$ZP_PERF_EXIT"
+    "$ZP_PERF_INIT" enable >/dev/null 2>&1 || true
+    "$ZP_PERF_INIT" start >/dev/null 2>&1 || true
+
+    # 等 daemon 起来 (最多 20 秒)
+    _i=0
+    while [ "$_i" -lt 20 ]; do
+        zp_perf_live && break
+        sleep 1
+        _i=$((_i + 1))
+    done
+    if ! zp_perf_live; then
+        _why="dae 没能起来"
+        [ -s "$ZP_PERF_LOG" ] && _why="dae 没能起来: $(tail -n 1 "$ZP_PERF_LOG" 2>/dev/null | cut -c1-120)"
+        printf '  %s —— 退回原来的模式\n' "$_why"
+        zp_perf_leave "$_why"
+        return 1
+    fi
+    printf '  · dae 在跑, 正在验证流量真的过得去…\n'
+
+    # 等"真的通" (最多 45 秒)。判据是境外地址够得到 —— 而且此刻 mihomo 是停着的,
+    # 所以这条连接只可能是 dae 挣来的 (这就是"不撒谎"的那一步)。
+    _i=0
+    _ip=""
+    # 等多久: 默认 15 次 × 3 秒 = 45 秒 (真机上节点建连 + DNS 都要时间)。
+    # ZP_PERF_VERIFY_TRIES 只给演练用 (那里没有真节点, 干等 45 秒纯属浪费)。
+    _tries="${ZP_PERF_VERIFY_TRIES:-15}"
+    while [ "$_i" -lt "$_tries" ]; do
+        # 先探出口, 再排除"这条通路其实是 mihomo 给的"。
+        # 顺序是这么定的: **探针才是证据**, mihomo 在不在只是要排除的干扰项 —— 反过来先
+        # 看 mihomo, 一旦那个判断本身不可靠 (init 脚本坏了 / 固件上的 running 子命令没有),
+        # 就会永远走不到探针那一步, 于是"通的"被误判成"不通"(反过来也会撒谎)。
+        if _ip="$(zp_perf_exit_ip)"; then
+            if zp_perf_mihomo_live; then
+                printf '  mihomo 还在跑 —— 两个数据面同时在, 不能算换成功\n'
+                _ip=""
+                break
+            fi
+            break
+        fi
+        _i=$((_i + 1))
+        sleep 3
+    done
+    if [ -z "$_ip" ]; then
+        _perr="$(sed -n '1p' "$ZP_PERF_DIR/probe_err" 2>/dev/null | tr -d '\r\n')"
+        _why="dae 起来了, 但流量出不去 (节点不通 / 分流数据不全, 或标准模式没停下来)"
+        [ -n "$_perr" ] && _why="$_why —— 探针说: $_perr"
+        printf '  %s —— 退回原来的模式\n' "$_why"
+        zp_perf_leave "$_why"
+        return 1
+    fi
+    printf '%s\n' "$_ip" > "$ZP_PERF_EXIT"
+    zp_perf_why_set ""
+    zp_perf_caps 1 ""
+    printf '性能模式已开启 —— 出口 %s (内核态分流: 直连流量不再经过用户态)\n' "$_ip"
+    log "性能模式开启, 出口 $_ip"
+    return 0
+}
+
+# 退出性能模式, 回到原来那一档。$1 = 为什么 (空 = 用户自己关的)。
+# 幂等: dae 没在跑的时候也能调 (进入失败的回滚路径会调它)。
+zp_perf_leave() {
+    _why="${1:-}"
+    zp_perf_set_state off
+    rm -f "$ZP_PERF_DIR/bad"
+    "$ZP_PERF_INIT" stop >/dev/null 2>&1 || true
+    "$ZP_PERF_INIT" disable >/dev/null 2>&1 || true
+    _prev="$(sed -n '1p' "$ZP_PERF_PREV" 2>/dev/null | tr -d '\r\n')"
+    [ -n "$_prev" ] || _prev=none
+    zp_perf_set_chosen "$_prev"
+    zp_perf_caps 0 "$_why"
+    "$ZP_INIT" enable >/dev/null 2>&1 || true
+    "$ZP_INIT" restart >/dev/null 2>&1 || true
+    printf '已回到标准模式 (数据面: %s)\n' "$_prev"
+    [ -n "$_why" ] || log "性能模式关闭 (用户操作)"
+    return 0
+}
+
+# 看门狗: 由 agent 每轮调用。说好"在用性能模式", 而 dae 已经不在了 → 自动退回标准模式。
+# 为什么要它: 性能模式下 mihomo 是停着的, dae 一死家里就断网 —— 而用户不会知道去关掉它。
+# 连续 3 轮 (~45 秒) 都看不到进程才算 (重启 / 短暂抖动不误判)。
+zp_perf_tick() {
+    [ "$(zp_perf_state)" = "on" ] || return 0
+    zp_perf_live && { rm -f "$ZP_PERF_DIR/bad"; return 0; }
+    _n=0
+    [ -f "$ZP_PERF_DIR/bad" ] && _n="$(sed -n '1p' "$ZP_PERF_DIR/bad" 2>/dev/null | tr -d '\r\n')"
+    _n=$(( ${_n:-0} + 1 ))
+    printf '%s\n' "$_n" > "$ZP_PERF_DIR/bad"
+    [ "$_n" -ge 3 ] || return 0
+    log "dae 连续 $_n 次检查都不在, 自动退回标准模式"
+    zp_perf_leave "dae 不在了 (连续 3 次没看到进程) —— 已自动退回标准模式"
+    return 0
+}
+
+# 给人看的状态 (界面不看这个 —— 它读的是同一个文件, 见 cgi / zpcore 的 status)。
+zp_perf_status() {
+    _cap="$(sed -n 's/^perf_cap=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    if [ "$(zp_perf_state)" = "on" ] && zp_perf_live; then
+        printf '性能模式: 已开启 (出口 %s)\n' "$(sed -n '1p' "$ZP_PERF_EXIT" 2>/dev/null)"
+        printf '  数据面      内核态 eBPF (dae): 直连流量不再经过用户态\n'
+        printf '  局域网接口  %s\n' "$(zp_perf_lan)"
+    elif [ "$(zp_perf_state)" = "on" ]; then
+        printf '性能模式: 说好在用, 但 dae 不在 (agent 会在 45 秒内自动退回标准模式)\n'
+        [ -s "$ZP_PERF_DIR/progress" ] && tail -n 3 "$ZP_PERF_DIR/progress"
+    else
+        printf '性能模式: 未开启'
+        if [ "$_cap" = "1" ]; then
+            printf ' (这台机器可以开: zeroproxy perf on)\n'
+        else
+            printf ' —— 这台机器开不了: %s\n' "$(sed -n 's/^perf_why=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+        fi
+    fi
+    if [ -n "$(zp_perf_why)" ]; then printf '  上次的结论  %s\n' "$(zp_perf_why)"; fi
+    if [ -s "$ZP_PERF_CONF" ]; then
+        printf '  已备好的节点 %s 个 (dae 初始配置)\n' \
+            "$(sed -n '/^node {/,/^}/p' "$ZP_PERF_CONF" | grep -c '://')"
+    fi
+}
+PERFEOF
+    chmod 755 "$ZP_DIR/perf.sh"
+
+    # 性能模式内核 (dae) 自己的 init 脚本。与 mihomo 分成两个服务是必须的: 两者**互斥**,
+    # "谁在跑"必须能被单独开关 (换模式 = 停一个、起另一个), 而不是靠一个服务里的分支。
+    cat > "$ZP_PERF_INIT" <<'PERFINITEOF'
+#!/bin/sh /etc/rc.common
+# ZeroProxy 性能模式内核 (dae)
+START=98
+STOP=04
+USE_PROCD=1
+
+ZP_DIR=/etc/zeroproxy
+PERF_DIR="$ZP_DIR/perf"
+DAE="$PERF_DIR/dae"
+CONF="$PERF_DIR/dae.dae"
+
+start_service() {
+    [ -x "$DAE" ] || return 0
+    [ -f "$CONF" ] || return 0
+    # 防御: 两个数据面不许同时跑 (谁后起谁把对方的包抢走, 现象是"时通时不通")。
+    # 换模式的正规路径会先把 mihomo 停掉并 disable (见 perf.sh 的 zp_perf_enter);
+    # 走到这里还开着, 说明是开机顺序或人为 enable —— 那就**不起 dae**, 别把家里搞乱。
+    if /etc/init.d/zeroproxy enabled >/dev/null 2>&1; then
+        logger -t zeroproxy-perf "标准模式的服务还开着, 不启动 dae (换模式请用 zeroproxy perf on)"
+        return 0
+    fi
+    procd_open_instance
+    # --disable-pidfile: /var/run/dae.pid 在"上次崩过"之后会挡着下一次启动 (经典坑);
+    # 存活性交给 procd。dae 自己在退出路径里会卸掉 eBPF 与 tproxy 口, 所以 respawn
+    # 之前不留残渣 —— 这一条是它的设计, 不是我们的假设 (见 docs/en/user-guide/run-as-daemon.md)。
+    procd_set_param command "$DAE" run -c "$CONF" \
+        --logfile "$PERF_DIR/dae.log" --logfile-maxsize 1 --logfile-maxbackups 1 \
+        --disable-pidfile
+    # 分流数据 (geoip.dat / geosite.dat) 与配置放在一起; 显式指给 dae (它也会看配置目录,
+    # 这里是双保险 —— 与 Xray 的 XRAY_LOCATION_ASSET 同一个用法)。
+    procd_set_param env DAE_LOCATION_ASSET="$PERF_DIR"
+    procd_set_param respawn 3600 5 5
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
+PERFINITEOF
+    chmod 755 "$ZP_PERF_INIT"
+
     # 控制 agent: 每 15 秒向面板上报一次状态并取回"期望开关 + 配置版本"。
     # 面板是唯一的事实来源 —— 路由器本地改开关也是请求面板去改 (见 CLI)。
     cat > "$ZP_DIR/agent.sh" <<'AGENTEOF'
@@ -2236,10 +2698,14 @@ json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '
 # 内核现在**真的**接管到哪。不看 caps 里的意图, 看现场 —— 这正是"永不撒谎"那一半:
 # 面板上显示的是这个值, 不是"我们打算用什么"。
 #   full     tun 在   → 全屋设备 + 路由器自身
+#   full     dae 在   → 性能模式 (eBPF): 局域网与路由器自身都接管, 且直连流量不走用户态
 #   lan      nft 表在 → 全屋设备 (路由器自身流量除外)
 #   lan_tcp  iptables 链在 → 只有局域网 TCP
 #   none     内核停着, 或规则被外 force 清了 → 未接管
 actual_covered() {
+    # 性能模式排第一: 它开着的时候 mihomo 是停的 (上面几条都不会命中), 但顺序上先说清楚 ——
+    # "谁在接管"是面板上最该回答的问题。判据同样是现场: dae 进程在不在。
+    if [ -n "$(pidof dae 2>/dev/null)" ]; then printf 'full'; return 0; fi
     if ip link show zp-tun >/dev/null 2>&1; then printf 'full'; return 0; fi
     if command -v nft >/dev/null 2>&1 && nft list table inet zp_router >/dev/null 2>&1; then
         printf 'lan'; return 0
@@ -2571,6 +3037,15 @@ core_up() {
     pgrep -f "$ZP_DIR/mihomo" >/dev/null 2>&1
 }
 
+# "这台机器现在有没有在提供代理" —— 标准模式下是 mihomo 在跑, 性能模式下是 dae 在跑。
+# 为什么单列一个: 它是**语义**上的总闸, 两个数据面都要算进来 —— 否则开了性能模式之后,
+# 面板上会显示"已关闭"(心跳里的 actual 取自 core_up), 而家里其实好好的。
+proxy_up() {
+    core_up && return 0
+    [ -n "$(pidof dae 2>/dev/null)" ] && return 0
+    return 1
+}
+
 flush_dns() { killall -HUP dnsmasq 2>/dev/null || /etc/init.d/dnsmasq reload 2>/dev/null || true; }
 
 switch_core() {
@@ -2622,6 +3097,13 @@ LAST_PULL=0
 FAILS=0
 while true; do
     migrate_servers
+    # 性能模式 (eBPF / dae) 的看门狗 —— **必须在算心跳之前**: 那一档下 mihomo 是停着的,
+    # dae 一死家里就断网, 而用户不会知道去关掉它。连续 3 轮看不到进程就自动退回标准模式,
+    # 于是这一轮上报出去的 mode/covered 已经是从现场读到的真实状态。
+    if [ -f "$ZP_DIR/perf.sh" ]; then
+        . "$ZP_DIR/perf.sh"
+        zp_perf_tick >/dev/null 2>&1 || true
+    fi
     # 多服务器: **每一台都要收到心跳**。
     # 早期版本只向第一台上报, 于是"没被上报的那台"在面板上永远显示离线 —— 用户加完
     # 第二台服务器, 看到的正是第二台一直是同步中 / 离线 (真机反馈)。
@@ -2677,7 +3159,8 @@ while true; do
         _b="$(field_of "$_f" base)"; _i="$(field_of "$_f" id)"; _k="$(field_of "$_f" secret)"
         [ -n "$_b" ] || continue
         BODY='{"device":"'"$_i"'","k":"'"$_k"'","version":"'"$ZP_VERSION"'"'
-        if core_up; then BODY="$BODY"',"actual":true'; else BODY="$BODY"',"actual":false'; fi
+        # actual = "这台机器现在真的在提供代理" —— 性能模式下 dae 在跑也算 (proxy_up)
+        if proxy_up; then BODY="$BODY"',"actual":true'; else BODY="$BODY"',"actual":false'; fi
         [ -n "$UI_URL_REPORT" ] && BODY="$BODY"',"ui":"'"$UI_URL_REPORT"'"'
         [ -n "$LAST_REV" ] && BODY="$BODY"',"rev":"'"$LAST_REV"'"'
         BODY="$BODY"',"report":{"mode":"'"$DP_REPORT"'","covered":"'"$COV_REPORT"'"'
@@ -2703,10 +3186,17 @@ while true; do
         # (本机覆盖是唯一的例外: 那是用户**明确**表达的意图, 必须执行 —— 它存在的理由
         #  正是"面板挂了也要能开关"。)
         if [ -n "$OVERRIDE" ]; then
-            if [ "$OVERRIDE" = "on" ] && ! core_up; then
+            if [ "$OVERRIDE" = "on" ] && ! proxy_up; then
                 log "本机覆盖=on (面板不可达), 启动内核"
                 switch_core on
-            elif [ "$OVERRIDE" = "off" ] && core_up; then
+            elif [ "$OVERRIDE" = "off" ] && [ -f "$ZP_DIR/perf.sh" ]; then
+                . "$ZP_DIR/perf.sh"
+                if [ "$(zp_perf_state)" = "on" ]; then
+                    log "本机覆盖=off (面板不可达), 退回标准模式并停止内核"
+                    zp_perf_leave "本机覆盖关闭"
+                fi
+            fi
+            if [ "$OVERRIDE" = "off" ] && core_up; then
                 log "本机覆盖=off (面板不可达), 停止内核"
                 switch_core off
             fi
@@ -2718,10 +3208,19 @@ while true; do
     FAILS=0
     DESIRED="$DESIRED_ALL"
 
-    if [ "$DESIRED" = "true" ] && ! core_up; then
+    # 性能模式先处理"面板要求关闭"这一条: 那一档下 mihomo 本来就是停的, 只停 mihomo 等于
+    # 什么都没关 —— 面板上的总开关关掉就必须真的关掉 (把 dae 也退出来)。
+    if [ "$DESIRED" = "false" ] && [ -f "$ZP_DIR/perf.sh" ]; then
+        . "$ZP_DIR/perf.sh"
+        if [ "$(zp_perf_state)" = "on" ]; then
+            log "面板要求关闭 (性能模式), 退回标准模式并停止内核"
+            zp_perf_leave "面板总开关关闭"
+        fi
+    fi
+    if [ "$DESIRED" = "true" ] && ! proxy_up; then
         log "面板要求开启, 启动内核"
         switch_core on
-    elif [ "$DESIRED" = "false" ] && core_up; then
+    elif [ "$DESIRED" = "false" ] && proxy_up; then
         log "面板要求关闭, 停止内核"
         switch_core off
     fi
@@ -2866,6 +3365,10 @@ ZP_API=127.0.0.1:9090
 # doctor 的"入口连通性"要照着配置里每个节点去连 —— 同一个坑: 这个路径也得在这里定义。
 ZP_CONF="$ZP_DIR/config.yaml"
 SERVERS="$ZP_DIR/servers"
+# 性能模式 (eBPF / dae) 的目录。虽然 perf.sh 里也定义了同名变量, 但**这里必须再写一遍**:
+# CLI 是独立文件, 那几个分支 (perf 动作 / doctor) 会先读它再 source perf.sh —— 少这一行
+# 就是"变量为空"的经典现场 (与上面 ZP_MIXED / ZP_API 同一个坑)。
+ZP_PERF_DIR="$ZP_DIR/perf"
 
 # 补内核模块该敲哪条命令 —— 按这台机器**真正的**包管理器来 (25.12 起是 apk; 装机时
 # 探到的结果记在 caps 里)。doctor 与 status 都从这里取, 不各写一份。
@@ -3205,6 +3708,37 @@ doctor() {
                 printf '      %s\n' "手动: 把匹配的 vmlinux-btf 包放进面板的 data/client/btf/ 后重跑安装命令" ;;
         esac
     fi
+    # 性能模式 (eBPF / dae): 能不能开 + 现在开着没有 + 凭什么这么说。
+    # 判据是**现场** (dae 进程在不在), 与界面 / 面板读到的是同一份事实。
+    _pcap="$(sed -n 's/^perf_cap=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    _pstate="$(sed -n '1p' "$ZP_DIR/perf/state" 2>/dev/null | tr -d '\r\n')"
+    # "在不在"用 perf.sh 那一份判断 (进程 + 服务), 不在这里另写一遍 —— 否则 CLI 与界面、
+    # agent 三处会各说各话 (这个项目已经因为"两处判据"栽过)。
+    _plive=0
+    if [ -f "$ZP_DIR/perf.sh" ]; then
+        . "$ZP_DIR/perf.sh"
+        zp_perf_live && _plive=1
+    fi
+    if [ "$_pcap" = "1" ]; then
+        if [ "$_plive" = "1" ]; then
+            printf '  ✓ 性能模式 (内核态 eBPF / dae) 正在生效 —— 出口 %s\n' \
+                "$(sed -n '1p' "$ZP_DIR/perf/exit_ip" 2>/dev/null || printf '未记录')"
+            if command -v tc >/dev/null 2>&1; then
+                _if="$(sed -n '/^lan_interface:/{s/.*: *//;p}' "$ZP_DIR/perf/dae.dae" 2>/dev/null | tr -d ' ' | head -n1)"
+                if [ -n "$_if" ] && tc filter show dev "$_if" >/dev/null 2>&1; then
+                    printf '      现场: %s 上挂着 eBPF 过滤器 (流量真的在内核里分流)\n' "$_if"
+                fi
+            fi
+        elif [ "$_pstate" = "on" ]; then
+            printf '  ! 性能模式说好在用, 但 dae 不在 —— agent 会在 45 秒内自动退回标准模式\n'
+            [ -s "$ZP_DIR/perf/progress" ] && tail -n 2 "$ZP_DIR/perf/progress" | sed 's/^/        /'
+        else
+            printf '  · 性能模式可以开 (内核态 eBPF): 界面上那个开关一键切换\n'
+        fi
+    else
+        printf '  · 性能模式开不了: %s\n' \
+            "$(sed -n 's/^perf_why=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    fi
     printf '    想测这台机器自己能跑多快: zeroproxy bench\n'
 
     echo
@@ -3495,6 +4029,12 @@ EOF
         # 面板**不可达**时才退回本机覆盖 —— 家里网出问题时连"关掉代理"都做不到, 是最坏
         # 的结果; 而这时恰恰是面板最容易不可达的时候。
         ON=$([ "$1" = on ] && echo true || echo false)
+        # 「关掉总开关」在性能模式下意味着**退出性能模式**: 那一档下 mihomo 是停着的,
+        # 只停 mihomo 等于什么都没关。先把它退出来 (幂等), 再照原路去改面板的期望状态。
+        if [ "$1" = "off" ] && [ -f "$ZP_DIR/perf.sh" ]; then
+            . "$ZP_DIR/perf.sh"
+            [ "$(zp_perf_state)" = "on" ] && zp_perf_leave "总开关关闭"
+        fi
         [ -n "$FIRST" ] || { echo "还没有接入任何服务器"; exit 1; }
         _base="$(field_of "$FIRST" base)"
         ID="$(field_of "$FIRST" id)"
@@ -3542,6 +4082,43 @@ EOF
         else
             echo "本来就没有本机覆盖 —— 总开关一直由面板决定。"
         fi
+        ;;
+    perf)
+        # 性能模式 (eBPF / dae)。逻辑全在 perf.sh 里 —— 一处实现, 三个入口
+        # (CLI / 本机界面 / agent 的看门狗), 见那个文件顶部。
+        . "$ZP_DIR/perf.sh"
+        _act="${2:-status}"
+        case "$_act" in
+            on|start|enable|off|stop|disable)
+                # 界面点按钮时**没有 TTY** (cgi / zpcore 转发过来): 后台跑、进度写文件、界面
+                # 轮询状态自己画出来 —— 与「更新客户端」同一条路。切换要下载内核 (最多 10 MB)
+                # 再等出口验证, 把 HTTP 请求挂一两分钟只会让界面干转圈。
+                # SSH 里执行时是 TTY: 前台跑, 进度实时打出来 (那一刻用户就想要这个)。
+                if [ -t 1 ]; then
+                    case "$_act" in
+                        on|start|enable) zp_perf_enter ;;
+                        *)               zp_perf_leave "" ;;
+                    esac
+                else
+                    mkdir -p "$ZP_PERF_DIR"
+                    : > "$ZP_PERF_DIR/progress" 2>/dev/null || true
+                    case "$_act" in
+                        on|start|enable)
+                            printf '正在准备性能模式…\n' >> "$ZP_PERF_DIR/progress"
+                            ( zp_perf_enter >> "$ZP_PERF_DIR/progress" 2>&1
+                              printf 'DONE=%s\n' "$?" >> "$ZP_PERF_DIR/progress" ) &
+                            echo "已开始切换到性能模式 (后台进行, 约一分钟; 界面会显示进度)" ;;
+                        *)
+                            printf '正在切回标准模式…\n' >> "$ZP_PERF_DIR/progress"
+                            ( zp_perf_leave "" >> "$ZP_PERF_DIR/progress" 2>&1
+                              printf 'DONE=%s\n' "$?" >> "$ZP_PERF_DIR/progress" ) &
+                            echo "已开始切回标准模式" ;;
+                    esac
+                fi ;;
+            prepare)  zp_perf_prepare ;;
+            progress) sed -n '1,30p' "$ZP_PERF_DIR/progress" 2>/dev/null ;;
+            *)        zp_perf_status ;;
+        esac
         ;;
     bench)
         # 真机基准。**它量的是"这台路由器自己"的能力**, 不是节点好坏: 同一个节点在手机上
@@ -4007,8 +4584,17 @@ install_ui() {
     # —— 固件自己的 Web 服务那条路走的是 /www, 而"能用它就不开新端口"是首选。
     _stage="$ZP_DIR/www"
     mkdir -p "$_stage/zeroproxy" "$_stage/cgi-bin"
-    for f in index.html app.js; do
+    # perf.js 是性能模式那块仪表盘 (跑车表盘 + 进入动画)。它与 app.js 分开, 因为那是一整段
+    # 独立的动画 / 状态机 —— 塞进 app.js 只会让两个都难读。
+    for f in index.html app.js perf.js; do
         if ! http_get "$ZP_BASE/c/ui/$f" > "$_stage/zeroproxy/$f" 2>/dev/null; then
+            # 老面板没有 perf.js (2.11.26 之前): 页面照发, 那块表盘不存在而已 ——
+            # 代理本身一个字节都不受影响, 所以这里不整条放弃界面。
+            if [ "$f" = "perf.js" ]; then
+                rm -f "$_stage/zeroproxy/$f"
+                note "面板上没有 perf.js (面板版本较旧?) —— 本机界面没有性能模式那块表盘"
+                continue
+            fi
             warn "面板没有提供界面文件 (面板版本较旧?), 跳过网页界面"
             rm -rf "$_stage"
             return 0
@@ -4024,6 +4610,7 @@ install_ui() {
     if [ -d /www ]; then
         mkdir -p /www/zeroproxy /www/cgi-bin 2>/dev/null || true
         cp "$_stage/zeroproxy/index.html" "$_stage/zeroproxy/app.js" /www/zeroproxy/ 2>/dev/null || true
+        [ -s "$_stage/zeroproxy/perf.js" ] && cp "$_stage/zeroproxy/perf.js" /www/zeroproxy/ 2>/dev/null || true
         cp "$_stage/cgi-bin/zeroproxy" /www/cgi-bin/zeroproxy 2>/dev/null || true
         chmod 755 /www/cgi-bin/zeroproxy 2>/dev/null || true
     fi
@@ -4234,6 +4821,23 @@ verify() {
     /etc/init.d/zeroproxy-agent enable >/dev/null 2>&1 || true
     # 先起控制 agent (它会立刻上报, 面板上马上就能看到这台设备), 再起内核
     /etc/init.d/zeroproxy-agent restart >/dev/null 2>&1 || true
+
+    # 性能模式正在用的时候**不许**顺手把 mihomo 拉起来 —— 两个数据面互斥, 一起跑就是互相
+    # 抢包。重跑安装命令 (= 升级客户端) 不该把用户点的那个模式悄悄换掉。
+    if [ "$(_perf_flag)" = "1" ]; then
+        . "$ZP_DIR/perf.sh"
+        if zp_perf_live; then
+            /etc/init.d/zeroproxy disable >/dev/null 2>&1 || true
+            /etc/init.d/zeroproxy stop >/dev/null 2>&1 || true
+            touch "$ZP_DIR/core.up"
+            ok "性能模式在用 (内核态 eBPF / dae): 标准模式的内核保持停用"
+            _eip="$(sed -n '1p' "$ZP_PERF_DIR/exit_ip" 2>/dev/null || true)"
+            [ -n "$_eip" ] && ok "  出口 $_eip (上次验证时记下的)"
+            return 0
+        fi
+        note "性能模式说好在用, 但 dae 已经不在 —— 自动退回标准模式"
+        zp_perf_leave "重跑安装命令时发现 dae 不在"
+    fi
     touch "$ZP_DIR/core.up"
     /etc/init.d/zeroproxy restart >/dev/null 2>&1 || true
 
@@ -4397,6 +5001,13 @@ finish() {
     elif [ "${NET_EBPF:-0}" != "1" ]; then
         printf '  性能档   eBPF 那一档还不能用: %s\n' "${CAPS_WHY_EBPF:-内核条件不满足}"
         printf '           %s\n' "(只影响未来的直连旁路性能模式; 当前数据面一个字节都不受影响)"
+    fi
+    # 性能模式 (eBPF / dae) 一句话: 能不能开。开关在面板 / 本机界面上, 这里只报告这台机器
+    # 有没有那个底子 —— 免得用户找了一圈才发现"这台固件根本开不了"。
+    if [ "${PERF_CAP:-0}" = "1" ]; then
+        printf '  性能模式 可以开 (内核态 eBPF / dae): 面板与本机界面上的开关一键切换\n'
+    else
+        printf '  性能模式 这台机器开不了: %s\n' "${PERF_WHY:-内核条件不满足}"
     fi
     case "${ACTIVE_MODE:-none}" in
         tun)      printf '  模式     TUN 全屋透明代理 (含路由器自身)\n' ;;

@@ -79,6 +79,9 @@ const COVERED_LABEL = {
   none: "未接管",
 };
 const MODE_LABEL = {
+  // 性能模式: 内核态 eBPF 分流 (dae), 直连流量真旁路。它也是 covered=full 的一档,
+  // 所以这里必须单独标出来 —— 否则面板上看起来和 TUN 没区别, 而用户是特意点开它的。
+  ebpf: "性能模式 (eBPF)",
   tun: "TUN",
   tproxy: "tproxy",
   redirect: "iptables REDIRECT",
