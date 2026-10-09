@@ -209,9 +209,12 @@ const UPDATE_STEPS = [
 ];
 let updTimer = null;
 let updLeaving = false;
+/* 已经看见**本次**更新的输出了。在那之前, 日志里可能还躺着上一次更新留下的 "EXIT=0" ——
+ * 拿它当真, 页面就会在刚点完确认时跳去"更新完成"并自动刷新, 而实际上什么都没开始。 */
+let updArmed = false;
 
 function updParse(text) {
-  const out = { step: -1, name: '', exit: null, from: '', to: '', live: '' };
+  const out = { step: -1, name: '', exit: null, skip: false, from: '', to: '', live: '' };
   String(text || '').split('\n').forEach((raw) => {
     const line = raw.replace(/\r/g, '').trim();
     if (!line) return;
@@ -219,6 +222,9 @@ function updParse(text) {
     if (ver) { out.to = ver[1]; out.from = ver[2]; return; }
     const ex = line.match(/^EXIT=(\d+)/);
     if (ex) { out.exit = parseInt(ex[1], 10); return; }
+    // "这次没有开始更新" (面板比本机旧 / 取不到面板的脚本) 也是终态, 但**不是**更新失败。
+    // 没有这个第二终态, 日志会停在一行 "==>" 上, 刷新之后进度面板永远转不完。
+    if (line === "SKIP=1") { out.skip = true; out.exit = -1; return; }
     const st = line.match(/^==>\s*(.*)$/);
     if (st) {
       out.name = st[1];
@@ -235,24 +241,32 @@ function updRender(text) {
   const total = UPDATE_STEPS.length;
   const box = $('upd');
   const running = s.exit === null;
+  // 还停在第一个已知小节之前 (最常见的就是"正在取面板的安装脚本"): 这一段**没有可报的
+  // 百分比**, 报个 3% 是编的。改用"来回跑"的不确定进度条, 老实说"在启动"。
+  const starting = running && s.step < 0;
   // 正在第 k 段 = 前 k 段已完成; 起步给一点点, 免得一动不动像卡住
   let pct = s.step >= 0 ? Math.round((s.step / total) * 100) : 0;
-  if (running) pct = Math.max(pct, 3);
   if (s.exit === 0) pct = 100;
   if (s.exit !== null && s.exit !== 0) pct = Math.max(pct, 5);
 
-  box.className = 'upd ' + (running ? 'running' : (s.exit === 0 ? 'done' : 'fail'));
-  $('upd-fill').style.width = pct + '%';
-  $('upd-pct').textContent = pct + '%';
+  box.className = 'upd ' + (starting ? 'running starting'
+    : running ? 'running' : (s.exit === 0 ? 'done' : 'fail'));
+  $('upd-fill').style.width = starting ? '' : pct + '%';   // 不确定态交给 CSS 的动画
+  $('upd-pct').textContent = starting ? '…' : pct + '%';
   $('upd-ico').textContent = running ? '↻' : (s.exit === 0 ? '✓' : '!');
 
   const ver = (s.from && s.to) ? ('v' + s.from + ' → v' + s.to) : '';
   if (running) {
-    $('upd-title').textContent = '正在更新客户端';
+    $('upd-title').textContent = starting ? '正在启动更新…' : '正在更新客户端';
     $('upd-sub').textContent = [ver, s.name || '准备开始'].filter(Boolean).join(' · ');
   } else if (s.exit === 0) {
     $('upd-title').textContent = '更新完成';
     $('upd-sub').textContent = [ver, '正在加载新版本…'].filter(Boolean).join(' · ');
+  } else if (s.skip) {
+    // 闸门拦下 / 取不到面板的脚本: 这次**没有开始**。写成"更新失败"是另一种错 ——
+    // 什么都没跑, 配置一个字节也没被动过。
+    $('upd-title').textContent = '这次没有开始更新';
+    $('upd-sub').textContent = '面板上没有比本机更新的客户端, 或面板暂时取不到 —— 配置没有被改动';
   } else {
     $('upd-title').textContent = '更新失败 (退出码 ' + s.exit + ')';
     $('upd-sub').textContent = '点「看完整日志」能看到卡在哪一步; 重试不会影响现有配置';
@@ -265,9 +279,11 @@ function updRender(text) {
     return `<li class="${st}"><span class="ic">${ic}</span><span>${esc(p[1])}</span></li>`;
   }).join('');
   $('upd-live').textContent = s.live || '';
-  // 「重试 / 看完整日志」只在**失败**时出现: 跑得好好的时候摆一个"重试"只会让人手痒,
-  // 而跑完就更不需要了。
-  $('upd-actions').hidden = !(s.exit !== null && s.exit !== 0);
+  // 跑完之后收起按钮区; 但**更新中**也要留一个「看完整日志」的口子 —— 真卡住时那是唯一
+  // 能自救的入口。「重试」则只在没在跑的时候出现: 跑得好好的摆一个"重试"只会让人手痒。
+  $('upd-actions').hidden = s.exit === 0;
+  $('upd-retry').hidden = running;
+  updBtnBusy(running);
 
   if (s.exit === 0 && !updLeaving) {
     // 先让人看清"完成了", 再整页淡出换新版 —— 那一跳不该是"啪"地闪一下
@@ -282,7 +298,14 @@ function updRender(text) {
 
 async function updPoll() {
   try {
-    updRender(unesc((await call('update-log')).message));
+    const msg = unesc((await call('update-log')).message || '');
+    const s = updParse(msg);
+    // 还没看到**本次**的输出之前, 日志里那句可能是上一次留下的 —— 尤其是一份带 EXIT=0
+    // 的"更新完成": 照它渲染, 页面会在刚点完确认时就假报完成并自动刷新。CLI 一动手就会
+    // 先清空日志并落一行, 所以这里等到"有内容且没有终态"再认。
+    if (!updArmed && (!msg.trim() || s.exit !== null)) return;
+    updArmed = true;
+    updRender(msg);
   } catch (e) {
     /* 更新期间界面文件正在被替换, 偶尔取不到是正常的 —— 下一轮再问 */
   }
@@ -296,30 +319,52 @@ function updStop() {
   if (updTimer) { clearInterval(updTimer); updTimer = null; }
 }
 
+/* 更新在跑的时候按钮必须锁住: 进度条转着而按钮还能点, 一点就是第二次更新 —— 两次抢同一个
+ * 日志、抢同一份文件替换, 结果是哪一次的都说不清。 */
+function updBtnBusy(on) {
+  const btn = $('update');
+  if (!btn) return;
+  if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+  btn.disabled = on;
+  btn.textContent = on ? '更新中…' : (btn.dataset.label || '更新客户端');
+}
+
+/* "先给反馈, 再等后端": 按下确认之后立刻把进度面板亮成不确定态 —— 后端那一步要先去面板
+ * 取脚本 (会重试三次, 丢包的链路上最坏几十秒), 干等正是用户看到的"点了没反应"。 */
+function updStarting() {
+  $('upd').hidden = false;
+  updRender('==> 正在取面板的安装脚本');
+}
+
 $('update').onclick = async () => {
   if (!confirm('从面板拉取最新客户端并重跑一次安装？\n\n过程中代理会短暂重启；配置、凭据、订阅都不受影响。')) return;
-  const btn = $('update');
-  btn.disabled = true;
+  updArmed = false;
+  updLeaving = false;
   $('update-hint').textContent = '';
   $('update-hint').style.color = '';
+  // 先给反馈: 进度面板立刻亮出来 (不确定态), 之后由 update-log 驱动成真实进度。
+  updStarting();
+  updStart();
   try {
     const msg = unesc((await call('update')).message || '');
     if (/^\s*面板版本 v/.test(msg)) {
-      $('upd').hidden = false;
       updRender(msg);
-      updStart();
       toast('更新已开始');
     } else {
       // 闸门拦下 (面板还是旧版) 之类的"没有开始": 如实说, 不显示进度条
+      updStop();
+      $('upd').hidden = true;
+      updBtnBusy(false);
       $('update-hint').textContent = msg.trim();
       $('update-hint').style.color = 'var(--warn)';
       toast('没有开始更新');
     }
   } catch (e) {
-    $('update-hint').textContent = e.message;
-    $('update-hint').style.color = 'var(--err)';
-  } finally {
-    btn.disabled = false;
+    // 进度面板**不收起**, 也先不说"失败了": 面板那条路会重试, 而 agent 的动作超时是 90
+    // 秒 —— "报错了但更新其实在跑"在真机上出现过。让它继续按日志说话, 同时把这句实情
+    // 写在上面, 用户至少知道现在是什么状态、该看哪里。
+    $('update-hint').textContent = '没能确认更新有没有开始: ' + e.message + '（下面继续按路由器自己的日志显示）';
+    $('update-hint').style.color = 'var(--warn)';
   }
 };
 $('upd-retry').onclick = () => { $('upd').hidden = true; updLeaving = false; $('update').click(); };
@@ -329,7 +374,11 @@ $('upd-more').onclick = () => { document.querySelector('details').open = true; }
 (async () => {
   try {
     const msg = unesc((await call('update-log')).message || '');
-    if (updParse(msg).exit === null && msg.indexOf('==>') >= 0) {
+    // 判据是"日志里有一次**没有终态**的运行": CLI 一动手就往日志里落一行, 所以连"正在取
+    // 面板的安装脚本"那一段也能接着显示; 而跑完 / 没开始 / 失败都带终态, 刷新之后就不会
+    // 停在一个假的进度上。
+    if (msg.trim() && updParse(msg).exit === null) {
+      updArmed = true;
       $('upd').hidden = false;
       updRender(msg);
       updStart();

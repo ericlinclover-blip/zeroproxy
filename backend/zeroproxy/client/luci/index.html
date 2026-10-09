@@ -117,6 +117,11 @@ body.zp-leaving{opacity:0;pointer-events:none}
      linear-gradient(90deg,var(--accent),color-mix(in srgb,var(--accent) 50%,#7dd3fc));
      background-size:180% 100%,100% 100%;animation:upd-shine 1.5s linear infinite}
 @keyframes upd-shine{from{background-position:180% 0,0 0}to{background-position:-80% 0,0 0}}
+/* 还没走到第一个已知小节 (最常见: 正在取面板的安装脚本): 这一段没有可报的百分比, 所以
+   不填一个编出来的宽度, 改成一段来回跑的不确定进度条 —— "在动, 但还不知道到哪了"。
+   没有这一条, 用户按下确认之后的几十秒里看到的就是一条 0% 的死条。 */
+.upd.starting .upd-bar i{width:34%;animation:upd-seek 1.15s ease-in-out infinite}
+@keyframes upd-seek{0%,100%{margin-left:0}50%{margin-left:66%}}
 .upd.done .upd-bar i,.upd.done.running .upd-bar i{background:var(--ok);animation:none;background-size:auto}
 .upd.fail .upd-bar i,.upd.fail.running .upd-bar i{background:var(--err);animation:none;background-size:auto}
 .upd-steps{list-style:none;margin:12px 0 0;padding:0;display:grid;gap:6px}

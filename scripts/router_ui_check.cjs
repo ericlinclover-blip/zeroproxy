@@ -46,6 +46,15 @@ function makeMock() {
     // 真实的日志格式就是安装脚本自己打印的那些 `==>` 小节, 所以这里照抄了一份。
     updAt: 0,
     updGuard: false,
+    // 一键更新那条路的另外两种现场 (都来自真机):
+    //   updSlow  —— 后端要先去面板取脚本 (会重试三次, 最坏几十秒) 才回话;
+    //   updSkip  —— 这次**没有开始** (取不到面板的脚本), 日志里落一个 SKIP=1 终态。
+    updSlow: false,
+    updSkip: false,
+    updOverride: "",
+    // 日志里还躺着**上一次**更新的"更新完成" (真机上点确认那一刻看到的就是这个) ——
+    // 界面不许把它当成本次的结果, 否则会假报完成并自动刷新。
+    updStale: false,
   };
   const HEAD = "面板版本 v1.9.9 (本机 v1.9.8) —— 开始更新。\n";
   const UPD_LOG = [
@@ -100,7 +109,15 @@ function makeMock() {
           return json(res, { ok: true, message: `已请求面板把总开关设为「${payload.on ? "on" : "off"}」` });
         }
         if (action === "refresh") return json(res, { ok: true, message: "完成" });
-        if (action === "update") {
+        const replyUpdate = () => {
+          if (state.updSkip) {
+            // CLI 在"没有开始"时也会往日志里落一个终态 —— 没有它, 刷新之后进度面板
+            // 会一直转下去, 看起来像卡住 (实际是这次根本没开始)。
+            state.updOverride = "==> 正在取面板的安装脚本\n" +
+              "取不到面板的安装脚本 (面板不可达?) —— 这次没有开始更新。\nSKIP=1";
+            return json(res, { ok: true, message:
+              "取不到面板的安装脚本 (面板不可达?) —— 稍后再试, 或看 zeroproxy update-log" });
+          }
           if (state.updGuard) {
             return json(res, { ok: true, message:
               "面板上是 v1.9.7，这台机器已经是 v1.9.8 —— 那不是升级。\n" +
@@ -108,8 +125,17 @@ function makeMock() {
           }
           state.updAt = 1;
           return json(res, { ok: true, message: HEAD + "已开始更新 (后台进行, 约 1 分钟; 配置与凭据保留)。" });
+        };
+        if (action === "update") {
+          // 真机上的后端不是秒回的: 它先去面板取脚本。界面必须在**回话之前**就有反馈。
+          if (state.updSlow) return setTimeout(replyUpdate, 1200);
+          return replyUpdate();
         }
         if (action === "update-log") {
+          if (state.updOverride) return json(res, { ok: true, message: state.updOverride });
+          if (state.updStale && state.updAt === 0) {
+            return json(res, { ok: true, message: UPD_LOG[UPD_LOG.length - 1] });
+          }
           // 每问一次就往前走一格, 到最后一格 (带 EXIT=0) 就停在那里
           if (state.updAt > 0 && state.updAt < UPD_LOG.length - 1) state.updAt += 1;
           return json(res, { ok: true, message: UPD_LOG[state.updAt] });
@@ -227,11 +253,39 @@ async function main() {
     check("把探测到的原因一起显示出来 (不用回终端猜)",
       /Operation not supported/.test(noneSub), noneSub);
 
-    console.log("\n[8] 一键更新: 进度条 + 完成后的跳转");
+    console.log("\n[8] 一键更新: 点了就有反馈 → 进度条 → 完成后的跳转");
+    // 真机现场是"点了确认之后什么都没发生, 只能刷新页面才看到它其实一直在跑"。两件事一起
+    // 凑出这个结果: ① 后端要先去面板取脚本 (重试三次, 丢包的链路上最坏几十秒) 才回话;
+    // ② 日志里还躺着上一次更新的"更新完成"。这里把两件事都复现出来。
+    server.zpState.updSlow = true;                 // 后端 1.2 秒后才回话
+    server.zpState.updStale = true;                // 日志里是上一次的"更新完成"
+    const tClick = Date.now();
     await page.click("#update");            // confirm 由上面的 dialog 处理器自动接受
-    await page.waitForSelector("#upd:not([hidden])", { timeout: 8000 });
+    await page.waitForSelector("#upd:not([hidden])", { timeout: 900 });
+    const dtClick = Date.now() - tClick;
+    check("确认之后立刻有反馈: 后端还没回话, 进度面板已经亮出来", dtClick < 1100,
+      `等了 ${dtClick}ms (后端 1200ms 后才回话)`);
     check("点了更新之后出现进度面板", await page.locator("#upd").isVisible());
-    check("标题写着老版本 → 新版本", /v1\.9\.8 → v1\.9\.9/.test(await page.locator("#upd-sub").innerText()),
+    check("启动态是不确定进度, 不编一个百分比", (await page.locator("#upd-pct").innerText()) === "…",
+      await page.locator("#upd-pct").innerText());
+    check("启动态明说在干什么 (不是一句干等)",
+      /取面板的安装脚本/.test(await page.locator("#upd-sub").innerText()),
+      await page.locator("#upd-sub").innerText());
+    check("不把上一次的'更新完成'当成本次结果",
+      !/更新完成/.test(await page.locator("#upd-title").innerText()),
+      await page.locator("#upd-title").innerText());
+    check("更新中按钮锁住 (再点一下就是第二次更新)",
+      await page.locator("#update").isDisabled());
+    // 等原生 confirm 那层灰底退完再截图 —— 否则拍到的是"半透明"的一页 (第一次就是这样)。
+    await page.waitForTimeout(260);
+    await page.screenshot({ path: path.join(SHOT_DIR, "router-update-starting.png") });
+    server.zpState.updSlow = false;
+    server.zpState.updStale = false;
+    await page.waitForFunction(
+      () => /v1\.9\.8 → v1\.9\.9/.test(document.getElementById("upd-sub").textContent),
+      null, { timeout: 8000 });
+    check("后端回话之后接上真实进度 (标题写着老版本 → 新版本)",
+      /v1\.9\.8 → v1\.9\.9/.test(await page.locator("#upd-sub").innerText()),
       await page.locator("#upd-sub").innerText());
     // 进度会随日志推进 (模拟器每问一次就长一格)
     await page.waitForFunction(
@@ -259,7 +313,7 @@ async function main() {
     check("完成后是 100%", (await page.locator("#upd-pct").innerText()) === "100%");
     check("完成后提示正在加载新版本",
       /正在加载新版本/.test(await page.locator("#upd-sub").innerText()));
-    check("完成后按钮区隐藏 (进行中才需要重试/看日志)",
+    check("完成后按钮区隐藏",
       await page.locator("#upd-actions").isHidden());
     check("侧栏步骤全部打勾",
       (await stepStates()).todo === 0 && (await stepStates()).doing === 0);
@@ -277,6 +331,25 @@ async function main() {
       (await page.locator("#update-hint").innerText()).split("\n")[0]);
     check("没有开始更新就不显示进度条", await page.locator("#upd").isHidden());
     server.zpState.updGuard = false;
+
+    console.log("\n[10] 「没有开始」也是一个终态: 刷新之后不许停在一个假的进度上");
+    // 闸门拦下 / 取不到面板的脚本都属于"这次没开始"。它也得在日志里留一个终态 (SKIP=1):
+    // 只落一行 "==> 正在取面板的安装脚本" 的话, 刷新之后进度面板会一直转下去 —— 那正是
+    // 用户报的"点完没反应, 刷新才看到一个转不完的条"。
+    server.zpState.updSkip = true;
+    await page.click("#update");
+    await page.waitForFunction(
+      () => /取不到面板的安装脚本/.test(document.getElementById("update-hint").textContent),
+      null, { timeout: 8000 });
+    check("没开始时把 CLI 的原话说清楚", true,
+      (await page.locator("#update-hint").innerText()).split("\n")[0]);
+    check("没开始就不显示进度面板", await page.locator("#upd").isHidden());
+    await page.reload();
+    await page.waitForSelector(".srv");
+    await page.waitForTimeout(700);          // 给"刷新后接着显示"那段判断留出时间
+    check("刷新之后也不会恢复成一个转不完的假进度",
+      await page.locator("#upd").isHidden());
+    server.zpState.updSkip = false;
 
     // 浏览器自己会请求 /favicon.ico 之类, 那是模拟器的事, 不算页面问题
     const real = errors.filter((e) => !/favicon|404 \(Not Found\)/.test(e));
