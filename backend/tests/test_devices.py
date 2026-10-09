@@ -692,9 +692,90 @@ def test_heredoc_scripts_define_every_variable_they_use():
         body = got.group(1)
         # 这一段里自己赋值过的大写变量 (含大小写混排的自定义变量)
         assigned = set(re.findall(r"^\s*([A-Za-z_][A-Za-z0-9_]*)=", body, re.M))
-        used = set(re.findall(r"\$\{?(ZP_[A-Za-z0-9_]+)", body))
-        missing = sorted(v for v in used if v not in assigned)
+        # 带默认值的引用 (${ZP_X:-…}) 不算 —— 它本来就允许为空, 那是"可选开关"的写法。
+        missing = sorted({
+            name for name, defaulted in
+            re.findall(r"\$\{?(ZP_[A-Za-z0-9_]+)(:[-=+?])?", body)
+            if not defaulted and name not in assigned
+        })
         assert not missing, f"{marker} 里用了但没定义的变量: {missing} (跨文件作用域不共享)"
+
+
+def test_tun_mtu_follows_the_wan_and_is_clamped(client, configured):
+    """tun 的 MTU 由**设备**按 WAN 的实际 MTU 算出来带过来 —— 面板不知道外面是什么。
+
+    PPPoE 的 WAN 是 1492, 而 tun 里出去的包还要再封装一层 (TCP+TLS+协议头 ≈ 60 字节):
+    tun 仍按 1500 收包时封装后就是超包, 表现是**"小页面能开、一下载就卡住"**。面板这一侧
+    只需要做一件事 —— 把越界的值挡回去 (对面给的值不对时宁可退回默认)。
+    """
+    _login(client)
+    device = _register(client, _pair_code(client)["code"])
+    sub = f"/c/sub/{device['id']}?k={device['secret']}"
+
+    # 默认 (老客户端不发这个参数): 1500, 一个字节不变
+    assert yaml.safe_load(client.get(sub).text)["tun"]["mtu"] == 1500
+
+    # 设备报多少就用多少 (合理区间内)
+    assert yaml.safe_load(client.get(sub + "&mtu=1432").text)["tun"]["mtu"] == 1432
+    assert yaml.safe_load(client.get(sub + "&mtu=1280").text)["tun"]["mtu"] == 1280
+
+    # 越界一律退回默认: 一个坏值不该把全屋的 MTU 带跑偏
+    for bad in (0, 99, 1279, 1501, 99999, -1):
+        got = yaml.safe_load(client.get(sub + f"&mtu={bad}").text)["tun"]["mtu"]
+        assert got == 1500, f"mtu={bad} 应当退回 1500, 实际 {got}"
+
+    # 多服务器骨架同一条路
+    assert yaml.safe_load(client.get(sub + "&format=skeleton&mtu=1400").text)["tun"]["mtu"] == 1400
+
+
+def test_bench_endpoint_is_a_bounded_target(client, configured):
+    """`zeroproxy bench` 的靶子是面板自己 —— 一个**匿名、有上限**的定长下载端点。
+
+    为什么靶子是面板: 它是这台路由器一定能访问到的地址 (装机时唯一可达的), 而且"直连"与
+    "经代理"两条路跑的是同一段路, 一比就知道代理本身吃掉了多少。
+    为什么必须随机字节: 面板前面可能有 nginx、链路上还有运营商 —— 对可压缩内容它们都可能
+    压一把, 那样量出来的不是链路速度。
+    """
+    from zeroproxy import routes
+
+    res = client.get("/c/bench/2")
+    assert res.status_code == 200
+    assert len(res.content) == 2 << 20
+    assert res.headers["content-type"] == "application/octet-stream"
+    assert res.headers["cache-control"] == "no-store"
+
+    # 随机字节 (压缩不了): 拿前 4 KB 看熵就够 —— 全零或重复的模式会被中间任何一层压掉
+    assert len(set(routes._BENCH_MB[:4096])) > 64
+
+    # 有上限: 这是匿名端点, 而且面板自己就在那条链路上 —— 不能变成放大器
+    huge = client.get(f"/c/bench/{routes.BENCH_MAX_MB + 50}")
+    assert len(huge.content) == routes.BENCH_MAX_MB << 20
+    assert len(client.get("/c/bench/0").content) == len(routes._BENCH_MB)
+
+
+def test_install_script_probes_the_wan_for_mtu_and_offload():
+    """性能那一半的两条现场判据: WAN 的实际 MTU, 以及转发卸载会不会把代理绕过去。"""
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+    # MTU: 只能从**本机**取 (面板不知道外面是 PPPoE 还是以太网), 而且要按 table main 取 ——
+    # tun 的 auto-route 会把默认路由挪到自己那张表里, 重跑安装时按"默认路由"取会取到
+    # zp-tun (1500), 那就成了"拿代理自己的 MTU 去算代理的 MTU"。
+    assert "wan_mtu() {" in text and "compute_tun_mtu" in text
+    assert "ip route show table main default" in text
+    assert "tun_mtu=" in text and "wan_mtu=" in text
+    # 转发卸载: 只探测 + 报出来, **不去改用户的防火墙**
+    assert "offload_state() {" in text and "flow_offloading" in text
+    assert "offload=" in text
+    # **不改用户的防火墙设置** (那是他自己的选择): 只看真正的命令行, 注释里提到 fw4 是可以的
+    code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+    assert "uci set firewall" not in code and "uci commit" not in code
+    # 设备把 MTU 带给面板 (单服务器与骨架两条路)
+    assert text.count("&mtu=$_mtu") == 2
+    # 基准: 命令、结果落盘、doctor 里显示、心跳带上面板
+    assert "bench)" in text and "bench_run" in text and "zeroproxy bench" in text
+    assert '> "$ZP_DIR/bench"' in text
+    assert "bench_direct" in text and "bench_proxy" in text
 
 
 def test_local_control_plane_source_and_build_script_ship_with_the_repo():

@@ -3005,6 +3005,33 @@ def client_agent_binary(arch: str, request: Request):
     )
 
 
+#: `zeroproxy bench` 的靶子数据。**必须是随机字节**: 面板前面可能有 nginx、链路上还有
+#: 运营商, 对可压缩的内容它们都可能压一把 —— 那样量出来的不是链路速度。生成一次复用。
+_BENCH_MB = os.urandom(1 << 20)
+
+#: 单次最多给多少 MB。这是个匿名端点, 而面板自己也在那条链路上 —— 不能变成放大器。
+BENCH_MAX_MB = int(os.environ.get("ZP_BENCH_MAX_MB", "8"))
+
+
+@router.get("/c/bench/{mb}")
+def client_bench(mb: int, request: Request):
+    """给路由器 `zeroproxy bench` 用的定长数据 (测"直连"与"经代理"两条路的吞吐)。
+
+    为什么靶子是面板自己: 它是这台路由器**一定能访问到**的那个地址 (装机时唯一可达的),
+    而且两条路跑的是同一段路 —— 一比就知道代理本身吃掉了多少。
+
+    匿名可达, 与 `/c/bin` 同性质: 不给凭据, 也不泄露任何东西 (纯随机字节)。
+    """
+    # 注意不是 `mb or 4`: 那个写法会把 0 当成"没给"(Python 里 0 是假值), 于是
+    # /c/bench/0 返回 4 MB —— 一个看起来"很小"的请求反而拿到最多的数据。钳到 [1, 上限]。
+    size = min(max(int(mb), 1), BENCH_MAX_MB)
+    return Response(
+        _BENCH_MB * size,
+        media_type="application/octet-stream",
+        headers={"cache-control": "no-store"},
+    )
+
+
 @router.get("/c/core/status")
 def client_core_status(request: Request):
     """内核缓存状态 (`?arch=arm64` 只看一档)。
@@ -3146,6 +3173,7 @@ def client_subscription(
     tproxy: int = 1,
     datapath: str = "",
     ipv6: int = 0,
+    mtu: int = 1500,
 ):
     """设备专属订阅。设备不该拿到主订阅令牌, 所以它走自己的凭据。
 
@@ -3161,6 +3189,8 @@ def client_subscription(
     `?ipv6=1` 是设备侧探出来的"这一档数据面能一并接管 IPv6"。不能接管时保持 v4-only
     (默认 0, 老客户端行为不变) —— 那时设备的 v6 会直接出去, 这件事由设备如实上报,
     面板上写"IPv6 未接管", 而不是假装接管了。
+    `?mtu=` 是设备按自己 WAN 的实际 MTU 算出来的 tun MTU (面板不知道外面是 PPPoE 还是
+    以太网; PPPoE 1492 时 tun 仍收 1500 的包, 封装后就是超包)。越界值一律退回 1500。
     三种输出:
       format=clash     整份路由器配置 (单服务器模式, 内联节点)
       format=skeleton  骨架 (多服务器模式: providers 与组的 use 留空, 由路由器填)
@@ -3192,6 +3222,7 @@ def client_subscription(
             tproxy=bool(tproxy),
             datapath=(datapath or "").strip().lower(),
             ipv6=bool(ipv6),
+            mtu=int(mtu),
             # 分流数据库的下载地址指向面板自己 (路由器只需要能访问面板)
             base=share_links.panel_base_url(request, state),
         )

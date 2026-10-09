@@ -465,6 +465,11 @@ def main() -> int:
         caps_text = open(os.path.join(fake_root, "caps"), encoding="utf-8").read()
         check("caps 是 schema 2 (chosen / covered / why)",
               "schema=2" in caps_text and "chosen=" in caps_text and "covered=" in caps_text)
+        # 性能那一半的现场判据也进了 caps: WAN 的实际 MTU 与转发卸载状态
+        check("caps 记下了 WAN / tun 的 MTU 与转发卸载状态",
+              "wan_mtu=" in caps_text and "tun_mtu=" in caps_text and "offload=" in caps_text,
+              [ln for ln in caps_text.splitlines()
+               if ln.startswith(("wan_mtu", "tun_mtu", "offload"))])
 
         # 分流数据库 (真机上这一步失败 = mihomo 去 GitHub 拉超时, 整份配置校验不过)
         for name in ("geoip.metadb", "geosite.dat"):
@@ -1073,6 +1078,22 @@ def main() -> int:
         # revert: 停用 + 拆数据面 + 与装机前快照逐条比对, 并给出结论
         subprocess.run(["sh", cli_plain, "local-auto"], capture_output=True, text=True)
         out = subprocess.run(["sh", cli_plain, "revert"], capture_output=True, text=True)
+
+        # 基准: 面板当靶子, 直连那一趟必须真的量出数, 并落到 $ZP_DIR/bench
+        bench = subprocess.run(["sh", cli_plain, "bench"], capture_output=True, text=True,
+                               env={**os.environ, "ZP_BENCH_MB": "1"})
+        bench_file = os.path.join(fake_root, "bench")
+        check("bench 从面板量到了直连吞吐并落盘",
+              "直连" in bench.stdout and os.path.exists(bench_file)
+              and "direct_kbps=" in open(bench_file, encoding="utf-8").read(),
+              bench.stdout.strip().splitlines()[:3])
+        # 代理端口没在监听时, "经代理"那一趟**必须报失败**, 不能拿直连的数字充数 ——
+        # curl 默认遵守 NO_PROXY, 而它常常含 127.0.0.1: 于是 -x 被忽略, 量出来的是直连
+        # (演练里就这么骗过一次: 7890 上什么都没有, 却报了 921 MB/s)。
+        check("经代理那一趟在代理端口没监听时报失败, 不拿直连的数字充数",
+              "经代理" in bench.stdout and "失败" in bench.stdout
+              and "没量到数" in bench.stdout,
+              [ln.strip() for ln in bench.stdout.splitlines() if "经代理" in ln][:1])
         check("revert 给出了逐条比对的结论",
               "结论:" in out.stdout and ("完全回到装机前" in out.stdout or "还有残留" in out.stdout),
               [ln.strip() for ln in out.stdout.splitlines() if "结论" in ln][:1])

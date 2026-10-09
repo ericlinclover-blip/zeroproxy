@@ -37,7 +37,9 @@ from .config import paths
 #:        那条检查会静默变成"没有连接"); 有流量却嗅探不出域名时才报 !。
 #: 1.4.6: "已知域名"按 host **或** sniffHost 数 (fake-ip 路线只有前者、纯嗅探只有后者);
 #:        doctor 的说明改准 —— 设备的 DNS 有 dnsmasq 与运营商两条路, 两条都按域名分流。
-SCRIPT_VERSION = "1.4.6"
+#: 1.4.7: 性能那一半 —— tun MTU 按 WAN 的实际 MTU 算 (PPPoE 1494 之类不再出超包);
+#:        转发卸载探测 (它会绕过 netfilter 让 tproxy/redirect 失效); zp bench。
+SCRIPT_VERSION = "1.4.7"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"

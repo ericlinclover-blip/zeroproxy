@@ -14,7 +14,7 @@
 |---|---|---|
 | **Phase 1** 数据面阶梯 + 诚实状态 | ✅ 已实现 | 五级阶梯 (ebpf 只探不选 → tun → tproxy → **iptables REDIRECT** → 不接管)、`caps` v2 (`chosen`/`covered`/`why.*`)、按现场验证 + 自动降级、`desired × actual × covered` 三元显示 —— 见 README 8.46 |
 | **Phase 2** 控制面 zpcore + 本地自治 | ✅ 已实现 | `client/agent/` (Go, 自带 HTTP 服务 + 令牌校验 + 只绑 LAN, 接口契约与原 cgi 一致)、面板分发 (`.gz`, 与内核同一条路)、**面板不可达时的本机覆盖**、**`revert` 与装机前快照逐条比对** —— 见 README 8.47 / 8.48 |
-| **Phase 3** IPv6 + 性能模式 | 🟡 部分 | **IPv6 已接管** (数据面 v6 规则 + 能力探测 + 能接管才给双栈、接不了如实标注); 性能模式 (`dae`) 仍**只探不选** —— 见 README 8.48 |
+| **Phase 3** IPv6 + 性能 | 🟡 大部分完成 | **IPv6 已接管** (数据面 v6 规则 + 能力探测 + 能接管才给双栈、接不了如实标注); **MTU 按 WAN 实算** (PPPoE 不再出超包)、**转发卸载探测** (它会绕过 netfilter 让 tproxy/redirect 静默失效)、**`zp bench` 内建基准** (直连 vs 经代理, 结果回报面板) —— 见 README 8.48 / 8.57; 只剩 **eBPF (dae) 性能模式**: 刻意不做 (换内核 = 另一套配置语言与 geo 格式, 且需 OpenWrt 默认不带的 BTF), 现在由 `doctor` 报出这一档的可用性 |
 | **Phase 4** 抗封锁与协议透传 | ✅ 对账完成 | 指纹 / UDP / 端口跳跃**已经做了**; AnyTLS / Finalmask / ECH **不适用** (面板不生成那几种节点, "透传"没有来源); spec 化 + 本地重渲染与 shell 侧 mixin **不做** (路由器上没有渲染器, shell 拼 YAML 正是这两年一直在删的那类代码) —— 逐项对账见 README 8.49 |
 | **Phase 5** 兼容矩阵真机回归 | 🟡 能自动化的都自动化了 | 四类机器的安装/开关/覆盖/revert/本地界面都进了 `router_install_check.py` (94 项); **真机 (每种固件一台)** 仍然只有你能做 |
 

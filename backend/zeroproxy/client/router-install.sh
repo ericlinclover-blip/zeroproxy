@@ -510,6 +510,15 @@ NET_EBPF=0
 #: 真实 v6 地址 (看起来一切正常, 代理却等于没装)。而 mihomo 自己的 `ipv6: false` 并不
 #: 真的关掉 v6 协议栈 (上游 issue #2254), 所以这件事只能由我们在数据面这一层回答。
 NET_IPV6=0
+#: WAN 的 MTU 与 tun 该用的 MTU。PPPoE 的 WAN 是 1492, 而 tun 里出去的包还要再被封装
+#: 一层 (TCP + TLS + 协议头 ≈ 60 字节) —— tun 仍按 1500 收包时封装后就是超包, 表现是
+#: **"小页面能开、一下载就卡住"**。按 WAN 的实际 MTU 收着点, 别让大包死在路上。
+WAN_MTU=""
+TUN_MTU=1500
+#: 转发卸载 (软件 flow offloading / 硬件 HNAT) 开着时, 已建立连接的转发会**绕过
+#: netfilter** —— tproxy / redirect 那两档的代理规则就在 netfilter 里, 被绕过的后果是
+#: "局域网设备上网正常, 但流量根本没走代理"。tun 那一档走的是路由, 不受影响。
+NET_OFFLOAD=0
 #: 最近一次探测的失败原因 (内核/程序的原话优先)。写进 caps, 面板与 UI 都要看得见 ——
 #: 8.45 的真机就是只有一句"未出现", 只能靠用户截图才拼出原因。
 PROBE_WHY=""
@@ -714,6 +723,58 @@ nft_v6_ok() {
 #   none    谈不上
 # 覆盖不了时**不做静默处理**: 记进 caps 并一路报到面板 —— 卡片上会写"IPv6 未接管",
 # 用户至少知道自己暴露在哪。
+# WAN 接口的 MTU。**用默认路由 + table main**: tun 的 auto-route 会把默认路由挪到它自己
+# 的独立路由表里, 重跑安装时按"默认路由"取很容易取到 zp-tun (MTU 1500) —— 那就成了
+# "拿代理自己的 MTU 去算代理的 MTU"。table main 里留着的是真实的 WAN 出口。
+wan_mtu() {
+    _dev="$(ip route show table main default 2>/dev/null \
+        | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -n1)"
+    if [ -z "$_dev" ]; then
+        _dev="$(uci -q get network.wan.device 2>/dev/null \
+            || uci -q get network.wan.ifname 2>/dev/null || true)"
+    fi
+    [ -n "$_dev" ] || return 1
+    _m="$(ip link show "$_dev" 2>/dev/null | sed -n 's/.*mtu \([0-9][0-9]*\).*/\1/p' | head -n1)"
+    [ -n "$_m" ] || return 1
+    printf '%s' "$_m"
+}
+
+# tun 的 MTU 取多少。只有一个出发点: **封装之后不能超过 WAN 的 MTU**。
+#   WAN = 1500 (以太网直连 / 大多数 DHCP): 保持 1500 —— 今天跑得好好的机器不去动它;
+#   WAN < 1500 (PPPoE 1492 / PPTP / 部分 4G): 按 WAN 减去封装开销, 否则大包被丢或分片,
+#   表现是"网页能开, 一下载就卡住"。下界 1280 是 IPv6 的最小 MTU。
+compute_tun_mtu() {
+    TUN_MTU=1500
+    WAN_MTU="$(wan_mtu 2>/dev/null || true)"
+    [ -n "$WAN_MTU" ] || { WAN_MTU=""; return 0; }
+    if [ "$WAN_MTU" -lt 1500 ] 2>/dev/null; then
+        TUN_MTU=$((WAN_MTU - 60))
+        [ "$TUN_MTU" -lt 1280 ] && TUN_MTU=1280
+    fi
+}
+
+# 转发卸载开着吗 (软件 flow offloading 或硬件 HNAT)。探测而已 —— **不去改用户的防火墙
+# 设置** (那是他自己的选择), 但必须报出来: 在 tproxy / redirect 那两档下它会让流量绕过代理。
+offload_state() {
+    _sw="$(uci -q get firewall.@defaults[0].flow_offloading 2>/dev/null || true)"
+    _hw="$(uci -q get firewall.@defaults[0].flow_offloading_hw 2>/dev/null || true)"
+    case "${_sw}${_hw}" in
+        *1*) printf '1' ;;
+        *)   printf '0' ;;
+    esac
+}
+
+# eBPF 那一档 (dae) 到底差什么 —— 只在探测失败时给一句能看懂的话。
+# 它要的不只是内核版本: BTF (CONFIG_DEBUG_INFO_BTF) 才是真门槛, 而 OpenWrt 官方内核
+# 默认**不带**它 (为了省体积), 所以绝大多数路由器上这一档永远是"看得见、吃不着"。
+ebpf_detail() {
+    if [ "$NET_EBPF" = "1" ]; then
+        printf '内核 %s + BTF 都在 —— 这一档技术上可用' "$(uname -r 2>/dev/null)"
+    else
+        printf '%s' "${CAPS_WHY_EBPF:-内核条件不满足}"
+    fi
+}
+
 compute_ipv6_cap() {
     NET_IPV6=0
     CAPS_WHY_IPV6=""
@@ -761,6 +822,9 @@ caps_write() {
         printf 'redirect=%s\n' "$NET_REDIRECT"
         printf 'ebpf=%s\n' "$NET_EBPF"
         printf 'ipv6=%s\n' "$NET_IPV6"
+        printf 'wan_mtu=%s\n' "$WAN_MTU"
+        printf 'tun_mtu=%s\n' "$TUN_MTU"
+        printf 'offload=%s\n' "$NET_OFFLOAD"
         printf 'autoredirect=%s\n' "$_ar"
         printf 'chosen=%s\n' "${DATAPATH:-none}"
         printf 'covered=%s\n' "${COVERED:-none}"
@@ -842,6 +906,9 @@ install_deps() {
 
     # 选中哪一级, 并把 chosen / covered / ipv6 / why.* 一起落进 caps (全链路共用这一份)
     choose_datapath
+    # WAN 的 MTU 与转发卸载 (性能那一半: 大包别死在路上 / 别让卸载把代理绕过去)
+    compute_tun_mtu
+    NET_OFFLOAD="$(offload_state)"
 
     case "$DATAPATH" in
         tun)
@@ -875,7 +942,20 @@ install_deps() {
             ;;
     esac
     if [ "$NET_EBPF" = "1" ]; then
-        note "这台机器有 eBPF 数据面的底子 (内核 $(uname -r) + BTF) —— 性能模式留给后续版本"
+        note "eBPF 数据面可用: $(ebpf_detail) —— 性能模式留给后续版本 (见设计文档 Phase 3)"
+    else
+        note "eBPF 数据面不可用: $(ebpf_detail)"
+    fi
+    if [ -n "$WAN_MTU" ] && [ "$TUN_MTU" != "1500" ]; then
+        note "WAN 的 MTU 是 $WAN_MTU (PPPoE?), tun 按 $TUN_MTU 收包 —— 免得封装之后成超包"
+    fi
+    if [ "$NET_OFFLOAD" = "1" ]; then
+        if [ "$DATAPATH" = "tun" ]; then
+            note "转发卸载开着 (flow offloading / HNAT) —— tun 这一档走路由, 不受它影响"
+        else
+            note "转发卸载开着: 它会绕过 netfilter, 而当前这一档 ($DATAPATH) 的代理规则就在那里"
+            note "  → 已建立的连接可能直接走 WAN 而不经代理; 要稳就把 flow offloading 关掉"
+        fi
     fi
     if [ "$NET_IPV6" = "1" ]; then
         note "IPv6 一并接管 (局域网设备的 v6 流量也走代理, 不会漏出去)"
@@ -1620,6 +1700,16 @@ datapath_flag() {
     esac
 }
 
+# tun 该用的 MTU (装机时按 WAN 的实际 MTU 算的)。面板据此写 tun.mtu —— 它自己不知道
+# 这台机器外面是 PPPoE 还是以太网。老 caps 没有这一位时按 1500 报 (行为不变)。
+tun_mtu_flag() {
+    _v="$(caps_get tun_mtu)"
+    case "$_v" in
+        ''|*[!0-9]*) printf '1500' ;;
+        *) printf '%s' "$_v" ;;
+    esac
+}
+
 # 这一档数据面能不能一并接管 IPv6 (装机时探的)。面板据此决定给不给双栈配置 ——
 # 覆盖不到还给双栈, 等于让内核去管它管不了的东西。老 caps 没有这一位时按 0 报:
 # 宁可在面板上显示"IPv6 未接管", 也不能说成接管了。
@@ -1648,11 +1738,12 @@ build_config() {
     # 带上它内核直接起不来)。
     _dp="$(datapath_flag)"
     _ip6="$(ipv6_flag)"
+    _mtu="$(tun_mtu_flag)"
     if [ "$_n" -le 1 ]; then
-        http_get "$_b/c/sub/$_i?k=$_k&format=clash&rules=smart&geo=$_geo&tproxy=$_tp&datapath=$_dp&ipv6=$_ip6"
+        http_get "$_b/c/sub/$_i?k=$_k&format=clash&rules=smart&geo=$_geo&tproxy=$_tp&datapath=$_dp&ipv6=$_ip6&mtu=$_mtu"
         return $?
     fi
-    _skel="$(http_get "$_b/c/sub/$_i?k=$_k&format=skeleton&rules=smart&geo=$_geo&tproxy=$_tp&datapath=$_dp&ipv6=$_ip6")" || return 1
+    _skel="$(http_get "$_b/c/sub/$_i?k=$_k&format=skeleton&rules=smart&geo=$_geo&tproxy=$_tp&datapath=$_dp&ipv6=$_ip6&mtu=$_mtu")" || return 1
     [ -n "$_skel" ] || return 1
     # provider 段落走临时文件而不是 `awk -v block=...`: -v 的值里带换行时, BSD awk
     # 直接报 "newline in string", busybox awk 的转义处理也不一致 (本机演练抓到的)。
@@ -1805,6 +1896,11 @@ while true; do
     DP_REPORT="$(datapath_flag)"
     COV_REPORT="$(actual_covered)"
     IPV6_REPORT="$(ipv6_flag)"
+    # 性能那一半 (面板卡片上要能回答"这台机器跑这个能到多少")
+    MTU_REPORT="$(tun_mtu_flag)"
+    OFFLOAD_REPORT="$(caps_get offload)"
+    BENCH_D="$(sed -n 's/^direct_kbps=//p' "$ZP_DIR/bench" 2>/dev/null | head -n1)"
+    BENCH_P="$(sed -n 's/^proxy_kbps=//p' "$ZP_DIR/bench" 2>/dev/null | head -n1)"
     WHY_REPORT=""
     if [ "$COV_REPORT" = "none" ]; then
         # 一级都没接管时, 把**每一级为什么不行**都带上。只报"选中的那一级"会漏掉关键信息:
@@ -1827,7 +1923,9 @@ while true; do
         BODY="$BODY"',"report":{"mode":"'"$DP_REPORT"'","covered":"'"$COV_REPORT"'"'
         BODY="$BODY"',"why":"'"$(json_escape "$WHY_REPORT")"'"'
         BODY="$BODY"',"client":"'"$ZP_VERSION"'","override":"'"$OVERRIDE"'"'
-        BODY="$BODY"',"ipv6":"'"$IPV6_REPORT"'"}}'
+        BODY="$BODY"',"ipv6":"'"$IPV6_REPORT"'","mtu":"'"$MTU_REPORT"'"'
+        BODY="$BODY"',"offload":"'"$OFFLOAD_REPORT"'"'
+        BODY="$BODY"',"bench_direct":"'"${BENCH_D:-0}"'","bench_proxy":"'"${BENCH_P:-0}"'"}}'
         RESP="$(http_post "$_b/c/report" "$BODY" || true)"
         if [ -z "$RESP" ]; then
             FAILS=$((FAILS + 1))
@@ -2051,6 +2149,41 @@ sniffed_hosts() {
     printf '%s' "$_conn" | grep -oE '"(host|sniffHost)"[ ]*:[ ]*"[^"]{1,}"' | wc -l | tr -d ' '
 }
 
+# curl 的 speed_download (字节/秒) → 人话。分开写是因为 doctor 与 bench 都要用。
+bench_kbps() { awk -v s="${1:-0}" 'BEGIN{ if (s+0 < 0) s=0; printf "%d", s/1024 }'; }
+bench_text() {
+    if [ -z "${1:-}" ]; then printf '失败'; return 1; fi
+    _kb="$(bench_kbps "$1")"
+    if [ "${_kb:-0}" -le 0 ] 2>/dev/null; then printf '失败'; return 1; fi
+    if [ "${_kb:-0}" -ge 1024 ] 2>/dev/null; then
+        awk -v k="$_kb" 'BEGIN{printf "%.1f MB/s", k/1024}'
+    else
+        printf '%s KB/s' "$_kb"
+    fi
+}
+
+# 真机基准: 用面板当靶子, 量"直连"与"经代理"两条路的吞吐。
+#   为什么要用面板当靶子: 它是这台路由器**一定能访问到**的地址 (装机时唯一可达的), 而
+#   两条路跑的是同一段路 —— 一比就知道代理本身吃掉了多少。测别的公网地址要么连不上,
+#   要么两边不是一个终点, 数字没有可比性。
+#   为什么只测 4 MB: 路由器是 CPU 瓶颈, 4 MB 足够把上限顶出来, 又不至于烧掉用户的流量
+#   (经代理的那一趟是要算节点流量的)。
+BENCH_MB="${ZP_BENCH_MB:-4}"
+bench_run() {
+    _url="$1"; _proxy="$2"
+    if [ "$_proxy" = "proxy" ]; then
+        # `--noproxy ""` 是**必须**的: curl 默认遵守 NO_PROXY, 而多数环境里那个变量含
+        # 127.0.0.1 / localhost —— 于是"经代理"这一趟会**绕过代理直连**, 量出一个跟直连
+        # 一样漂亮的数字 (演练环境里就这么骗过一次: 代理端口根本没在监听, 却报了 921 MB/s)。
+        # 这一趟必须是真经代理, 不然这个数字比不测更糟。
+        curl -s -o /dev/null -m 120 --noproxy "" -x "http://127.0.0.1:$ZP_MIXED" \
+            -w '%{speed_download}' "$_url" 2>/dev/null || true
+    else
+        # 反过来: "直连"这一趟必须**真的不走代理** —— 环境里若设了 HTTP_PROXY, curl 会用它。
+        curl -s -o /dev/null -m 120 --noproxy '*' -w '%{speed_download}' "$_url" 2>/dev/null || true
+    fi
+}
+
 # 真机体检。它问的每一句都是"到底行不行", 每一条都给证据 —— 装机之后、出问题时第一个
 # 应该跑的命令。设计上它只能在真机上给出完整答案 (本机没有"局域网侧"这回事), 所以
 # 演练只验它的判据与输出格式。
@@ -2118,6 +2251,16 @@ doctor() {
     if [ "$(running)" = yes ] && [ "${_dnspkts:-0}" -gt 0 ] 2>/dev/null; then
         printf '  · 另有 %s 个查询是设备直接查外部 DNS 的，已被内核接管\n' "$_dnspkts"
     fi
+    if [ -s "$ZP_DIR/bench" ]; then
+        _bkd="$(sed -n 's/^direct_kbps=//p' "$ZP_DIR/bench" 2>/dev/null | head -n1)"
+        _bkp="$(sed -n 's/^proxy_kbps=//p' "$ZP_DIR/bench" 2>/dev/null | head -n1)"
+        _bka="$(sed -n 's/^at=//p' "$ZP_DIR/bench" 2>/dev/null | head -n1)"
+        if [ -n "$_bkp" ]; then
+            printf '  · 上次实测（zeroproxy bench，%s）: 直连 %s KB/s · 经代理 %s KB/s\n' \
+                "$(date -d "@${_bka:-0}" '+%m-%d %H:%M' 2>/dev/null || echo '?')" \
+                "${_bkd:-?}" "$_bkp"
+        fi
+    fi
     printf '    设备的 DNS 有两条路: 查路由器自己的 dnsmasq（本机服务, 不进内核, 于是连接靠嗅探认出域名），\n'
     printf '    或查运营商 DNS（IPv6 上很常见, 它会进内核并被 dns-hijack 成 fake-ip）—— 两条路都按域名分流。\n'
     printf '    所以"DNS 计数为 0"只说明这一刻没人直接查外部 DNS, 不是故障; 要证明的是上面那条。\n'
@@ -2131,6 +2274,33 @@ doctor() {
         printf '  ! 未接管 — %s\n' "$(sed -n 's/^why.ipv6=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
         printf '      这台机器上局域网设备的 IPv6 会直接出去\n'
     fi
+
+    echo
+    echo "性能"
+    _wan="$(sed -n 's/^wan_mtu=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    _tun="$(sed -n 's/^tun_mtu=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    if [ -n "$_tun" ]; then
+        if [ -n "$_wan" ] && [ "$_wan" != "1500" ]; then
+            printf '  ✓ WAN MTU %s（PPPoE?）→ tun 按 %s 收包，封装后不会成超包\n' "$_wan" "$_tun"
+        else
+            printf '  · WAN MTU %s → tun %s（以太网直连, 用默认值）\n' "${_wan:-未知}" "$_tun"
+        fi
+    fi
+    _off="$(sed -n 's/^offload=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    if [ "$_off" = "1" ]; then
+        if [ "$_live" = "tun" ]; then
+            printf '  · 转发卸载开着（flow offloading / HNAT）—— tun 走路由, 不受影响\n'
+        else
+            printf '  ! 转发卸载开着, 而数据面是 %s —— 它绕过 netfilter, 连接可能不走代理\n' "${_live:-?}"
+        fi
+    fi
+    _ebpf="$(sed -n 's/^ebpf=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    if [ "$_ebpf" = "1" ]; then
+        printf '  · eBPF 挡位可用（内核 + BTF 都在）—— 性能模式尚未实现\n'
+    else
+        printf '  · eBPF 挡位不可用: %s\n' "$(sed -n 's/^why.ebpf=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    fi
+    printf '    想测这台机器自己能跑多快: zeroproxy bench\n'
 
     echo
     echo "出口"
@@ -2391,6 +2561,36 @@ EOF
             echo "本来就没有本机覆盖 —— 总开关一直由面板决定。"
         fi
         ;;
+    bench)
+        # 真机基准。**它量的是"这台路由器自己"的能力**, 不是节点好坏: 同一个节点在手机上
+        # 能跑 200 Mbps, 在这台双核 A53 上可能只有 40 —— 这个数字决定了"换协议/换节点
+        # 还有没有意义"。结果落在 $ZP_DIR/bench, agent 会随心跳带给面板。
+        [ -n "$FIRST" ] || { echo "还没有接入任何服务器"; exit 1; }
+        command -v curl >/dev/null 2>&1 || { echo "这台固件上没有 curl —— 跑不了基准"; exit 1; }
+        _url="$(field_of "$FIRST" base)/c/bench/$BENCH_MB"
+        echo "路由器基准测试 (靶子是面板, ${BENCH_MB} MB —— 经代理那一趟会算节点流量)"
+        printf '  直连   … '
+        _dr="$(bench_run "$_url" direct)"
+        _dk="$(bench_kbps "$_dr")"
+        printf '%s\n' "$(bench_text "$_dr")"
+        printf '  经代理 … '
+        _pr="$(bench_run "$_url" proxy)"
+        _pk="$(bench_kbps "$_pr")"
+        printf '%s\n' "$(bench_text "$_pr")"
+        if [ "${_dk:-0}" -gt 0 ] 2>/dev/null && [ "${_pk:-0}" -gt 0 ] 2>/dev/null; then
+            printf '  代理开销 %s%%（经代理 / 直连）\n' \
+                "$(awk -v a="$_pk" -v b="$_dk" 'BEGIN{printf "%d", (1-a/b)*100}')"
+        fi
+        if [ "${_pk:-0}" -le 0 ] 2>/dev/null; then
+            printf '    （经代理那一趟没量到数 —— 内核在跑吗? 看 zeroproxy status）\n'
+        fi
+        {
+            printf 'at=%s\n' "$(date +%s)"
+            printf 'direct_kbps=%s\n' "${_dk:-0}"
+            printf 'proxy_kbps=%s\n' "${_pk:-0}"
+        } > "$ZP_DIR/bench" 2>/dev/null || true
+        echo "  已记下 —— 面板设备卡上会显示这两个数字 (agent 下一轮心跳带过去)"
+        ;;
     ui)
         # 端口在 ui.port 里 (安装时定下的): 空 = 固件自己的 Web 服务, 有值 = 自带 httpd。
         _port="$(cat "$ZP_DIR/ui.port" 2>/dev/null)"
@@ -2448,7 +2648,7 @@ EOF
         rm -rf "$ZP_DIR" /etc/init.d/zeroproxy /etc/init.d/zeroproxy-agent /etc/init.d/zeroproxy-ui /usr/bin/zeroproxy
         echo "已卸载。这台设备在面板上仍然存在, 请在面板「客户端」里一并移除。"
         ;;
-    *) echo "用法: zeroproxy [doctor|status|ui|servers|add <链接>|drop <键>|refresh|geo|on|off|local-auto|revert|log|uninstall]" ;;
+    *) echo "用法: zeroproxy [doctor|status|ui|servers|add <链接>|drop <键>|refresh|geo|on|off|local-auto|revert|bench|log|uninstall]" ;;
 esac
 CLIEOF
     chmod 755 "$ZP_CLI"

@@ -106,7 +106,16 @@ function coverageChip(d) {
   const v6 = String(r.ipv6 ?? "") === "0" && cov !== "none"
     ? `<span class="tag-chip" title="这台设备的数据面覆盖不到 IPv6: 局域网设备的 v6 流量会直接出去, 目标网站能看到真实的 v6 地址">IPv6 未接管</span>`
     : "";
-  return `<span class="tag-chip"${why}>${esc(mode ? `${mode} · ${txt}` : txt)}</span>${v6}`;
+  // 实测吞吐: **这台机器**能跑多快, 不是节点好坏。同一个节点在手机上能跑 200 Mbps、
+  // 在这台双核 A53 上可能只有 40 —— 它决定了"换协议 / 换节点还有没有意义"。
+  // 数字来自设备上的 `zeroproxy bench` (靶子是面板, 两条路跑同一段路)。
+  const dp = Number(r.bench_direct || 0);
+  const pp = Number(r.bench_proxy || 0);
+  const mb = (n) => Math.round((n / 1024) * 10) / 10;
+  const bench = pp > 0
+    ? `<span class="tag-chip" title="zeroproxy bench 实测: 直连 ${mb(dp)} MB/s · 经代理 ${mb(pp)} MB/s">实测 ${mb(pp)} MB/s</span>`
+    : "";
+  return `<span class="tag-chip"${why}>${esc(mode ? `${mode} · ${txt}` : txt)}</span>${v6}${bench}`;
 }
 
 /** 内核缓存这一行 —— 回答"现在发这条安装命令, 会不会卡在下载内核上"。

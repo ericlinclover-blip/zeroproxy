@@ -364,7 +364,7 @@ ROUTER_TUN = {
 }
 
 
-def router_tun(tproxy: bool = True) -> dict:
+def router_tun(tproxy: bool = True, mtu: int = 1500) -> dict:
     """路由器端的 `tun` 段 (按设备的实际能力裁剪)。
 
     `auto-redirect` 会往内核里写 nftables 规则 (sing-tun 在 OpenWrt 上还会写
@@ -377,11 +377,14 @@ def router_tun(tproxy: bool = True) -> dict:
     所以去掉 auto-redirect 不影响功能。设备在装机时探一次自己有没有 nft/tproxy, 用
     `?tproxy=0` 告诉面板 —— 有就用, 没有就别写, 别让它把 tun 拖垮。
     """
-    if tproxy:
-        return dict(ROUTER_TUN)
-    trimmed = dict(ROUTER_TUN)
-    trimmed.pop("auto-redirect", None)
-    return trimmed
+    tun = dict(ROUTER_TUN)
+    # MTU 由设备按 WAN 的实际 MTU 算出来带过来 (面板不知道外面是 PPPoE 还是以太网)。
+    # 只在合理区间内采纳; 越界说明对面给的值不对, 宁可退回默认。
+    if isinstance(mtu, int) and 1280 <= mtu <= 1500:
+        tun["mtu"] = mtu
+    if not tproxy:
+        tun.pop("auto-redirect", None)
+    return tun
 
 
 def router_dns(geo: bool = True, ipv6: bool = False) -> dict:
@@ -727,6 +730,7 @@ def clash_profile(
     tproxy: bool = True,
     datapath: str = "tun",
     ipv6: bool = False,
+    mtu: int = 1500,
 ) -> str:
     """Clash / mihomo 配置。
 
@@ -872,7 +876,7 @@ def clash_profile(
                 "skip-domain": ["Mijia Cloud", "+.push.apple.com"],
             },
             "dns": router_dns(geo, ipv6),
-            "tun": router_tun(tproxy),
+            "tun": router_tun(tproxy, mtu),
             "geox-url": geox,
             # 多服务器模式: 节点由路由器挂成 proxy-providers, 这里留一个空 map 当锚点
             **({"proxy-providers": {}} if skeleton else {"proxies": proxies}),
@@ -1244,6 +1248,7 @@ def router_skeleton(
     tproxy: bool = True,
     datapath: str = "tun",
     ipv6: bool = False,
+    mtu: int = 1500,
 ) -> str:
     """路由器端多服务器模式的骨架 (`?format=skeleton`)。
 
@@ -1252,7 +1257,7 @@ def router_skeleton(
     """
     return clash_profile(
         state, template, router=True, device=device, skeleton=True, geo=geo, base=base,
-        tproxy=tproxy, datapath=datapath, ipv6=ipv6,
+        tproxy=tproxy, datapath=datapath, ipv6=ipv6, mtu=mtu,
     )
 
 
@@ -1268,6 +1273,7 @@ def subscription_body(
     tproxy: bool = True,
     datapath: str = "tun",
     ipv6: bool = False,
+    mtu: int = 1500,
 ) -> tuple[str, str]:
     """返回 (响应体, media_type)。
 
@@ -1280,12 +1286,12 @@ def subscription_body(
     if fmt in ("skeleton", "router-skeleton"):
         return router_skeleton(
             state, template, device=device, geo=geo, base=base, tproxy=tproxy,
-            datapath=datapath, ipv6=ipv6,
+            datapath=datapath, ipv6=ipv6, mtu=mtu,
         ), "text/yaml; charset=utf-8"
     if fmt in ("clash", "mihomo", "yaml", "yml"):
         return clash_profile(
             state, template, router=router, device=device, geo=geo, base=base,
-            tproxy=tproxy, datapath=datapath, ipv6=ipv6,
+            tproxy=tproxy, datapath=datapath, ipv6=ipv6, mtu=mtu,
         ), "text/yaml; charset=utf-8"
     if fmt in ("singbox-next", "singbox14", "singbox-1.14", "singbox-new"):
         # 面向 sing-box ≥1.14: 用 http_clients 指定下载出口 (无废弃警告)
