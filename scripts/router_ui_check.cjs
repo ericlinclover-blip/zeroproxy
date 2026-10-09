@@ -53,6 +53,8 @@ function makeMock() {
     updSlow: false,
     updSkip: false,
     updFail: false,
+    // 路由器上根本没有 update.log 时, CLI 会回一句人话 —— 那句不许被当成"有一次在跑"。
+    updNoLog: false,
     updOverride: "",
     // 日志里还躺着**上一次**更新的"更新完成" (真机上点确认那一刻看到的就是这个) ——
     // 界面不许把它当成本次的结果, 否则会假报完成并自动刷新。
@@ -154,6 +156,7 @@ function makeMock() {
           return replyUpdate();
         }
         if (action === "update-log") {
+          if (state.updNoLog) return json(res, { ok: true, message: "(还没有更新记录)" });
           if (state.updOverride) return json(res, { ok: true, message: state.updOverride });
           if (state.updStale && state.updAt === 0) {
             return json(res, { ok: true, message: UPD_LOG[UPD_LOG.length - 1] });
@@ -421,6 +424,20 @@ async function main() {
     await page.waitForTimeout(700);          // 等那条 0.55s 的进度条过渡跑完再拍
     await page.screenshot({ path: path.join(SHOT_DIR, "router-update-failed.png") });
     server.zpState.updFail = false;
+
+    console.log("\n[12] 没有更新记录时, 不许凭空长出「正在更新中」(真机 8.70)");
+    // 路由器上没有 update.log 时, CLI 会回一句"(还没有更新记录)"。8.66 加的"刷新之后接着
+    // 显示"只看"非空 + 没有终态", 于是这句话被当成一次正在跑的更新 —— 每次打开页面都长出
+    // 一个进度面板, 连按钮都锁成「更新中…」。用户看到的正是那个"卡住"的假象。
+    server.zpState.updOverride = "";
+    server.zpState.updNoLog = true;
+    await page.reload();
+    await page.waitForSelector(".srv");
+    await page.waitForTimeout(700);          // 让"刷新后接着显示"那段判断跑完
+    check("没有更新记录 → 不显示进度面板", await page.locator("#upd").isHidden());
+    check("「更新客户端」按钮没被锁住 (还能点)",
+      await page.locator("#update").isEnabled(), await page.locator("#update").innerText());
+    server.zpState.updNoLog = false;
 
     // 浏览器自己会请求 /favicon.ico 之类, 那是模拟器的事, 不算页面问题
     const real = errors.filter((e) => !/favicon|404 \(Not Found\)/.test(e));

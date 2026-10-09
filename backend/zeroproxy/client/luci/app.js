@@ -239,6 +239,16 @@ function updParse(text) {
   return out;
 }
 
+/* 这份日志是不是"真的跑过一次更新"? 判据: 有 `==>` 小节, 或者带终态 (EXIT= / SKIP=)。
+ *
+ * 为什么非要单独判一次 (真机 8.70): 没有更新记录时 CLI 会回一句人话 ——
+ * "(还没有更新记录)"。8.66 加的"刷新之后接着显示"只看"非空 + 没有终态", 于是这句话
+ * 被当成了"有一次正在跑的更新": **每次打开页面都凭空长出一个「正在更新中」的面板,
+ * 连「更新客户端」按钮都被锁成「更新中…」** —— 用户以为卡住了, 其实什么都没在跑。 */
+function updLooksLikeRun(text) {
+  return /^==>/m.test(text) || /^(EXIT=\d+|SKIP=1)$/m.test(text);
+}
+
 function updRender(text) {
   const s = updParse(text);
   const total = UPDATE_STEPS.length;
@@ -316,7 +326,7 @@ async function updPoll() {
     // 还没看到**本次**的输出之前, 日志里那句可能是上一次留下的 —— 尤其是一份带 EXIT=0
     // 的"更新完成": 照它渲染, 页面会在刚点完确认时就假报完成并自动刷新。CLI 一动手就会
     // 先清空日志并落一行, 所以这里等到"有内容且没有终态"再认。
-    if (!updArmed && (!msg.trim() || s.exit !== null)) return;
+    if (!updArmed && (!updLooksLikeRun(msg) || s.exit !== null)) return;
     updArmed = true;
     updRender(msg);
   } catch (e) {
@@ -395,7 +405,8 @@ $('upd-more').onclick = () => { document.querySelector('details').open = true; }
     // 判据是"日志里有一次**没有终态**的运行": CLI 一动手就往日志里落一行, 所以连"正在取
     // 面板的安装脚本"那一段也能接着显示; 而跑完 / 没开始 / 失败都带终态, 刷新之后就不会
     // 停在一个假的进度上。
-    if (msg.trim() && updParse(msg).exit === null) {
+    // 而且它必须**像一次运行** —— 否则 CLI 那句"(还没有更新记录)"会凭空造出一个进度面板。
+    if (updLooksLikeRun(msg) && updParse(msg).exit === null) {
       updArmed = true;
       $('upd').hidden = false;
       updRender(msg);
