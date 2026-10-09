@@ -5,6 +5,7 @@
  */
 import { $, esc, toast, show } from "../lib/dom.js";
 import { api } from "../lib/api.js";
+import { forgetToken } from "../lib/bootstrap.js";
 import { S, reloadDash } from "../lib/state.js";
 import { renderSteps } from "../lib/render.js";
 
@@ -34,6 +35,8 @@ $("#btn-setup").onclick = async () => {
     renderSteps(res.steps || [], prog);
     prog.classList.remove("hidden");
     $("#setup-bar").classList.add("hidden");
+    // 拿到 2xx = 服务端已经收下这次初始化 (并作废了引导令牌), 本标签页不用再留着它
+    forgetToken();
     const failed = (res.steps || []).filter((s) => !s.ok);
     const dest = res.redirect || {};
     if (!failed.length && dest.ready) {
@@ -53,6 +56,19 @@ $("#btn-setup").onclick = async () => {
       toast(`部署完成但有 ${failed.length} 步失败`);
     } else {
       btn.textContent = "完成 ✓";
+      // 初始化是在 **HTTP** 页面上做的 (引导阶段面板同时挂在 80 端口, 这样点开
+      // 终端给的链接就是初始化页, 不用先跟"您的连接不是私密连接"打交道)。而配置
+      // 一落进 nginx, 80 端口就只剩 ACME 与跳转 —— 这一页的后续请求会立刻失效
+      // (拿到的是伪装主页), 所以主动把人送到 HTTPS 面板。域名面板就绪就跳域名,
+      // 否则回到 IP 的 HTTPS 入口 (那一次证书提示躲不掉, 但已经初始化完了)。
+      if (dest.secure_url && location.protocol === "http:") {
+        showSetupHandoff({ url: dest.secure_url }, payload.username, 0, {
+          stay: false,
+          note: "面板已切到 HTTPS。IP 地址用的是自签证书, 浏览器会提示一次\"不安全\", " +
+            "点「继续访问」即可; 之后请改用你的域名访问面板 (真实证书, 无警告)。",
+        });
+        return;
+      }
       if (dest.url && !dest.ready) {
         // 证书/域名这一步没成: 说清原因, 别让用户以为该用域名却打不开
         const hint = $("#setup-hint");
@@ -72,10 +88,14 @@ $("#btn-setup").onclick = async () => {
   }
 };
 
-/* 部署完成 → 交接到域名面板。默认 3 秒后自动跳, 也给"留在本页"的出口。 */
-export function showSetupHandoff(dest, user, seconds) {
+/* 部署完成 → 交接到新的面板入口。默认 3 秒后自动跳, 也给"留在本页"的出口
+ * (opts.stay === false 时不提供它: 那种情况下本页已经不再提供面板, 留下来只会
+ *  看到"连接中断" —— 例如初始化是在 80 端口的 HTTP 页面上做的)。 */
+export function showSetupHandoff(dest, user, seconds, opts = {}) {
   const url = `${String(dest.url || "").replace(/\/+$/, "")}/?user=${encodeURIComponent(user || "")}`;
   const total = Number(seconds) > 0 ? Number(seconds) : 3;
+  const note = opts.note || `该地址用的是真实证书, 不会再报"不安全"; 用户名已预填, 输入密码即可登录。`;
+  const stay = opts.stay === false ? "" : `<button class="btn ghost small" id="handoff-stay">留在本页</button>`;
   const box = $("#setup-done");
   box.classList.remove("hidden");
   box.innerHTML = `
@@ -87,11 +107,9 @@ export function showSetupHandoff(dest, user, seconds) {
       <div id="handoff-count">正在跳转到 <b>${esc(url)}</b> · ${total} 秒</div>
       <div class="row center mt-3">
         <button class="btn small" id="handoff-go">立即前往</button>
-        <button class="btn ghost small" id="handoff-stay">留在本页</button>
+        ${stay}
       </div>
-      <div class="muted fs-sm mt-2">
-        该地址用的是真实证书, 不会再报"不安全"; 用户名已预填, 输入密码即可登录。
-      </div>
+      <div class="muted fs-sm mt-2">${note}</div>
     </div>`;
   let left = total;
   const go = () => { location.href = url; };
@@ -102,7 +120,8 @@ export function showSetupHandoff(dest, user, seconds) {
     if (left <= 0) { clearInterval(timer); go(); }
   }, 1000);
   $("#handoff-go").onclick = go;
-  $("#handoff-stay").onclick = () => {
+  const stayBtn = $("#handoff-stay");
+  if (stayBtn) stayBtn.onclick = () => {
     clearInterval(timer);
     box.classList.add("hidden");
     box.innerHTML = "";

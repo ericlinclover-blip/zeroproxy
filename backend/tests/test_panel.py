@@ -99,6 +99,39 @@ def test_setup_offers_handoff_when_cert_and_domain_are_ready(client, token, home
     assert calls and calls[0][0] == DOMAIN          # 真的按域名探过一次, 不是无脑跳
 
 
+def test_setup_hands_off_to_https_when_the_bootstrap_page_was_plain_http(client, token, home, monkeypatch):
+    """初始化是在 **80 端口的明文 HTTP 页**上做的 (见 install.sh), 而配置一落进 nginx,
+    那一页就不再提供面板 (80 只剩 ACME 与跳转)。
+
+    所以后端要告诉前端"HTTPS 入口在哪", 前端才能把人送过去 —— 否则用户会停在一个
+    请求全部失效的页面上 (他看到的是伪装主页, 而不是"连接中断")。
+
+    只在**从默认 HTTP 端口进来**时给: 本地 dev.sh / 回归脚本的面板自己就听在那个明文
+    端口上 (Host 带 :8899), 不需要换地址, 也就不该被赶去没有人听的 https。
+    """
+    from zeroproxy import services
+
+    monkeypatch.setattr(services, "is_prod", lambda: True)
+    payload = {"domain": DOMAIN, "username": USERNAME, "password": PASSWORD, "token": token}
+
+    # (a) 80 端口进来 (Host 不带端口): 给 HTTPS 入口
+    body = client.post("/api/setup", json=payload).json()
+    assert body["redirect"]["secure_url"] == f"https://testserver:{config.PANEL_PORT}/", body["redirect"]
+
+
+def test_setup_does_not_force_https_on_the_panels_own_port(client, token, home, monkeypatch):
+    """面板自己那个对外端口 (8899) 明文进来时**不该**被赶去 https —— 那是本地开发
+    (dev.sh / browser_check) 的形态: 它本来就一直听着这个明文端口。"""
+    from zeroproxy import services
+
+    monkeypatch.setattr(services, "is_prod", lambda: True)
+    payload = {"domain": DOMAIN, "username": USERNAME, "password": PASSWORD, "token": token}
+    body = client.post(
+        "/api/setup", json=payload, headers={"host": f"127.0.0.1:{config.PANEL_PORT}"}
+    ).json()
+    assert body["redirect"]["secure_url"] == "", body["redirect"]
+
+
 # ---------------------------------------------------------------- 鉴权
 
 def test_dashboard_requires_auth(client, configured):
@@ -3480,6 +3513,80 @@ def test_install_script_says_it_is_not_for_routers():
     # `dpkg: command not found` (看不出哪一步、也不知道换什么)。
     assert "dpkg --print-architecture 2>/dev/null" in text, "dpkg 不在时不许把脚本直接带走"
     assert _bash_syntax_ok(path)
+
+
+def test_install_puts_the_bootstrap_page_on_plain_http_port_80():
+    """第一跳要"打开就是初始化页", 而不是先跟证书警告页打交道。
+
+    真机反馈: 装完点开终端给的链接 `https://<IP>:8899/?token=…`, 浏览器先拦一页
+    「您的连接不是私密连接」(引导阶段用的是自签证书) —— "根本无法丝滑流畅地跳转到
+    程序的初始化页"; 而且 8899 还得用户自己去安全组放行, 80 却是 ACME 必须开着的。
+
+    所以引导期把初始化页同时挂在 **80 端口的明文 HTTP** 上, 终端打印的主链接也换成它;
+    `https://<IP>:8899` 仍然保留 (80 被占 / 被拦时的备用)。面板完成 setup 后这份引导
+    配置会被 apply 生成的那份整体覆盖 —— 那时 80 只剩 ACME 与跳转, 明文只存在于
+    "还没有管理员账号"的引导期。
+    """
+    import re
+
+    path = os.path.join(REPO_ROOT, "install.sh")
+    text = open(path, encoding="utf-8").read()
+    # 80 那份引导 server: 按 IP 匹配 (不去动发行版自带的 default 站点, 免得撞上
+    # nginx 的 "duplicate default server"), 双栈监听, ACME 路径仍然在
+    assert "server_name $SERVER_IP;" in text
+    assert re.search(r"listen 80;\n\s*listen \[::\]:80;", text), "80 端口要双栈监听"
+    assert "location ^~ /.well-known/acme-challenge/" in text, "80 上的 ACME 路径不能丢"
+    # 主链接是 http://<IP>/ (没有证书警告), 备用才是 https://<IP>:8899
+    assert 'PANEL_URL="http://${SERVER_IP}/?token=${ZP_TOKEN}"' in text
+    assert 'PANEL_URL_TLS="https://${SERVER_IP}:$PANEL_PORT/?token=${ZP_TOKEN}"' in text
+    assert 'ok "  初始化页:  $PANEL_URL"' in text
+    assert _bash_syntax_ok(path)
+
+
+def test_boot_never_routes_an_unconfigured_panel_to_the_login_page():
+    """第一次 /api/status 抖一下, 不能把还没初始化的用户送进登录页。
+
+    真机形态: 面板刚装好 (或刚重启), 用户点开链接 —— 第一个 /api/status 失败一次。
+    老代码只分"已登录 / 未登录", 于是把它当成掉登录而 `show("view-login")`; 而登录页
+    对一个还没初始化的面板只会回 409「系统尚未初始化」: 用户既登不进去、也回不到
+    初始化页, 只能去终端重新找那条带令牌的链接 —— "点开链接进不了初始化页"。
+    """
+    import re
+
+    path = os.path.join(REPO_ROOT, "backend", "static", "app", "views", "dashboard.js")
+    text = open(path, encoding="utf-8").read()
+    assert "function routeByStatus" in text
+    assert re.search(r"if \(!st\.configured\)", text), "分流要看 configured, 不能只看 authenticated"
+    assert re.search(r"const st = await waitForStatus", text), "连不上时要重试并拿回 status"
+    assert re.search(r"if \(st\) return routeByStatus\(st, presetUser\)", text)
+    # 老写法 (只认 alive 布尔值 → 未初始化的面板也会落到登录页) 不许回来
+    assert "const alive = await sessionState(8, 1500)" not in text
+
+
+def test_bootstrap_token_survives_a_page_reload():
+    """引导页刷新一次, 令牌不能丢。
+
+    证书警告之后浏览器重载、用户自己按 F5, 都是这一步的常态; 而地址栏里的令牌一进
+    页面就被抹掉了 (那是对的: 一次性凭据不该长期留在历史 / 截图里)。老代码于是只剩
+    一句「请用带 ?token= 的链接打开本页」, 而那条链接在终端里, 多半已经滚没了 ——
+    用户只能重新跑一遍安装命令才知道自己该打开哪里。
+    """
+    lib = os.path.join(REPO_ROOT, "backend", "static", "app", "lib", "bootstrap.js")
+    assert os.path.isfile(lib), "令牌在本标签页的驻留要单独一层 (lib/bootstrap.js)"
+    text = open(lib, encoding="utf-8").read()
+    assert "sessionStorage" in text and "zp-bootstrap" in text
+    dash = open(
+        os.path.join(REPO_ROOT, "backend", "static", "app", "views", "dashboard.js"),
+        encoding="utf-8",
+    ).read()
+    assert "rememberToken(urlToken)" in dash, "带令牌打开时要记住它"
+    assert "S.bootstrapToken = urlToken || readToken();" in dash
+    setup = open(
+        os.path.join(REPO_ROOT, "backend", "static", "app", "views", "setup.js"),
+        encoding="utf-8",
+    ).read()
+    # 初始化成功 (服务端此刻已作废令牌) 之后才清 —— 403 那次走的是 catch, 不能清
+    assert "forgetToken()" in setup[setup.index('await api("/api/setup"'):]
 
 
 def test_upgrade_sim_harness_is_valid():

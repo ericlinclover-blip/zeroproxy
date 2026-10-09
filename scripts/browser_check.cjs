@@ -172,6 +172,50 @@ async function main() {
     page.on("console", (m) => { if (m.type() === "error") consoleErrors.push(m.text()); });
     page.on("requestfailed", (r) => failedRequests.push(`${r.url()} ${r.failure()?.errorText}`));
 
+    console.log("\n[0] 第一跳: 抖动与刷新都不能把人挡在初始化页外");
+    // 这一段故意要让一个 /api/status 失败, 所以单独开一个 page 跑 —— 失败请求与
+    // console 错误是挂在主 page 上统计的, 不能让自己的"事故现场"把它弄脏。
+    // (会话 / sessionStorage 都是按 page 隔离的, 主流程不受影响。)
+    const probe = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+    // 事故现场 1: 面板刚装好, 用户点开终端给的那条链接 —— 第一个 /api/status 抖了一下
+    // (面板刚重启 / 线路抖)。以前这里只分"已登录 / 未登录", 于是**未初始化**的面板
+    // 会把人送进登录页; 而登录页对一个还没初始化的面板只会回 409「系统尚未初始化」,
+    // 用户既登不进去、也回不到初始化页 —— "点开链接进不了初始化页"。
+    {
+      let n = 0;
+      await probe.route("**/api/status", async (route) => {
+        n += 1;
+        return n === 1 ? route.abort("connectionfailed") : route.continue();
+      });
+      await probe.goto(`${base}/?token=${TOKEN}`);
+      let onSetup = true;
+      try {
+        await probe.waitForSelector("#view-setup:not(.hidden)", { timeout: 20000 });
+      } catch (e) { onSetup = false; }
+      const onLogin = await probe.evaluate(
+        () => !document.querySelector("#view-login").classList.contains("hidden"));
+      await probe.unroute("**/api/status");
+      check("首次 /api/status 抖一下后仍落在初始化页 (没被送进登录页)",
+        onSetup && !onLogin, onLogin ? "进了登录页" : "");
+    }
+    // 事故现场 2: 用户在引导页按了 F5 (或浏览器因为证书警告重载了本页)。地址栏里的
+    // 令牌一进页面就被抹掉了, 以前刷新一次就只剩一句"请用带 ?token= 的链接打开本页",
+    // 而那条链接在终端里。现在令牌记在本标签页的 sessionStorage 里, 刷新照常初始化。
+    {
+      await probe.goto(`${base}/?token=${TOKEN}`);
+      await probe.waitForSelector("#view-setup:not(.hidden)");
+      await probe.reload();
+      let onSetup = true;
+      try {
+        await probe.waitForSelector("#view-setup:not(.hidden)", { timeout: 15000 });
+      } catch (e) { onSetup = false; }
+      const hinted = await probe.evaluate(
+        () => !document.querySelector("#setup-hint").classList.contains("hidden"));
+      check("刷新初始化页后令牌还在 (不会卡在\"请用带 ?token= 的链接打开本页\")",
+        onSetup && !hinted, hinted ? "出现了缺少令牌的提示" : "");
+    }
+    await probe.close();
+
     console.log("\n[1] 初始化流程");
     await page.goto(`${base}/?token=${TOKEN}`);
     await page.waitForSelector("#view-setup:not(.hidden)");

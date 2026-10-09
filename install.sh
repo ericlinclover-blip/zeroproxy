@@ -13,8 +13,9 @@
 #    ZP_PORT=8899            面板端口
 #    XRAY_VERSION=24.11.30   指定 Xray 版本 (默认 latest)
 #
-#  完成后终端输出面板地址 https://<IP>:8899 (自签证书, 浏览器需点一次"继续访问"),
-#  浏览器打开 → 输入 域名/用户名/密码 → 一键生成全部配置。
+#  完成后终端输出初始化页地址 http://<IP>/ (80 端口, 打开即初始化页, 没有证书警告;
+#  同一页也挂在 https://<IP>:8899, 那是自签证书 —— 打不开 80 时用它, 浏览器需点一次
+#  "继续访问"), 浏览器打开 → 输入 域名/用户名/密码 → 一键生成全部配置。
 # ============================================================
 set -Eeuo pipefail
 
@@ -407,10 +408,37 @@ server {
         proxy_read_timeout 3600s;
     }
 }
+
+# 初始化页同时挂在 **80 端口的明文 HTTP** 上。
+# 为什么: 引导阶段面板用的是自签证书, 浏览器打开 https://<IP>:$PANEL_PORT 会先拦一页
+# "您的连接不是私密连接" —— 用户点开终端给的那条链接, 想看的是初始化页, 不是证书警告。
+# 而 80 是 ACME 必须放行的端口 (几乎不存在没开的情况), 所以让第一跳走它:
+# 点链接 → 直接就是初始化页。
+# 只按 IP 匹配 server_name (不用 default_server): 这样不必去动发行版自带的 default
+# 站点, 也就不会撞上"duplicate default server"。
+# 面板完成 setup 后, 这份引导配置会被 apply 生成的那份整体覆盖 —— 那时 80 端口只剩
+# ACME 与跳 HTTPS, 面板不再以明文对外 (明文只存在于"还没有管理员账号"的引导期)。
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $SERVER_IP;
+    location ^~ /.well-known/acme-challenge/ {
+        root $ZP_HOME/www;
+    }
+    location / {
+        proxy_pass http://zeroproxy_panel;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_read_timeout 3600s;
+    }
+}
 NGINX
 if nginx -t >/dev/null 2>&1; then
   systemctl reload nginx 2>/dev/null || systemctl restart nginx
-  ok "面板反向代理已就绪 (https://<IP>:$PANEL_PORT)"
+  ok "初始化页已就绪 (http://<IP>/ 与 https://<IP>:$PANEL_PORT)"
 else
   warn "nginx 引导配置校验失败, 请检查 /etc/nginx/conf.d/zeroproxy.conf"
 fi
@@ -451,14 +479,18 @@ fi
 # ---------------- 10. 完成 ----------------
 echo
 if [ -n "$ZP_TOKEN" ]; then
-  PANEL_URL="https://${SERVER_IP}:$PANEL_PORT/?token=${ZP_TOKEN}"
+  PANEL_URL="http://${SERVER_IP}/?token=${ZP_TOKEN}"
+  PANEL_URL_TLS="https://${SERVER_IP}:$PANEL_PORT/?token=${ZP_TOKEN}"
 else
-  PANEL_URL="https://${SERVER_IP}:$PANEL_PORT/"
+  PANEL_URL="http://${SERVER_IP}/"
+  PANEL_URL_TLS="https://${SERVER_IP}:$PANEL_PORT/"
 fi
 ok "=============================================="
 ok "  ZeroProxy 部署完成!"
-ok "  面板地址:  $PANEL_URL"
-ok "  (引导阶段用自签证书, 浏览器首次提示不安全, 点「继续访问」)"
+ok "  初始化页:  $PANEL_URL"
+ok "  (80 端口明文 HTTP —— 打开就是初始化页, 没有证书警告, 也不需要额外放行端口)"
+ok "  备用地址:  $PANEL_URL_TLS"
+ok "  (面板自签证书, 浏览器会提示不安全, 点「继续访问」; 80 被占用 / 被拦时用它)"
 ok "  打开链接 → 输入 域名/用户名/密码 → 一键生成"
 ok "  完成后请改用 https://<你的域名>:$PANEL_PORT 访问面板 (真实证书, 无警告)"
 ok "=============================================="

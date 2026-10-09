@@ -5,7 +5,8 @@
  *  在这里被切断 (否则 dashboard ↔ traffic 会互相 import)。
  */
 import { $, toast, copyText, show } from "../lib/dom.js";
-import { api, sessionState, markDisconnected } from "../lib/api.js";
+import { api, sleep, sessionState, markDisconnected } from "../lib/api.js";
+import { readToken, rememberToken } from "../lib/bootstrap.js";
 import { snapshotDraftInputs, restoreDraftInputs } from "../lib/drafts.js";
 import { openQr, SUB_FMT_LABEL } from "../lib/dialog.js";
 import { S, setDashRenderers } from "../lib/state.js";
@@ -161,14 +162,60 @@ function setupScrollSpy() {
 /* 入口: 决定进"初始化 / 登录 / 仪表盘"哪一个视图。
  * 放在这个模块里而不是 main.js, 是因为它要用 loadDash —— 反过来 loadDash 的连接
  * 异常分支也要回调 boot(), 两者必须同处一个模块才不会变成循环依赖。 */
+
+/** /api/status 连不上时的等待: 面板重启内核、网络抖一下都是常态, 别一秒就判死。
+ *  返回最后一次拿到的 status 对象, 一直连不上返回 null。 */
+async function waitForStatus(tries = 8, delay = 1500) {
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await api("/api/status");
+    } catch (e) { /* 还没回来: 继续等 */ }
+    if (i < tries - 1) await sleep(delay);
+  }
+  return null;
+}
+
+/** 按 /api/status 把用户送到该去的视图。
+ *
+ *  **未初始化一定回初始化页** —— 这里以前只分"已登录 / 未登录"两支, 于是面板还没
+ *  初始化 (但第一次 /api/status 刚好抖了一下) 时, 用户会被送到**登录页**: 而登录页
+ *  对一个没初始化的面板只会回 409「系统尚未初始化」, 用户既登不进去、也回不到初始化页,
+ *  只能去终端重新找那条带令牌的链接 —— "点开链接进不了初始化页"就是这么来的。
+ */
+function routeByStatus(st, presetUser) {
+  if (!st.configured) {
+    show("view-setup");
+    if (st.token_required && !S.bootstrapToken) {
+      const hint = $("#setup-hint");
+      hint.textContent = "本面板已启用引导令牌保护。请使用安装完成时终端打印的、带 ?token= 的链接打开本页, 否则无法完成初始化。";
+      hint.classList.remove("hidden");
+    }
+    return;
+  }
+  if (st.authenticated) return loadDash();
+  if (presetUser) {
+    $("#login-user").value = presetUser;
+    const hint = $("#login-hint");
+    hint.textContent = "已切换到域名面板 (真实证书)。用刚设置的账号密码登录即可, 用户名已填好。";
+    hint.classList.remove("hidden");
+  }
+  show("view-login");
+  if (presetUser) $("#login-pass").focus();
+}
+
 export async function boot() {
   // 引导令牌来自 install.sh 打印的链接 (?token=...), 初始化时必须带上
   const params = new URLSearchParams(location.search);
-  S.bootstrapToken = params.get("token") || "";
+  const urlToken = params.get("token") || "";
+  // 本标签页记住它 (见 lib/bootstrap.js): 地址栏里的那份马上就会被抹掉, 而这一步
+  // 用户刷新是常态 (证书警告之后的重载、或自己按 F5) —— 不记住的话刷新一次就再也
+  // 初始化不了了。
+  if (urlToken) rememberToken(urlToken);
+  S.bootstrapToken = urlToken || readToken();
   // 初始化完成后会把用户送到域名面板, 顺手带上刚设的用户名 (?user=...), 省一次输入
   // (会话 Cookie 是按 host 存的, 跨到域名必须重新登录 —— 密码绝不会出现在 URL 里)
   const presetUser = params.get("user") || "";
-  if (S.bootstrapToken || presetUser) history.replaceState(null, "", location.pathname);
+  if (urlToken || presetUser) history.replaceState(null, "", location.pathname);
   // 换域名后跳过来的那一跳带着一次性交接票据 (?handoff=…): 先换成会话, 用户就
   // 不用在新域名上再登一次。票据从地址栏里立刻抹掉, 只在历史里留下一跳的时间。
   const handoff = params.get("handoff") || "";
@@ -185,37 +232,17 @@ export async function boot() {
     }
   }
   try {
-    const st = await api("/api/status");
-    if (!st.configured) {
-      show("view-setup");
-      if (st.token_required && !S.bootstrapToken) {
-        const hint = $("#setup-hint");
-        hint.textContent = "本面板已启用引导令牌保护。请使用安装完成时终端打印的、带 ?token= 的链接打开本页, 否则无法完成初始化。";
-        hint.classList.remove("hidden");
-      }
-      return;
-    }
-    if (st.authenticated) return loadDash();
-    if (presetUser) {
-      $("#login-user").value = presetUser;
-      const hint = $("#login-hint");
-      hint.textContent = "已切换到域名面板 (真实证书)。用刚设置的账号密码登录即可, 用户名已填好。";
-      hint.classList.remove("hidden");
-    }
-    show("view-login");
-    if (presetUser) $("#login-pass").focus();
+    return routeByStatus(await api("/api/status"), presetUser);
   } catch (e) {
-    // /api/status 都连不上 = 面板或内核正在重启 (改配置后的正常现象), 别急着把人
-    // 扔到"初始化"页 —— 先重试, 拿到答复再决定是回仪表盘还是真去登录。
+    // /api/status 连不上 = 面板或内核正在重启, 或就是网络抖了一下 (改配置后的正常
+    // 现象)。先重试, 拿到答复再按 configured 决定去哪 —— 而不是猜成"登录"。
     markDisconnected();
-    const alive = await sessionState(8, 1500);
-    if (alive) return loadDash();
+    const st = await waitForStatus(8, 1500);
+    if (st) return routeByStatus(st, presetUser);
     show("view-login");
-    if (alive === null) {
-      const hint = $("#login-hint");
-      hint.textContent = "面板暂时连不上 (可能正在重启内核)。稍等几秒刷新本页即可, 不需要重新初始化。";
-      hint.classList.remove("hidden");
-    }
+    const hint = $("#login-hint");
+    hint.textContent = "面板暂时连不上 (可能正在重启内核)。稍等几秒刷新本页即可, 不需要重新初始化。";
+    hint.classList.remove("hidden");
   }
 }
 

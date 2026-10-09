@@ -702,13 +702,30 @@ def _post_setup_redirect(state: dict, request: Request) -> dict:
     """
     domain = (state.get("domain") or "").strip()
     url = share_links.panel_base_url(request, state)
+    # 用户在 80 端口的 HTTP 页面上初始化时, 配置一落到 nginx, 那一页就不再提供面板
+    # (80 只剩 ACME 与跳转) —— 前端据此把人送到 HTTPS 入口。域名面板就绪时前端会
+    # 优先用上面的 url, 这个只是"证书/域名还没就绪"时的兜底 (自签证书 + IP)。
+    # 只在**生产 + 从 80 端口明文进场**时给: 本地开发 (dev.sh / 回归脚本) 的面板本身就是
+    # 那个明文端口, 一直听在那儿, 用户不需要换地址 —— 别把开发验证赶去根本没人听的 https。
+    # 判据是"请求进在默认 HTTP 端口上" (Host 头不带端口, 或就是 :80), 这只有引导期的
+    # nginx 才会出现 —— 面板自己那个对外端口是 8899, 绝不会落在这一支。
+    fwd_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    scheme = fwd_proto or request.url.scheme
+    raw_host = request.headers.get("host") or request.url.netloc or ""
+    host, _, host_port = raw_host.partition(":")
+    secure_url = (
+        f"https://{host}:{config.PANEL_PORT}/"
+        if (host and scheme == "http" and host_port in ("", "80") and services.is_prod())
+        else ""
+    )
     if not services.is_domain(domain):
-        return {"ready": False, "url": url, "reason": "填写的是 IP, 没有域名面板可切"}
+        return {"ready": False, "url": url, "secure_url": secure_url,
+                "reason": "填写的是 IP, 没有域名面板可切"}
     if state.get("cert", {}).get("type") != "letsencrypt":
-        return {"ready": False, "url": url,
+        return {"ready": False, "url": url, "secure_url": secure_url,
                 "reason": "证书不是 Let's Encrypt (域名可能还没解析到本机, 或 80 端口被挡)"}
     ok, detail = services.probe_public_panel(domain, config.PANEL_PORT)
-    return {"ready": ok, "url": url, "reason": detail}
+    return {"ready": ok, "url": url, "secure_url": secure_url, "reason": detail}
 
 
 def _chain_view(state: dict) -> dict:
