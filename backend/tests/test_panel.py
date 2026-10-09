@@ -3507,8 +3507,9 @@ def test_install_script_says_it_is_not_for_routers():
     path = os.path.join(REPO_ROOT, "install.sh")
     text = open(path, encoding="utf-8").read()
     assert "openwrt" in text and "这台机器是 OpenWrt 路由器" in text, "识别到路由器要明说"
-    assert "/c/<配对码>" in text or "/c/<" in text, "要给出路由器端真正该用的那条命令"
-    assert "wget -qO- " in text, "路由器端的入口是面板生成的那一行 (wget -qO- ... | sh)"
+    # 路由器端真正该用的那条命令是**面板生成的** (带一次性配对码、自带重试与证书兜底) ——
+    # 这里不再手写一份: 手写的那份在改了命令之后就成了错的指路牌 (2026-10 第一跳重写)。
+    assert "路由器端" in text and "生成安装命令" in text, "要指出路由器端该用面板生成的那一行"
     # dpkg 只在 apt 系存在: 命令替换失败会把 set -e 的脚本直接干掉, 于是报错变成一行
     # `dpkg: command not found` (看不出哪一步、也不知道换什么)。
     assert "dpkg --print-architecture 2>/dev/null" in text, "dpkg 不在时不许把脚本直接带走"

@@ -627,7 +627,11 @@ dialog.modal-mask::backdrop { background: transparent; }
 .cmd-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
 .cmd-box { display: flex; align-items: center; gap: 10px; }
 .cmd-box code {
-  flex: 1; overflow-x: auto; white-space: nowrap; padding: 9px 12px; border-radius: 9px;
+  /* 安装命令是**一行但很长** (带重试与证书兜底的一整段 shell, 见 routes._install_command)。
+     以前这里是 nowrap + 横向滚动 —— 短命令好看, 长命令就成了"只能看到开头一句话",
+     用户复制的还是完整的, 但看起来像被截断了。改成按字符换行: 短命令的样子不变。 */
+  flex: 1; min-width: 0; overflow-wrap: anywhere; word-break: break-all;
+  white-space: pre-wrap; padding: 9px 12px; border-radius: 9px;
   background: var(--bg-soft); border: 1px solid var(--border-soft); font-size: 12.5px;
 }
 

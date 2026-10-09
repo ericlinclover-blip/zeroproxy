@@ -842,7 +842,12 @@ def _dashboard_body(state: dict, request: Request, traffic: dict | None = None) 
         "chain": _chain_view(state),
         # 客户端设备 (路由器/手机/电脑) + 路由器安装脚本的元信息
         "devices": devices.view(state),
-        "client": router_client.summary(),
+        # update_command 一起带上: 面板上那条"固定的更新命令"必须与生成安装命令的
+        # 那一份**同一处渲染** —— 界面里手写一份的话, 改了命令这边就会漂移。
+        "client": {
+            **router_client.summary(),
+            "update_command": _install_command(share_links.panel_base_url(request, state), ""),
+        },
         "xhttp": state.get("xhttp", {}),
         "ports": state.get("ports", {}),
         "traffic": traffic,
@@ -2774,8 +2779,89 @@ class DeviceReportIn(BaseModel):
     set_desired: bool | None = None
 
 
+#: 第一跳取脚本的重试次数。与脚本内部的 http_get 一致 (5 次) —— "一次丢包不该变成
+#: 一个很贵的结论" 这条规矩对第一跳同样成立, 而它以前是唯一没被这条规矩覆盖的一跳。
+INSTALL_CMD_RETRIES = 5
+
+#: 第一跳命令的模板。`$c` 是路由器上的下载工具: OpenWrt 默认只有 wget (uclient-fetch
+#: 提供的那个名字), 个别系统上连 wget 都没有、只有 uclient-fetch —— 两个都认, 参数一样。
+#: 第二次尝试带 --no-check-certificate: 那是**面板自签阶段**唯一能走通的路 (脚本内部
+#: 的 TLS_OPTS 回退是同一个道理)。
+_INSTALL_CMD = (
+    "(z=/tmp/zp-install.sh;c=wget;command -v wget >/dev/null 2>&1||c=uclient-fetch;i=0;"
+    "until $c -q -T 20 -O \"$z\" __ZP_URL__||"
+    "$c -q -T 20 --no-check-certificate -O \"$z\" __ZP_URL__;do i=$((i+1));"
+    "if [ \"$i\" -ge __ZP_RETRIES__ ];then "
+    "echo \"!! 取不到安装脚本 —— 面板不可达 / 域名解析不了 / 端口没开 / 证书不受信 "
+    "(试了 __ZP_RETRIES__ 次, 上面的 -T 20 是单次超时)\";exit 1;fi;"
+    "echo \"  · 第 $i 次没拿到 (网络抖了一下), 重试…\";sleep \"$i\";done;"
+    # 整个子 shell 里只跑"看起来像脚本"的正文; 取不到就以非 0 退出 —— 让调用方 (人、脚本、
+    # 自动化) 都能看出这一次没成, 而不是"命令跑完了、什么都没发生"。
+    "if head -c2 \"$z\" 2>/dev/null|grep -q \"#!\";then sh \"$z\";"
+    "elif [ -s \"$z\" ];then echo \"!! 面板返回的不是安装脚本, 原文:\";head -n3 \"$z\";exit 1;"
+    "else exit 1;fi)"
+)
+
+
 def _install_command(base: str, code: str) -> str:
-    return f"wget -qO- {base}/c/{code} | sh"
+    """面板生成的那一行安装命令 (路由器终端里粘贴的就是它)。
+
+    `code` 为空 = 固定地址的更新命令 (`/c/install.sh`, 不带配对码)。
+
+    **为什么不是 `wget -qO- <url> | sh`** —— 真机反馈: 在 OpenWrt 25.12 的路由器上执行
+    面板生成的链接, "没有任何反馈, 执行失败"。四个毛病叠在一起就是这个现象:
+
+      ① `-q` 把**所有**失败都吞掉。一发丢包、一次 4xx、一个证书错误, 在用户眼里都是
+         "什么都没发生" —— 连该重试还是该换配置都看不出来;
+      ② 只试一次。脚本内部早就改成了"重试 5 次"(这条链路实测约四成 SYN 会被丢,
+         见 README 8.63 的真机记录), 而第一跳一直是"一次不成就算了";
+      ③ 面板还在自签阶段 (用 IP 打开、证书还没签) 时, 校验证书的请求必然失败 ——
+         脚本内部会退到"跳过校验并告警", 第一跳却不会, 于是整条命令死在第一跳;
+      ④ `| sh` 会把面板 4xx 的正文直接喂给 shell, 用户在终端里看到一堆语法错。
+
+    现在这四件事都在命令里: 重试 + 证书兜底 + **只运行看起来像脚本的正文** + 失败时把
+    工具原话打出来。它仍然是一行 —— 复制粘贴的体验没有变。
+    """
+    url = f"{base}/c/{code}" if code else f"{base}/c/install.sh"
+    # 与 render_script 同一条规矩: 命令会被粘进 shell, 出现这些字符就直接拒绝渲染。
+    if any(ch in url for ch in '"`$\n\\'):
+        raise ValueError("安装命令里不能出现引号 / 反引号 / 美元 / 换行")
+    return (
+        _INSTALL_CMD
+        .replace("__ZP_URL__", f'"{url}"')
+        .replace("__ZP_RETRIES__", str(INSTALL_CMD_RETRIES))
+    )
+
+
+def _client_script(body: str) -> Response:
+    """把一份正文当成"给 shell 看的脚本"下发 (安装脚本与说明都是这个形态)。"""
+    return Response(
+        body,
+        media_type="text/x-shellscript; charset=utf-8",
+        headers={"cache-control": "no-store"},
+    )
+
+
+def _client_error_script(reason: str, hint: str) -> str:
+    """取不到安装脚本时下发的**可执行**说明 (而不是一段纯文本)。
+
+    为什么不是 404 + 一句话: 第一跳的下载工具不保证会把 4xx 的正文写出来 (uclient-fetch
+    就常常只回一句"失败"), 于是用户看到的**又是**"什么都没有发生" —— 这正是真机反馈的
+    那个形状。所以这里当"面板给的仍然是脚本": 它把原因打在终端上, 再以非 0 退出。
+    老的 `wget -qO- <url> | sh` 也照样看得见这句话。
+
+    文案会被单引号包住塞进 printf, 所以里面不许出现单引号 / 反引号 / 美元符。
+    """
+    for text in (reason, hint):
+        if any(ch in text for ch in "'`$\n\\"):
+            raise ValueError("说明文案里不能出现引号 / 反引号 / 美元 / 换行")
+    return (
+        "#!/bin/sh\n"
+        "# ZeroProxy: 面板没有给出安装脚本, 这里是一份能读懂的说明 (由面板下发)\n"
+        f"printf '%s\\n' 'ZeroProxy: {reason}' >&2\n"
+        f"printf '%s\\n' '  {hint}' >&2\n"
+        "exit 2\n"
+    )
 
 
 @router.post("/api/devices/pair")
@@ -2805,7 +2891,13 @@ def device_list(request: Request):
     state = load_state()
     if not _require_auth(state, request):
         return _err("未登录", 401)
-    return {"devices": devices.view(state), "client": router_client.summary()}
+    return {
+        "devices": devices.view(state),
+        "client": {
+            **router_client.summary(),
+            "update_command": _install_command(share_links.panel_base_url(request, state), ""),
+        },
+    }
 
 
 @router.get("/api/devices/cores")
@@ -2927,16 +3019,17 @@ def client_install_script_pinned(request: Request):
     """
     state = load_state()
     if not state["configured"]:
-        return _err("面板尚未初始化", 409)
+        return _client_script(
+            _client_error_script(
+                "这台面板还没有完成初始化 (还没有管理员账号)。",
+                "先在服务器上跑完 install.sh, 用终端给出的链接打开面板完成初始化, 再重新生成安装命令。",
+            )
+        )
     try:
         body = router_client.render_script(share_links.panel_base_url(request, state), "")
     except (OSError, ValueError) as exc:
         return _err(f"安装脚本不可用: {exc}", 500)
-    return Response(
-        body,
-        media_type="text/x-shellscript; charset=utf-8",
-        headers={"cache-control": "no-store"},
-    )
+    return _client_script(body)
 
 
 @router.get("/c/perf/config")
@@ -3085,22 +3178,27 @@ def client_install_script(code: str, request: Request):
     """安装脚本本体 (`wget -qO- <面板>/c/<配对码> | sh` 拉的就是它)。"""
     state = load_state()
     if not state["configured"]:
-        return _err("面板尚未初始化", 409)
+        return _client_script(
+            _client_error_script(
+                "这台面板还没有完成初始化 (还没有管理员账号)。",
+                "先按 install.sh 结尾打印的链接打开面板完成初始化, 再重新生成安装命令。",
+            )
+        )
     if not devices.pair_code_live(state, code):
-        return Response(
-            "ZeroProxy: 配对码无效或已过期, 请回面板「客户端」重新生成安装命令。\n",
-            status_code=404,
-            media_type="text/plain; charset=utf-8",
+        # 注意这里回的是 **200 + 一份脚本**, 不是 404 + 一句话: 路由器那一跳的下载工具
+        # 不保证会把 4xx 的正文写出来, 而"取不到脚本"的失败必须是能读懂的 (见
+        # _client_error_script)。正文里的原因照样是"配对码无效或已过期"。
+        return _client_script(
+            _client_error_script(
+                "这个配对码无效, 或者已经过期 / 用过了 (配对码 30 分钟内有效, 用过即废)。",
+                "回面板「客户端」页点一次「生成安装命令」, 复制新的那一条再跑 (旧的那条不会复活)。",
+            )
         )
     try:
         body = router_client.render_script(share_links.panel_base_url(request, state), code)
     except (OSError, ValueError) as exc:
         return _err(f"安装脚本不可用: {exc}", 500)
-    return Response(
-        body,
-        media_type="text/x-shellscript; charset=utf-8",
-        headers={"cache-control": "no-store"},
-    )
+    return _client_script(body)
 
 
 @router.get("/c/bin/{arch}")

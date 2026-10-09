@@ -135,7 +135,12 @@ async function main() {
     await page.click("#btn-pair");
     await page.waitForSelector(".cmd-box code", { timeout: 10000 });
     const cmd = await page.locator(".cmd-box code").innerText();
-    check("生成安装命令", /^wget -qO- .+\/c\/[0-9a-f]{32} \| sh$/.test(cmd.trim()), cmd.trim().slice(0, 60) + "…");
+    // 第一跳带重试 + 证书兜底 + "只运行看起来像脚本的正文" (见 routes._install_command) ——
+    // 旧写法 wget -qO- … | sh 会把所有失败都吞掉, 真机上表现为"什么都没有发生"。
+    check("生成安装命令 (带重试与证书兜底, 不再是 -qO- 静默管道)",
+      /\/c\/[0-9a-f]{32}/.test(cmd.trim()) && /重试/.test(cmd) && /--no-check-certificate/.test(cmd)
+      && !/-qO-/.test(cmd),
+      cmd.trim().slice(0, 60) + "…");
     await page.locator("#sec-clients").scrollIntoViewIfNeeded();
     await page.screenshot({ path: path.join(SHOT_DIR, "clients-install.png") });
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import time
 
 import pytest
@@ -44,6 +45,12 @@ def _register(client, code: str) -> dict:
     return res.json()
 
 
+def _run_as_shell(body: str) -> tuple[int, str]:
+    """把面板下发的东西当脚本跑一遍 (用户的终端就是这么干的)。"""
+    proc = subprocess.run(["sh", "-s"], input=body, capture_output=True, text=True)
+    return proc.returncode, proc.stdout + proc.stderr
+
+
 # ---------------------------------------------------------------- 面板侧
 
 def test_pair_code_requires_login(client, configured):
@@ -54,11 +61,32 @@ def test_pair_code_requires_login(client, configured):
 def test_pair_returns_copyable_command(client, configured):
     _login(client)
     data = _pair_code(client)
-    assert data["command"].startswith("wget -qO- ")
-    assert data["command"].endswith("| sh")
+    assert data["command"].startswith("(") and data["command"].endswith(")")
     assert f"/c/{data['code']}" in data["command"]
     assert DOMAIN in data["command"]        # 命令里用的是面板自己的域名
     assert data["ttl"] > 0
+
+
+def test_install_command_survives_one_dropped_packet(client, configured):
+    """第一跳必须自带重试 + 证书兜底 + 失败时能说话。
+
+    真机 (OpenWrt 25.12) 反馈的原话是"执行面板生成的链接后, 没有任何反馈, 执行失败" ——
+    旧写法 `wget -qO- <url> | sh` 会把**所有**失败都吞掉 (-q), 而且只试一次。
+    """
+    _login(client)
+    cmd = _pair_code(client)["command"]
+    assert "\n" not in cmd, "面板给的仍然是一行 (复制粘贴的体验不许变)"
+    assert "-qO-" not in cmd, "`-q` + 管道给 sh 的旧写法不许回来: 它把失败都藏起来"
+    # 丢包不是"一次不成就算了": 面板那条链路实测约四成 SYN 会被丢掉
+    assert "重试" in cmd and "sleep" in cmd, "要能自己重试 (真机上四成 SYN 会被丢)"
+    # 面板还在自签阶段 (用 IP 打开、证书还没签) 时, 校验证书的请求必然失败
+    assert "--no-check-certificate" in cmd
+    # OpenWrt 上的 wget 是 uclient-fetch 提供的名字, 个别系统上只有 uclient-fetch
+    assert "uclient-fetch" in cmd
+    # 只运行"看起来像脚本"的正文 —— 面板的 4xx 正文不许被喂给 sh
+    assert "head -c2" in cmd and "grep -q" in cmd
+    # 取不到时要说清是哪一类, 而不是让用户对着空屏幕
+    assert "取不到安装脚本" in cmd
 
 
 def test_devices_appear_on_dashboard(client, configured):
@@ -93,11 +121,27 @@ def test_install_script_is_rendered_for_this_panel(client, configured):
 
 
 def test_install_script_rejects_unknown_or_used_code(client, configured):
+    """配对码不对时下发的是**能读懂的说明**, 而不是一段 (路由器根本拿不到的) 4xx 正文。
+
+    契约在 2026-10 变了: 第一跳的下载工具不保证会把 4xx 的正文写出来 (uclient-fetch
+    就常常只回一句"失败"), 于是"配对码过期"和"网络断了"在终端里长得一模一样 ——
+    都是什么都不显示。现在两种情况都下发一份 `#!/bin/sh` 的说明: 打印原因、退出码 2;
+    老的 `wget -qO- url | sh` 也照样看得见这句话。
+    """
     _login(client)
-    assert client.get("/c/deadbeef").status_code == 404
+    dead = client.get("/c/deadbeef")
+    assert dead.status_code == 200, "取不到脚本时也要给出一份能跑的说明"
+    assert dead.text.startswith("#!/bin/sh")
+    rc, out = _run_as_shell(dead.text)
+    assert rc == 2 and "配对码" in out, out
+
     code = _pair_code(client)["code"]
     _register(client, code)          # 用掉
-    assert client.get(f"/c/{code}").status_code == 404
+    used = client.get(f"/c/{code}")
+    assert used.status_code == 200
+    assert "过期" in used.text or "用过" in used.text
+    rc, out = _run_as_shell(used.text)
+    assert rc == 2 and "配对码" in out, out
 
 
 def test_pair_code_is_single_use(client, configured):

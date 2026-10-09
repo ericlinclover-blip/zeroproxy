@@ -218,6 +218,9 @@ function ago(ts) {
 
 function routerTab(dash, routers) {
   if (!routers.length) return installCard(dash);
+  // 更新命令由面板渲染 (与"生成安装命令"同一处): 界面里手写一份迟早在改命令时漂移。
+  const updateCmd = ((dash && dash.client) || {}).update_command
+    || "（面板还没给出更新命令 —— 刷新一下本页）";
   return `
     <div class="client-hint">
       开启后, 连在这台路由器上的<b>所有设备</b> (手机 / 电脑 / 电视) 直接就能用, 不需要每台各装客户端。
@@ -229,7 +232,7 @@ function routerTab(dash, routers) {
     </div>
     <div class="muted fs-xs mt-2">
       升级路由器上的客户端 (界面 / agent) 用这条固定的更新命令, <b>不需要配对码, 也不会多出一台设备</b>:
-      <code class="mono">wget -qO- &lt;面板地址&gt;/c/install.sh | sh</code>
+      <code class="mono">${esc(updateCmd)}</code>
     </div>
     ${pairInfo ? pairCard() : ""}`;
 }
@@ -330,6 +333,7 @@ function pairCard(dash) {
     ${coreRow(dash)}
     ${agentRow(dash)}
     <div class="muted fs-xs mt-2">
+      这一行<b>自带重试与证书兜底</b> (网络抖一下不会白跑), 取不到脚本时会把原因打在终端上。
       安装过程约 1 分钟 (含 20 MB 内核 + 4 MB 分流数据下载); 结束后终端会告诉你是 TUN
       还是 tproxy 模式, 以及分流是否已就绪; 数据面的覆盖范围 (全屋 / 仅局域网 TCP) 会
       跟着设备回报显示在卡片上。刷新本页即可看到设备卡片。

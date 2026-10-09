@@ -1750,6 +1750,148 @@ def main() -> int:
                        env={**os.environ})
         check("已经好的文件不会被 `ui fix` 动 (幂等, 内容是逐字节相同)",
               open(acl_dst, encoding="utf-8").read() == before_run)
+
+        # ---------------------------------------------------------------- 第一跳
+        #
+        # 用户拿到的是面板生成的一行命令, 在**路由器**上跑。真机反馈 (OpenWrt 25.12):
+        # "执行面板生成的链接后, 没有任何反馈, 执行失败"。旧写法
+        # `wget -qO- <url> | sh` 把这件事变成了可能: `-q` 吞掉所有失败、只试一次、
+        # 而且 `| sh` 会把面板 4xx 的正文当脚本喂进去。这一节在**真的 shell + 真的
+        # 下载工具 (uclient-fetch 的替身)** 上把那条路走一遍。
+        print("\n[17] 第一跳 (面板生成的那一行命令): 丢包 / 自签 / 配对码失效都不许"
+              "「什么都没有发生」")
+        sys.path.insert(0, BACKEND)
+        from zeroproxy import routes as zp_routes  # noqa: E402
+
+        import http.server  # noqa: E402
+
+        MARKER = "#!/bin/sh\necho ZP-FIRST-HOP-OK\n"
+
+        class _Marker(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                body = MARKER.encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/x-shellscript")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):  # pragma: no cover
+                pass
+
+        # uclient-fetch 的替身: 带 -q 就**什么都不说** (真机上失败时就是这个样子),
+        # 默认校验证书 (自签会失败), 用 ZP_SHIM_FAILS 模拟"前几次 SYN 被丢掉"。
+        shim_dir = os.path.join(tmp, "shim")
+        os.makedirs(shim_dir, exist_ok=True)
+        shim = os.path.join(shim_dir, "wget")
+        with open(shim, "w") as fh:
+            fh.write(
+                "#!/bin/sh\n"
+                "q=0;out=;tmo=900;insecure=0;url=\n"
+                "while [ $# -gt 0 ]; do\n"
+                "  a=\"$1\"; shift\n"
+                "  case \"$a\" in\n"
+                "    -q) q=1 ;;\n"
+                "    --no-check-certificate) insecure=1 ;;\n"
+                "    -O) out=\"$1\"; shift ;;\n"
+                "    -T) tmo=\"$1\"; shift ;;\n"
+                "    -O*) out=\"${a#-O}\" ;;\n"
+                "    -T*) tmo=\"${a#-T}\" ;;\n"
+                "    -qO) q=1; out=\"$1\"; shift ;;\n"
+                "    -qT) q=1; tmo=\"$1\"; shift ;;\n"
+                "    -qO*) q=1; out=\"${a#-qO}\" ;;\n"
+                "    -qT*) q=1; tmo=\"${a#-qT}\" ;;\n"
+                "    -*) ;;\n"
+                "    *) url=\"$a\" ;;\n"
+                "  esac\n"
+                "done\n"
+                "[ -n \"$url\" ] || exit 1\n"
+                "[ \"$out\" = \"-\" ] && out=\n"      # -O- = 写到标准输出 (真机上的含义)
+                "if [ -n \"$ZP_SHIM_CNT\" ]; then\n"
+                "  n=0; [ -f \"$ZP_SHIM_CNT\" ] && n=$(cat \"$ZP_SHIM_CNT\")\n"
+                "  if [ \"$n\" -lt \"${ZP_SHIM_FAILS:-0}\" ]; then\n"
+                "    echo $((n+1)) > \"$ZP_SHIM_CNT\"; exit 1\n"
+                "  fi\n"
+                "fi\n"
+                "if [ \"$q\" = 1 ]; then set -- -s; else set -- -sS; fi\n"
+                "[ \"$insecure\" = 1 ] && set -- \"$@\" -k\n"
+                "if [ -n \"$out\" ]; then exec curl \"$@\" -f --max-time \"$tmo\" -o \"$out\" \"$url\"; fi\n"
+                "exec curl \"$@\" -f --max-time \"$tmo\" \"$url\"\n"
+            )
+        os.chmod(shim, 0o755)
+
+        def first_hop(cmd: str, fails: int = 0) -> tuple[int, str]:
+            cnt = os.path.join(tmp, "shim-cnt")
+            if os.path.exists(cnt):
+                os.remove(cnt)
+            env2 = {**os.environ, "PATH": shim_dir + os.pathsep + os.environ.get("PATH", ""),
+                    "ZP_SHIM_CNT": cnt, "ZP_SHIM_FAILS": str(fails)}
+            proc = subprocess.run(["sh", "-c", cmd], capture_output=True, text=True,
+                                  env=env2, timeout=180)
+            return proc.returncode, proc.stdout + proc.stderr
+
+        marker_srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Marker)
+        threading.Thread(target=marker_srv.serve_forever, daemon=True).start()
+        marker_base = f"http://127.0.0.1:{marker_srv.server_address[1]}"
+
+        # 自签的 HTTPS 靶子 (面板在"域名还没签下证书"时就是这个形态)
+        tls_srv = None
+        tls_base = ""
+        cert, key = os.path.join(tmp, "tls.pem"), os.path.join(tmp, "tls.key")
+        gen = subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+             "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1",
+             "-keyout", key, "-out", cert], capture_output=True, text=True)
+        if gen.returncode == 0:
+            import ssl  # noqa: E402
+
+            tls_srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Marker)
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(cert, key)
+            tls_srv.socket = ctx.wrap_socket(tls_srv.socket, server_side=True)
+            threading.Thread(target=tls_srv.serve_forever, daemon=True).start()
+            tls_base = f"https://127.0.0.1:{tls_srv.server_address[1]}"
+
+        code_probe = "00112233445566778899aabbccddeeff"
+        new_cmd = zp_routes._install_command(marker_base, code_probe)
+        old_cmd = f"wget -qO- {marker_base}/c/{code_probe} | sh"
+
+        rc_old, out_old = first_hop(old_cmd, fails=2)
+        check("对照 (旧写法): 一次丢包就『什么都没有发生』 —— 真机反馈的就是这个形状",
+              rc_old == 0 and out_old.strip() == "" and "ZP-FIRST-HOP-OK" not in out_old,
+              repr(out_old[:60]))
+        rc_new, out_new = first_hop(new_cmd, fails=2)
+        check("第一跳: 前两次丢包后自己重试成功 (脚本真的跑起来了)",
+              rc_new == 0 and "ZP-FIRST-HOP-OK" in out_new, out_new.strip()[:100])
+        check("第一跳: 丢包那两次在屏幕上说了话 (不是静默等待)", "重试" in out_new,
+              [ln for ln in out_new.splitlines() if "重试" in ln][:1])
+
+        if tls_base:
+            rc_tls, out_tls = first_hop(zp_routes._install_command(tls_base, code_probe))
+            check("第一跳: 面板还在自签阶段也能装上 (第二次尝试跳过证书校验)",
+                  rc_tls == 0 and "ZP-FIRST-HOP-OK" in out_tls, out_tls.strip()[:100])
+            rc_tls_old, out_tls_old = first_hop(f"wget -qO- {tls_base}/c/{code_probe} | sh")
+            check("对照 (旧写法): 自签面板上一个字都不说 —— 那个错误以前没人看得见",
+                  out_tls_old.strip() == "", repr(out_tls_old[:60]))
+
+        rc_dead, out_dead = first_hop(zp_routes._install_command("http://127.0.0.1:9", code_probe))
+        check("第一跳: 面板整个不可达时说清是哪一类 (不再是空屏幕)",
+              rc_dead != 0 and "取不到安装脚本" in out_dead, out_dead.strip()[:120])
+
+        # 配对码失效: 面板下发的是**能跑的说明** (不是 4xx 正文), 第一跳会把它原样念出来
+        _, pair_body, _ = panel.req("POST", "/api/devices/pair", {"label": "first-hop"})
+        pair = json.loads(pair_body)
+        check("第一跳命令仍然是一行, 且不再把面板正文直接喂给 sh",
+              "\n" not in pair["command"] and "| sh" not in pair["command"])
+        panel.req("POST", "/c/pair", {"code": pair["code"], "kind": "router", "arch": "arm64"})
+        rc_used, out_used = first_hop(pair["command"])
+        check("第一跳: 配对码已经用过时, 终端里读得到原因 (而不是一片空白)",
+              rc_used != 0 and "配对码" in out_used and "生成安装命令" in out_used,
+              out_used.strip()[:140])
+
+        marker_srv.shutdown()
+        if tls_srv:
+            tls_srv.shutdown()
     finally:
         logs = []
         for panel in panels:
