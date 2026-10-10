@@ -1536,7 +1536,10 @@ def main() -> int:
                     "      echo \"mismatched input ':' expecting '}'\"; exit 1\n"
                     "    fi\n"
                     "    exit 0 ;;\n"
-                    "  run) while :; do sleep 30; done ;;\n"
+                    # 真 dae 起来之后会往 --logfile 里写自己的话 (出错时尤其重要)。替身也写一行:
+                    # 出口验不过时, 那句"dae 日志: …"必须真的带上它的原话, 而不是空着。
+                    "  run) echo 'level=error msg=\"ZAKE-DAE-DIAL-ERROR\"' >> \"$ZP_ROOT/perf/dae.log\""
+                    "; while :; do sleep 30; done ;;\n"
                     "esac\nexit 0\n"
                 )
             os.chmod(where, 0o755)
@@ -1613,12 +1616,12 @@ def main() -> int:
               r_644.returncode != 0 and "too open" in r_644.stdout and r_600.returncode == 0,
               (r_644.stdout or "").strip()[:80])
 
-        def _run_cli(*args, timeout=120):
+        def _run_cli(*args, timeout=120, probe_url=None):
             return subprocess.run(
                 ["sh", cli_perf, *args], capture_output=True, text=True, timeout=timeout,
                 env={**os.environ, "ZP_ROOT": perf_root, "ZP_KERNEL": btf_kver,
                      "ZP_PERF_VERIFY_TRIES": "2",   # 演练里没有真节点, 别干等 45 秒
-                     "ZP_PERF_PROBE": f"http://127.0.0.1:{probe.port}/cdn-cgi/trace"},
+                     "ZP_PERF_PROBE": probe_url or f"http://127.0.0.1:{probe.port}/cdn-cgi/trace"},
             )
 
         # 1) 真正切过去 (CLI 没有 TTY → 后台跑, 进度写文件; 界面就是照它画进度的)
@@ -1676,6 +1679,17 @@ def main() -> int:
         check("出口验不过时**自动退回**: perf=0, 并且说明是为什么",
               "DONE=1" in prog and "perf=0" in p_caps and "出不去" in p_caps,
               [ln for ln in p_caps.splitlines() if ln.startswith("perf")])
+        p_why = ""
+        _why_path = os.path.join(perf_root, "perf", "why")
+        if os.path.exists(_why_path):
+            p_why = open(_why_path, encoding="utf-8").read().strip()
+        # 界面那张卡片读的是 perf/why (不是 caps) —— 只写 caps 时卡片会一直挂着上一次的旧结论,
+        # 于是这次失败看起来像上次那个原因 (真机上就是这么被骗的, 8.84)。
+        check("退回时写的是**这一次**的原因 (界面读的那个文件), 不是旧结论",
+              "出不去" in p_why and p_why != "准备阶段失败 (见上)", p_why[:100])
+        # dae 自己的原话要跟到原因里 —— 用户不必再去 tail 一个文件
+        check("原因里带上了 dae 日志的原话 (不用再去 tail 文件)",
+              "ZAKE-DAE-DIAL-ERROR" in p_why, p_why[-120:])
         check("退回之后 dae 不在了、mihomo 回来了 (没有留在断网状态)",
               not os.path.exists(os.path.join(perf_root, "perf", "dae.pid"))
               and os.path.exists(os.path.join(perf_root, "core.running")))
@@ -1715,6 +1729,63 @@ def main() -> int:
               any("FAKE-VALIDATE-REJECTED" in ln for ln in why_line) and "见上" not in p_caps,
               why_line[:1] or "(caps 里没有 perf_why)")
         os.remove(os.path.join(perf_root, "perf", "force-fail"))
+
+        # 5) 两个数据面同时在: 一个**停不掉**的 mihomo。判据必须以进程为准 (真机上有固件的
+        #    `init running` 永远为真, 而它一旦那样, 这一档就永远进不去), 而且原因必须说清
+        #    是"标准模式没停下来" —— 不是含糊的"流量出不去"(真机上就是这么被带偏的, 8.84)。
+        #    替身用一个**真进程**: 直接跑 <root>/mihomo 这个脚本 (argv 里就带那个路径,
+        #    `pgrep -f` 看得见), 并且无视 TERM —— 真机上 mihomo 是二进制, comm 就叫
+        #    mihomo, `pidof` 与 `killall` 都打得到; 演练机 (macOS) 没有 pidof, 走的是
+        #    pgrep 那条兜底, 而"杀掉"那一半靠真机验 (这里验的是判据与措辞)。
+        _real_mihomo = os.path.join(perf_root, "mihomo")
+        _mihomo_backup = _real_mihomo + ".stub"
+        shutil.move(_real_mihomo, _mihomo_backup)
+        with open(_real_mihomo, "w") as fh:
+            fh.write("#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n")
+        os.chmod(_real_mihomo, 0o755)
+        _stub_proc = subprocess.Popen(["sh", _real_mihomo])
+        time.sleep(0.5)
+        probe2 = FakeMirror(b"ip=203.0.113.9\n")     # 探针这一轮是**通**的
+        _run_cli("perf", "on", probe_url=f"http://127.0.0.1:{probe2.port}/cdn-cgi/trace")
+        for _ in range(60):
+            prog = open(os.path.join(perf_root, "perf", "progress"), encoding="utf-8").read()
+            if "DONE=" in prog:
+                break
+            time.sleep(0.5)
+        why_now = open(os.path.join(perf_root, "perf", "why"), encoding="utf-8").read()
+        check("标准模式停不掉时: 判得出来, 而且说清是它 (不是含糊的『流量出不去』)",
+              "DONE=1" in prog and "标准模式没停下来" in why_now
+              and "两个数据面同时在" in why_now and "探针说" not in why_now,
+              why_now.strip()[:90])
+        check("它先真的补送过 TERM (不是看到进程就直接放弃)",
+              "再送它一次 TERM" in prog,
+              [ln.strip() for ln in prog.splitlines() if "TERM" in ln][:1])
+        _stub_proc.kill()
+        _stub_proc.wait(timeout=10)
+        probe2.close()
+        shutil.move(_mihomo_backup, _real_mihomo)    # 把内核替身放回去, 别影响后面的节
+
+        # 6) 切换的空档里 agent 不许替用户把 mihomo 拉起来: 它每 15 秒一轮心跳, 撞上
+        #    "mihomo 已停、dae 还没起来"那几秒就会把标准模式拉回来 —— 于是两个数据面同时在,
+        #    出口验证必然失败 (真机 8.84 的形状)。反过来, 不在性能模式时它照旧要能启动内核。
+        _core_marker = os.path.join(perf_root, "core.running")
+        if os.path.exists(_core_marker):
+            os.remove(_core_marker)
+        with open(os.path.join(perf_root, "perf", "state"), "w") as fh:
+            fh.write("on\n")
+        subprocess.run(["sh", os.path.join(perf_root, "agent.sh"), "once"],
+                       capture_output=True, text=True, timeout=60,
+                       env={**os.environ, "ZP_ROOT": perf_root})
+        check("性能模式在用: agent 不会替用户把标准模式拉回来",
+              not os.path.exists(_core_marker),
+              "core.running 被它建出来了" if os.path.exists(_core_marker) else "没动")
+        with open(os.path.join(perf_root, "perf", "state"), "w") as fh:
+            fh.write("off\n")
+        subprocess.run(["sh", os.path.join(perf_root, "agent.sh"), "once"],
+                       capture_output=True, text=True, timeout=60,
+                       env={**os.environ, "ZP_ROOT": perf_root})
+        check("不在性能模式时, agent 照旧按面板要求启动内核",
+              os.path.exists(_core_marker))
 
         # [16] LuCI 那三件套: 升级不许毁掉好文件, 坏了要能就地修 (真机事故: 升级之后 403)
         # 现场: 以前是 `http_get ... > /usr/share/rpcd/acl.d/xxx.json || true` —— 重定向先清空

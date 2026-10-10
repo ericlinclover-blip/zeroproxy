@@ -2309,8 +2309,20 @@ zp_perf_live() {
     "$ZP_PERF_INIT" running >/dev/null 2>&1
 }
 
-# mihomo 在不在 (验证"这时候的连通性是 dae 挣来的"要用它)
-zp_perf_mihomo_live() { "$ZP_INIT" running >/dev/null 2>&1; }
+# mihomo 在不在 —— 这一步是"这条连通性到底是谁挣来的"的判据, 必须准。
+#
+# 判据以**进程**为准 (dae 那边用的也是进程): 固件上的 `/etc/init.d/<svc> running`
+# 不可靠, 而它一旦"永远为真", 每次都会被判成"两个数据面同时在, 不能算换成功" ——
+# 性能模式就永远进不去, 而且报出来的原因是错的 (看起来像"流量出不去", 其实那天探针是通的,
+# 真机 8.84)。两个进程判据 (pidof / pgrep) 都没有的机器才回落到服务状态。
+zp_perf_mihomo_live() {
+    pidof mihomo >/dev/null 2>&1 && return 0
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -f "$ZP_DIR/mihomo" >/dev/null 2>&1 && return 0
+        return 1
+    fi
+    "$ZP_INIT" running >/dev/null 2>&1
+}
 
 # 局域网接口。dae 不会自己猜局域网口 (只有 wan 能 auto), 所以这个值必须问出来。
 zp_perf_lan() {
@@ -2523,6 +2535,17 @@ zp_perf_enter() {
     zp_perf_set_state on
     "$ZP_INIT" stop >/dev/null 2>&1 || true
     "$ZP_INIT" disable >/dev/null 2>&1 || true
+    # 停完再看一眼**进程**真的走了没有。两个数据面同时抢包是这一档最坏的形状 (现象是
+    # "时通时不通"), 而 stop 与进程退出之间有一拍 —— 没走就再送一次 TERM。
+    # 不用 -9: tun 设备与它加的路由是 mihomo 自己**在退出路径里**收的, 硬杀容易留下
+    # 指向一个已经消失的设备的黑洞路由, 那比"多等两秒"危险得多。
+    _k=0
+    while zp_perf_mihomo_live && [ "$_k" -lt 5 ]; do
+        [ "$_k" = "0" ] && printf '  · 标准模式还占着 (mihomo 进程还在), 再送它一次 TERM…\n'
+        killall mihomo 2>/dev/null || true
+        sleep 1
+        _k=$((_k + 1))
+    done
     zp_perf_set_chosen ebpf
     rm -f "$ZP_PERF_EXIT"
     "$ZP_PERF_INIT" enable >/dev/null 2>&1 || true
@@ -2548,6 +2571,7 @@ zp_perf_enter() {
     # 所以这条连接只可能是 dae 挣来的 (这就是"不撒谎"的那一步)。
     _i=0
     _ip=""
+    _mihomo_bad=""
     # 等多久: 默认 15 次 × 3 秒 = 45 秒 (真机上节点建连 + DNS 都要时间)。
     # ZP_PERF_VERIFY_TRIES 只给演练用 (那里没有真节点, 干等 45 秒纯属浪费)。
     _tries="${ZP_PERF_VERIFY_TRIES:-15}"
@@ -2559,6 +2583,7 @@ zp_perf_enter() {
         if _ip="$(zp_perf_exit_ip)"; then
             if zp_perf_mihomo_live; then
                 printf '  mihomo 还在跑 —— 两个数据面同时在, 不能算换成功\n'
+                _mihomo_bad="标准模式没停下来 (mihomo 进程还在) —— 两个数据面同时在, 不能算换成功"
                 _ip=""
                 break
             fi
@@ -2569,8 +2594,19 @@ zp_perf_enter() {
     done
     if [ -z "$_ip" ]; then
         _perr="$(sed -n '1p' "$ZP_PERF_DIR/probe_err" 2>/dev/null | tr -d '\r\n')"
-        _why="dae 起来了, 但流量出不去 (节点不通 / 分流数据不全, 或标准模式没停下来)"
-        [ -n "$_perr" ] && _why="$_why —— 探针说: $_perr"
+        if [ -n "$_mihomo_bad" ]; then
+            # 这一种**不是**"流量出不去": 探针那天是通的 (所以 probe_err 是空的), 拦下它的
+            # 是"两个数据面同时在"。分开说 —— 否则界面把原因指错方向, 人也跟着查错地方 (8.84)。
+            _why="$_mihomo_bad"
+        else
+            _why="dae 起来了, 但流量出不去 (节点不通 / 分流数据不全, 或标准模式没停下来)"
+            [ -n "$_perr" ] && _why="$_why —— 探针说: $_perr"
+        fi
+        # dae 自己那句原话往往就是答案 (节点不通 / DNS 起不来 / eBPF 加载失败)。附在原因后面:
+        # 界面那一格与终端里的滚动说的是同一件事, 不用再让人去 tail 一个文件 (8.84)。
+        _dae_err="$(grep -a -E 'level=(error|fatal|warning)' "$ZP_PERF_LOG" 2>/dev/null | tail -n 1 | tr -d '\r' | cut -c1-140)"
+        [ -n "$_dae_err" ] || _dae_err="$(tail -n 1 "$ZP_PERF_LOG" 2>/dev/null | tr -d '\r' | cut -c1-140)"
+        [ -n "$_dae_err" ] && _why="$_why —— dae 日志: $_dae_err"
         printf '  %s —— 退回原来的模式\n' "$_why"
         zp_perf_leave "$_why"
         return 1
@@ -2588,6 +2624,10 @@ zp_perf_enter() {
 zp_perf_leave() {
     _why="${1:-}"
     zp_perf_set_state off
+    # 界面那条"上次的结论"读的就是这个文件 —— 只写 caps 是不够的: 真机上卡片一直显示着
+    # 上一次的旧结论 (比如早就修掉的"准备阶段失败"), 于是这次失败看起来像上次那个原因。
+    # 一句真话比一句旧话重要 (8.84)。
+    zp_perf_why_set "$_why"
     rm -f "$ZP_PERF_DIR/bad"
     "$ZP_PERF_INIT" stop >/dev/null 2>&1 || true
     "$ZP_PERF_INIT" disable >/dev/null 2>&1 || true
@@ -3065,6 +3105,16 @@ proxy_up() {
     return 1
 }
 
+# 性能模式的**意图** (说好在用)。为什么要单列: 切换过程中有一小段"mihomo 已停、dae 还没
+# 起来"的空档, 那个空档里 proxy_up 是假 —— 而 agent 每 15 秒一轮心跳, 撞上就会替用户把
+# 标准模式拉回来, 于是两个数据面同时在, 出口验证必然判失败 (真机上就是这么失败的: 探针是
+# 通的, 拦下它的是"mihomo 还在跑")。用户已经明确进了那一档, 这几秒该等它 —— 而 dae 真挂了
+# 有看门狗在 45 秒内退回标准模式, 退回来之后这里自然会再接管。
+perf_intending() {
+    [ -f "$ZP_DIR/perf/state" ] || return 1
+    [ "$(sed -n '1p' "$ZP_DIR/perf/state" 2>/dev/null | tr -d '\r\n')" = "on" ]
+}
+
 flush_dns() { killall -HUP dnsmasq 2>/dev/null || /etc/init.d/dnsmasq reload 2>/dev/null || true; }
 
 switch_core() {
@@ -3236,7 +3286,7 @@ while true; do
             zp_perf_leave "面板总开关关闭"
         fi
     fi
-    if [ "$DESIRED" = "true" ] && ! proxy_up; then
+    if [ "$DESIRED" = "true" ] && ! proxy_up && ! perf_intending; then
         log "面板要求开启, 启动内核"
         switch_core on
     elif [ "$DESIRED" = "false" ] && proxy_up; then

@@ -612,6 +612,17 @@ def test_install_script_builds_the_perf_mode_switch_the_honest_way():
     # 与标准模式互斥 (避免两个数据面同时抢包)
     assert '"$ZP_INIT" stop' in code and '"$ZP_INIT" disable' in code
     assert "ZP_INIT=/etc/init.d/zeroproxy" in code and "ZP_PERF_INIT=/etc/init.d/zeroproxy-perf" in code
+    # "这条连通性是谁挣来的"这个判据必须以**进程**为准: 固件上的 `init running` 不可靠,
+    # 而它一旦永远为真, 每次都会被判成"两个数据面同时在" —— 性能模式永远进不去 (真机 8.84)。
+    assert 'pidof mihomo' in code and 'pgrep -f "$ZP_DIR/mihomo"' in code, "mihomo 在不在要看进程"
+    # 停不干净要自己补一刀 (TERM), 而"两个数据面同时在"必须与"流量出不去"分开说 ——
+    # 前者拦下它的是标准模式, 探针那天其实是通的。
+    assert "killall mihomo" in code and "标准模式没停下来" in code
+    # 失败原因要带 dae 自己的原话, 并且写进界面读的那份文件 (perf/why) —— 只写 caps 时
+    # 卡片会一直挂着上一次的旧结论。
+    assert "dae 日志: " in code and 'zp_perf_why_set "$_why"' in code
+    # 切换的空档里 agent 不许替用户把标准模式拉回来
+    assert "perf_intending" in code and "perf_intending; then" in code
     # caps 里的那几个字段是界面 / 面板 / 诊断读的同一份
     for key in ("perf_cap=", "perf=", "perf_why="):
         assert f"printf '{key}" in code or f"s/^{key}" in code, f"caps 要记 {key}"
