@@ -25,6 +25,7 @@ TCP / WS / TLS / gRPC / Meek / HTTPUpgrade)。所以 `vless-xhttp` 会被排除,
 """
 from __future__ import annotations
 
+import re
 from urllib.parse import urlsplit
 
 from . import share_links
@@ -50,6 +51,27 @@ QUIC_BLOCK = "l4proto(udp) && dport(443) -> block"
 def _quote(value: str) -> str:
     """dae 的字符串字面量: 单引号包裹, 内部转义。"""
     return "'" + str(value).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+#: node 段里键名允许的字符。别的字符一律换成 **下划线**。
+#: 为什么不能像值那样用引号把键括起来: dae 的语法里键是**裸标识符**, `'a': 'link'` 不是
+#: "带引号的键", 而是一个语法错误 —— 真机 (v2.1.1) 上 `dae validate` 会直接回
+#: `mismatched input ':' expecting '}'` (这一版之前就是这么写的, 于是性能模式永远起不来)。
+_IDENT_BAD = re.compile(r"[^0-9A-Za-z_.\-]")
+
+
+def _ident(value: str) -> str:
+    """把节点 id 变成 dae 认的裸键名。
+
+    实测 (dae v2.1.1 的 ANTLR 语法): 首字符不能是数字或 `-`, 不能出现 `:` 与非 ASCII;
+    中段允许字母数字与 `_ . / + @ # % -`。节点 id 是我们自己生成的 (vless-reality /
+    vless-ws / trojan / hysteria2), 本来就合规 —— 这里做净化是为了"以后加节点"时
+    面板仍然发得出一份**能起**的配置, 而不是把这个问题再留给下一次真机。
+    """
+    name = _IDENT_BAD.sub("_", str(value))
+    if not name or not (name[0].isascii() and (name[0].isalpha() or name[0] == "_")):
+        name = "n" + name
+    return name
 
 
 def panel_direct_rules(base: str) -> list[str]:
@@ -119,8 +141,18 @@ def render(
     add("")
 
     add("node {")
+    # 键名净化之后要防撞名 (两个不同的 id 可能净成同一个键): dae 会因为"同名节点"而只剩
+    # 一个, 那是**静默少一个节点** —— 比报错更难发现, 所以在这里就让它们彼此区分开。
+    used: set[str] = set()
     for node_id, link in nodes:
-        add(f"    {_quote(node_id)}: {_quote(link)}")
+        key = _ident(node_id)
+        if key in used:
+            suffix = 2
+            while f"{key}_{suffix}" in used:
+                suffix += 1
+            key = f"{key}_{suffix}"
+        used.add(key)
+        add(f"    {key}: {_quote(link)}")
     add("}")
     add("")
 

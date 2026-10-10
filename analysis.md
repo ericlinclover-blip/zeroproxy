@@ -1,6 +1,6 @@
 # ZeroProxy 架构现状
 
-> 快照: **2026-10-10** · 面板 **v2.11.31** · 路由器客户端 **v1.4.27** · `state.json` schema **v5**
+> 快照: **2026-10-10** · 面板 **v2.11.32** · 路由器客户端 **v1.4.28** · `state.json` schema **v5**
 > 本文回答"**现在是什么样**"。另外两份文档分工不同, 不要混读:
 > `README.md` 是逐版开发日志 (4000+ 行, 每一版为什么这么改、哪次真机踩的坑);
 > `docs/RESEARCH.md` 与 `docs/ROUTER-CLIENT-REDESIGN.md` 是竞品调研与设计依据。
@@ -336,7 +336,9 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
   三条硬规矩: 进去前 `dae validate` 校验配置、进去后用**出口探针**验证流量真的过得去、
   任何一步失败都退回原来的模式。dae 与它的配置由面板分发 (`/c/perf/*`, 与内核 / 分流数据
   同一套); 节点内联成分享链接, dae 不支持的 XHTTP 被排除并写进配置头部。`caps` 记
-  `perf_cap` / `perf` / `perf_why`; `ZP_PERF=0` 可关。
+  `perf_cap` / `perf` / `perf_why`; `ZP_PERF=0` 可关。两个真机踩到的**配置侧**硬约束写在
+  代码注释里 (README 8.83): 配置文件的权限必须 ≤0640 (dae 的 merger 会拒 0644), 而
+  `node` 段的键必须是裸标识符 (带引号的键是 dae 的语法错误)。
 * **内核 BTF 自动补齐**: 不带 `CONFIG_DEBUG_INFO_BTF` 的固件没有 `/sys/kernel/btf/vmlinux`,
   CO-RE eBPF (dae 那一类, 也是"性能档"的候选) 就用不了。检测到缺失时自动补: 先问本机软件源
   (`vmlinux-btf`), 再问面板 (`/c/btf` —— 面板按 minor 系列 + 架构挑包、缓存、发下来, 与内核
@@ -416,9 +418,9 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
 
 | 脚本 | 覆盖 |
 |---|---|
-| `backend/tests/` (pytest) | **317 通过 + 6 skip** (无真实内核二进制时跳过)。dry-run 全流程 + 安全边界 + 状态迁移 |
+| `backend/tests/` (pytest) | **318 通过 + 6 skip** (无真实内核二进制时跳过)。dry-run 全流程 + 安全边界 + 状态迁移 |
 | `scripts/verify.py` | 用真实 Xray/Hysteria/mihomo/sing-box 校验生成的配置与订阅 (含**两台机器真跑一条链**) |
-| `scripts/router_install_check.py` | **167 项**。真的用 shell 跑一遍路由器安装脚本: 七类机器 (含 OpenWrt 25.12 / apk 三态 / BTF 两种现场 / 性能模式的进-出-回退) / 本机覆盖 / revert 比对 / zpcore 真跑 / **第一跳** (面板生成的那一行命令外面顶一个 uclient-fetch 替身: 丢包重试、自签面板按证书状态跳过校验、配对码失效时读得到原因; 旧写法的"什么都没有发生"与命令长度都钉在测试里) |
+| `scripts/router_install_check.py` | **170 项**。真的用 shell 跑一遍路由器安装脚本: 七类机器 (含 OpenWrt 25.12 / apk 三态 / BTF 两种现场 / 性能模式的进-出-回退) / 本机覆盖 / revert 比对 / zpcore 真跑 / **第一跳** (面板生成的那一行命令外面顶一个 uclient-fetch 替身: 丢包重试、自签面板按证书状态跳过校验、配对码失效时读得到原因; 旧写法的"什么都没有发生"与命令长度都钉在测试里)。性能模式那一节的假 dae **照真机复刻两条硬规矩** (0644 拒 / node 键带引号拒) 并先自证一次 —— 它以前无条件 exit 0, 于是这两类事故在演练里永远是绿的 |
 | `scripts/browser_check.cjs` | **157 项**, 真 Chromium 走「初始化 → 仪表盘」全流程 + 交互 + CSP + 截图 |
 | `scripts/clients_check.cjs` | 真实浏览器点客户端开关 |
 | `scripts/router_ui_check.cjs` | **62 项**。路由器本地界面 (含「没有更新记录时不许凭空长出进度面板」这类判据, 以及性能模式那块表盘: 真实浏览器里点一次, 看刻度/进度/表针/出口/熄火) |
@@ -437,6 +439,9 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
 * **文档重叠**: README (逐版日志) 与本文、`docs/` 三份之间有信息重叠; README 面向历史, 本文面向现状,
   长期需要保持本文随代码更新 (否则又会退回「过期快照」)。
 * **eBPF 数据面 (性能模式)**: 已实现 (L0 = dae, 见 §11 那条), 仍然是**用户按需开启**的一档 ——
-  它与 tun/tproxy 互斥、开着时没有第二个数据面兜底, 所以默认不动它。真机上还没有验过
-  (dae 真的加载 eBPF / 出口验证 / 回退后的连通性), 这一点写在 README 8.78 的最后一段。
+  它与 tun/tproxy 互斥、开着时没有第二个数据面兜底, 所以默认不动它。真机上第一次跑
+  (GL-MT3600BE · 25.12.5 · 内核 6.12.94) 暴露的两处**配置侧**毛病已在 8.83 修掉, 配置本身
+  用上游真解析器 (parser + merger + 路由优化器 + DNS 路由校验) 在 3 模板 × 有无分流数据 6
+  种组合下全过; 仍未在真机验完的是**切换本身**: dae 加载 eBPF、出口真的换成节点 IP、以及
+  拔掉节点之后的回退与连通性。
 * **真机回归**: 自动化能覆盖的都覆盖了, 但「每种固件一台真机」仍然只能人工做 (见 `docs/ROUTER-CLIENT-REDESIGN.md` Phase 5)。

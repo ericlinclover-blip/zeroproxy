@@ -2454,7 +2454,14 @@ zp_perf_prepare() {
     _lan="$(zp_perf_lan)"
     _url="$_base/c/perf/config?id=$_id&k=$_sec&lan=$_lan&geo=$_geo"
     printf '  · 取 dae 配置 (局域网口: %s)…\n' "$_lan"
-    if ! zp_perf_get "$_url" "$ZP_PERF_CONF.new" 30 2 || [ ! -s "$ZP_PERF_CONF.new" ]; then
+    # 权限是这一档的**硬门槛**, 不是"讲究": dae 的配置合并器自己会拒绝一份"组可写 / 别人
+    # 可读"的配置 —— 原话是 `permissions %04o for '%v' are too open; ... suggest 0640 or
+    # 0600`。而 curl -o 建文件是跟着 umask 走的 (固件默认 022 → 0644), 于是 `dae validate`
+    # 的第一句话永远是权限错, 性能模式在真机上就卡死在这一步 (8.83 之前就是这样)。
+    # 两条一起做: 建的时候就按 077 建 (子 shell 里改 umask, 不影响调用方), 落盘后再 chmod
+    # 一次 —— 后者管的是"上一版留下的 0644 那份配置/ mv 覆盖"这两种情况。
+    if ! ( umask 077; zp_perf_get "$_url" "$ZP_PERF_CONF.new" 30 2 ) \
+        || [ ! -s "$ZP_PERF_CONF.new" ]; then
         printf '  面板没有给出 dae 配置\n'; return 1
     fi
     # 拿到的东西必须像一份 dae 配置 (不是一页错误页)
@@ -2464,6 +2471,7 @@ zp_perf_prepare() {
         return 1
     fi
     mv "$ZP_PERF_CONF.new" "$ZP_PERF_CONF"
+    chmod 600 "$ZP_PERF_CONF" 2>/dev/null || true
 
     # 4) 校验 (`dae validate` 会把路由规则与 DNS 路由都跑一遍) —— 校验不过就不动数据面
     if ! _out="$("$ZP_PERF_BIN" validate -c "$ZP_PERF_CONF" 2>&1)"; then
@@ -2489,11 +2497,22 @@ zp_perf_enter() {
         return 1
     fi
     printf '准备性能模式…\n'
-    if ! zp_perf_prepare; then
-        zp_perf_why_set "准备阶段失败 (见上)"
-        zp_perf_caps 0 "准备阶段失败"
+    # 准备的输出**收下来再原样打出去**: 终端里的样子一个字节都不变, 但界面那条"上次的结论"
+    # 拿到了真正的原因。为什么必须这么做: 失败原因以前只活在终端的滚动里, 而界面只写
+    # "准备阶段失败 (见上)" —— 在手机上点这个按钮的人根本看不到那个"上" (真机反馈就是这个
+    # 形状: 一句话把人挡在门外, 还得再跑一次带 TTY 的命令才能问出为什么)。
+    if ! _prep="$(zp_perf_prepare 2>&1)"; then
+        printf '%s\n' "$_prep"
+        # 最后一行就是原因: 失败路径都是以一句人话结尾的 (取 dae 失败 / 配置校验失败: xx …),
+        # 而中间的 `· 取 …` 是进度。取最后一条非进度行, 去掉缩进并截断 —— 界面那一格放不下
+        # 一屏日志, 而原因的头一句就够定位了。
+        _why_line="$(printf '%s\n' "$_prep" | grep -v '^ *·' | sed -e 's/^[[:space:]]*//' -e '/^$/d' | tail -n 1 | cut -c1-160)"
+        [ -n "$_why_line" ] || _why_line="准备阶段失败"
+        zp_perf_why_set "$_why_line"
+        zp_perf_caps 0 "$_why_line"
         return 1
     fi
+    printf '%s\n' "$_prep"
 
     # 记下"原来那一档": 退出来的时候要回到它 (而不是回到"默认")
     _prev="$(sed -n 's/^chosen=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"

@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import time
 
@@ -643,6 +644,16 @@ def test_dae_config_speaks_daes_language_and_skips_what_it_cannot_dial(client, c
     assert "vless://" in body and "trojan://" in body and "hysteria2://" in body
     assert "# 跳过: vless-xhttp" in body, "dae 拨不了的节点要如实写出来"
     assert "vless-xhttp:" not in body, "跳过的节点不许出现在 node 段里"
+    # node 段的**键**必须是裸标识符: dae 的语法里没有"带引号的键"这种东西, `'a': 'link'`
+    # 是解析错误。这一版之前每一行都带引号, 于是真机上 `dae validate` 直接
+    # `mismatched input ':' expecting '}'` —— 性能模式永远卡在准备阶段 (README 8.83)。
+    for line in body.split("node {", 1)[1].split("\n}", 1)[0].splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        key, _, val = line.partition(":")
+        assert re.match(r"^[A-Za-z_][0-9A-Za-z_.\-]*$", key), line
+        assert val.strip().startswith("'") and val.strip().endswith("'"), line
 
     # geo=0 是降级: 引用分流数据的规则**整条去掉** (dae 读不到数据文件是起不来, 不是跳过规则)
     degraded = client.get(f"{base}&geo=0").text
@@ -651,6 +662,39 @@ def test_dae_config_speaks_daes_language_and_skips_what_it_cannot_dial(client, c
 
     # 设备专属配置: 凭据不对就是 403
     assert client.get("/c/perf/config?id=x&k=y").status_code == 403
+
+
+def test_dae_node_keys_are_bare_identifiers(monkeypatch):
+    """node 段的键名要经得起任何节点 id —— dae 只认裸标识符, 而键是**解析错误**的入口。
+
+    真机 (dae v2.1.1) 的判据是它的 ANTLR 语法: 首字符不能是数字 / `-`, 不能有 `:` 与非
+    ASCII。节点 id 是我们自己生成的 (vless-reality / chain-<8 位 hex>), 本来就合规; 这一层
+    净化是为"以后加节点"准备的 —— 少一个节点是静默的, 而配置起不来是看得见的。
+    """
+    from zeroproxy import dae_config, share_links
+
+    legal = re.compile(r"^[A-Za-z_][0-9A-Za-z_.\-]*$")
+    for hostile in ("vless-reality", "1abc", "-x", ".x", "a:b", "a b", "节点", "a'b", "",
+                    "a" * 300, "🚀", "a\\b"):
+        assert legal.match(dae_config._ident(hostile)), hostile
+
+    # 键名净化之后撞名的两份节点要各自区分开 (同名 = dae 那边静默少一个节点)
+    monkeypatch.setattr(
+        share_links, "enabled_links",
+        lambda state: [
+            ("vless-reality", "vless://a@b:1"),
+            ("1 bad:key", "trojan://p@b:2"),
+            ("dup", "trojan://p@b:3"),
+            ("dup", "trojan://p@b:4"),
+        ],
+    )
+    body, _ = dae_config.render({"routing": {"template": "smart"}}, "https://p.example.com")
+    lines = [ln.strip() for ln in body.split("node {", 1)[1].split("\n}", 1)[0].splitlines() if ln.strip()]
+    keys = [ln.partition(":")[0] for ln in lines]
+    assert len(lines) == 4 and len(set(keys)) == 4, lines
+    for line, key in zip(lines, keys):
+        assert legal.match(key), line
+        assert not key.startswith("'"), f"键名不能带引号: {line}"
 
 
 def test_perf_binary_endpoint_answers_instead_of_hanging(client, configured, monkeypatch):

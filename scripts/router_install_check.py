@@ -1509,12 +1509,33 @@ def main() -> int:
         os.makedirs(perf_tools, exist_ok=True)
 
         def _write_fake_dae(where: str) -> None:
-            """假 dae: 会 validate / run。run 起来之后就一直挂着 (真实 daemon 那样)。"""
+            """假 dae: 会 validate / run。run 起来之后就一直挂着 (真实 daemon 那样)。
+
+            **它按真机的行为说话** —— 复刻 dae v2.1.1 两条把性能模式挡在门外的硬规矩
+            (8.83 那次真机验证的结论, 见 README):
+              ① 配置的组位 / 其他人位必须干净 (它的 merger: `fi.Mode()&0037 > 0` → 拒绝,
+                 原话 "permissions %04o ... are too open; suggest 0640 or 0600");
+              ② `node` 段的键必须是**裸标识符** —— 带引号的键在 dae 的语法里不是"键", 而是
+                 解析错误 (`mismatched input ':' expecting '}'`)。
+            一条总是 exit 0 的替身会让这两类事故永远绿着, 所以这里宁可比真的严格。
+            """
             with open(where, "w") as fh:
                 fh.write(
                     "#!/bin/sh\n"
                     'case "$1" in\n'
-                    "  validate) exit 0 ;;\n"
+                    "  validate)\n"
+                    "    shift; conf=\"\"\n"
+                    "    while [ $# -gt 0 ]; do case \"$1\" in -c|--config) conf=\"$2\"; shift 2 ;; *) shift ;; esac; done\n"
+                    "    [ -n \"$conf\" ] || { echo 'Argument \"--config\" or \"-c\" is required but not provided.'; exit 1; }\n"
+                    "    if [ -f \"$ZP_ROOT/perf/force-fail\" ]; then echo 'config error: FAKE-VALIDATE-REJECTED'; exit 1; fi\n"
+                    "    _perm=\"$(ls -l \"$conf\" | awk '{print $1}')\"\n"
+                    "    _grp=\"$(printf '%s' \"$_perm\" | cut -c5-7)\"; _oth=\"$(printf '%s' \"$_perm\" | cut -c8-10)\"\n"
+                    "    case \"$_grp\" in *w*|*x*) echo \"permissions too open for '$conf'; suggest 0640 or 0600\"; exit 1 ;; esac\n"
+                    "    [ \"$_oth\" = '---' ] || { echo \"permissions too open for '$conf'; suggest 0640 or 0600\"; exit 1; }\n"
+                    "    if sed -n '/^node {/,/^}/p' \"$conf\" | grep -q \"^[[:space:]]*'\"; then\n"
+                    "      echo \"mismatched input ':' expecting '}'\"; exit 1\n"
+                    "    fi\n"
+                    "    exit 0 ;;\n"
                     "  run) while :; do sleep 30; done ;;\n"
                     "esac\nexit 0\n"
                 )
@@ -1572,6 +1593,26 @@ def main() -> int:
         with open(cli_perf, "w") as fh:
             fh.write(cli_text)
 
+        # 替身先自己照一次真机: 0644 必须被拒 (dae 的 merger 原话), 0600 必须过 —— 否则
+        # 下面那条"配置落盘是 0600"就只是在断言一个我们自己写的宽松替身。
+        probe_conf = os.path.join(perf_root, "perf", "perm-probe.dae")
+        with open(probe_conf, "w") as fh:
+            fh.write("global{}\nrouting{}\n")
+        _fake_env = {**os.environ, "ZP_ROOT": perf_root}
+
+        def _fake_validate(path_: str):
+            return subprocess.run(
+                ["sh", os.path.join(perf_root, "perf", "dae"), "validate", "-c", path_],
+                capture_output=True, text=True, env=_fake_env)
+
+        os.chmod(probe_conf, 0o644)
+        r_644 = _fake_validate(probe_conf)
+        os.chmod(probe_conf, 0o600)
+        r_600 = _fake_validate(probe_conf)
+        check("替身按真机的两条硬规矩说话: 0644 被拒 / 0600 通过",
+              r_644.returncode != 0 and "too open" in r_644.stdout and r_600.returncode == 0,
+              (r_644.stdout or "").strip()[:80])
+
         def _run_cli(*args, timeout=120):
             return subprocess.run(
                 ["sh", cli_perf, *args], capture_output=True, text=True, timeout=timeout,
@@ -1612,6 +1653,10 @@ def main() -> int:
         check("doctor 里有一条「性能模式正在生效」+ 现场证据",
               "性能模式" in doc2.stdout and "正在生效" in doc2.stdout,
               [ln.strip() for ln in doc2.stdout.splitlines() if "性能模式" in ln][:1])
+        conf_path = os.path.join(perf_root, "perf", "dae.dae")
+        conf_mode = oct(os.stat(conf_path).st_mode & 0o777)
+        check("落盘的 dae 配置是 0600 (dae 硬性拒绝组可写 / 别人可读的配置)",
+              conf_mode == "0o600", conf_mode)
 
         # 2) 出口不通时必须**自动退回** —— 家里不能被留在断网状态
         probe.close()
@@ -1653,6 +1698,23 @@ def main() -> int:
         check("看门狗: dae 连续几轮不在就自动退回标准模式 (家里不会断着)",
               "perf=0" in p_caps and os.path.exists(os.path.join(perf_root, "core.running")),
               [ln for ln in p_caps.splitlines() if ln.startswith("perf")])
+
+        # 4) 准备阶段失败时, 界面那条"上次的结论"必须是**真原因** —— 以前只写"准备阶段失败
+        # (见上)", 而在手机上点按钮的人根本看不到那个"上" (真机反馈就是这个形状)。
+        with open(os.path.join(perf_root, "perf", "force-fail"), "w") as fh:
+            fh.write("1\n")
+        _run_cli("perf", "on")
+        for _ in range(20):
+            prog = open(os.path.join(perf_root, "perf", "progress"), encoding="utf-8").read()
+            if "DONE=1" in prog:
+                break
+            time.sleep(0.5)
+        p_caps = open(os.path.join(perf_root, "caps"), encoding="utf-8").read()
+        why_line = [ln for ln in p_caps.splitlines() if ln.startswith("perf_why=")]
+        check("准备阶段失败时界面拿到的是真原因 (不是「见上」)",
+              any("FAKE-VALIDATE-REJECTED" in ln for ln in why_line) and "见上" not in p_caps,
+              why_line[:1] or "(caps 里没有 perf_why)")
+        os.remove(os.path.join(perf_root, "perf", "force-fail"))
 
         # [16] LuCI 那三件套: 升级不许毁掉好文件, 坏了要能就地修 (真机事故: 升级之后 403)
         # 现场: 以前是 `http_get ... > /usr/share/rpcd/acl.d/xxx.json || true` —— 重定向先清空
