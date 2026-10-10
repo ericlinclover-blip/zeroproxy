@@ -1497,8 +1497,10 @@ def main() -> int:
             with open(path_body, "w") as fh:
                 fh.write("#!/bin/sh\n" + (
                     'case "$1" in\n'
-                    f'  running) [ -f "{os.path.join(perf_root, "core.running")}" ] && exit 0 || exit 1 ;;\n'
-                    f'  start|restart|reload) touch "{os.path.join(perf_root, "core.running")}"; exit 0 ;;\n'
+                f'  running) [ -f "{os.path.join(perf_root, "core.running")}" ] && exit 0 || exit 1 ;;\n'
+                # 每次"被拉起来"都留一行: 有的用例要问的不是"现在在不在跑", 而是"有没有人
+                # 动过它" (那才是判据 —— 文件可能本来就存在)。
+                f'  start|restart|reload) touch "{os.path.join(perf_root, "core.running")}"; echo "$1" >> "{os.path.join(perf_root, "core.startlog")}"; exit 0 ;;\n'
                     f'  stop) rm -f "{os.path.join(perf_root, "core.running")}"; exit 0 ;;\n'
                     "  enable|disable) exit 0 ;;\n"
                     "esac\nexit 0\n"
@@ -1616,12 +1618,13 @@ def main() -> int:
               r_644.returncode != 0 and "too open" in r_644.stdout and r_600.returncode == 0,
               (r_644.stdout or "").strip()[:80])
 
-        def _run_cli(*args, timeout=120, probe_url=None):
+        def _run_cli(*args, timeout=120, probe_url=None, extra_env=None):
             return subprocess.run(
                 ["sh", cli_perf, *args], capture_output=True, text=True, timeout=timeout,
                 env={**os.environ, "ZP_ROOT": perf_root, "ZP_KERNEL": btf_kver,
                      "ZP_PERF_VERIFY_TRIES": "2",   # 演练里没有真节点, 别干等 45 秒
-                     "ZP_PERF_PROBE": probe_url or f"http://127.0.0.1:{probe.port}/cdn-cgi/trace"},
+                     "ZP_PERF_PROBE": probe_url or f"http://127.0.0.1:{probe.port}/cdn-cgi/trace",
+                     **(extra_env or {})},
             )
 
         # 1) 真正切过去 (CLI 没有 TTY → 后台跑, 进度写文件; 界面就是照它画进度的)
@@ -1786,6 +1789,93 @@ def main() -> int:
                        env={**os.environ, "ZP_ROOT": perf_root})
         check("不在性能模式时, agent 照旧按面板要求启动内核",
               os.path.exists(_core_marker))
+
+        # 7) 出口等于**本机 WAN 地址**时不许算成功 —— 那是"这条流量没走代理"。真机上就是这个
+        #    形状: 探针走 IPv6 直连出去, 出口记成了本机自己的 240e:… 而界面显示"已开启"。
+        #    替身: 一个假的 `ip` 命令 (报出与探针同一个地址), 只在这一条用例里进 PATH。
+        _fakebin = os.path.join(tmp, "perftools-ip")
+        os.makedirs(_fakebin, exist_ok=True)
+        with open(os.path.join(_fakebin, "ip"), "w") as fh:
+            fh.write("#!/bin/sh\n"
+                     "case \"$*\" in\n"
+                     "  *addr*) echo '2: eth0    inet 203.0.113.9/24 brd 203.0.113.255 scope global eth0' ;;\n"
+                     "  *)      echo 'default via 192.0.2.1 dev eth0' ;;\n"
+                     "esac\n")
+        os.chmod(os.path.join(_fakebin, "ip"), 0o755)
+        probe3 = FakeMirror(b"ip=203.0.113.9\n")      # 探针"通"了, 但出口是本机地址
+        with open(os.path.join(perf_root, "perf", "state"), "w") as fh:
+            fh.write("off\n")
+        _run_cli("perf", "on", probe_url=f"http://127.0.0.1:{probe3.port}/cdn-cgi/trace",
+                 extra_env={"PATH": _fakebin + os.pathsep + os.environ.get("PATH", "")})
+        for _ in range(60):
+            prog = open(os.path.join(perf_root, "perf", "progress"), encoding="utf-8").read()
+            if "DONE=" in prog:
+                break
+            time.sleep(0.5)
+        why_ip = open(os.path.join(perf_root, "perf", "why"), encoding="utf-8").read()
+        p_caps = open(os.path.join(perf_root, "caps"), encoding="utf-8").read()
+        check("出口是本机自己的地址时**不算通** (真机上就是这样被记成成功的)",
+              "本机自己的地址" in why_ip and "perf=0" in p_caps, why_ip.strip()[:90])
+        probe3.close()
+
+        # 8) 本机界面的两条入口 (80 端口的 cgi / 8399 的 zpcore) 必须说同一套话: perf 里
+        #    少了 `live` 那一页就永远显示"内核已停止 · 全屋代理关 · 性能模式异常", 而 dae
+        #    正在分流 —— 真机上用户看到的"还是不能用"就是这一条 (8.85)。
+        with open(os.path.join(perf_root, "perf", "dae.pid"), "w") as fh:
+            fh.write("%d\n" % os.getpid())          # 一个真实活着、kill -0 得过关的 pid
+        # cgi 要跑**仓库里那一份** (路径换成本机根): 装机到这一步还没有 luci_install, 所以
+        # 演练根里没有 cgi —— 用仓库那份才能验"两条入口说同一套话"。
+        _tok = "router-install-check-token"
+        with open(os.path.join(perf_root, "ui.token"), "w") as fh:
+            fh.write(_tok + "\n")
+        _cgi_src = open(os.path.join(BACKEND, "zeroproxy", "client", "luci", "cgi"),
+                        encoding="utf-8").read()
+        _cgi_src = _cgi_src.replace("/etc/zeroproxy", perf_root).replace(
+            "/etc/init.d/zeroproxy", perf_root + "/initd")
+        _cgi_path = os.path.join(tmp, "cgi-perf.sh")
+        with open(_cgi_path, "w") as fh:
+            fh.write(_cgi_src)
+        _cgi = subprocess.run(
+            ["sh", _cgi_path], capture_output=True, text=True, timeout=30,
+            env={**os.environ, "ZP_ROOT": perf_root, "QUERY_STRING": f"k={_tok}&a=status"})
+        check("cgi 的 status 带 perf.live (缺了它, LuCI 那一页会把在跑的 dae 报成不在)",
+              '"live":"1"' in _cgi.stdout and '"perf"' in _cgi.stdout,
+              ((_cgi.stdout or "")[-160:] + " | stderr: " + (_cgi.stderr or "")[-80:]).replace("\n", " "))
+        os.remove(os.path.join(perf_root, "perf", "dae.pid"))
+
+        # 9) 「打开总开关」在性能模式下不是"把 mihomo 拉起来" —— dae 在跑时它必须什么都不做
+        #    (再起 mihomo 就是两个数据面抢包); dae 真不在了才退回标准模式再开。
+        with open(os.path.join(perf_root, "perf", "state"), "w") as fh:
+            fh.write("on\n")
+        with open(os.path.join(perf_root, "perf", "dae.pid"), "w") as fh:
+            fh.write("%d\n" % os.getpid())
+        _on = _run_cli("on")
+        # 判据落在 CLI 自己说的话上: 它在守卫里就结束了 —— 既没有去改面板的期望状态
+        # (那一条之后就是"把内核拉起来"), 也没有走本机覆盖那条路。这两条是这一档下唯一
+        # 能把 mihomo 拉起来的路径, 所以"都没出现"就是"没拉起来"。
+        check("性能模式在跑时, 总开关「on」不会把 mihomo 也拉起来",
+              "性能模式已经在用" in _on.stdout
+              and "已请求面板把总开关设为" not in _on.stdout
+              and "本机把全屋代理设为" not in _on.stdout
+              and open(os.path.join(perf_root, "perf", "state"), encoding="utf-8").read().strip() == "on",
+              (_on.stdout.strip().replace("\n", " / ")[:120]
+               + " || state=" + open(os.path.join(perf_root, "perf", "state"), encoding="utf-8").read().strip()
+               + " || agent 进程: "
+               + (subprocess.run(["pgrep", "-fl", "agent.sh"], capture_output=True, text=True).stdout
+                  .strip().replace("\n", " , ")[:80] or "无")))
+        _startlog = os.path.join(perf_root, "core.startlog")
+        _starts = (len(open(_startlog, encoding="utf-8").read().splitlines())
+                   if os.path.exists(_startlog) else 0)
+        with open(os.path.join(perf_root, "perf", "dae.pid"), "w") as fh:
+            fh.write("999999\n")                    # dae 不在了
+        _on2 = _run_cli("on")
+        check("dae 不在了: 总开关「on」先退回标准模式, 再把内核拉起来",
+              "先退回标准模式" in _on2.stdout and os.path.exists(_core_marker)
+              and (len(open(_startlog, encoding="utf-8").read().splitlines())
+                   if os.path.exists(_startlog) else 0) > _starts,
+              _on2.stdout.strip().splitlines()[:1])
+        with open(os.path.join(perf_root, "perf", "state"), "w") as fh:
+            fh.write("off\n")
 
         # [16] LuCI 那三件套: 升级不许毁掉好文件, 坏了要能就地修 (真机事故: 升级之后 403)
         # 现场: 以前是 `http_get ... > /usr/share/rpcd/acl.d/xxx.json || true` —— 重定向先清空

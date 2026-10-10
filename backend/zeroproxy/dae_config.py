@@ -166,6 +166,10 @@ def render(
     add("")
 
     add("dns {")
+    # 不吃"过期但仍可用"的缓存 (RFC 8767 stale)。这一条对这套东西特别重要: 上游只要有一次
+    # 被污染 (或者那条查询走的是直连), 那个坏答案就会在 stale 窗口里继续发给所有人 ——
+    # 真机上就有一个域名在缓存里躺了很久, 表现是"这个站打不开, 别的都正常" (8.85)。
+    add("    optimistic_cache: false")
     add("    upstream {")
     for name, url in DNS_UPSTREAMS:
         add(f"        {name}: {_quote(url)}")

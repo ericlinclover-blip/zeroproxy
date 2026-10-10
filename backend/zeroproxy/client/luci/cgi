@@ -169,6 +169,16 @@ case "$action" in
         perf_state="$(sed -n '1p' "$ZP_DIR/perf/state" 2>/dev/null | tr -d '\r\n')"
         perf_why="$(sed -n '1p' "$ZP_DIR/perf/why" 2>/dev/null | tr -d '\r\n')"
         perf_exit="$(sed -n '1p' "$ZP_DIR/perf/exit_ip" 2>/dev/null | tr -d '\r\n')"
+        # 性能模式的**现场** (dae 进程在不在) —— 与 perf.sh / zpcore 同一套判据。
+        # 这个字段漏过一次: 界面要 `perf.live === '1'` 才会画成"性能模式运行中"、总开关才算
+        # "开", 少了它, 从 LuCI 菜单进来那一页 (80 端口这条 cgi) 就永远显示"内核已停止 ·
+        # 全屋代理关 · 性能模式异常/正在回退", 而 dae 明明正在分流 —— 用户看到的"不能用"
+        # 就是这么来的 (8.85)。判据与 perf.sh 一致: 先看进程, 服务状态只作兜底。
+        perf_live="0"
+        if [ -n "$(pidof dae 2>/dev/null)" ]; then perf_live="1"
+        elif command -v pidof >/dev/null 2>&1; then perf_live="0"
+        elif /etc/init.d/zeroproxy-perf running >/dev/null 2>&1; then perf_live="1"
+        fi
         # "正在切" = 说好在切 (state=on) 而 dae 还没起来, 或者进度文件里还没有终态。
         # 界面据此把"进入中"那段动画放下去, 而不是干等。
         perf_busy="0"
@@ -198,8 +208,8 @@ case "$action" in
         header
         printf '{"ok":true,"core":"%s","mode":"%s","covered":"%s","why":"%s","ipv6":"%s","client":"%s","wan":"%s","servers":[%s],' \
             "$core" "$mode" "$covered" "$(jstr "$why")" "$ipv6" "$(jval_s "$ver")" "$wan" "$items"
-        printf '"perf":{"cap":"%s","state":"%s","why":"%s","exit_ip":"%s","busy":"%s","progress":"%s"}}\n' \
-            "$perf_cap" "$perf_state" "$(jstr "$perf_why")" "$(jval_s "$perf_exit")" \
+        printf '"perf":{"cap":"%s","state":"%s","live":"%s","why":"%s","exit_ip":"%s","busy":"%s","progress":"%s"}}\n' \
+            "$perf_cap" "$perf_state" "$perf_live" "$(jstr "$perf_why")" "$(jval_s "$perf_exit")" \
             "$perf_busy" "$(jstr "$perf_prog")"
         ;;
     add)

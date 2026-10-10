@@ -2303,9 +2303,14 @@ zp_perf_set_state() { mkdir -p "$ZP_PERF_DIR"; printf '%s\n' "$1" > "$ZP_PERF_ST
 zp_perf_why() { sed -n '1p' "$ZP_PERF_WHY" 2>/dev/null | tr -d '\r\n'; }
 zp_perf_why_set() { mkdir -p "$ZP_PERF_DIR"; printf '%s\n' "$1" | tr -d '\r\n' > "$ZP_PERF_WHY"; }
 
-# dae **现在**在不在 —— 判据是现场 (进程 / 服务), 不是"我们下过一条命令"。
+# dae **现在**在不在 —— 判据是现场 (进程), 不是"我们下过一条命令"。
+#
+# 与 mihomo 那边同一个道理 (见 zp_perf_mihomo_live): 固件上的 `init running` 不可靠, 而这一档
+# "说好在用而 dae 已经不在"是要立刻退回的 (家里断着不能被看门狗漏掉)。所以进程判据能用时
+# 只认它; 只有这台机器连 pidof 都没有, 才回落到服务状态。
 zp_perf_live() {
-    [ -n "$(pidof dae 2>/dev/null)" ] && return 0
+    pidof dae >/dev/null 2>&1 && return 0
+    command -v pidof >/dev/null 2>&1 && return 1
     "$ZP_PERF_INIT" running >/dev/null 2>&1
 }
 
@@ -2330,6 +2335,11 @@ zp_perf_lan() {
     [ -n "$_d" ] || _d=br-lan
     printf '%s' "$_d"
 }
+
+# 刷本机 DNS 缓存。进出这一档时解析路径整个换了 (dae 接管 DNS / 又交回 mihomo), 而 dnsmasq
+# 还揣着上一条路径上拿到的答案 —— 真机上就有一个被污染的域名在里面躺了很久 (8.85)。
+# 动作与 mihomo init 里那一步一致。
+zp_perf_flush_dns() { killall -HUP dnsmasq 2>/dev/null || /etc/init.d/dnsmasq reload 2>/dev/null || true; }
 
 # 面板凭据 (第一个面板)。dae 的节点是**面板渲染好**的, 所以这里只需要地址与设备凭据。
 zp_perf_panel() {
@@ -2367,16 +2377,42 @@ zp_perf_get() {  # $1=url $2=目标 $3=超时 $4=最多试几次
 
 # 出口 IP —— **唯一**能证明"流量真的过去了"的东西。
 # 注意它必须是境外地址: 国内地址按分流规则走直连, dae 通不通都是直连的答案。
+#
+# 两个坑都在真机上踩过 (8.85):
+#   ① **IPv6 会骗人**: 这台机器上路由器自身的 v6 出口没被 dae 接管, 而 curl 默认优先 v6 ——
+#      于是探针"通"了, 出口却是本机自己的 240e:… (CN 电信的地址)。所以这里只探 v4: 走的是
+#      与局域网设备同一条被接管的路径, 答案才有意义。
+#   ② **出口等于本机 WAN 地址**就说明这条流量根本没走代理 —— 那不算成功, 要说出来。
+#
+# 本机 WAN 上的地址 (出口等于它 = 直连)。拿不到 `ip` 命令时就跳过这一步 (老固件也还有
+# 前半条判据: 至少它得是个能解析的出口)。
+zp_perf_own_addrs() {
+    _dev="$(ip route show table main default 2>/dev/null | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -n1)"
+    [ -n "$_dev" ] || _dev="$(ip route show default 2>/dev/null | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -n1)"
+    [ -n "$_dev" ] || return 0
+    # 两条 -e 分开写: `inet6\?` 不是"可选的 6" —— GNU sed 认, BSD sed (演练机) 与部分
+    # busybox sed 不认。这种"聪明"的正则一写就把判据悄悄变成空 (踩过)。
+    ip -o addr show dev "$_dev" 2>/dev/null \
+        | sed -n -e 's/.*[ ]inet6[ ]\([0-9a-fA-F:]*\)\/.*/\1/p' \
+                 -e 's/.*[ ]inet[ ]\([0-9.][0-9.]*\)\/.*/\1/p'
+}
+
 zp_perf_exit_ip() {
     _body=""
     _err=""
     if command -v curl >/dev/null 2>&1; then
-        _body="$(curl -fsSk -m 8 "$ZP_PERF_PROBE" 2>&1)" || _err="$(printf '%s' "$_body" | head -n1 | cut -c1-120)"
+        _body="$(curl -4 -fsSk -m 8 "$ZP_PERF_PROBE" 2>&1)" || _err="$(printf '%s' "$_body" | head -n1 | cut -c1-120)"
     else
         _body="$(uclient-fetch -q --no-check-certificate -O - "$ZP_PERF_PROBE" 2>&1)" \
             || _err="$(printf '%s' "$_body" | head -n1 | cut -c1-120)"
     fi
     _ip="$(printf '%s' "$_body" | sed -n 's/^ip=\([0-9a-fA-F:.]*\)$/\1/p' | head -n1)"
+    if [ -n "$_ip" ] && zp_perf_own_addrs | grep -qx "$_ip"; then
+        # 出口就是本机 WAN 的地址: 这条流量压根没进代理。**不能算通** —— 之前正是这一条
+        # 让"性能模式已开启"带着一个本机地址记了下来, 而用户在意的境外站点其实没走代理。
+        printf '出口是本机自己的地址 (%s) —— 这条流量没走代理\n' "$_ip" > "$ZP_PERF_DIR/probe_err" 2>/dev/null || true
+        return 1
+    fi
     if [ -z "$_ip" ]; then
         # 把"为什么没验成"记下来: 这句话要出现在失败提示里 —— 真机上"流量出不去"可能是
         # 节点不通 / DNS 没起来 / 探针地址被墙, 三者下一步完全不同, 不能只留一句猜测。
@@ -2566,6 +2602,8 @@ zp_perf_enter() {
         return 1
     fi
     printf '  · dae 在跑, 正在验证流量真的过得去…\n'
+    # 解析路径换了 (dnsmasq → dae), 先把缓存丢掉再探 —— 否则探针可能拿到上一条路径上的答案
+    zp_perf_flush_dns
 
     # 等"真的通" (最多 45 秒)。判据是境外地址够得到 —— 而且此刻 mihomo 是停着的,
     # 所以这条连接只可能是 dae 挣来的 (这就是"不撒谎"的那一步)。
@@ -2637,6 +2675,7 @@ zp_perf_leave() {
     zp_perf_caps 0 "$_why"
     "$ZP_INIT" enable >/dev/null 2>&1 || true
     "$ZP_INIT" restart >/dev/null 2>&1 || true
+    zp_perf_flush_dns
     printf '已回到标准模式 (数据面: %s)\n' "$_prev"
     [ -n "$_why" ] || log "性能模式关闭 (用户操作)"
     return 0
@@ -4191,6 +4230,21 @@ EOF
         if [ "$1" = "off" ] && [ -f "$ZP_DIR/perf.sh" ]; then
             . "$ZP_DIR/perf.sh"
             [ "$(zp_perf_state)" = "on" ] && zp_perf_leave "总开关关闭"
+        fi
+        # 「打开总开关」在性能模式下**不是**"把 mihomo 拉起来": 那一档下代理已经开着
+        # (数据面是 dae), 再起 mihomo 就是两个数据面同时在抢包 —— 现象是"时通时不通"。
+        # 真机上这个坑差点被界面踩中: 本机界面某条路的 status 少了 perf.live, 总开关因此
+        # 显示成"关", 用户照着点一下就会造出这种状态 (8.85)。dae 不在了才退回标准模式再开。
+        if [ "$1" = "on" ] && [ -f "$ZP_DIR/perf.sh" ]; then
+            . "$ZP_DIR/perf.sh"
+            if [ "$(zp_perf_state)" = "on" ]; then
+                if zp_perf_live; then
+                    echo "性能模式已经在用 (出口 $(sed -n '1p' "$ZP_PERF_DIR/exit_ip" 2>/dev/null || printf '未记录')) —— 总开关开着, 不必再起标准模式"
+                    exit 0
+                fi
+                echo "性能模式说好在用但 dae 不在 —— 先退回标准模式, 再开总开关"
+                zp_perf_leave "dae 不在, 用户要求打开总开关"
+            fi
         fi
         [ -n "$FIRST" ] || { echo "还没有接入任何服务器"; exit 1; }
         _base="$(field_of "$FIRST" base)"

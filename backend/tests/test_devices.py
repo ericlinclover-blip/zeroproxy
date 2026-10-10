@@ -623,6 +623,16 @@ def test_install_script_builds_the_perf_mode_switch_the_honest_way():
     assert "dae 日志: " in code and 'zp_perf_why_set "$_why"' in code
     # 切换的空档里 agent 不许替用户把标准模式拉回来
     assert "perf_intending" in code and "perf_intending; then" in code
+    # 探针要**只探 v4** 并拒收"出口就是本机自己的地址" —— 真机上 curl 默认走了 IPv6 直连,
+    # 出口记成了本机自己的 240e:… 而界面写着"已开启" (8.85)。
+    assert "zp_perf_own_addrs" in code and "出口是本机自己的地址" in code
+    assert "curl -4 -fsSk" in code, "探针不能再用默认(优先 v6)的方式出去"
+    # 解析路径换了要丢缓存, 否则被污染的旧答案会一直被发出去
+    assert "zp_perf_flush_dns" in code
+    # dae 在不在也要以进程为准 (与 mihomo 那条同一个道理)
+    assert "pidof dae" in code
+    # 总开关「on」在性能模式下不许把 mihomo 拉起来 (两个数据面抢包)
+    assert "性能模式已经在用" in code and "不必再起标准模式" in code
     # caps 里的那几个字段是界面 / 面板 / 诊断读的同一份
     for key in ("perf_cap=", "perf=", "perf_why="):
         assert f"printf '{key}" in code or f"s/^{key}" in code, f"caps 要记 {key}"
@@ -706,6 +716,40 @@ def test_dae_node_keys_are_bare_identifiers(monkeypatch):
     for line, key in zip(lines, keys):
         assert legal.match(key), line
         assert not key.startswith("'"), f"键名不能带引号: {line}"
+
+
+def test_dae_config_does_not_serve_stale_dns_cache(monkeypatch):
+    """dae 的 DNS 不许吃"过期但仍可用"的缓存 (RFC 8767 stale)。
+
+    上游只要有一次被污染 (或者那条查询走了直连), 那个坏答案就会在 stale 窗口里继续发给
+    所有人 —— 真机上就有一个域名在缓存里躺了很久, 表现是"这个站打不开, 别的都正常" (8.85)。
+    """
+    from zeroproxy import dae_config, share_links
+
+    monkeypatch.setattr(share_links, "enabled_links",
+                        lambda state: [("trojan", "trojan://p@b:443")])
+    body, _ = dae_config.render({"routing": {"template": "smart"}}, "https://p.example.com")
+    assert "optimistic_cache: false" in body
+
+
+def test_luci_cgi_speaks_the_same_perf_vocabulary_as_zpcore():
+    """两个入口 (80 端口的 cgi / 8399 的 zpcore) 必须说同一套话。
+
+    漏过一次: cgi 的 perf 里没有 `live`, 而界面要 `perf.live === '1'` 才把"性能模式运行中 /
+    总开关 = 开"画出来 —— 于是从 LuCI 菜单进来那一页永远显示"内核已停止 · 全屋代理关 ·
+    性能模式异常", 而 dae 正在分流。用户看到的"还是不能用"就是这一条 (8.85)。
+    """
+    import os as _os
+
+    from zeroproxy import router_client
+
+    client_dir = _os.path.dirname(router_client.script_path())
+    cgi = open(_os.path.join(client_dir, "luci", "cgi"), encoding="utf-8").read()
+    serve = open(_os.path.join(client_dir, "agent", "serve.go"), encoding="utf-8").read()
+    for field in ("cap", "state", "live", "why", "exit_ip", "busy", "progress"):
+        assert f'"{field}"' in serve, f"zpcore 少了 {field}"
+        assert f'"{field}":"%s"' in cgi, f"cgi 少了 perf.{field}"
+    assert "pidof dae" in cgi, "判据与 perf.sh 一致: 先看进程 (服务状态只作兜底)"
 
 
 def test_perf_binary_endpoint_answers_instead_of_hanging(client, configured, monkeypatch):
