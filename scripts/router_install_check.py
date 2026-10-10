@@ -1877,6 +1877,52 @@ def main() -> int:
         with open(os.path.join(perf_root, "perf", "state"), "w") as fh:
             fh.write("off\n")
 
+        # 1b) 性能模式**在用**的时候重跑一次安装命令 (= 常有的"更新客户端"):
+        #     真机上这一跑把 TUN / tproxy / redirect 三条全"探"成不通 (数据面正被 dae 接着),
+        #     然后摘要把原因写成"去补内核模块 / 换固件" —— 一句误诊, 用户会截图当成故障
+        #     (8.87)。这里先造一份"空机上探过的 caps", 再看它会不会被这次探测冲掉。
+        # 这一步会**重写 init 脚本** (安装脚本本来就该这么做), 所以它只能放在 [15] 末尾:
+        # 插在中间会把后面几条用例用的假服务冲掉 (踩过一次)。先自己把"性能模式正在用"的
+        # 现场摆好: 假的 mihomo / dae 服务 + dae 进程活着 + state=on。
+        _fake_init(os.path.join(perf_root, "initd"))
+        with open(os.path.join(perf_root, "initd-perf"), "w") as fh:
+            fh.write("#!/bin/sh\n" + (
+                'case "$1" in\n'
+                f'  start|restart) "$ZP_ROOT/perf/dae" run -c "$ZP_ROOT/perf/dae.dae" & echo $! > "$ZP_ROOT/perf/dae.pid"; exit 0 ;;\n'
+                f'  stop) [ -f "$ZP_ROOT/perf/dae.pid" ] && kill "$(cat "$ZP_ROOT/perf/dae.pid")" 2>/dev/null; rm -f "$ZP_ROOT/perf/dae.pid"; exit 0 ;;\n'
+                f'  running) [ -f "$ZP_ROOT/perf/dae.pid" ] && kill -0 "$(cat "$ZP_ROOT/perf/dae.pid")" 2>/dev/null && exit 0; exit 1 ;;\n'
+                "  enable|disable) exit 0 ;;\n"
+                "esac\nexit 0\n"
+            ))
+        os.chmod(os.path.join(perf_root, "initd-perf"), 0o755)
+        with open(os.path.join(perf_root, "perf", "dae.pid"), "w") as fh:
+            fh.write("%d\n" % os.getpid())
+        with open(os.path.join(perf_root, "perf", "state"), "w") as fh:
+            fh.write("on\n")
+        _caps_path = os.path.join(perf_root, "caps")
+        _caps_before = open(_caps_path, encoding="utf-8").read()
+        _caps_before = re.sub(r"^tun=.*$", "tun=1", _caps_before, flags=re.M)
+        _caps_before = re.sub(r"^nft=.*$", "nft=1", _caps_before, flags=re.M)
+        _caps_before = re.sub(r"^tproxy=.*$", "tproxy=1", _caps_before, flags=re.M)
+        _caps_before = re.sub(r"^redirect=.*$", "redirect=1", _caps_before, flags=re.M)
+        with open(_caps_path, "w") as fh:
+            fh.write(_caps_before)
+        ok_again, out_again = run_install(
+            "perf-again", root=perf_root,
+            extra={"PATH": perf_tools + os.pathsep + os.environ.get("PATH", ""),
+                   "ZP_KERNEL": btf_kver, "ZP_ROOT": perf_root},
+        )
+        check("性能模式在用: 重跑安装命令**不误诊** (不说三条路都不通, 也不让人去补内核模块/换固件)",
+              ok_again and "内核态 eBPF (dae)" in out_again
+              and "三条路都没探通" not in out_again
+              and "透明代理未生效" not in out_again,
+              [ln.strip() for ln in out_again.splitlines() if "eBPF" in ln][:1])
+        _caps_after = open(_caps_path, encoding="utf-8").read()
+        check("那次探测不采信: caps 里空机探到的能力位与 chosen 都还在",
+              "tun=1" in _caps_after and "chosen=ebpf" in _caps_after,
+              [ln for ln in _caps_after.splitlines() if ln.startswith(("tun=", "chosen="))])
+
+
         # [16] LuCI 那三件套: 升级不许毁掉好文件, 坏了要能就地修 (真机事故: 升级之后 403)
         # 现场: 以前是 `http_get ... > /usr/share/rpcd/acl.d/xxx.json || true` —— 重定向先清空
         # 目标, 而 `|| true` 把失败咽掉。面板正好在重启 (nginx 回 502) 的那一次升级, 就把一份

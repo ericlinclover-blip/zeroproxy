@@ -752,6 +752,22 @@ def test_luci_cgi_speaks_the_same_perf_vocabulary_as_zpcore():
     assert "pidof dae" in cgi, "判据与 perf.sh 一致: 先看进程 (服务状态只作兜底)"
 
 
+def test_install_while_perf_mode_is_on_does_not_misdiagnose():
+    """性能模式在用的时候重跑安装命令, 不许把"数据面正被 dae 接着"误诊成"三条路都不通"。
+
+    真机上就是这么演的: TUN / tproxy / redirect 全被探成不通, 摘要给出"补内核模块 / 换固件"
+    的下一步 —— 而设备其实好好的 (dae 正在分流)。那是 8.87 修的三处: `case` 里补 `ebpf` 那一支、
+    `verify()` 在性能模式分支里要设 ACTIVE_MODE、以及探测结论不采信 (回填 caps 里空机的记录)。
+    """
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+    assert "数据面: 内核态 eBPF (dae)" in text, "DATAPATH 的 case 里要有 ebpf 那一支"
+    assert "模式     内核态 eBPF (性能模式" in text, "摘要的「模式」那一行也要认这一档"
+    assert 'ACTIVE_MODE="ebpf"' in text, "verify() 的性能模式分支要设 ACTIVE_MODE"
+    assert "标准模式那三级的探测这次不采信" in text, "探测结论不采信 + 回填 caps"
+
+
 def test_perf_gauge_speaks_in_real_units():
     """那块表盘只许说真话 —— 读数就是真实速率, 一个视觉只有一个含义。
 

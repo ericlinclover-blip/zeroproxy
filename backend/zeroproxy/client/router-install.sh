@@ -1391,6 +1391,33 @@ install_deps() {
     # `zeroproxy perf on` (点界面上的按钮) 时做, 这里只探能力。
     perf_cap_probe
 
+    # 性能模式**正在用**的时候, 上面那几探探的是"数据面已被 dae 接着的机器", 结论不可用 ——
+    # 真机上三条全报不通, 然后摘要给出"TUN 都用不了, 去补内核模块 / 换固件"这种误诊
+    # (用户会截图当成故障)。所以这里把 caps 里**上一次空机探测**的能力位回填回去:
+    # 那些值才代表这台机器的底子, 而"现在走哪一档"由 chosen=ebpf 说话 (8.87)。
+    if [ "$(_perf_flag)" = "1" ]; then
+        note "性能模式正在用 (内核态 eBPF): 标准模式那三级的探测这次不采信, 沿用上次的记录"
+        for _f in tun nft tproxy redirect ebpf; do
+            _old="$(sed -n "s/^$_f=//p" "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+            [ -n "$_old" ] || continue
+            case "$_f" in
+                tun)      NET_TUN="$_old" ;;
+                nft)      NET_NFT="$_old" ;;
+                tproxy)   NET_TPROXY="$_old" ;;
+                redirect) NET_REDIRECT="$_old" ;;
+                ebpf)     NET_EBPF="$_old" ;;
+            esac
+        done
+        for _l in tun tproxy redirect; do
+            _ow="$(sed -n "s/^why.$_l=//p" "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+            case "$_l" in
+                tun)      CAPS_WHY_TUN="$_ow" ;;
+                tproxy)   CAPS_WHY_TPROXY="$_ow" ;;
+                redirect) CAPS_WHY_REDIRECT="$_ow" ;;
+            esac
+        done
+    fi
+
     # WAN 的 MTU 与转发卸载 (性能那一半: 大包别死在路上 / 别让卸载把代理绕过去)。
     # **必须在 choose_datapath 之前算完**: choose_datapath → set_datapath → write_caps,
     # 那一刻就把 caps 写死了。放在它后面算, 值算出来了却没人再写一次 —— 真机上表现为
@@ -1422,6 +1449,13 @@ install_deps() {
             note "这台固件没有 nf_tables、也建不出 tun —— 用最老也最抗造的一条路接管局域网"
             if [ -n "$CAPS_WHY_TUN" ]; then note "tun 不可用: $CAPS_WHY_TUN"; fi
             if [ -n "$CAPS_WHY_TPROXY" ]; then note "tproxy 不可用: $CAPS_WHY_TPROXY"; fi
+            ;;
+        ebpf)
+            # 性能模式 (dae) 就是这一档: 它不是 mihomo 的一级, 但它**在接管** ——
+            # 以前这里没有这一支, 于是性能模式正常工作时反而落进下面那个"三条路都不通"
+            # 的分支, 报出一句误诊 (真机上用户截了图, 8.87)。
+            ok "数据面: 内核态 eBPF (dae) —— 性能模式正在用, 局域网与路由器自身都由它接管"
+            note "标准模式那三级 (TUN / tproxy / redirect) 的判定要等熄火之后再跑安装命令才准"
             ;;
         *)
             DEPENDENCY_NOTE="no-datapath"
@@ -5199,9 +5233,17 @@ verify() {
             /etc/init.d/zeroproxy disable >/dev/null 2>&1 || true
             /etc/init.d/zeroproxy stop >/dev/null 2>&1 || true
             touch "$ZP_DIR/core.up"
+            # 现场验过的数据面就是 eBPF 这一档 —— 摘要与"模式/覆盖"两行读的都是它,
+            # 漏了这一句就会落进"未生效"那一支 (8.87)。
+            ACTIVE_MODE="ebpf"
             ok "性能模式在用 (内核态 eBPF / dae): 标准模式的内核保持停用"
             _eip="$(sed -n '1p' "$ZP_PERF_DIR/exit_ip" 2>/dev/null || true)"
-            [ -n "$_eip" ] && ok "  出口 $_eip (上次验证时记下的)"
+            _wip="$(sed -n '1p' "$ZP_DIR/wan_ip" 2>/dev/null || true)"
+            if [ -n "$_eip" ] && [ "$_eip" = "$_wip" ]; then
+                note "  出口 $_eip (本机): 路由器自身的流量没走代理 —— 局域网设备不受影响"
+            elif [ -n "$_eip" ]; then
+                ok "  出口 $_eip (上次验证时记下的)"
+            fi
             return 0
         fi
         note "性能模式说好在用, 但 dae 已经不在 —— 自动退回标准模式"
@@ -5331,6 +5373,9 @@ finish() {
     # 说什么话, 取决于**真的生效到哪** (ACTIVE_MODE 是现场验过的, 不是探测的意图)。
     # 之前这里只看"tun 有没有建出来", 于是 tproxy 也没装上的机器照样报"已开启"(8.45)。
     case "${ACTIVE_MODE:-none}" in
+        ebpf)
+            ok "性能模式已开启 —— 手机 / 电脑 / 电视连上这台路由器即可用 (数据面: 内核态 eBPF)"
+            printf '  %s\n' "（这一档下标准模式的内核是停用的; 要回到 TUN 模式请在界面点「熄火」）" ;;
         tun)
             ok "全屋代理已开启 —— 手机 / 电脑 / 电视连上这台路由器即可用" ;;
         tproxy)
@@ -5379,6 +5424,7 @@ finish() {
         printf '  性能模式 这台机器开不了: %s\n' "${PERF_WHY:-内核条件不满足}"
     fi
     case "${ACTIVE_MODE:-none}" in
+        ebpf)     printf '  模式     内核态 eBPF (性能模式, dae) —— 含路由器自身\n' ;;
         tun)      printf '  模式     TUN 全屋透明代理 (含路由器自身)\n' ;;
         tproxy)   printf '  模式     tproxy 全屋透明代理 (本机自身流量除外)\n' ;;
         redirect) printf '  模式     iptables REDIRECT 局域网 TCP (不含 UDP 与本机自身)\n' ;;
