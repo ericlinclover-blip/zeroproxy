@@ -33,11 +33,11 @@ type statusResp struct {
 	IPv6    string `json:"ipv6"`
 	//: 数据面上真的过了多少包。规则在但 0 包 = 没人被接管 (多半是接口名不对),
 	//: 这个数字是界面上唯一能一眼看出来的"真的接管了"的证据。
-	Packets int           `json:"packets"`
+	Packets int `json:"packets"`
 	//: WAN 口的收+发字节数。界面那块性能模式表盘的转速就是它算出来的 (真流量才有转速)。
 	//: 与原 cgi 同一个字段名, 老页面拿到它也不会用坏 (它只读自己认识的键)。
-	WAN     int64         `json:"wan"`
-	Client  string        `json:"client"`
+	WAN    int64  `json:"wan"`
+	Client string `json:"client"`
 	//: 性能模式 (内核态 eBPF / dae) 那几个值 —— 表盘按它们画。与原 cgi 逐字段一致。
 	Perf    perfResp      `json:"perf"`
 	Servers []serverEntry `json:"servers"`
@@ -47,11 +47,14 @@ type statusResp struct {
 // cap=能不能开 / state=意图 / live=现场 / why=上一次的结论 / exit_ip=验证过的出口 /
 // busy=正在切换 / progress=切换到了哪一步 (CLI 写下的原话)。
 type perfResp struct {
-	Cap      string `json:"cap"`
-	State    string `json:"state"`
-	Live     string `json:"live"`
-	Why      string `json:"why"`
-	ExitIP   string `json:"exit_ip"`
+	Cap    string `json:"cap"`
+	State  string `json:"state"`
+	Live   string `json:"live"`
+	Why    string `json:"why"`
+	ExitIP string `json:"exit_ip"`
+	//: 面板看到的本机公网地址 (agent 心跳写下来的 wan_ip)。界面拿它判断"出口探针是不是
+	//: 其实从本机直连出去的" —— 相等就把那个出口如实标成 (本机), 不冒充节点出口 (8.86)。
+	WanIP    string `json:"wan_ip"`
 	Busy     string `json:"busy"`
 	Progress string `json:"progress"`
 }
@@ -370,6 +373,7 @@ func currentPerf(cfg serveConfig) perfResp {
 		State:    perfFile(cfg.dir, "state"),
 		Live:     live,
 		Why:      perfFile(cfg.dir, "why"),
+		WanIP:    perfFile(cfg.dir, "wan_ip"),
 		ExitIP:   perfFile(cfg.dir, "exit_ip"),
 		Busy:     busy,
 		Progress: tail,

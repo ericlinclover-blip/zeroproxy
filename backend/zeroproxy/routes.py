@@ -3580,4 +3580,8 @@ def client_report(payload: DeviceReportIn, request: Request):
             "rev": devices.config_rev(state),
             "name": device["name"],
             "template": share_links.template_of(state),
+            # 面板看到的这台设备的公网地址。设备端拿它做一件事: 判断"性能模式的出口探针
+            # 是不是其实从本机直连出去的" —— 那条心跳是直连 (分流规则里面板域名走 direct),
+            # 所以这个值就是本机 WAN 的出口地址。相等 = 探针没走代理 (见 README 8.86)。
+            "ip": _client_ip(request),
         }

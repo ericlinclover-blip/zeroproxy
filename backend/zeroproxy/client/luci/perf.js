@@ -16,12 +16,16 @@
   const $ = (id) => document.getElementById(id);
   const REDUCED = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
   const NS = 'http://www.w3.org/2000/svg';
-  const MAX = 8;          // 满刻度 8 (RPM ×1000)
-  const ARC = Math.PI * 100;  // 半圆弧长, r = 100
-  const FULL_KBPS = 12500;    // 100 Mbps 顶到红区 (家庭宽带里已经很快了)
+  const CX = 130;             // 表盘圆心
+  const CY = 118;
+  const R = 96;               // 弧半径
+  const ARC = Math.PI * R;    // 半圆弧长 (301.6)
+  const CAP_KBPS = 12500;     // 满弧 = 12.5 MB/s ≈ 100 Mbps (家用宽带里已经很快了)
   const PHASES = 5;
 
-  const needle = { value: 0, target: 0, vel: 0, raf: 0 };
+  //: 弧与值点都从**同一个** p 算出来 —— 这样"点在哪"和"弧到哪"永远不会打架
+  //: (第一版是指针 + 弧各算各的, 加上旋转方向算反了, 于是针会掉到刻度线下面)。
+  const anim = { value: 0, target: 0, vel: 0, raf: 0 };
   const last = { at: 0, wan: 0, kbps: 0, live: false, state: '' };
   let timer = 0;
   let busyUntil = 0;
@@ -30,83 +34,95 @@
 
   function polar(deg, r) {
     const a = (deg * Math.PI) / 180;
-    return [130 + r * Math.cos(a), 130 - r * Math.sin(a)];
+    return [CX + r * Math.cos(a), CY - r * Math.sin(a)];
   }
 
+  /** 刻度: 半圈 9 根, 每 25% 一根长的。**不写数字** —— 数字留给中间那个真实速率
+   *  (第一版把小刻度 + RPM 数字铺在盘面上, 反而把真读数挤成了脚注)。 */
   function buildTicks() {
     const g = $('perf-ticks');
     if (!g || g.childNodes.length) return;
-    for (let v = 0; v <= MAX; v++) {
-      const deg = 180 - (v / MAX) * 180;
-      const major = v % 2 === 0;
-      const [x1, y1] = polar(deg, major ? 84 : 88);
-      const [x2, y2] = polar(deg, 96);
+    for (let i = 0; i <= 8; i++) {
+      const major = i % 2 === 0;
+      const deg = 180 - (i / 8) * 180;
+      const [x1, y1] = polar(deg, R + 7);
+      const [x2, y2] = polar(deg, R + (major ? 15 : 11));
       const line = document.createElementNS(NS, 'line');
       line.setAttribute('x1', x1.toFixed(1));
       line.setAttribute('y1', y1.toFixed(1));
       line.setAttribute('x2', x2.toFixed(1));
       line.setAttribute('y2', y2.toFixed(1));
       line.setAttribute('class', 'pg-tick' + (major ? ' major' : ''));
-      line.dataset.v = String(v);
       g.appendChild(line);
-      if (major) {
-        const [tx, ty] = polar(deg, 68);
-        const t = document.createElementNS(NS, 'text');
-        t.setAttribute('x', tx.toFixed(1));
-        t.setAttribute('y', (ty + 3).toFixed(1));
-        t.setAttribute('text-anchor', 'middle');
-        t.setAttribute('class', 'pg-num');
-        t.textContent = String(v);
-        g.appendChild(t);
-      }
     }
   }
 
-  function paintNeedle() {
-    const el = $('perf-needle');
-    if (!el) return;
-    const v = Math.max(0, Math.min(MAX, needle.value));
-    el.setAttribute('transform', 'rotate(' + (180 - (v / MAX) * 180).toFixed(2) + ' 130 130)');
-    const read = $('perf-rpm');
-    if (read) read.textContent = String(Math.round(v * 10) / 10);
-    document.querySelectorAll('#perf-ticks .pg-tick').forEach((t) => {
-      t.classList.toggle('lit', Number(t.dataset.v) <= Math.round(v));
+  /** 弧与值点都由 p (0..1) 画出来 —— 一处几何, 不可能互相打架。 */
+  function paintValue(p) {
+    const q = Math.max(0, Math.min(1, p));
+    const arc = $('perf-arc');
+    if (arc) {
+      // 圆头线帽会沿切线多伸出去半个线宽 (5px), 减掉它, 弧的**尖端**才是真正的值。
+      arc.style.strokeDashoffset = String(ARC * (1 - q) + 5);
+    }
+    const ring = $('perf-mark-ring');
+    const dot = $('perf-mark');
+    const show = q > 0.004;
+    const [x, y] = polar(180 - q * 180, R);
+    [ring, dot].forEach((el) => {
+      if (!el) return;
+      el.setAttribute('cx', x.toFixed(1));
+      el.setAttribute('cy', y.toFixed(1));
+      el.setAttribute('opacity', show ? '1' : '0');
     });
   }
 
-  // 临界阻尼弹簧 —— 真表的针是"甩过去、稳下来", 线性插值看着像在数数。
+  /** 读数: 真实速率 + 真实单位 (KB/s 与 MB/s 都按 1024 算)。 */
+  function formatSpeed(kbps) {
+    const v = Math.max(0, Number(kbps) || 0);
+    if (v >= 1024) return [String(Math.round(v / 1024 * 10) / 10), 'MB/s'];
+    if (v >= 10) return [String(Math.round(v)), 'KB/s'];
+    return [String(Math.round(v * 10) / 10), 'KB/s'];
+  }
+
+  function paintRead(kbps, textOverride, unitOverride) {
+    const [num, unit] = formatSpeed(kbps);
+    const read = $('perf-rpm');
+    const unitEl = $('perf-unit');
+    if (read) {
+      read.textContent = textOverride !== undefined ? textOverride : num;
+      read.classList.toggle('off', textOverride === '—');
+    }
+    if (unitEl) unitEl.textContent = unitOverride !== undefined ? unitOverride : unit;
+  }
+
+  // 临界阻尼弹簧 —— 弧和点"甩过去、稳下来", 而不是数字在跳。读数本身不做平滑:
+  // 它就是刚量到的那个速率 (平滑过的数字看着舒服, 但它不是"现在有多快")。
   function springTick() {
     const k = 0.17, damp = 0.74;
-    const delta = needle.target - needle.value;
-    needle.vel = (needle.vel + delta * k) * damp;
-    needle.value += needle.vel;
-    if (Math.abs(needle.target - needle.value) < 0.004 && Math.abs(needle.vel) < 0.004) {
-      needle.value = needle.target;
-      needle.vel = 0;
-      needle.raf = 0;
-      paintNeedle();
+    const delta = anim.target - anim.value;
+    anim.vel = (anim.vel + delta * k) * damp;
+    anim.value += anim.vel;
+    if (Math.abs(anim.target - anim.value) < 0.004 && Math.abs(anim.vel) < 0.004) {
+      anim.value = anim.target;
+      anim.vel = 0;
+      anim.raf = 0;
+      paintValue(anim.value);
       return;
     }
-    paintNeedle();
-    needle.raf = requestAnimationFrame(springTick);
+    paintValue(anim.value);
+    anim.raf = requestAnimationFrame(springTick);
   }
 
   function to(target) {
-    needle.target = Math.max(0, Math.min(MAX, target));
+    anim.target = Math.max(0, Math.min(1, target));
     if (REDUCED) {
-      needle.value = needle.target;
-      needle.vel = 0;
-      paintNeedle();
+      anim.value = anim.target;
+      anim.vel = 0;
+      paintValue(anim.value);
       return;
     }
-    if (!needle.raf) needle.raf = requestAnimationFrame(springTick);
-  }
-
-  function setArc(pct) {
-    const el = $('perf-arc');
-    if (!el) return;
-    const p = Math.max(0, Math.min(1, pct));
-    el.style.strokeDashoffset = String(ARC * (1 - p));
+    if (!anim.raf) anim.raf = requestAnimationFrame(springTick);
   }
 
   function paintSegs(n, failed) {
@@ -160,34 +176,37 @@
     last.at = now;
     last.wan = Number((state && state.wan) || 0);
 
-    // 表针: 切换中按进度走, 生效后按真实流量走, 其余贴着 0。
-    if (busy && !live) {
-      const p = phaseOf(perf) / PHASES;
-      to(0.6 + p * 4.6);          // 起步抖一下, 然后随进度一路上扬
-      setArc(p);
-    } else if (on && live) {
-      const rpm = MAX * Math.sqrt(Math.min(1, last.kbps / FULL_KBPS));
-      to(Math.max(0.7, rpm));     // 怠速 0.7: 引擎在转, 只是没在飙
-      setArc(1);
+    // 弧与点 = 当前速率占上限的比例。**切换中不许假装速度**: 那一档读数照旧是真实速率,
+    // 进度由下面那五段说 (第一版让指针按进度乱走, 看起来像在飙, 其实一个包都没过)。
+    const frac = Math.min(1, last.kbps / CAP_KBPS);
+    if (on && live) {
+      to(Math.pow(frac, 0.6));    // 低速率也要看得出动静 (开方一点的观感)
     } else {
       to(0);
-      setArc(0);
     }
+    paintRead(on && live ? last.kbps : 0);
 
     card.classList.toggle('idle', !live);
     card.classList.toggle('live', live);
     card.classList.toggle('booting', busy && !live);
-    paintSegs(live ? PHASES : phaseOf(perf), failed && !live);
+    // 五段只说"切换走到哪一步": 切换中/失败时出现, 平时收起来 (开着还亮着五条, 像进度条没走完)。
+    const segsEl = $('perf-segs');
+    const showSegs = busy || failed;
+    if (segsEl) segsEl.classList.toggle('hidden', !showSegs);
+    if (showSegs) paintSegs(phaseOf(perf), failed && !live);
 
     const pill = $('perf-pill');
     const capEl = $('perf-cap');
+    const warnEl = $('perf-warn');
     const sub = $('perf-sub');
+    if (warnEl) warnEl.textContent = '';
 
     if (!cap) {
       pill.className = 'pill warn';
       pill.innerHTML = '<span class="dot"></span>不可用';
       capEl.textContent = '这台机器开不了: ' + (perf.why || '内核条件不满足');
       sub.textContent = '需要内核 ≥5.17 且带 BTF。缺 BTF 时重跑一次安装命令会自动补上。';
+      paintRead(0, '—', '不可用');
       btn.textContent = '不可用';
       btn.disabled = true;
     } else if (busy && !live) {
@@ -208,10 +227,16 @@
     } else if (on && live) {
       pill.className = 'pill ok';
       pill.innerHTML = '<span class="dot"></span>已开启';
-      capEl.textContent = (perf.exit_ip ? '出口 ' + perf.exit_ip + ' · ' : '') +
-        '内核态分流 · 当前 ' + Math.round(last.kbps) + ' KB/s';
+      // 出口这一个是探针**从这台路由器自己**测到的。它要是正好等于本机 WAN 地址 (面板那条
+      // 心跳看到的就是它), 那这条流量根本没走代理 —— 如实标出来, 不把它写成"节点出口"(8.86)。
+      const own = String(perf.exit_ip || '') !== '' && String(perf.exit_ip) === String(perf.wan_ip || '');
+      capEl.textContent = (perf.exit_ip ? '出口 ' + perf.exit_ip + (own ? ' (本机)' : '') + ' · ' : '') +
+        '内核态 eBPF 分流 · 上限约 100 Mbps';
+      if (own && warnEl) {
+        warnEl.textContent = '探针走的是本机出口: 路由器自身的流量没走代理 (局域网设备不受影响)';
+      }
       sub.textContent = '直连流量不再经过用户态 (eBPF 在内核里分流)。' +
-        (failed ? ' 上次的结论: ' + (perf.why || '') : '');
+        (failed || perf.why ? ' 上次的结论: ' + (perf.why || '') : '');
       btn.textContent = '熄火 (回到标准模式)';
       btn.disabled = false;
     } else {
@@ -224,17 +249,6 @@
       btn.textContent = '启动引擎';
       btn.disabled = false;
     }
-
-    // 进入过程中: 一旦真的生效, 给一次"起压"反馈 (闪一下 + 报出口)
-    if (live && !last.live) {
-      const b = $('perf-btn');
-      b.classList.remove('done');
-      void b.offsetWidth;           // 让动画能重放
-      b.classList.add('done');
-      if (window.toast && perf.exit_ip) window.toast('性能模式已开启 · 出口 ' + perf.exit_ip);
-    }
-    last.live = live;
-    last.state = String(perf.state || '');
 
     schedule(live, busy, now);
   }
@@ -268,7 +282,13 @@
     try {
       const r = await window.call(on ? 'perf-on' : 'perf-off');
       if (window.toast) window.toast(String((r && r.message) || '已提交').split('\n')[0]);
-      if (on) { phaseOf({ busy: '1' }); to(1.4); paintSegs(1); }   // 点火: 表针先抖一下
+      if (on) {
+        // 点火: 立刻把五段亮起来 (切换进度就归它说), 读数与弧照旧是真实速率 —— 不假装在飙。
+        const segs = $('perf-segs');
+        if (segs) segs.classList.remove('hidden');
+        paintSegs(1);
+        to(0);
+      }
       busyUntil = Date.now() + 90000;
       if (typeof window.load === 'function') await window.load();
     } catch (e) {

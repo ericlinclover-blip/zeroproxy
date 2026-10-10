@@ -501,13 +501,15 @@ async function main() {
       await page.locator("#update").isEnabled(), await page.locator("#update").innerText());
     server.zpState.updOverride = "";
 
-    console.log("\n[14] 性能模式: 那块跑车仪表盘 (真的点一次)");
-    // 刻度与数字是 perf.js 用 SVG 画出来的 —— 它们存在, 就说明那个脚本真的被加载、
-    // 被 cgi 发出来了 (而不是浏览器把 index.html 当成了 js)。
+    console.log("\n[14] 性能模式: 那块速率表 (真的点一次)");
+    // 刻度是 perf.js 用 SVG 画出来的 —— 它存在, 就说明那个脚本真的被加载、被 cgi 发出来了
+    // (而不是浏览器把 index.html 当成了 js)。9 根里 5 根长的; 盘面上**不写数字** ——
+    // 数字留给中间那个真实速率 (第一版把小刻度 + RPM 数字铺在盘面上, 真读数反而成了脚注)。
     check("仪表盘的刻度是脚本画出来的 (perf.js 真的加载了)",
       (await page.locator("#perf-ticks line").count()) === 9
-      && (await page.locator("#perf-ticks text").count()) === 5,
-      `${await page.locator("#perf-ticks line").count()} 条刻度 / ${await page.locator("#perf-ticks text").count()} 个数字`);
+      && (await page.locator("#perf-ticks line.major").count()) === 5
+      && (await page.locator("#perf-ticks text").count()) === 0,
+      `${await page.locator("#perf-ticks line").count()} 条刻度 (${await page.locator("#perf-ticks line.major").count()} 长) / ${await page.locator("#perf-ticks text").count()} 个数字`);
 
     // 开不了的机器: 表盘上要写清"为什么", 而且按钮点不动 —— 不许给一个点了没反应的按钮。
     server.zpState.perf = { cap: "0", state: "off", live: "0", why: "内核 5.4.281 低于 5.17",
@@ -527,34 +529,47 @@ async function main() {
     await page.waitForSelector(".srv");
     // SVG <text> 没有 innerText —— 统一走 textContent 读表盘上的数字。
     const rpmText = () => page.locator("#perf-rpm").evaluate((el) => el.textContent);
-    check("没开的时候: 表针贴怠速 (0)",
-      (await rpmText()).trim() === "0", await rpmText());
+    const unitText = () => page.locator("#perf-unit").evaluate((el) => el.textContent);
+    check("没开的时候: 读数是 0 (真实速率, 不是编出来的刻度)",
+      (await rpmText()).trim() === "0", `${await rpmText()} ${await unitText()}`);
     await page.click("#perf-btn");
     await page.waitForFunction(() => /进入中/.test(document.getElementById("perf-pill").textContent), null, { timeout: 5000 });
     check("点击后立刻进入「进入中」并禁用按钮 (不能连点)",
       await page.locator("#perf-btn").isDisabled(), await page.locator("#perf-btn").innerText());
     await page.waitForFunction(() => document.querySelectorAll("#perf-segs i.on").length >= 1, null, { timeout: 5000 });
     const segsMid = await page.locator("#perf-segs i.on").count();
-    const rpmMid = parseFloat(await rpmText());
     check("切换过程中五段进度真的在往前走 (取自后端写的进度原话)",
       segsMid >= 1 && segsMid < 5, `${segsMid}/5 段`);
-    check("表针在动 (进入过程里就有转速)", rpmMid > 0, `${rpmMid} rpm`);
+    // 切换中**不许假装速度**: 那一档一个包都还没从节点过, 读数就该是真实的 0。
+    check("切换中不编速度 (读数仍是真实速率 0)", (await rpmText()).trim() === "0", await rpmText());
 
     await page.waitForFunction(() => /已开启/.test(document.getElementById("perf-pill").textContent), null, { timeout: 8000 });
     check("生效后: 状态是「已开启」并报出验证过的出口",
       /203\.0\.113\.7/.test(await page.locator("#perf-cap").innerText()),
       await page.locator("#perf-cap").innerText());
-    check("五段进度全亮 (绿灯: 一路走到生效)", (await page.locator("#perf-segs i.on").count()) === 5);
+    check("生效后五段收起 (它不是速度条, 开着还亮五条像进度没走完)",
+      await page.locator("#perf-segs").evaluate((el) => el.classList.contains("hidden")));
     check("按钮变成「熄火」", /熄火/.test(await page.locator("#perf-btn").innerText()),
       await page.locator("#perf-btn").innerText());
-    // 转速必须跟着**真实流量**走: 让模拟器多推一点字节, 表针就该抬起来
+    // 读数必须跟着**真实流量**走: 让模拟器多推一点字节, 数字就该变
     const rpmBefore = parseFloat(await rpmText());
     server.zpState.wan += 6 * 1024 * 1024;
     await page.waitForFunction((prev) => parseFloat(document.getElementById("perf-rpm").textContent) !== prev,
       rpmBefore, { timeout: 8000 });
     const rpmAfter = parseFloat(await rpmText());
-    check("表针跟着真实流量走 (WAN 字节数涨了, 转速就变)",
-      rpmAfter !== rpmBefore, `${rpmBefore} → ${rpmAfter} rpm`);
+    check("读数跟着真实流量走 (WAN 字节数涨了, 数字就变)",
+      rpmAfter !== rpmBefore, `${rpmBefore} → ${rpmAfter} ${await unitText()}`);
+    // 出口探针那次要是从本机直连出去的 (等于面板看到的本机地址), 卡片必须**如实标出来**,
+    // 不许把本机地址写成节点出口 —— 真机上用户看到的就是这个 (8.86)。
+    server.zpState.perf.exit_ip = "219.133.176.186";
+    server.zpState.perf.wan_ip = "219.133.176.186";
+    await page.reload();
+    await page.waitForSelector(".srv");
+    await page.waitForFunction(() => /已开启/.test(document.getElementById("perf-pill").textContent), null, { timeout: 8000 });
+    check("出口等于本机地址时: 标成 (本机) 并给出警告, 不冒充节点出口",
+      /\(本机\)/.test(await page.locator("#perf-cap").innerText())
+      && /没走代理/.test(await page.locator("#perf-warn").innerText()),
+      `${await page.locator("#perf-cap").innerText()} / ${await page.locator("#perf-warn").innerText()}`);
     await page.screenshot({ path: path.join(SHOT_DIR, "router-ui-perf.png") });
 
     await page.click("#perf-btn");

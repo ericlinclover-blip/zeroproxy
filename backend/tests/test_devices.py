@@ -746,10 +746,57 @@ def test_luci_cgi_speaks_the_same_perf_vocabulary_as_zpcore():
     client_dir = _os.path.dirname(router_client.script_path())
     cgi = open(_os.path.join(client_dir, "luci", "cgi"), encoding="utf-8").read()
     serve = open(_os.path.join(client_dir, "agent", "serve.go"), encoding="utf-8").read()
-    for field in ("cap", "state", "live", "why", "exit_ip", "busy", "progress"):
+    for field in ("cap", "state", "live", "why", "exit_ip", "wan_ip", "busy", "progress"):
         assert f'"{field}"' in serve, f"zpcore 少了 {field}"
         assert f'"{field}":"%s"' in cgi, f"cgi 少了 perf.{field}"
     assert "pidof dae" in cgi, "判据与 perf.sh 一致: 先看进程 (服务状态只作兜底)"
+
+
+def test_perf_gauge_speaks_in_real_units():
+    """那块表盘只许说真话 —— 读数就是真实速率, 一个视觉只有一个含义。
+
+    真机上用户的反馈就是"显示有问题": 指针的旋转方向算反了 (0.7 的针掉到 0 刻度线下面),
+    大数是编出来的 `RPM ×1000`、真实速率反而挤在脚注里, 开着的时候整条弧永远填满 (看着像
+    进度条走完了)。现在: 弧与值点由**同一个** p 画出来 (不可能互相打架), 刻度不写数字,
+    五段只在切换时出现, 切换中读数照旧是真实的 0 —— 不假装在飙 (README 8.86)。
+    """
+    import os as _os
+
+    from zeroproxy import router_client
+
+    luci = _os.path.join(_os.path.dirname(router_client.script_path()), "luci")
+    js = open(_os.path.join(luci, "perf.js"), encoding="utf-8").read()
+    html = open(_os.path.join(luci, "index.html"), encoding="utf-8").read()
+    # 注释里解释"第一版那个编出来的单位"是可以的 —— 只查**会被渲染/执行的那部分**。
+    import re as _re
+
+    def strip_comments(text: str) -> str:
+        text = _re.sub(r"/\*.*?\*/", "", text, flags=_re.S)
+        return "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("//"))
+
+    assert "RPM" not in strip_comments(html), "编出来的单位不许再出现在盘面上"
+    assert "RPM" not in strip_comments(js), "编出来的单位不许再出现在读数里"
+    assert "function formatSpeed" in js and "MB/s" in js and "KB/s" in js, "读数要用真实单位"
+    assert "polar(180 - q * 180" in js, "弧与值点必须由同一个 p 画出来"
+    assert "pg-num" not in js and "pg-num" not in html, "刻度上不许再写数字"
+    assert "paintRead(on && live ? last.kbps : 0)" in js, "切换中读数不许被前端编出来"
+    assert "segsEl.classList.toggle('hidden', !showSegs)" in js, "五段只在切换/失败时出现"
+    # 出口等于本机地址时要如实标出来 (探针没走代理), 不许冒充节点出口
+    assert "perf.wan_ip" in js and "本机" in js and "没走代理" in js
+
+
+def test_report_hands_back_the_address_the_panel_sees(client, configured):
+    """面板要把"它看到的这台设备的公网地址"回给设备。
+
+    用途只有一个但很硬: 性能模式的出口探针是从**路由器自己**发出去的, 而这条心跳走直连
+    (分流规则里面板域名是 direct) —— 于是两个地址相等就说明"那条探针根本没走代理"。
+    真机上就是这么把本机地址 (219.133…) 记成了"已开启"的出口 (README 8.86)。
+    """
+    _login(client)
+    device = _register(client, _pair_code(client)["code"])
+    res = client.post("/c/report", json={"device": device["id"], "k": device["secret"], "actual": True})
+    assert res.status_code == 200, res.text
+    assert "ip" in res.json(), res.json()
 
 
 def test_perf_binary_endpoint_answers_instead_of_hanging(client, configured, monkeypatch):

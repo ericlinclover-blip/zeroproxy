@@ -3287,6 +3287,14 @@ while true; do
         [ "$_d" = "false" ] && DESIRED_ALL="false"
         # 配置版本取第一台能应答的 (配置内容各台不同, 用哪台的 rev 都只是"变了就重拉")
         [ -z "$REV" ] && REV="$(json_get "$RESP" rev)"
+        # 面板看到的本机公网地址 (那条心跳走直连)。性能模式的出口探针用它判断"是不是其实
+        # 从本机直连出去的" —— 界面据此如实标注, 不把本机地址写成节点出口 (8.86)。
+        _wip="$(json_get "$RESP" ip)"
+        if [ -n "$_wip" ] && [ "$_wip" != "$(cat "$ZP_DIR/wan_ip" 2>/dev/null)" ]; then
+            umask 077
+            printf '%s\n' "$_wip" > "$ZP_DIR/wan_ip"
+            umask 022
+        fi
     done
 
     if [ -z "$REV" ]; then

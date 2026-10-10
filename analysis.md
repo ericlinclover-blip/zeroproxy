@@ -1,6 +1,6 @@
 # ZeroProxy 架构现状
 
-> 快照: **2026-10-10** · 面板 **v2.11.34** · 路由器客户端 **v1.4.30** · `state.json` schema **v5**
+> 快照: **2026-10-10** · 面板 **v2.11.35** · 路由器客户端 **v1.4.31** · `state.json` schema **v5**
 > 本文回答"**现在是什么样**"。另外两份文档分工不同, 不要混读:
 > `README.md` 是逐版开发日志 (4000+ 行, 每一版为什么这么改、哪次真机踩的坑);
 > `docs/RESEARCH.md` 与 `docs/ROUTER-CLIENT-REDESIGN.md` 是竞品调研与设计依据。
@@ -421,12 +421,12 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
 
 | 脚本 | 覆盖 |
 |---|---|
-| `backend/tests/` (pytest) | **320 通过 + 6 skip** (无真实内核二进制时跳过)。dry-run 全流程 + 安全边界 + 状态迁移 |
+| `backend/tests/` (pytest) | **322 通过 + 6 skip** (无真实内核二进制时跳过)。dry-run 全流程 + 安全边界 + 状态迁移 |
 | `scripts/verify.py` | 用真实 Xray/Hysteria/mihomo/sing-box 校验生成的配置与订阅 (含**两台机器真跑一条链**) |
 | `scripts/router_install_check.py` | **180 项**。真的用 shell 跑一遍路由器安装脚本: 七类机器 (含 OpenWrt 25.12 / apk 三态 / BTF 两种现场 / 性能模式的进-出-回退) / 本机覆盖 / revert 比对 / zpcore 真跑 / **第一跳** (面板生成的那一行命令外面顶一个 uclient-fetch 替身: 丢包重试、自签面板按证书状态跳过校验、配对码失效时读得到原因; 旧写法的"什么都没有发生"与命令长度都钉在测试里)。性能模式那一节的假 dae **照真机复刻两条硬规矩** (0644 拒 / node 键带引号拒) 并先自证一次 —— 它以前无条件 exit 0, 于是这两类事故在演练里永远是绿的; 另有"停不掉的 mihomo"(真进程)、"切换期间 agent 不许拉起标准模式"、"出口等于本机 WAN 地址时不算通"与"cgi 的 status 必须带 perf.live" |
 | `scripts/browser_check.cjs` | **157 项**, 真 Chromium 走「初始化 → 仪表盘」全流程 + 交互 + CSP + 截图 |
 | `scripts/clients_check.cjs` | 真实浏览器点客户端开关 |
-| `scripts/router_ui_check.cjs` | **62 项**。路由器本地界面 (含「没有更新记录时不许凭空长出进度面板」这类判据, 以及性能模式那块表盘: 真实浏览器里点一次, 看刻度/进度/表针/出口/熄火) |
+| `scripts/router_ui_check.cjs` | **62 项**。路由器本地界面 (含「没有更新记录时不许凭空长出进度面板」这类判据, 以及性能模式那块**速率表**: 真实浏览器里点一次, 看刻度/切换五段/真实读数/出口/熄火)。8.86 重做表盘时这一节的断言按新契约改过, 但**这台机器上没有 playwright, 没能在这里跑** —— 只做了静态更新 (下一次在有浏览器的地方跑时要留意) |
 | `scripts/geo_slow_check.cjs` | 长任务前端行为 (默认约 3 分钟的真下载) |
 | `scripts/upgrade_sim.sh` | 真跑 `upgrade.sh` (桩掉 root/systemd), 覆盖成功与回滚两条路径 |
 | `scripts/build-agent.sh` | 构建 `zpcore` 并注入版本号到 `client/agent/dist/` |

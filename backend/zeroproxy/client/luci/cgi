@@ -169,6 +169,9 @@ case "$action" in
         perf_state="$(sed -n '1p' "$ZP_DIR/perf/state" 2>/dev/null | tr -d '\r\n')"
         perf_why="$(sed -n '1p' "$ZP_DIR/perf/why" 2>/dev/null | tr -d '\r\n')"
         perf_exit="$(sed -n '1p' "$ZP_DIR/perf/exit_ip" 2>/dev/null | tr -d '\r\n')"
+        # 面板看到的本机公网地址 (agent 每轮心跳写下来)。界面拿它判断"出口探针是不是其实
+        # 从本机直连出去的" —— 相等就把那个出口如实标成 (本机), 不冒充节点出口 (8.86)。
+        perf_wan_ip="$(sed -n '1p' "$ZP_DIR/wan_ip" 2>/dev/null | tr -d '\r\n')"
         # 性能模式的**现场** (dae 进程在不在) —— 与 perf.sh / zpcore 同一套判据。
         # 这个字段漏过一次: 界面要 `perf.live === '1'` 才会画成"性能模式运行中"、总开关才算
         # "开", 少了它, 从 LuCI 菜单进来那一页 (80 端口这条 cgi) 就永远显示"内核已停止 ·
@@ -208,9 +211,9 @@ case "$action" in
         header
         printf '{"ok":true,"core":"%s","mode":"%s","covered":"%s","why":"%s","ipv6":"%s","client":"%s","wan":"%s","servers":[%s],' \
             "$core" "$mode" "$covered" "$(jstr "$why")" "$ipv6" "$(jval_s "$ver")" "$wan" "$items"
-        printf '"perf":{"cap":"%s","state":"%s","live":"%s","why":"%s","exit_ip":"%s","busy":"%s","progress":"%s"}}\n' \
+        printf '"perf":{"cap":"%s","state":"%s","live":"%s","why":"%s","exit_ip":"%s","wan_ip":"%s","busy":"%s","progress":"%s"}}\n' \
             "$perf_cap" "$perf_state" "$perf_live" "$(jstr "$perf_why")" "$(jval_s "$perf_exit")" \
-            "$perf_busy" "$(jstr "$perf_prog")"
+            "$(jval_s "$perf_wan_ip")" "$perf_busy" "$(jstr "$perf_prog")"
         ;;
     add)
         url="$(jval url)"
