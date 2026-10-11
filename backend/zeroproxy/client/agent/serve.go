@@ -311,38 +311,22 @@ func cliArgs(action string, payload map[string]any) ([]string, error) {
 }
 
 func currentStatus(cfg serveConfig) statusResp {
-	core := "stopped"
-	if ok(probeTimeout, cfg.initd, "running") {
-		core = "running"
-	}
-	mode, covered := liveMode()
-	caps := readCaps(cfg.dir)
-	why := ""
-	if mode == "none" {
-		// 一级都没接管时把**每一级为什么不行**都带上: 只报"选中的那一级"会漏掉关键信息
-		// (真机截图里选的是 tun, 屏幕上却只有 tproxy 的原因, 于是没人知道 iptables 那条路
-		//  到底为什么也没用上)。与 agent.sh 的心跳报的是同一份。
-		var parts []string
-		for _, level := range []string{"tun", "tproxy", "redirect"} {
-			if v := caps["why."+level]; v != "" {
-				parts = append(parts, level+": "+v)
-			}
-		}
-		why = strings.Join(parts, " · ")
-	}
+	// 与 `zpcore state`、agent 心跳、CLI 用的是同一个 snapshot —— 界面上不会再出现
+	// "命令行说未生效、界面说已连接"这种同一台机器两个说法 (8.88 / 8.90)。
+	s := snapshotAt(cfg.commonConfig)
 	return statusResp{
 		OK:      true,
-		Core:    core,
-		Mode:    mode,
-		Covered: covered,
-		Why:     why,
+		Core:    s.Core,
+		Mode:    s.Mode,
+		Covered: s.Covered,
+		Why:     s.Why,
 		// IPv6 是泄漏面: 探不到就必须显示出来 (目标网站会看到真实的 v6 地址)
-		IPv6:    caps["ipv6"],
-		Packets: datapathPackets(mode),
-		WAN:     wanBytes(),
-		Client:  readTrimmed(filepath.Join(cfg.dir, "version")),
-		Perf:    currentPerf(cfg),
-		Servers: readServers(cfg.dir),
+		IPv6:    s.Caps.get("ipv6"),
+		Packets: s.Packets,
+		WAN:     s.WAN,
+		Client:  s.Version,
+		Perf:    s.Perf,
+		Servers: s.Servers,
 	}
 }
 
@@ -350,17 +334,17 @@ func currentStatus(cfg serveConfig) statusResp {
 //
 // "正在切换"的判据: 进度文件存在且还没有终态行 (DONE=…)。CLI 是这么写的 (见安装在
 // perf.sh 里的 zp_perf_enter), 这里只是把它读出来 —— 前端不猜, 后端也不编。
-func currentPerf(cfg serveConfig) perfResp {
-	progress := perfFile(cfg.dir, "progress")
+func currentPerf(dir, initd string) perfResp {
+	progress := perfFile(dir, "progress")
 	busy := "0"
 	if progress != "" && !strings.Contains(progress, "DONE=") {
 		busy = "1"
 	}
 	live := "0"
-	if daeRunning() {
+	if daeRunning(initd) {
 		live = "1"
 	}
-	caps := readCaps(cfg.dir)
+	caps := readCaps(dir)
 	// 进度只取最后几行: 界面上的标题栏放不下整份日志, 而且前面那几行是"取内核"的旧闻。
 	tail := progress
 	if lines := strings.Split(progress, "\n"); len(lines) > 3 {
@@ -370,11 +354,11 @@ func currentPerf(cfg serveConfig) perfResp {
 	}
 	return perfResp{
 		Cap:      caps["perf_cap"],
-		State:    perfFile(cfg.dir, "state"),
+		State:    perfFile(dir, "state"),
 		Live:     live,
-		Why:      perfFile(cfg.dir, "why"),
-		WanIP:    perfFile(cfg.dir, "wan_ip"),
-		ExitIP:   perfFile(cfg.dir, "exit_ip"),
+		Why:      perfFile(dir, "why"),
+		WanIP:    perfFile(dir, "wan_ip"),
+		ExitIP:   perfFile(dir, "exit_ip"),
 		Busy:     busy,
 		Progress: tail,
 	}

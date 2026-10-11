@@ -53,6 +53,43 @@ TOKEN = "router-install-check"
 results: list[tuple[str, bool, str]] = []
 
 
+#: 运行时装机件 (client/runtime/) 在演练里的"改写版"目录。演练是把整套东西装到临时根目录
+#: 里跑的 (patch_for_local_run 也是把安装脚本里的 /etc/zeroproxy 换掉); 装机件现在由面板
+#: 分发、不在安装脚本里, 所以它们也必须在发出去之前改写一份 —— 由 main() 建目录, 面板通过
+#: ZP_RUNTIME_DIR 指向它, 每次装机前 stage_runtime() 按那一次的根目录重写一遍。
+RUNTIME_STAGE = ""
+
+
+def stage_runtime(root: str) -> None:
+    """把 client/runtime/ 里的装机件改写成"指向这次要装的根目录"的一份, 供面板分发。
+
+    真机上这些文件写的就是 /etc/zeroproxy 那几个固定目录, 一个字节都不用改; 演练必须能把
+    整套东西装到临时目录里跑, 所以在这里做与 patch_for_local_run 同样的路径替换。面板每次
+    请求都重新读文件, 而装机是一个接一个跑的, 所以"先改写、再跑这一次"是安全的。
+    """
+    src = os.path.join(BACKEND, "zeroproxy", "client", "runtime")
+    os.makedirs(RUNTIME_STAGE, exist_ok=True)
+    for name in os.listdir(src):
+        path = os.path.join(src, name)
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        # 顺序: `-agent` / `-perf` 以后者为前缀, 但这里换的是**目录前缀**, 所以
+        # /etc/init.d/zeroproxy → <root>/initd 会顺带把 -perf / -agent 变成 initd-perf 之类,
+        # 与 patch_for_local_run 对安装脚本做的事完全一致。
+        text = text.replace("/etc/init.d/zeroproxy", root + "/initd")
+        text = text.replace("/usr/bin/zeroproxy", root + "/cli")
+        text = text.replace("/etc/zeroproxy", root)
+        # LuCI 三件套的落盘路径 (CLI 的 `ui fix` 会写它们) —— 与 patch_for_local_run 同款。
+        text = text.replace("/usr/share/luci/menu.d", root + "/usr/share/luci/menu.d")
+        text = text.replace("/usr/share/rpcd/acl.d", root + "/usr/share/rpcd/acl.d")
+        text = text.replace("/www/luci-static", root + "/www/luci-static")
+        text = text.replace("[ -d /www ]", "[ -d " + root + "/www ]")
+        with open(os.path.join(RUNTIME_STAGE, name), "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+
 def check(name: str, ok: bool, detail: object = "") -> None:
     results.append((name, ok, detail))
     print(f"  {'✓' if ok else '✗'} {name}{' — ' + str(detail) if detail else ''}")
@@ -274,6 +311,7 @@ class Panel:
             # 验的是"缓存里有匹配的包时面板发不发得出来", 不是"面板能不能访问 GitHub"。
             "ZP_BTF_API": "http://127.0.0.1:9",
             "ZP_GEO_MIN_BYTES": "16",    # 分流数据库同理 (演练不下载真的 4 MB)
+            "ZP_RUNTIME_DIR": RUNTIME_STAGE,   # 运行时装机件的改写版 (见 stage_runtime)
             # 分流数据库的镜像表也换掉: 面板那条路万一没走通, 客户端会去够镜像 ——
             # 演练必须离线可跑, 不能因为网络脸色而红 (与 ZP_CORE_MIRRORS 同一个理由)。
             "ZP_GEO_MIRRORS": "http://127.0.0.1:9/{url}",
@@ -343,6 +381,9 @@ def main() -> int:
     tmp = tempfile.mkdtemp(prefix="zp-router-check-")
     fake_root = os.path.join(tmp, "root")
     os.makedirs(fake_root, exist_ok=True)
+    global RUNTIME_STAGE
+    RUNTIME_STAGE = os.path.join(tmp, "runtime-stage")
+    os.makedirs(RUNTIME_STAGE, exist_ok=True)
     env = {**os.environ, "ZP_GEODATA_AUTO": "0", "ZP_PUBLIC_IP": "0"}
     os.environ.update(env)
     sys.path.insert(0, BACKEND)
@@ -439,6 +480,7 @@ def main() -> int:
                        main_only: str = "") -> tuple[bool, str]:
             target = root or fake_root
             path = os.path.join(tmp, f"install-{label}.sh")
+            stage_runtime(target)      # 装机件要按这一次的根目录改写一份 (面板从这里取)
             text = patch_for_local_run(script, target)
             if main_only:
                 # 只跑指定的那几步 (不看装机全流程) —— [16] 要验的是"面板不可达时,
@@ -473,6 +515,16 @@ def main() -> int:
             print(proc.stdout.strip())
             if proc.returncode:
                 print(proc.stderr[-800:])
+            # macOS 自带的 /etc/rc.common 让"带 procd shebang 的 init 脚本"执行后一律退出 0
+            # (见上面 [15] 的注释) —— 于是 `zeroproxy-perf running` 在**没有 dae** 的机器上
+            # 也为真, 会被 live.sh 判成"性能模式在跑"。真机上回答这个问题的是 procd, 这里用
+            # 一份自己的假服务 (默认"没有 dae"); [15] 那一节会在装完之后覆盖成它会自己起
+            # dae 的那一份 —— 所以这里必须写在"装完之后"。不这么补, 演练会把一个
+            # macOS 环境问题变成被测逻辑的假信号。
+            if os.path.isdir(target):
+                with open(os.path.join(target, "initd-perf"), "w") as fh:
+                    fh.write("#!/bin/sh\nexit 1\n")
+                os.chmod(os.path.join(target, "initd-perf"), 0o755)
             # stdout + stderr: die/warn 的话都走 stderr, 断言要看得到
             return proc.returncode == 0, proc.stdout + proc.stderr
 
@@ -509,15 +561,23 @@ def main() -> int:
         check("配置里透明代理端口与策略组都在 (与数据面无关)",
               "redir-port" in config_text and "tproxy-port" in config_text
               and "proxy-groups" in config_text)
-        for name in ("device.json", "agent.sh", "initd", "initd-agent", "cli", "tproxy.nft"):
+        for name in ("device.json", "agent.sh", "initd", "initd-agent", "cli", "tproxy.nft", "live.sh"):
             check(f"生成 {name}", os.path.exists(os.path.join(fake_root, name)))
         # 生成的脚本 (agent / init / CLI) 必须真的能被 sh 解析 —— 它们是 heredoc 里
         # 写字写出来的, 外层脚本的 `sh -n` 看不到里面, 只有把文件拿出来才验得到。
-        for name in ("agent.sh", "redirect.sh", "initd", "initd-agent", "cli"):
+        for name in ("agent.sh", "redirect.sh", "initd", "initd-agent", "cli", "live.sh"):
             path_ = os.path.join(fake_root, name)
             check(f"{name} 通过 sh -n (语法)",
                   os.path.exists(path_)
                   and subprocess.run(["sh", "-n", path_], capture_output=True).returncode == 0)
+        # 装机件是**从面板取回来**的 (/c/rt/<名字>) —— 名字走白名单: 这个端点匿名可达,
+        # 不能变成任意文件读取。
+        _rt_status, _rt_body, _ = panel.req_raw("GET", "/c/rt/live.sh")
+        check("运行时装机件由面板分发 (/c/rt/<name>)",
+              _rt_status == 200 and _rt_body.lstrip().startswith("#")
+              and "zp_live_mode" in _rt_body, f"HTTP {_rt_status}")
+        check("/c/rt/<name> 走白名单 (未登记的名字 404)",
+              panel.req_raw("GET", "/c/rt/nope.sh")[0] == 404)
         caps_text = open(os.path.join(fake_root, "caps"), encoding="utf-8").read()
         check("caps 是 schema 2 (chosen / covered / why)",
               "schema=2" in caps_text and "chosen=" in caps_text and "covered=" in caps_text)
@@ -1841,6 +1901,21 @@ def main() -> int:
         check("cgi 的 status 带 perf.live (缺了它, LuCI 那一页会把在跑的 dae 报成不在)",
               '"live":"1"' in _cgi.stdout and '"perf"' in _cgi.stdout,
               ((_cgi.stdout or "")[-160:] + " | stderr: " + (_cgi.stderr or "")[-80:]).replace("\n", " "))
+
+        # 8b) 同一个事实, 三个入口必须说一样的话。真机教训: 性能模式 (eBPF / dae) 下
+        #     mihomo 是停的, 而 CLI 的 status / doctor 只看 zp-tun / nft / iptables, 于是
+        #     把在跑的 dae 报成"未生效 / 服务没在跑" —— 用户 SSH 进来敲的第一条排障命令
+        #     就在骗他。现在它们与 agent 心跳、本地界面读同一份判据 (live.sh)。
+        _st = _run_cli("status")
+        check("性能模式在跑时 `zeroproxy status` 认的是 eBPF 那一档 (不再报「未生效」)",
+              ("eBPF" in _st.stdout or "性能模式" in _st.stdout) and "未生效" not in _st.stdout,
+              [ln.strip() for ln in _st.stdout.splitlines() if ("模式" in ln or "内核" in ln)][:2])
+        _doc = _run_cli("doctor")
+        check("doctor 也认这一档 (不把在跑的 dae 说成「服务没在跑」/「数据面没有生效」)",
+              "服务没在跑" not in _doc.stdout and "数据面没有生效" not in _doc.stdout,
+              [ln.strip() for ln in _doc.stdout.splitlines()
+               if ("内核" in ln or "现场" in ln or "数据面" in ln)][:3])
+
         os.remove(os.path.join(perf_root, "perf", "dae.pid"))
 
         # 9) 「打开总开关」在性能模式下不是"把 mihomo 拉起来" —— dae 在跑时它必须什么都不做
@@ -2176,6 +2251,161 @@ def main() -> int:
         marker_srv.shutdown()
         if tls_srv:
             tls_srv.shutdown()
+
+        # ---------------------------------------------------------------- [18] 一致性矩阵
+        print("\n[18] 四个现场入口的一致性: status / doctor / 本地界面 / 心跳必须说同一句话")
+        # Stage 0 把"现在哪一级真的在接管"收成了一份 (live.sh)。这一节是它的护栏: 对**每一档**
+        # 数据面, 四个消费者必须报同一档 —— CLI 的 status 与 doctor、本地界面 (zpcore) 的
+        # status、以及 agent 心跳交给面板的 mode/covered。以前判据被抄了四遍, 漂移正是从
+        # "某一档下某一个入口没跟上"开始的 (性能模式下 status 报"未生效", 8.88)。
+        #
+        # 做法: 一组假工具按一个**状态文件**说话 (改那个文件 = 换现场), 于是不必为每一档
+        # 重起 zpcore。四档 mihomo 数据面各跑一遍。
+        mroot = os.path.join(tmp, "matrix-root")
+        ok_m, _out_m = run_install("matrix", root=mroot,
+                                   extra={"PATH": good + os.pathsep + os.environ.get("PATH", "")})
+        check("矩阵机装上了 (运行文件 + 一台已配对的设备)", ok_m)
+        mtools = os.path.join(tmp, "mtools")
+        mmode = os.path.join(tmp, "matrix-mode")
+        os.makedirs(mtools, exist_ok=True)
+        with open(mmode, "w") as fh:
+            fh.write("none\n")
+
+        def _mtool(name: str, body: str) -> None:
+            tool = os.path.join(mtools, name)
+            with open(tool, "w") as fh:
+                fh.write("#!/bin/sh\nST=\"$(cat " + mmode + " 2>/dev/null)\"\n" + body)
+            os.chmod(tool, 0o755)
+
+        _mtool("ip", 'case "$*" in\n'
+                     '  *"link show zp-tun"*) [ "$ST" = tun ] && exit 0 || exit 1 ;;\n'
+                     'esac\nexit 0\n')
+        _mtool("nft", 'case "$*" in\n'
+                      '  *"list table inet zp_router"*) [ "$ST" = tproxy ] && exit 0 || exit 1 ;;\n'
+                      'esac\nexit 0\n')
+        _mtool("iptables", 'case "$*" in\n'
+                           '  *"-L zp_router"*) [ "$ST" = redirect ] && exit 0 || exit 1 ;;\n'
+                           'esac\nexit 0\n')
+        _mtool("pidof", "exit 1\n")       # 这一节只走 mihomo 的那几档 (没有 dae)
+        _mtool("logread", "exit 0\n")
+        menv = {**os.environ, "PATH": mtools + os.pathsep + os.environ.get("PATH", "")}
+
+        _msrv = sorted(os.listdir(os.path.join(mroot, "servers")))[0]
+        with open(os.path.join(mroot, "servers", _msrv), encoding="utf-8") as fh:
+            _mdev = re.search(r'"id"\s*:\s*"([^"]+)"', fh.read()).group(1)
+        _ztok = open(os.path.join(mroot, "ui.token"), encoding="utf-8").read().strip()
+        _zport = PORT + 40
+        _zurl = f"http://127.0.0.1:{_zport}/cgi-bin/zeroproxy?a=status&k={_ztok}"
+        _zproc = None
+        if go:
+            _zproc = subprocess.Popen(
+                [zpcore_bin, "serve", "--dir", mroot, "--bind", "127.0.0.1",
+                 "--port", str(_zport), "--cli", os.path.join(mroot, "cli"),
+                 "--init", os.path.join(mroot, "initd")],
+                env=menv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            if _zproc is not None:
+                for _ in range(40):
+                    try:
+                        urllib.request.urlopen(_zurl, timeout=5).read()
+                        break
+                    except Exception:
+                        time.sleep(0.5)
+
+            def _mcli(*args: str) -> str:
+                p = subprocess.run(["sh", os.path.join(mroot, "cli"), *args],
+                                   capture_output=True, text=True, timeout=120, env=menv)
+                return p.stdout + p.stderr
+
+            def _zstat() -> dict:
+                if _zproc is None:
+                    return {}
+                try:
+                    with urllib.request.urlopen(_zurl, timeout=15) as resp:
+                        return json.loads(resp.read().decode())
+                except Exception:
+                    return {}
+
+            def _hb() -> dict:
+                subprocess.run(["sh", os.path.join(mroot, "agent.sh"), "once"],
+                               capture_output=True, text=True, timeout=180, env=menv)
+                try:
+                    _, body, _ = panel.req("GET", "/api/devices")
+                    for item in json.loads(body)["devices"]["items"]:
+                        if item["id"] == _mdev:
+                            return item.get("report") or {}
+                except Exception:
+                    pass
+                return {}
+
+            def _status_mode(text: str) -> str:
+                for line in text.splitlines():
+                    if line.startswith("模式:"):
+                        for word, tok in (("性能模式", "ebpf"), ("TUN", "tun"), ("tproxy", "tproxy"),
+                                          ("redirect", "redirect"), ("未生效", "none")):
+                            if word in line:
+                                return tok
+                return "?"
+
+            def _doctor_mode(text: str) -> str:
+                m = re.search(r"数据面真的在（(\w+)）", text)
+                if m:
+                    return m.group(1)
+                m = re.search(r"现场是 (\w+)", text)
+                if m:
+                    return m.group(1)
+                return "none" if "数据面没有生效" in text else "?"
+
+            for st, cov in (("tun", "full"), ("tproxy", "lan"),
+                            ("redirect", "lan_tcp"), ("none", "none")):
+                with open(mmode, "w") as fh:
+                    fh.write(st + "\n")
+                # caps 与现场摆成一致 (doctor 那句"现场一致"读的就是它们)
+                with open(os.path.join(mroot, "caps"), "w") as fh:
+                    fh.write(f"schema=2\nchosen={st}\ncovered={cov}\n")
+                zc = _zstat()
+                hb = _hb()
+                seen = {"status": _status_mode(_mcli("status")),
+                        "doctor": _doctor_mode(_mcli("doctor")),
+                        "心跳": str(hb.get("mode") or "?")}
+                if _zproc is not None:
+                    seen["本地界面"] = str(zc.get("mode") or "?")
+                check(f"矩阵 [{st}] 四个现场入口报的是同一档 (status / doctor / 界面 / 心跳)",
+                      all(v == st for v in seen.values()), seen)
+                covs = {"心跳": str(hb.get("covered") or "?")}
+                if _zproc is not None:
+                    covs["本地界面"] = str(zc.get("covered") or "?")
+                check(f"矩阵 [{st}] 覆盖范围也是同一档 ({cov})",
+                      all(v == cov for v in covs.values()), covs)
+
+            # 契约本身: `zpcore state` 是这台机器上"现在是怎么个情况"的唯一生产者 ——
+            # shell 按 key=value 读它, 机器按 --json 读它; caps 的键原样带出来。
+            if go:
+                _sc = subprocess.run(
+                    [zpcore_bin, "state", "--dir", mroot, "--init", os.path.join(mroot, "initd")],
+                    capture_output=True, text=True, env=menv).stdout
+                check("zpcore state 给出 mode / covered 与 caps 的键 (shell 就按这份读)",
+                      "mode=" in _sc and "covered=" in _sc and "chosen=" in _sc,
+                      [ln for ln in _sc.splitlines()
+                       if ln.startswith(("mode=", "covered=", "chosen="))])
+                _sj = subprocess.run(
+                    [zpcore_bin, "state", "--json", "--dir", mroot, "--init",
+                     os.path.join(mroot, "initd")],
+                    capture_output=True, text=True, env=menv).stdout
+                try:
+                    _obj = json.loads(_sj)
+                except Exception:
+                    _obj = {}
+                check("zpcore state --json 是机器可读的同一份状态",
+                      all(k in _obj for k in ("mode", "covered", "chosen", "perf", "caps")),
+                      sorted(_obj)[:8])
+        finally:
+            if _zproc is not None:
+                _zproc.terminate()
+                try:
+                    _zproc.wait(timeout=5)
+                except Exception:
+                    _zproc.kill()
     finally:
         logs = []
         for panel in panels:

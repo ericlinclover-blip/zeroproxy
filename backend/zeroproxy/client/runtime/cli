@@ -1,0 +1,1091 @@
+#!/bin/sh
+# ZeroProxy 路由器客户端运维命令
+ZP_DIR=/etc/zeroproxy
+ZP_VERSION="__ZP_CLIENT_VERSION__"
+# 本机代理端口与内核控制口 —— doctor 用它们做出口测试与"按域名分流"检查。
+# 注意这两个必须在**这里**定义: CLI 是独立的文件, 与安装脚本不共享作用域 (漏掉一个的
+# 症状是变量为空、URL 变成 http:///connections、然后静默显示"没有连接")。
+ZP_MIXED=7890
+ZP_API=127.0.0.1:9090
+# doctor 的"入口连通性"要照着配置里每个节点去连 —— 同一个坑: 这个路径也得在这里定义。
+ZP_CONF="$ZP_DIR/config.yaml"
+SERVERS="$ZP_DIR/servers"
+# 性能模式 (eBPF / dae) 的目录。虽然 perf.sh 里也定义了同名变量, 但**这里必须再写一遍**:
+# CLI 是独立文件, 那几个分支 (perf 动作 / doctor) 会先读它再 source perf.sh —— 少这一行
+# 就是"变量为空"的经典现场 (与上面 ZP_MIXED / ZP_API 同一个坑)。
+ZP_PERF_DIR="$ZP_DIR/perf"
+
+# 数据面"现场"的判据只有一份 (live.sh): status / doctor 与 agent 心跳、本地界面读的是
+# 同一份。以前它们各写一遍, 于是性能模式 (eBPF / dae) 下 status 报"未生效" (真机漂移)。
+[ -r "$ZP_DIR/live.sh" ] && . "$ZP_DIR/live.sh"
+
+# 补内核模块该敲哪条命令 —— 按这台机器**真正的**包管理器来 (25.12 起是 apk; 装机时
+# 探到的结果记在 caps 里)。doctor 与 status 都从这里取, 不各写一份。
+deps_hint() {
+    case "$(sed -n 's/^pkgmgr=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)" in
+        apk)  printf 'apk -U add kmod-tun kmod-nft-tproxy   (报了 UNTRUSTED 就再加 --allow-untrusted)' ;;
+        opkg) printf 'opkg install kmod-tun kmod-nft-tproxy' ;;
+        *)    printf '本机没有 apk / opkg —— 内核模块只能从固件里补' ;;
+    esac
+}
+# LuCI 那三件套 (菜单 / 权限 / 承载页) 的就地修复。
+#
+# 为什么 CLI 里要有这一条: 它们的失败方式**恰好**是"用户什么都点不开" —— 菜单里点
+# 「服务 → ZeroProxy」得到 403 (ACL 读不出来), 或者菜单干脆不见 (菜单 JSON 坏了)。
+# 那一刻用户能拿到的唯一入口是 SSH, 所以修它的办法必须是一条命令, 而不是"把安装命令
+# 再跑一遍"(那要求面板可达, 还要等一分钟)。
+# 数据来源按顺序: 面板 (最新) → 本机缓存 $ZP_DIR/luci/ (装机时放的内置兜底, 离线也能修)。
+ui_fix() {
+    _base=""
+    [ -n "${FIRST:-}" ] && _base="$(field_of "$FIRST" base)"
+    _fixed=0
+    _missing=0
+    for _f in menu.json acl.json status.js; do
+        case "$_f" in
+            status.js) _dst=/www/luci-static/resources/view/zeroproxy/status.js ;;
+            menu.json) _dst=/usr/share/luci/menu.d/luci-app-zeroproxy.json ;;
+            acl.json)  _dst=/usr/share/rpcd/acl.d/luci-app-zeroproxy.json ;;
+        esac
+        # 已经是一份好的就别动它 (也许只是另一处坏了)
+        _fine=0
+        if [ -s "$_dst" ]; then
+            case "$_f" in
+                status.js) _fine=1 ;;
+                *) [ "$(head -c 1 "$_dst" 2>/dev/null)" = "{" ] && _fine=1 ;;
+            esac
+        fi
+        [ "$_fine" = "1" ] && continue
+        _tmp="$_dst.new.$$"
+        _got=0
+        if [ -n "$_base" ]; then
+            mkdir -p "$(dirname "$_dst")" 2>/dev/null || true
+            if command -v curl >/dev/null 2>&1; then
+                curl -fsSk -m 15 "$_base/c/ui/$_f" -o "$_tmp" 2>/dev/null && [ -s "$_tmp" ] && _got=1
+            else
+                uclient-fetch -q --no-check-certificate -T 15 -O "$_tmp" "$_base/c/ui/$_f" 2>/dev/null \
+                    && [ -s "$_tmp" ] && _got=1
+            fi
+            if [ "$_got" = "1" ]; then
+                mv "$_tmp" "$_dst" && chmod 644 "$_dst" 2>/dev/null || true
+                _fixed=$((_fixed + 1))
+                continue
+            fi
+            rm -f "$_tmp"
+        fi
+        # 面板不可达 (或没给这一份) → 用本机那份内置兜底
+        if [ -s "$ZP_DIR/luci/$_f" ]; then
+            mkdir -p "$(dirname "$_dst")" 2>/dev/null || true
+            cp "$ZP_DIR/luci/$_f" "$_dst" && chmod 644 "$_dst" 2>/dev/null || true
+            _fixed=$((_fixed + 1))
+        else
+            _missing=$((_missing + 1))
+        fi
+    done
+    # rpcd 要重新读 ACL; LuCI 的菜单索引是**它自己缓存的** (/tmp/luci-indexcache*), 只 reload
+    # rpcd 不够 —— 这两件事一起做才叫"修好了"。
+    /etc/init.d/rpcd reload >/dev/null 2>&1 || /etc/init.d/rpcd restart >/dev/null 2>&1 || true
+    rm -f /tmp/luci-indexcache* /tmp/luci-modulecache/* 2>/dev/null || true
+    if [ "$_missing" != "0" ]; then
+        echo "修不了: 有 $_missing 份既没拿到面板的、本机也没有兜底副本。"
+        echo "  重跑一次安装命令 (或把面板升到 v2.11.28 再试) —— 那会把这三份一起放好。"
+        return 1
+    fi
+    if [ "$_fixed" = "0" ]; then
+        echo "LuCI 那三件套本来就是好的 (菜单 / 权限 / 承载页都在), 已顺手清掉菜单索引缓存。"
+    else
+        echo "已修好 $_fixed 份: 菜单 / 权限 / 承载页现在都在。"
+        echo "  去 LuCI 里重新点一次「服务 → ZeroProxy」(可能要刷新一下页面)。"
+    fi
+    return 0
+}
+
+FIRST="$(ls "$SERVERS"/*.json 2>/dev/null | head -n1)"
+
+field_of() { sed -n 's/.*"'"$2"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1" | head -n1; }
+key_of() {
+    printf '%s' "$1" | sed -e 's#^https*://##' -e 's/[^A-Za-z0-9]/_/g' | cut -c1-32
+}
+servers() { ls "$SERVERS"/*.json 2>/dev/null; }
+
+running() { /etc/init.d/zeroproxy running >/dev/null 2>&1 && echo yes || echo no; }
+
+# 数据面上真的有流量经过吗 —— **规则存在 ≠ 有流量**。接口名写错 (L3 那一档最容易) 时
+# 规则照样"装得上", 却一个包都不命中; 而这是唯一能证明"真的接管了"的现场证据。
+# 输出两个数字: "总包数 DNS包数" (拿不到就给 0 0)。
+datapath_packets() {
+    _mode="$(sed -n 's/^chosen=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    case "$_mode" in
+        tun)
+            _rx="$(cat /sys/class/net/zp-tun/statistics/rx_packets 2>/dev/null | head -n1)"
+            printf '%s 0\n' "${_rx:-0}"
+            ;;
+        tproxy)
+            _dump="$(nft list table inet zp_router 2>/dev/null || true)"
+            _tot="$(printf '%s\n' "$_dump" | sed -n 's/.*counter packets \([0-9][0-9]*\).*/\1/p' \
+                | awk '{s+=$1} END{print s+0}')"
+            _dns="$(printf '%s\n' "$_dump" | grep 'dport 53' \
+                | sed -n 's/.*counter packets \([0-9][0-9]*\).*/\1/p' \
+                | awk '{s+=$1} END{print s+0}')"
+            printf '%s %s\n' "${_tot:-0}" "${_dns:-0}"
+            ;;
+        redirect)
+            _dump="$(iptables -t nat -L zp_router -v -n 2>/dev/null || true)"
+            _tot="$(printf '%s\n' "$_dump" | awk 'NR>2 {s+=$1} END{print s+0}')"
+            _dns="$(printf '%s\n' "$_dump" | awk '$0 ~ /dpt:53/ {s+=$1} END{print s+0}')"
+            printf '%s %s\n' "${_tot:-0}" "${_dns:-0}"
+            ;;
+        *) printf '0 0\n' ;;
+    esac
+}
+
+# 有多少条连接**已经被识别出域名** —— 这是"按域名分流真的在工作"的证据, 三种数据面都成立。
+#
+# 域名从哪来, 两条路都有:
+#   * 设备的 DNS 走到内核 (查运营商 DNS 的查询会被 dns-hijack 接住, 给出 fake-ip) →
+#     mihomo 手里有 fake-ip → 域名 的映射, 连接一进来就知道域名;
+#   * DNS 没进内核 (设备查的是路由器自己的 dnsmasq, 那是本机服务) → 连接是真实 IP, 靠
+#     **嗅探**从 TLS SNI / HTTP Host 里把域名认回来。
+# 所以"host 或 sniffHost 任一非空"才算数 —— 只数 host 会漏掉纯嗅探的那一半。
+#
+# 为什么不拿 DNS 计数器当判据: 它只统计"设备直接查外部 DNS"的那一部分, 为 0 是正常状态。
+# 第一版 doctor 把它写成"设备可能没把路由器当 DNS", 方向正好反了 (真机上那一行打着"!",
+# 而代理其实一切正常)。
+sniffed_hosts() {
+    command -v curl >/dev/null 2>&1 || return 1
+    _conn="$(curl -s -m 5 "http://$ZP_API/connections" 2>/dev/null || true)"
+    [ -n "$_conn" ] || return 1
+    printf '%s' "$_conn" | grep -oE '"(host|sniffHost)"[ ]*:[ ]*"[^"]{1,}"' | wc -l | tr -d ' '
+}
+
+# 一次 TCP 新建连接, 并区分三种结局 —— 这是"入口按比例丢包"唯一看得见的证据。
+#
+# 为什么非做不可: 内核与面板都只看"这一条连接成没成", 看不到"十次里有几次没成"。于是
+# 一个入口 IP 被运营商/GFW 按比例丢弃时, 面板上绿灯、内核日志里全是 warning, 而用户的
+# 表现是"网页开一半、App/视频一直转圈"。真机实测过: 同一台路由器直连入口面板 20 次里
+# 12 次 SYN 石沉大海 (装机时那条"重试两次"的注释就是被这件事逼出来的), 而 `doctor`
+# 七项全绿, 只报了一句"面板不可达"——方向完全指错了。
+#
+# 判据用 curl 的 time_connect: 连不上时它是 0.000000, 连上了 (那怕随后 TLS/协议不合而
+# 失败) 才是正数 —— 所以它能干净地区分"端口通了"与"端口没通", 不依赖任何协议。
+# 输出四种之一: ok / timeout / refused / err (notool = 这台固件上没有可用的探测工具)。
+tcp_once() {
+    _th="$1"; _tp="$2"
+    if command -v curl >/dev/null 2>&1; then
+        # --noproxy '*': 不让环境里的 *_proxy 变量把这几个探测改道 —— 探测必须量的是
+        # "这台机器自己到入口的那一跳", 被代理变量接走就什么都没测到。
+        _tc="$(curl -sk --noproxy '*' -o /dev/null -m 4 --connect-timeout 2 -w '%{time_connect}' \
+            "https://$_th:$_tp/" 2>/dev/null)"
+        _trc=$?
+        if [ -n "$_tc" ] && awk -v t="$_tc" 'BEGIN{exit !(t+0 > 0)}' 2>/dev/null; then
+            printf 'ok'
+        elif [ "$_trc" = "7" ]; then
+            printf 'refused'
+        elif [ "$_trc" = "28" ]; then
+            printf 'timeout'
+        else
+            printf 'err'
+        fi
+        return 0
+    fi
+    if command -v nc >/dev/null 2>&1; then
+        if nc -w 2 "$_th" "$_tp" </dev/null >/dev/null 2>&1; then printf 'ok'; else printf 'timeout'; fi
+        return 0
+    fi
+    printf 'notool'
+}
+
+# 连续探测同一个入口 N 次, 打印 "ok timeout refused err total"。
+# 次数可以由 ZP_DOCTOR_PROBES 调 (演练把它压低, 真机默认 5 次 —— 3 次在 37% 丢包下
+# 有 1/4 的概率一次都不丢, 会漏报)。
+entry_probe() {
+    _eh="$1"; _ep2="$2"; _en="${3:-5}"
+    _eok=0; _eto=0; _erf=0; _eer=0; _ei=0
+    while [ "$_ei" -lt "$_en" ]; do
+        _ei=$((_ei + 1))
+        case "$(tcp_once "$_eh" "$_ep2")" in
+            ok) _eok=$((_eok + 1)) ;;
+            timeout) _eto=$((_eto + 1)) ;;
+            refused) _erf=$((_erf + 1)) ;;
+            *) _eer=$((_eer + 1)) ;;
+        esac
+    done
+    printf '%s %s %s %s %s\n' "$_eok" "$_eto" "$_erf" "$_eer" "$_en"
+}
+
+# 配置里每个节点落在哪台机器的哪个端口 —— 这就是客户端真正要连的"入口"。
+# 只取 TCP 节点: hysteria2 那一档只有 UDP 端口, 拿 TCP 去连必然是"连不上", 会假报故障。
+# 同一个 host:port 只探一次 (5 个节点常常全在同一台机器上)。
+entry_endpoints() {
+    awk '
+        /^  type: /{ t=$2 }
+        /^  server: /{ s=$2 }
+        /^  port: /{
+            if (t != "hysteria2" && s != "") {
+                k = s ":" $2
+                if (!(k in seen)) { seen[k]=1; print k }
+            }
+        }
+    ' "$ZP_CONF" 2>/dev/null
+}
+
+# curl 的 speed_download (字节/秒) → 人话。分开写是因为 doctor 与 bench 都要用。
+bench_kbps() { awk -v s="${1:-0}" 'BEGIN{ if (s+0 < 0) s=0; printf "%d", s/1024 }'; }
+bench_text() {
+    if [ -z "${1:-}" ]; then printf '失败'; return 1; fi
+    _kb="$(bench_kbps "$1")"
+    if [ "${_kb:-0}" -le 0 ] 2>/dev/null; then printf '失败'; return 1; fi
+    if [ "${_kb:-0}" -ge 1024 ] 2>/dev/null; then
+        awk -v k="$_kb" 'BEGIN{printf "%.1f MB/s", k/1024}'
+    else
+        printf '%s KB/s' "$_kb"
+    fi
+}
+
+# 真机基准: 用面板当靶子, 量"直连"与"经代理"两条路的吞吐。
+#   为什么要用面板当靶子: 它是这台路由器**一定能访问到**的地址 (装机时唯一可达的), 而
+#   两条路跑的是同一段路 —— 一比就知道代理本身吃掉了多少。测别的公网地址要么连不上,
+#   要么两边不是一个终点, 数字没有可比性。
+#   为什么只测 4 MB: 路由器是 CPU 瓶颈, 4 MB 足够把上限顶出来, 又不至于烧掉用户的流量
+#   (经代理的那一趟是要算节点流量的)。
+BENCH_MB="${ZP_BENCH_MB:-4}"
+bench_run() {
+    _url="$1"; _proxy="$2"
+    if [ "$_proxy" = "proxy" ]; then
+        # `--noproxy ""` 是**必须**的: curl 默认遵守 NO_PROXY, 而多数环境里那个变量含
+        # 127.0.0.1 / localhost —— 于是"经代理"这一趟会**绕过代理直连**, 量出一个跟直连
+        # 一样漂亮的数字 (演练环境里就这么骗过一次: 代理端口根本没在监听, 却报了 921 MB/s)。
+        # 这一趟必须是真经代理, 不然这个数字比不测更糟。
+        curl -s -o /dev/null -m 120 --noproxy "" -x "http://127.0.0.1:$ZP_MIXED" \
+            -w '%{speed_download}' "$_url" 2>/dev/null || true
+    else
+        # 反过来: "直连"这一趟必须**真的不走代理** —— 环境里若设了 HTTP_PROXY, curl 会用它。
+        curl -s -o /dev/null -m 120 --noproxy '*' -w '%{speed_download}' "$_url" 2>/dev/null || true
+    fi
+}
+
+# 真机体检。它问的每一句都是"到底行不行", 每一条都给证据 —— 装机之后、出问题时第一个
+# 应该跑的命令。设计上它只能在真机上给出完整答案 (本机没有"局域网侧"这回事), 所以
+# 演练只验它的判据与输出格式。
+doctor() {
+    echo "ZeroProxy 路由器端体检"
+    echo "────────────────────────────────────────────"
+    echo
+    echo "固件"
+    _fw="$(sed -n 's/^fw=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    _pm="$(sed -n 's/^pkgmgr=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    printf '  · %s · 包管理器 %s\n' "${_fw:+OpenWrt }${_fw:-未知版本}" "${_pm:-未知}"
+    # 内核模块这一步失败过没有 —— 这是"这台固件为什么起不来"最常见的根因, 单独报出来
+    # 并附上按本机包管理器写好的那条命令 (25.12 起是 apk, 24.10 及更早是 opkg)。
+    _dw="$(sed -n 's/^deps_why=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    if [ -n "$_dw" ]; then
+        printf '  ! 内核模块没装上: %s\n' "$_dw"
+        printf '      补装: %s\n' "$(deps_hint)"
+    else
+        printf '  ✓ 内核模块这一步没有失败记录 (kmod-tun / kmod-nft-tproxy)\n'
+    fi
+
+    echo
+    echo "内核"
+    # 现场是哪一档 —— 判据只有一份 (live.sh 的 zp_live_mode): agent 心跳 / CLI status /
+    # 本地界面 (zpcore) 读的都是它。性能模式下 mihomo 是停的、dae 在跑, 所以这里不能以
+    # "mihomo 在不在"作门槛 (以前那样会让 doctor 把在跑的 dae 说成"服务没在跑")。
+    _live="$(zp_live_mode 2>/dev/null)"
+    [ -n "$_live" ] || _live="none"
+    if [ "$(running)" = yes ]; then
+        printf '  ✓ 服务在跑：%s\n' "$("$ZP_DIR/mihomo" -v 2>/dev/null | head -n1)"
+    elif [ "$_live" = "ebpf" ]; then
+        printf '  ✓ 性能模式在跑：内核态 eBPF (dae) —— 标准模式的 mihomo 已停用 (两者互斥)\n'
+    else
+        printf '  ✗ 服务没在跑 — 面板上打开总开关，或本机执行 zeroproxy on\n'
+    fi
+
+    echo
+    echo "数据面"
+    _chosen="$(sed -n 's/^chosen=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    _covered="$(sed -n 's/^covered=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    printf '  选择：%s（覆盖 %s）\n' "${_chosen:-未知}" "${_covered:-未知}"
+    # 现场 vs 意图: caps 里的是"我们打算用什么", 这里问的是"现在真的在不在"
+    if [ "$_live" = "$_chosen" ] && [ "$_live" != "none" ]; then
+        printf '  ✓ 现场一致：数据面真的在（%s）\n' "$_live"
+    elif [ "$_live" = "none" ]; then
+        printf '  ✗ 数据面没有生效 — 局域网里没有人被接管\n'
+        for _lv in tun tproxy redirect; do
+            _w="$(sed -n "s/^why.$_lv=//p" "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+            [ -n "$_w" ] && printf '      %s: %s\n' "$_lv" "$_w"
+        done
+        # 上面那几条原因多半指向"缺 kmod" —— 直接把补装命令给出来 (按本机包管理器)
+        [ -n "$_dw" ] && printf '      下一步: %s\n' "$(deps_hint)"
+    else
+        printf '  ! caps 说 %s、现场是 %s — 重跑一次安装命令让它对齐\n' "$_chosen" "$_live"
+    fi
+    # TUN 这一档还要多问一句 (8.74): "转发进/出 tun" 的防火墙放行在不在。少了它,
+    # "设备在"是真的、"流量过得去"是假的 —— 局域网整个被丢, 而上面每一行都还是绿的,
+    # 面板与路由器界面也会双双显示"已连接"。所以这一项必须单独报出来。
+    if [ "$_live" = "tun" ] && [ -f "$ZP_DIR/tunfw.sh" ]; then
+        . "$ZP_DIR/tunfw.sh"
+        if ! zp_tunfw_needed; then
+            printf '  ✓ 防火墙放行由 auto-redirect 负责 (这台机器不需要我们补)\n'
+        elif zp_tunfw_live; then
+            printf '  ✓ 已补上防火墙放行 (auto-redirect 缺席, 转发进/出 tun 靠它)\n'
+        else
+            printf '  ✗ 防火墙放行**不在** —— 局域网转发会被丢掉 (家里会全断, 而上面每行都是绿的)\n'
+            printf '      修: 重跑一次安装命令; 只想先恢复上网: zeroproxy off\n'
+        fi
+    fi
+    _pk="$(datapath_packets)"
+    _pkts="${_pk%% *}"; _dnspkts="${_pk##* }"
+    if [ "$_live" != "none" ]; then
+        if [ "${_pkts:-0}" -gt 0 ] 2>/dev/null; then
+            printf '  ✓ 规则上真的有流量：%s 个包经过\n' "$_pkts"
+        else
+            printf '  ! 规则在，但还没有流量经过 — 刚刚开机/刚重启就是这样；\n'
+            printf '      如果局域网设备已经在用网还是 0，多半是接口名不对（redirect 那一档最常见）\n'
+        fi
+    fi
+
+    echo
+    echo "DNS 与按域名分流"
+    # 判据是"嗅探出域名的连接数", 不是 DNS 计数器 —— 见 sniffed_hosts() 上面那段的理由:
+    # 局域网设备查的是路由器自己的 dnsmasq (本机服务), DNS 计数为 0 是正常的。
+    _sniffed="$(sniffed_hosts 2>/dev/null || true)"
+    if [ -n "$_sniffed" ] && [ "${_sniffed:-0}" -gt 0 ] 2>/dev/null; then
+        printf '  ✓ 按域名分流在工作：%s 条连接已经识别出域名\n' "$_sniffed"
+    elif [ "${_pkts:-0}" -gt 0 ] 2>/dev/null; then
+        # 有流量经过却一条域名都没嗅探出来 —— 这才可疑: 分流会退化成"按 IP 判断",
+        # 国内/国外那套规则基本失效 (TLS 之外还有一大半流量是靠 SNI 认出来的)。
+        printf '  ! 有流量经过, 但一条都没嗅探出域名 —— 分流在按 IP 判断\n'
+        printf '      看一下 /etc/zeroproxy/config.yaml 里 sniffer.enable 是不是 true\n'
+    else
+        printf '  · 这一刻没有活跃的"已知域名"的连接（刚开机 / 刚好空闲 / 设备还没开始用网）\n'
+    fi
+    if [ "$(running)" = yes ] && [ "${_dnspkts:-0}" -gt 0 ] 2>/dev/null; then
+        printf '  · 另有 %s 个查询是设备直接查外部 DNS 的，已被内核接管\n' "$_dnspkts"
+    fi
+    if [ -s "$ZP_DIR/bench" ]; then
+        _bkd="$(sed -n 's/^direct_kbps=//p' "$ZP_DIR/bench" 2>/dev/null | head -n1)"
+        _bkp="$(sed -n 's/^proxy_kbps=//p' "$ZP_DIR/bench" 2>/dev/null | head -n1)"
+        _bka="$(sed -n 's/^at=//p' "$ZP_DIR/bench" 2>/dev/null | head -n1)"
+        if [ -n "$_bkp" ]; then
+            printf '  · 上次实测（zeroproxy bench，%s）: 直连 %s KB/s · 经代理 %s KB/s\n' \
+                "$(date -d "@${_bka:-0}" '+%m-%d %H:%M' 2>/dev/null || echo '?')" \
+                "${_bkd:-?}" "$_bkp"
+        fi
+    fi
+    printf '    设备的 DNS 有两条路: 查路由器自己的 dnsmasq（本机服务, 不进内核, 于是连接靠嗅探认出域名），\n'
+    printf '    或查运营商 DNS（IPv6 上很常见, 它会进内核并被 dns-hijack 成 fake-ip）—— 两条路都按域名分流。\n'
+    printf '    所以"DNS 计数为 0"只说明这一刻没人直接查外部 DNS, 不是故障; 要证明的是上面那条。\n'
+
+    echo
+    echo "IPv6"
+    _v6="$(sed -n 's/^ipv6=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    if [ "$_v6" = "1" ]; then
+        printf '  ✓ 已一并接管（局域网设备的 v6 也走代理）\n'
+    else
+        printf '  ! 未接管 — %s\n' "$(sed -n 's/^why.ipv6=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+        printf '      这台机器上局域网设备的 IPv6 会直接出去\n'
+    fi
+
+    echo
+    echo "性能"
+    _wan="$(sed -n 's/^wan_mtu=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    _tun="$(sed -n 's/^tun_mtu=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    if [ -n "$_tun" ]; then
+        if [ -n "$_wan" ] && [ "$_wan" != "1500" ]; then
+            printf '  ✓ WAN MTU %s（PPPoE?）→ tun 按 %s 收包，封装后不会成超包\n' "$_wan" "$_tun"
+        elif [ -z "$_wan" ]; then
+            # 取不到 ≠ 以太网。老实说取不到, 别替它下结论 (真机上就是这么显示成"以太网直连"的)
+            printf '  · 取不到 WAN 的 MTU（这台机器上没有默认路由?）→ tun 保持 %s\n' "$_tun"
+        else
+            printf '  · WAN MTU %s → tun %s（以太网直连, 用默认值）\n' "$_wan" "$_tun"
+        fi
+    fi
+    _off="$(sed -n 's/^offload=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    if [ "$_off" = "1" ]; then
+        if [ "$_live" = "tun" ]; then
+            printf '  · 转发卸载开着（flow offloading / HNAT）—— tun 走路由, 不受影响\n'
+        else
+            printf '  ! 转发卸载开着, 而数据面是 %s —— 它绕过 netfilter, 连接可能不走代理\n' "${_live:-?}"
+        fi
+    fi
+    _ebpf="$(sed -n 's/^ebpf=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    if [ "$_ebpf" = "1" ]; then
+        _bhow="$(sed -n 's/^btf_how=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+        _bpath="$(sed -n 's/^btf_path=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+        case "$_bhow" in
+            feed|panel) printf '  ✓ eBPF 挡位的前提就绪（内核 BTF 已自动补上: %s）—— 性能模式尚未实现\n' "$_bpath" ;;
+            detached)   printf '  ✓ eBPF 挡位的前提就绪（detached BTF: %s）—— 性能模式尚未实现\n' "$_bpath" ;;
+            *)          printf '  · eBPF 挡位可用（内核自带 BTF）—— 性能模式尚未实现\n' ;;
+        esac
+    else
+        printf '  · eBPF 挡位不可用: %s\n' "$(sed -n 's/^why.ebpf=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+        # 缺的是 BTF 时给一条能照着做的下一步 (手动把包放进面板是最稳的那条)
+        _bwhy="$(sed -n 's/^why.btf=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+        case "$_bwhy" in
+            "") ;;
+            *没有包管理器*) ;;
+            *)
+                printf '      补 BTF: 装机时脚本会自动补 (先问本机软件源, 再问面板)。这次没成: %s\n' "$_bwhy"
+                printf '      %s\n' "手动: 把匹配的 vmlinux-btf 包放进面板的 data/client/btf/ 后重跑安装命令" ;;
+        esac
+    fi
+    # 性能模式 (eBPF / dae): 能不能开 + 现在开着没有 + 凭什么这么说。
+    # 判据是**现场** (dae 进程在不在), 与界面 / 面板读到的是同一份事实。
+    _pcap="$(sed -n 's/^perf_cap=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    _pstate="$(sed -n '1p' "$ZP_DIR/perf/state" 2>/dev/null | tr -d '\r\n')"
+    # "在不在"用 perf.sh 那一份判断 (进程 + 服务), 不在这里另写一遍 —— 否则 CLI 与界面、
+    # agent 三处会各说各话 (这个项目已经因为"两处判据"栽过)。
+    _plive=0
+    if [ -f "$ZP_DIR/perf.sh" ]; then
+        . "$ZP_DIR/perf.sh"
+        zp_perf_live && _plive=1
+    fi
+    if [ "$_pcap" = "1" ]; then
+        if [ "$_plive" = "1" ]; then
+            printf '  ✓ 性能模式 (内核态 eBPF / dae) 正在生效 —— 出口 %s\n' \
+                "$(sed -n '1p' "$ZP_DIR/perf/exit_ip" 2>/dev/null || printf '未记录')"
+            if command -v tc >/dev/null 2>&1; then
+                _if="$(sed -n '/^lan_interface:/{s/.*: *//;p}' "$ZP_DIR/perf/dae.dae" 2>/dev/null | tr -d ' ' | head -n1)"
+                if [ -n "$_if" ] && tc filter show dev "$_if" >/dev/null 2>&1; then
+                    printf '      现场: %s 上挂着 eBPF 过滤器 (流量真的在内核里分流)\n' "$_if"
+                fi
+            fi
+        elif [ "$_pstate" = "on" ]; then
+            printf '  ! 性能模式说好在用, 但 dae 不在 —— agent 会在 45 秒内自动退回标准模式\n'
+            [ -s "$ZP_DIR/perf/progress" ] && tail -n 2 "$ZP_DIR/perf/progress" | sed 's/^/        /'
+        else
+            printf '  · 性能模式可以开 (内核态 eBPF): 界面上那个开关一键切换\n'
+        fi
+    else
+        printf '  · 性能模式开不了: %s\n' \
+            "$(sed -n 's/^perf_why=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    fi
+    # LuCI 那三件套 (菜单 / 权限 / 承载页)。它们坏掉时的症状最坑人: 菜单里点「服务 →
+    # ZeroProxy」只回一个 **403**, 页面上没有半个字说明原因 (真机事故, README 8.79)。
+    # 所以体检里单独报一句, 并给出那条能就地修好的命令。
+    if [ -d /usr/share/luci/menu.d ]; then
+        _luci_bad=""
+        [ -s /www/luci-static/resources/view/zeroproxy/status.js ] || _luci_bad="承载页"
+        [ "$(head -c 1 /usr/share/luci/menu.d/luci-app-zeroproxy.json 2>/dev/null)" = "{" ] \
+            || _luci_bad="${_luci_bad:+$_luci_bad / }菜单"
+        [ "$(head -c 1 /usr/share/rpcd/acl.d/luci-app-zeroproxy.json 2>/dev/null)" = "{" ] \
+            || _luci_bad="${_luci_bad:+$_luci_bad / }权限"
+        if [ -n "$_luci_bad" ]; then
+            printf '  ✗ LuCI 集成缺了: %s —— 菜单里点「服务 → ZeroProxy」会报 403\n' "$_luci_bad"
+            printf '      下一步: zeroproxy ui fix (就地修好, 不需要面板)\n'
+        else
+            printf '  ✓ LuCI 集成齐备 (菜单 / 权限 / 承载页)\n'
+        fi
+    fi
+    printf '    想测这台机器自己能跑多快: zeroproxy bench\n'
+
+    echo
+    echo "入口连通性"
+    # 这一项回答的是"这台路由器**新建**连接连得上入口吗, 成不成比例" —— 面板与内核都只看
+    # 单条连接的结果, 看不到比例, 所以它是唯一能提前暴露"入口被按比例丢包"的地方。
+    if ! command -v curl >/dev/null 2>&1 && ! command -v nc >/dev/null 2>&1; then
+        printf '  · 这台固件上既没有 curl 也没有 nc, 跳过（而"入口按比例丢包"正是最容易漏的一环）\n'
+    elif [ -z "$(entry_endpoints 2>/dev/null)" ]; then
+        printf '  · 配置里还没有可探测的节点（还没配对 / 还没拉到配置）\n'
+    else
+        _ebad=0; _eto_all=0; _erf_all=0
+        for _eep in $(entry_endpoints 2>/dev/null | head -n 3); do
+            _eh="${_eep%:*}"; _epn="${_eep##*:}"
+            _er="$(entry_probe "$_eh" "$_epn" "${ZP_DOCTOR_PROBES:-5}")"
+            _eok="${_er%% *}"; _erest="${_er#* }"
+            _eto="${_erest%% *}"; _erest="${_erest#* }"
+            _erf="${_erest%% *}"; _erest="${_erest#* }"
+            _eerr="${_erest%% *}"; _en="${_erest##* }"
+            if [ "$_eok" = "$_en" ]; then
+                printf '  ✓ %s 连续 %s 次新建连接全部成功\n' "$_eep" "$_en"
+            elif [ "$_eto" -gt 0 ]; then
+                _ebad=1; _eto_all=$((_eto_all + _eto)); _erf_all=$((_erf_all + _erf))
+                printf '  ✗ %s 连续 %s 次新建连接只成了 %s 次（%s 次超时）\n' "$_eep" "$_en" "$_eok" "$_eto"
+            else
+                _ebad=1; _erf_all=$((_erf_all + _erf))
+                printf '  ✗ %s 连不上（%s/%s 次被拒）\n' "$_eep" "$_erf" "$_en"
+            fi
+        done
+        if [ "$_ebad" = "1" ]; then
+            if [ "$_eto_all" -gt 0 ]; then
+                printf '      这一跳在**按比例丢包**。面板和内核都只看"这条连接成没成", 看不到比例,\n'
+                printf '      所以界面上一切正常, 表现却是"网页开一半、App/视频一直转圈", 设备越多越明显;\n'
+                printf '      国内流量走直连不受影响 —— "国内正常、国外不行"正是它的典型样子。\n'
+                printf '      下一步: 换这个入口的 IP/服务器, 或加一条备用入口（换 IP / 加中转 / 挂 CDN）。\n'
+            else
+                printf '      端口被拒 ≠ 丢包: 先确认入口机器上的服务在跑、端口没被安全组/防火墙拦。\n'
+            fi
+        fi
+    fi
+
+    echo
+    echo "出口"
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsS -m 12 -x "http://127.0.0.1:$ZP_MIXED" -o /dev/null \
+            "http://www.gstatic.com/generate_204" 2>/dev/null; then
+            printf '  ✓ 经本机代理端口能出网\n'
+        else
+            printf '  ! 经本机代理端口出不去（节点可能全关着，或节点本身不通）\n'
+        fi
+    else
+        printf '  · 这台固件上没有 curl，跳过出口测试\n'
+    fi
+
+    echo
+    echo "面板"
+    for _f in $(servers); do
+        _b="$(field_of "$_f" base)"
+        _key="$(key_of "$_b")"
+        if ! command -v curl >/dev/null 2>&1; then
+            printf '  · 这台固件上没有 curl，跳过面板连通性测试\n'
+            continue
+        fi
+        # 同样要**连探几次**: 面板与节点常常在同一台机器上, 一次性探测在"按比例丢包"的
+        # 入口上大概率照样成功, 报出来的"可达"就是假绿 (真机上它和节点一起丢, 只是那条
+        # 提示写着"面板不可达", 把根因指到了面板身上)。
+        _pok=0; _pn="${ZP_DOCTOR_PROBES:-5}"; _pi=0
+        while [ "$_pi" -lt "$_pn" ]; do
+            _pi=$((_pi + 1))
+            if curl -fsSk -m 6 -o /dev/null "$_b/api/status" 2>/dev/null; then
+                _pok=$((_pok + 1))
+            fi
+        done
+        if [ "$_pok" = "$_pn" ]; then
+            printf '  ✓ %s 可达（%s/%s）\n' "$_key" "$_pok" "$_pn"
+        elif [ "$_pok" = "0" ]; then
+            printf '  ! %s 不可达（代理照常工作；本机开关会自动落到本机覆盖）\n' "$_key"
+        else
+            printf '  ! %s 时通时不通（%s/%s 次）—— 面板和节点常在同一台机器上,\n' "$_key" "$_pok" "$_pn"
+            printf '      若上面"入口连通性"那一项也在丢, 就是同一个根因, 别只当成面板的小毛病\n'
+        fi
+    done
+    if [ -s "$ZP_DIR/local.override" ]; then
+        printf '  ! 本机覆盖生效中：%s（交回面板：zeroproxy local-auto）\n' \
+            "$(tr -d '\r\n ' < "$ZP_DIR/local.override")"
+    fi
+
+    echo
+    echo "────────────────────────────────────────────"
+    echo "下一步：以上有 ✗ 或 ! 时，把这一整段发回面板即可定位。"
+}
+
+# 与装机前的快照逐条比对。**逐行**, 不是"看起来差不多" —— 数据面残留是"关掉了但网还是
+# 不对劲"这一类问题的唯一解释, 必须能直接指出来。左右两边: 左=现在, 右=装机前。
+revert_report() {
+    _dir="$ZP_DIR/baseline"
+    # 同上: 判断"拍过没有"看 taken_at。机器上没有 nftables 时 nft.txt 本来就是空的,
+    # 用大小判会把"拍过了、而且现在也对得上"误报成"没有快照"。
+    if [ ! -f "$_dir/taken_at" ]; then
+        echo "本机没有装机前的快照 (旧版本装的, 或者快照被删了) —— 无法逐条比对。"
+        echo "  自己看一眼: nft list ruleset | grep -i zp_ ; iptables -t nat -L zp_router ; ip rule"
+        return 0
+    fi
+    _drift=0
+    for _pair in "nft:nft list ruleset" "iptables:iptables-save" "ip6tables:ip6tables-save" "ip-rule:ip rule show" "ip6-rule:ip -6 rule show"; do
+        _name="${_pair%%:*}"
+        _cmd="${_pair#*:}"
+        _base="$_dir/$_name.txt"
+        [ -f "$_base" ] || continue
+        _cur="$(eval "$_cmd" 2>/dev/null || true)"
+        if [ "$_cur" = "$(cat "$_base" 2>/dev/null || true)" ]; then
+            printf '  ✓ %-9s 与装机前一致\n' "$_name"
+            continue
+        fi
+        _drift=1
+        printf '  ! %-9s 与装机前**不一致** (左=现在, 右=装机前):\n' "$_name"
+        _now_file="$ZP_DIR/.revert.$_name"
+        printf '%s\n' "$_cur" > "$_now_file"
+        if command -v diff >/dev/null 2>&1; then
+            diff "$_now_file" "$_base" 2>/dev/null | head -n 8 | sed 's/^/      /'
+        fi
+        rm -f "$_now_file"
+    done
+    if [ "$_drift" = "0" ]; then
+        echo "结论: 已完全回到装机前的状态 (防火墙与策略路由逐条一致)。"
+    else
+        echo "结论: 还有残留 —— 上面标 ! 的那几项; 把这段发回面板可以定位。"
+    fi
+    return 0
+}
+
+case "${1:-status}" in
+    doctor)
+        # 真机体检: 逐项问"到底行不行", 每项给证据 (判据与输出格式在 doctor() 里)
+        doctor
+        ;;
+    status)
+        # 现场是哪一档 —— 判据只有一份 (live.sh 的 zp_live_mode), 与 agent 心跳 / 本地界面
+        # 读的是同一份。live.sh 不在 (升级中途) 才退回内联判据 (缺 dae 那一档)。
+        _lm="$(zp_live_mode 2>/dev/null)"
+        if [ -z "$_lm" ]; then
+            if ip link show zp-tun >/dev/null 2>&1; then _lm=tun
+            elif nft list table inet zp_router >/dev/null 2>&1; then _lm=tproxy
+            elif iptables -t nat -L zp_router >/dev/null 2>&1; then _lm=redirect
+            else _lm=none; fi
+        fi
+        # 性能模式下 mihomo 是停的, 而 dae 在跑 —— 这时候说"已停止"就是骗人 (真机漂移)。
+        if [ "$(running)" = yes ]; then
+            echo "内核:  运行中"
+        elif [ "$_lm" = "ebpf" ]; then
+            echo "内核:  运行中 (性能模式: dae; 标准模式的 mihomo 停用)"
+        else
+            echo "内核:  已停止"
+        fi
+        # 固件与包管理器 (装机时记进 caps): "内核模块能不能补"全看这两项, 出问题时
+        # 第一个该看的就是这一行。
+        _fw="$(sed -n 's/^fw=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+        _pm="$(sed -n 's/^pkgmgr=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+        if [ -n "$_fw" ] || [ -n "$_pm" ]; then
+            printf '固件:  %s%s\n' \
+                "$( [ -n "$_fw" ] && printf 'OpenWrt %s' "$_fw" || printf '未知版本' )" \
+                "$( [ -n "$_pm" ] && printf ' · 包管理器 %s' "$_pm" )"
+        fi
+        echo "服务器 ($(servers | wc -l | tr -d ' ') 台):"
+        for _f in $(servers); do
+            printf '  %-16s %s\n' "$(key_of "$(field_of "$_f" base)")" "$(field_of "$_f" base)"
+        done
+        # 模式按"现在到底是什么在生效"报, 不看 /dev/net/tun 这个节点 —— 它在某些固件上
+        # 存在但建不出设备 (真机: 原厂 5.4.281), 那时报 TUN 就是骗人。能力是装机时探的。
+        case "$_lm" in
+            ebpf)     echo "模式:  性能模式 (内核态 eBPF / dae; 局域网 + 路由器自身)" ;;
+            tun)      echo "模式:  TUN (全屋透明, 含路由器自身)" ;;
+            tproxy)   echo "模式:  tproxy (全屋透明, 本机自身流量除外)" ;;
+            redirect) echo "模式:  redirect (局域网 TCP 透明代理; 不含 UDP 与本机自身流量)" ;;
+            *)        echo "模式:  未生效 (只有本机代理端口可用)" ;;
+        esac
+        if [ -f "$ZP_DIR/caps" ]; then
+            printf '能力:  tun=%s nft=%s tproxy=%s redirect=%s ebpf=%s btf=%s (装机时探测)\n' \
+                "$(sed -n 's/^tun=//p' "$ZP_DIR/caps" | head -n1)" \
+                "$(sed -n 's/^nft=//p' "$ZP_DIR/caps" | head -n1)" \
+                "$(sed -n 's/^tproxy=//p' "$ZP_DIR/caps" | head -n1)" \
+                "$(sed -n 's/^redirect=//p' "$ZP_DIR/caps" | head -n1)" \
+                "$(sed -n 's/^ebpf=//p' "$ZP_DIR/caps" | head -n1)" \
+                "$(sed -n 's/^btf=//p' "$ZP_DIR/caps" | head -n1)"
+            # 内核 BTF 是装机时**自动补**的 (25.12 那台真机就是缺这个) —— 补过就写清来源
+            _bhow="$(sed -n 's/^btf_how=//p' "$ZP_DIR/caps" | head -n1)"
+            case "$_bhow" in
+                feed|panel)
+                    printf '性能档: 内核 BTF 已自动补上 (%s: %s)\n' \
+                        "$( [ "$_bhow" = "feed" ] && printf '本机软件源' || printf '面板分发' )" \
+                        "$(sed -n 's/^btf_path=//p' "$ZP_DIR/caps" | head -n1)" ;;
+            esac
+            _chosen="$(sed -n 's/^chosen=//p' "$ZP_DIR/caps" | head -n1)"
+            _covered="$(sed -n 's/^covered=//p' "$ZP_DIR/caps" | head -n1)"
+            [ -n "$_chosen" ] && printf '选择:  %s (覆盖 %s)\n' "$_chosen" "${_covered:-?}"
+            # 另外几级为什么不行 —— 面板上显示的就是这一份, 排障时不用再猜
+            for _lv in tun tproxy redirect; do
+                _why="$(sed -n "s/^why.$_lv=//p" "$ZP_DIR/caps" | head -n1)"
+                [ -n "$_why" ] && printf '原因:  %s: %s\n' "$_lv" "$_why"
+            done
+        fi
+        # 本机覆盖: 面板不可达时用 zeroproxy on|off 写下的那份意图 (它优先于面板)
+        if [ -s "$ZP_DIR/local.override" ]; then
+            printf '覆盖:  本机覆盖「%s」—— 面板说了不算, 直到你执行 zeroproxy local-auto\n' \
+                "$(tr -d '\r\n ' < "$ZP_DIR/local.override")"
+        fi
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsS -m 8 "http://127.0.0.1:9090/version" 2>/dev/null | head -c 200 && echo
+        fi
+        ;;
+    servers)
+        echo "服务器清单 ($ZP_DIR/servers):"
+        for _f in $(servers); do
+            printf '  %-16s %s  (设备 %s)\n' "$(key_of "$(field_of "$_f" base)")" \
+                "$(field_of "$_f" base)" "$(field_of "$_f" id)"
+        done
+        ;;
+    add)
+        # 从面板复制一行 (安装命令里的那个 URL), 粘进来即可 —— 不用再走一次完整安装。
+        _url="${2:-}"
+        [ -n "$_url" ] || { echo "用法: zeroproxy add https://面板:8899/c/<配对码>"; exit 2; }
+        case "$_url" in
+            http*://*/c/*) ;;
+            *) echo "这看起来不是一个面板链接。请到面板「客户端」生成安装命令, 复制其中 https://…/c/… 这一段。"; exit 2 ;;
+        esac
+        _base="${_url%/c/*}"
+        _code="${_url##*/c/}"
+        _key="$(key_of "$_base")"
+        mkdir -p "$SERVERS"
+        echo "正在与 $_base 配对…"
+        _model="$(cat /tmp/sysinfo/model 2>/dev/null || uname -m)"; _hn="$(cat /proc/sys/kernel/hostname 2>/dev/null || echo router)"
+        _model="$(printf %s "$_model" | tr -d '"')"
+        _body='{"code":"'"$_code"'","kind":"router","model":"'"$_model"'","hostname":"'"$_hn"'","arch":"'"$(uname -m)"'","os":"OpenWrt","version":"'"$ZP_VERSION"'"}'
+        if command -v curl >/dev/null 2>&1; then
+            _resp="$(curl -fsSk -m 30 -H 'Content-Type: application/json' --data "$_body" "$_base/c/pair" 2>/dev/null)"
+        else
+            _resp="$(uclient-fetch -q --no-check-certificate -O - --post-data "$_body" "$_base/c/pair" 2>/dev/null)"
+        fi
+        _id="$(printf '%s' "$_resp" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+        _sec="$(printf '%s' "$_resp" | sed -n 's/.*"secret"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+        if [ -z "$_id" ] || [ -z "$_sec" ]; then
+            echo "配对失败: $(printf '%s' "$_resp" | sed -n 's/.*"error"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+            echo "配对码是一次性的, 请回面板重新生成一条安装命令后复制其中的链接。"
+            exit 1
+        fi
+        cat > "$SERVERS/$_key.json" <<EOF
+{
+  "base": "$_base",
+  "id": "$_id",
+  "secret": "$_sec",
+  "name": "$_base"
+}
+EOF
+        chmod 600 "$SERVERS/$_key.json"
+        echo "已接入: $_key ($_base)"
+        # 注意把"重建配置"与"重启内核"分开判断: 重启失败不该把已经写好的配置撤掉
+        # (内核本来就是 procd 常驻的, 它自己会重启)。
+        if "$ZP_DIR/agent.sh" config > "$ZP_DIR/config.yaml.new" 2>/dev/null \
+            && "$ZP_DIR/mihomo" -t -d "$ZP_DIR" -f "$ZP_DIR/config.yaml.new" >/dev/null 2>&1; then
+            mv "$ZP_DIR/config.yaml.new" "$ZP_DIR/config.yaml"
+            /etc/init.d/zeroproxy restart >/dev/null 2>&1 || true
+            echo "配置已更新并重载 (现在共 $(servers | wc -l | tr -d ' ') 台服务器)"
+        else
+            rm -f "$ZP_DIR/config.yaml.new"
+            echo "配置更新失败, 旧配置仍在运行 (看 zeroproxy log)"
+        fi
+        ;;
+    drop)
+        _key="${2:-}"
+        _file="$SERVERS/$_key.json"
+        [ -f "$_file" ] || { echo "没有这台服务器: $_key (用 zeroproxy servers 看清单)"; exit 2; }
+        mv "$_file" "$_file.removed"
+        echo "已移除 $_key, 正在重建配置…"
+        if "$ZP_DIR/agent.sh" config > "$ZP_DIR/config.yaml.new" 2>/dev/null \
+            && "$ZP_DIR/mihomo" -t -d "$ZP_DIR" -f "$ZP_DIR/config.yaml.new" >/dev/null 2>&1; then
+            mv "$ZP_DIR/config.yaml.new" "$ZP_DIR/config.yaml"
+            /etc/init.d/zeroproxy restart >/dev/null 2>&1
+            rm -f "$_file.removed"
+            echo "完成 (剩余 $(servers | wc -l | tr -d ' ') 台服务器)"
+        else
+            mv "$_file.removed" "$_file"
+            rm -f "$ZP_DIR/config.yaml.new"
+            echo "重建失败, 已回滚 —— 这台服务器还在用"
+        fi
+        echo "提示: 面板上的设备记录不会自动删除, 需要的话在那边一并移除。"
+        ;;
+    refresh)
+        echo "重新拉取全部服务器的节点…"
+        if "$ZP_DIR/agent.sh" config > "$ZP_DIR/config.yaml.new" 2>/dev/null \
+            && "$ZP_DIR/mihomo" -t -d "$ZP_DIR" -f "$ZP_DIR/config.yaml.new" >/dev/null 2>&1; then
+            mv "$ZP_DIR/config.yaml.new" "$ZP_DIR/config.yaml"
+            /etc/init.d/zeroproxy restart >/dev/null 2>&1
+            echo "完成"
+        else
+            rm -f "$ZP_DIR/config.yaml.new"
+            echo "拉取失败, 旧配置仍在运行 (看 zeroproxy log)"
+            exit 1
+        fi
+        ;;
+    on|off)
+        # 先按"面板是唯一事实来源"走: 告诉面板改期望状态, agent 下一轮生效。
+        # 面板**不可达**时才退回本机覆盖 —— 家里网出问题时连"关掉代理"都做不到, 是最坏
+        # 的结果; 而这时恰恰是面板最容易不可达的时候。
+        ON=$([ "$1" = on ] && echo true || echo false)
+        # 「关掉总开关」在性能模式下意味着**退出性能模式**: 那一档下 mihomo 是停着的,
+        # 只停 mihomo 等于什么都没关。先把它退出来 (幂等), 再照原路去改面板的期望状态。
+        if [ "$1" = "off" ] && [ -f "$ZP_DIR/perf.sh" ]; then
+            . "$ZP_DIR/perf.sh"
+            [ "$(zp_perf_state)" = "on" ] && zp_perf_leave "总开关关闭"
+        fi
+        # 「打开总开关」在性能模式下**不是**"把 mihomo 拉起来": 那一档下代理已经开着
+        # (数据面是 dae), 再起 mihomo 就是两个数据面同时在抢包 —— 现象是"时通时不通"。
+        # 真机上这个坑差点被界面踩中: 本机界面某条路的 status 少了 perf.live, 总开关因此
+        # 显示成"关", 用户照着点一下就会造出这种状态 (8.85)。dae 不在了才退回标准模式再开。
+        if [ "$1" = "on" ] && [ -f "$ZP_DIR/perf.sh" ]; then
+            . "$ZP_DIR/perf.sh"
+            if [ "$(zp_perf_state)" = "on" ]; then
+                if zp_perf_live; then
+                    echo "性能模式已经在用 (出口 $(sed -n '1p' "$ZP_PERF_DIR/exit_ip" 2>/dev/null || printf '未记录')) —— 总开关开着, 不必再起标准模式"
+                    exit 0
+                fi
+                echo "性能模式说好在用但 dae 不在 —— 先退回标准模式, 再开总开关"
+                zp_perf_leave "dae 不在, 用户要求打开总开关"
+            fi
+        fi
+        [ -n "$FIRST" ] || { echo "还没有接入任何服务器"; exit 1; }
+        _base="$(field_of "$FIRST" base)"
+        ID="$(field_of "$FIRST" id)"
+        KEY="$(field_of "$FIRST" secret)"
+        BODY='{"device":"'"$ID"'","k":"'"$KEY"'","set_desired":'"$ON"'}'
+        _sent=0
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSk -m 15 -H 'Content-Type: application/json' --data "$BODY" "$_base/c/report" >/dev/null 2>&1 && _sent=1
+        else
+            uclient-fetch -q --no-check-certificate -O - --post-data "$BODY" "$_base/c/report" >/dev/null 2>&1 && _sent=1
+        fi
+        if [ "$_sent" = "1" ]; then
+            # 面板答上了 —— 它是唯一事实来源, 顺手清掉本机覆盖 (否则面板以后改不动它)
+            rm -f "$ZP_DIR/local.override" 2>/dev/null || true
+            echo "已请求面板把总开关设为「$1」, 约 15 秒内生效 (zeroproxy status 查看)"
+            exit 0
+        fi
+        umask 077
+        printf '%s\n' "$1" > "$ZP_DIR/local.override"
+        umask 022
+        if [ "$1" = "on" ]; then
+            /etc/init.d/zeroproxy start >/dev/null 2>&1 || true
+            touch "$ZP_DIR/core.up"
+        else
+            rm -f "$ZP_DIR/core.up"
+            /etc/init.d/zeroproxy stop >/dev/null 2>&1 || true
+            nft delete table inet zp_router 2>/dev/null || true
+            if [ -f "$ZP_DIR/redirect.sh" ]; then
+                . "$ZP_DIR/redirect.sh"
+                zp_redirect_clear 2>/dev/null || true
+            fi
+            if [ -f "$ZP_DIR/tunfw.sh" ]; then
+                . "$ZP_DIR/tunfw.sh"
+                zp_tunfw_clear 2>/dev/null || true
+            fi
+        fi
+        killall -HUP dnsmasq 2>/dev/null || true
+        echo "面板不可达 —— 已在本机把全屋代理设为「$1」并立即生效。"
+        echo "  这是**本机覆盖**: 面板恢复后也不会自动改回去。交回面板: zeroproxy local-auto"
+        ;;
+    local-auto)
+        if [ -s "$ZP_DIR/local.override" ]; then
+            rm -f "$ZP_DIR/local.override"
+            echo "已清除本机覆盖 —— 总开关重新由面板决定 (agent 下一轮生效, 约 15 秒)。"
+        else
+            echo "本来就没有本机覆盖 —— 总开关一直由面板决定。"
+        fi
+        ;;
+    perf)
+        # 性能模式 (eBPF / dae)。逻辑全在 perf.sh 里 —— 一处实现, 三个入口
+        # (CLI / 本机界面 / agent 的看门狗), 见那个文件顶部。
+        . "$ZP_DIR/perf.sh"
+        _act="${2:-status}"
+        case "$_act" in
+            on|start|enable|off|stop|disable)
+                # 界面点按钮时**没有 TTY** (cgi / zpcore 转发过来): 后台跑、进度写文件、界面
+                # 轮询状态自己画出来 —— 与「更新客户端」同一条路。切换要下载内核 (最多 10 MB)
+                # 再等出口验证, 把 HTTP 请求挂一两分钟只会让界面干转圈。
+                # SSH 里执行时是 TTY: 前台跑, 进度实时打出来 (那一刻用户就想要这个)。
+                if [ -t 1 ]; then
+                    case "$_act" in
+                        on|start|enable) zp_perf_enter ;;
+                        *)               zp_perf_leave "" ;;
+                    esac
+                else
+                    mkdir -p "$ZP_PERF_DIR"
+                    : > "$ZP_PERF_DIR/progress" 2>/dev/null || true
+                    case "$_act" in
+                        on|start|enable)
+                            printf '正在准备性能模式…\n' >> "$ZP_PERF_DIR/progress"
+                            ( zp_perf_enter >> "$ZP_PERF_DIR/progress" 2>&1
+                              printf 'DONE=%s\n' "$?" >> "$ZP_PERF_DIR/progress" ) &
+                            echo "已开始切换到性能模式 (后台进行, 约一分钟; 界面会显示进度)" ;;
+                        *)
+                            printf '正在切回标准模式…\n' >> "$ZP_PERF_DIR/progress"
+                            ( zp_perf_leave "" >> "$ZP_PERF_DIR/progress" 2>&1
+                              printf 'DONE=%s\n' "$?" >> "$ZP_PERF_DIR/progress" ) &
+                            echo "已开始切回标准模式" ;;
+                    esac
+                fi ;;
+            prepare)  zp_perf_prepare ;;
+            progress) sed -n '1,30p' "$ZP_PERF_DIR/progress" 2>/dev/null ;;
+            *)        zp_perf_status ;;
+        esac
+        ;;
+    bench)
+        # 真机基准。**它量的是"这台路由器自己"的能力**, 不是节点好坏: 同一个节点在手机上
+        # 能跑 200 Mbps, 在这台双核 A53 上可能只有 40 —— 这个数字决定了"换协议/换节点
+        # 还有没有意义"。结果落在 $ZP_DIR/bench, agent 会随心跳带给面板。
+        [ -n "$FIRST" ] || { echo "还没有接入任何服务器"; exit 1; }
+        command -v curl >/dev/null 2>&1 || { echo "这台固件上没有 curl —— 跑不了基准"; exit 1; }
+        _url="$(field_of "$FIRST" base)/c/bench/$BENCH_MB"
+        echo "路由器基准测试 (靶子是面板, ${BENCH_MB} MB —— 经代理那一趟会算节点流量)"
+        printf '  直连   … '
+        _dr="$(bench_run "$_url" direct)"
+        _dk="$(bench_kbps "$_dr")"
+        printf '%s\n' "$(bench_text "$_dr")"
+        printf '  经代理 … '
+        _pr="$(bench_run "$_url" proxy)"
+        _pk="$(bench_kbps "$_pr")"
+        printf '%s\n' "$(bench_text "$_pr")"
+        if [ "${_dk:-0}" -gt 0 ] 2>/dev/null && [ "${_pk:-0}" -gt 0 ] 2>/dev/null; then
+            # 别写"代理开销 -10%": 负的开销读起来像 bug。经代理比直连还快是**正常**的 ——
+            # 差的是两条线的走向 (经代理那趟是"到节点再到面板"), 节点到面板的线路好的时候
+            # 就会更快 (GL-MT3000 实测: 直连 7.7 MB/s, 经代理 8.6 MB/s, 面板与节点都在香港)。
+            if [ "$_pk" -lt "$_dk" ] 2>/dev/null; then
+                printf '  经代理比直连慢 %s%%\n' \
+                    "$(awk -v a="$_pk" -v b="$_dk" 'BEGIN{printf "%d", (1-a/b)*100}')"
+            else
+                printf '  经代理比直连快 %s%%（节点到面板的线路比直连好, 不是异常）\n' \
+                    "$(awk -v a="$_pk" -v b="$_dk" 'BEGIN{printf "%d", (a/b-1)*100}')"
+            fi
+        fi
+        if [ "${_pk:-0}" -le 0 ] 2>/dev/null; then
+            printf '    （经代理那一趟没量到数 —— 内核在跑吗? 看 zeroproxy status）\n'
+        fi
+        {
+            printf 'at=%s\n' "$(date +%s)"
+            printf 'direct_kbps=%s\n' "${_dk:-0}"
+            printf 'proxy_kbps=%s\n' "${_pk:-0}"
+        } > "$ZP_DIR/bench" 2>/dev/null || true
+        echo "  已记下 —— 面板设备卡上会显示这两个数字 (agent 下一轮心跳带过去)"
+        ;;
+    ui)
+        if [ "${2:-}" = "fix" ]; then
+            # `zeroproxy ui fix`: 修 LuCI 那三件套 (菜单 / 权限 / 承载页)。真机上它们坏掉的
+            # 症状就是"菜单里点进去 403" —— 那时用户只能 SSH, 所以修法必须是一条命令。
+            ui_fix
+            exit $?
+        fi
+        # 端口在 ui.port 里 (安装时定下的): 空 = 固件自己的 Web 服务, 有值 = 自带 httpd。
+        _port="$(cat "$ZP_DIR/ui.port" 2>/dev/null)"
+        [ -n "$_port" ] && _port=":$_port"
+        _ip="$(uci get network.lan.ipaddr 2>/dev/null || echo 192.168.1.1)"
+        echo "http://$_ip$_port/cgi-bin/zeroproxy?k=$(cat "$ZP_DIR/ui.token" 2>/dev/null)"
+        [ -s "$ZP_DIR/ui.token" ] || echo "(令牌文件不见了 —— 重跑一次安装命令会重新生成)"
+        echo "(打开一次即可; 之后同一浏览器不用再带令牌)"
+        ;;
+    log)        logread -e zeroproxy | tail -n "${2:-40}" ;;
+    geo)
+        # 重新取分流数据库 (面板换了 / 数据更新了, 不用重跑安装)
+        "$ZP_DIR/agent.sh" geo force && echo "分流数据库已更新" \
+            || echo "取分流数据库失败 (面板不可达, 或面板自己取不到上游数据)"
+        ;;
+    revert)
+        # 停用代理并拆掉数据面, 然后**证明**拆干净了 —— 与装机前快照逐条比对。
+        # 保留配置与凭据 (那是 uninstall 的事): 想恢复只要再跑一次面板上的更新命令
+        # (`wget -qO- <面板>/c/install.sh | sh`), 它会按现有 state 重新落地并重新启用。
+        echo "正在停服务并拆掉数据面…"
+        /etc/init.d/zeroproxy-agent stop >/dev/null 2>&1 || true
+        /etc/init.d/zeroproxy-agent disable >/dev/null 2>&1 || true
+        /etc/init.d/zeroproxy stop >/dev/null 2>&1 || true
+        /etc/init.d/zeroproxy disable >/dev/null 2>&1 || true
+        /etc/init.d/zeroproxy-ui stop >/dev/null 2>&1 || true
+        /etc/init.d/zeroproxy-ui disable >/dev/null 2>&1 || true
+        rm -f "$ZP_DIR/core.up"
+        nft delete table inet zp_router 2>/dev/null || true
+        if [ -f "$ZP_DIR/redirect.sh" ]; then
+            . "$ZP_DIR/redirect.sh"
+            zp_redirect_clear 2>/dev/null || true
+        fi
+        if [ -f "$ZP_DIR/tunfw.sh" ]; then
+            . "$ZP_DIR/tunfw.sh"
+            zp_tunfw_clear 2>/dev/null || true
+        fi
+        # tun 的 auto-route 规则随内核退出自动回收; 这里只兜我们自己加过的东西
+        killall -HUP dnsmasq 2>/dev/null || true
+        revert_report
+        echo "配置与凭据都还在。重新启用: 跑一次面板上的更新命令 (wget -qO- <面板>/c/install.sh | sh)"
+        ;;
+    update)
+        # 一键更新: 从面板拉最新的安装脚本并重跑 (走**更新模式** —— 不带配对码, 不会在面板上
+        # 多出设备)。界面上那个按钮调的就是它。
+        #
+        # **后台跑**两个理由: ① 它会替换 /usr/bin/zeroproxy 这个正在运行的文件, 前台跑容易
+        # 半途出岔子; ② 它要下载 20 MB 内核, 与其让界面转一分钟, 不如"提交后立刻回话、
+        # 稍后刷新"。过程写进 $ZP_DIR/update.log, 结束时往 syslog 丢一句结论 (界面上的
+        # 「最近日志」读的就是 syslog)。
+        [ -n "$FIRST" ] || { echo "还没有接入任何服务器"; exit 1; }
+        _base="$(field_of "$FIRST" base)"
+        _log="$ZP_DIR/update.log"
+        : > "$_log" 2>/dev/null || true
+        # 一开始就往日志里落一行 —— 界面上的进度面板是**照着这个日志**画的, 而下面取面板
+        # 那份脚本要走三次重试 (丢包的链路上最坏几十秒)。没有这一行, 那几十秒里刷新页面
+        # 什么都看不到, 用户只能干等; 有了它, 从按下按钮那一刻起就有东西可显示。
+        echo "==> 正在取面板的安装脚本" >> "$_log" 2>/dev/null || true
+        # 先把面板要发的那份脚本取下来, **看一眼它的版本** —— 比本机旧就停下。
+        #
+        # 为什么需要这道闸门: 按钮触发的更新会把路由器上的**全部客户端文件**换成面板那一版。
+        # 面板还没更新时点下去 = 把机器**降级**, 而且会覆盖掉本机刚拿到的东西。真机上踩过:
+        # 面板 2.11.9 / 本机 1.4.11, 点按钮之后页面报"未知操作: update" —— 因为覆盖回来的
+        # 旧 cgi 里没有那个动作分支。
+        _tmp="$ZP_DIR/.update-script"
+        # 面板那条路会**偶尔丢一个包就整条挂住**: 真机上同一个地址连 6 次, 3 次是 0.15 秒,
+        # 3 次 SYN 石沉大海、一直挂到我给的超时 (40% 左右)。只拉一次的话, 用户按下按钮、
+        # 界面上什么都没发生, 最后报出来却是"面板不可达" —— 而实际情况是"再试一次就行"。
+        # 所以这里试三次 (每次 25 秒上限, 与原来 60 秒的总预算同量级)。半个文件也要清掉:
+        # 下一轮若还失败, 留着上一轮的残片会让"脚本有没有拿到"的判断失真。
+        _try=0; _got=0
+        while [ "$_try" -lt 4 ]; do
+            _try=$((_try + 1))
+            rm -f "$_tmp"
+            _rc=1
+            if command -v curl >/dev/null 2>&1; then
+                if curl -fsSk -m 10 "$_base/c/install.sh" -o "$_tmp" 2>/dev/null; then _rc=0; fi
+            else
+                if uclient-fetch -q --no-check-certificate -T 10 -O "$_tmp" "$_base/c/install.sh" 2>/dev/null; then _rc=0; fi
+            fi
+            # 只有 curl/uclient-fetch 自己说"传完了"才算拿到 —— 被掐断的那次也会留下
+            # 半个文件, 而半份脚本里的版本号照样能被 sed 抠出来, 拿去跑就是另一回事了。
+            if [ "$_rc" = "0" ] && [ -s "$_tmp" ]; then _got=1; break; fi
+            # 让界面那句"正在取面板的安装脚本"有进展可看: 这一步的每一次重试都要等到超时,
+            # 静悄悄等几十秒正是"点了没反应"的来源之一。
+            echo "  · 面板第 $_try 次没回话 (链路丢包), 正在重试…" >> "$_log" 2>/dev/null || true
+            sleep "$_try"
+        done
+        [ "$_got" = "1" ] || rm -f "$_tmp"
+        _panel_ver=""
+        if [ -s "$_tmp" ]; then
+            _panel_ver="$(sed -n 's/^ZP_CLIENT_VERSION="\(.*\)"/\1/p' "$_tmp" | head -n1)"
+        fi
+        if [ -z "$_panel_ver" ]; then
+            rm -f "$_tmp"
+            # 给日志一个**终态**。没有它, 上面那行"正在取面板的安装脚本"就没人收尾, 刷新
+            # 之后进度面板会一直转下去 —— 看起来像卡住, 而实际是"这次根本没开始"。
+            # SKIP = 没有开始 (与 EXIT= 区分开: 那个是"跑了, 结果是这个码")。
+            echo "取不到面板的安装脚本 (面板不可达?) —— 这次没有开始更新。" >> "$_log"
+            echo "SKIP=1" >> "$_log"
+            echo "取不到面板的安装脚本 (面板不可达?) —— 稍后再试, 或看 zeroproxy update-log"
+            exit 1
+        fi
+        # 版本比较 (a<b → -1, = → 0, > → 1)。只看前三位, 够用。
+        _cmp="$(awk -v a="$_panel_ver" -v b="$ZP_VERSION" 'BEGIN{
+            n=split(a,x,"."); m=split(b,y,".");
+            for(i=1;i<=3;i++){ x[i]+=0; y[i]+=0;
+                if (x[i]>y[i]) { print 1; exit }
+                if (x[i]<y[i]) { print -1; exit } }
+            print 0 }')"
+        if [ "$_cmp" = "-1" ]; then
+            rm -f "$_tmp"
+            echo "面板上没有比本机更新的客户端 —— 这次没有开始更新。" >> "$_log"
+            echo "SKIP=1" >> "$_log"
+            # 变量名后面紧跟中文时必须写 ${VAR}: 有的 shell 会把高字节算进变量名,
+            # `set -u` 下就变成 "unbound variable" —— 偏偏只在真的走到这一行时才炸。
+            echo "面板上是 v${_panel_ver}，这台机器已经是 v${ZP_VERSION} —— 那不是升级。"
+            echo "  面板那边可能还没更新完: 先在面板点「检查更新 → 一键更新」, 再回来点这个按钮。"
+            exit 0
+        fi
+        echo "面板版本 v$_panel_ver (本机 v$ZP_VERSION) —— 开始更新。"
+        (
+            # 用刚取下来的那一份跑 —— 不再下第二次 (版本也已经核对过了)
+            sh "$_tmp" >>"$_log" 2>&1
+            _rc=$?
+            rm -f "$_tmp"
+            echo "EXIT=$_rc" >> "$_log"
+            if [ "$_rc" = "0" ]; then
+                logger -t zeroproxy "客户端更新完成 (刷新本页看版本号)"
+            else
+                logger -t zeroproxy "客户端更新失败 (退出码 $_rc), 详情: zeroproxy update-log"
+            fi
+        ) &
+        echo "已开始更新 (后台进行, 约 1 分钟; 配置与凭据保留)。"
+        echo "  完成后刷新本页看客户端版本号; 详情: zeroproxy update-log 或本页「最近日志」"
+        ;;
+    update-log) cat "$ZP_DIR/update.log" 2>/dev/null || echo "(还没有更新记录)" ;;
+    uninstall)
+        # 先停 agent 再停内核: 反过来的话 agent 会在内核停掉后立刻把它拉起来
+        /etc/init.d/zeroproxy-agent stop >/dev/null 2>&1 || true
+        /etc/init.d/zeroproxy-agent disable >/dev/null 2>&1 || true
+        /etc/init.d/zeroproxy-ui stop >/dev/null 2>&1 || true
+        /etc/init.d/zeroproxy-ui disable >/dev/null 2>&1 || true
+        /etc/init.d/zeroproxy stop >/dev/null 2>&1 || true
+        /etc/init.d/zeroproxy disable >/dev/null 2>&1 || true
+        nft delete table inet zp_router 2>/dev/null || true
+        if [ -f "$ZP_DIR/redirect.sh" ]; then
+            . "$ZP_DIR/redirect.sh"
+            zp_redirect_clear 2>/dev/null || true
+        fi
+        if [ -f "$ZP_DIR/tunfw.sh" ]; then
+            . "$ZP_DIR/tunfw.sh"
+            zp_tunfw_clear 2>/dev/null || true
+        fi
+        killall -HUP dnsmasq 2>/dev/null || true
+        rm -rf "$ZP_DIR" /etc/init.d/zeroproxy /etc/init.d/zeroproxy-agent /etc/init.d/zeroproxy-ui /usr/bin/zeroproxy
+        echo "已卸载。这台设备在面板上仍然存在, 请在面板「客户端」里一并移除。"
+        ;;
+    *) echo "用法: zeroproxy [doctor|status|ui|servers|add <链接>|drop <键>|refresh|geo|on|off|local-auto|revert|bench|update|update-log|log|uninstall]" ;;
+esac

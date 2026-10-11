@@ -18,6 +18,32 @@ import yaml
 from conftest import DOMAIN, PASSWORD, USERNAME
 
 
+def _runtime_file(name: str) -> str:
+    """读一份运行时装机件 (client/runtime/<name>)。"""
+    from zeroproxy import router_client
+
+    with open(os.path.join(router_client.runtime_dir(), name), encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _client_source() -> str:
+    """路由器客户端的"源码" = 安装脚本 + client/runtime/ 下的运行时装机件。
+
+    这些文件以前是安装脚本用 heredoc 现场生成的; 现在它们随面板分发 (每个文件能单独
+    shellcheck / 单测, 安装脚本也缩回"引导"的体量)。这些用例断言的是"客户端带了这个
+    行为" —— 所以它们该看的是整个客户端, 而不是只剩那一个脚本。
+    """
+    from zeroproxy import router_client
+
+    parts = [open(router_client.script_path(), encoding="utf-8").read()]
+    for entry in sorted(os.listdir(router_client.runtime_dir())):
+        path = os.path.join(router_client.runtime_dir(), entry)
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as fh:
+                parts.append(fh.read())
+    return "\n".join(parts)
+
+
 def _login(client) -> None:
     res = client.post("/api/login", json={"username": USERNAME, "password": PASSWORD})
     assert res.status_code == 200, res.text
@@ -144,8 +170,11 @@ def test_install_script_is_rendered_for_this_panel(client, configured):
     # 面板基址取自身份面板地址 (域名 + 面板端口), 而不是请求里的 Host
     assert f'ZP_BASE="{configured["panel_url"]}"' in body
     assert DOMAIN in body
+    # 这一行命令下发的是**安装脚本**; 它现在只负责引导 —— 数据面脚本 / agent / CLI 等随
+    # 面板分发 (client/runtime/)。所以"这台机器会拿到什么"得看整份客户端。
+    hay = body + "\n" + _client_source()
     for needle in ("mihomo -t", "/etc/init.d/zeroproxy", "uninstall", "device.json"):
-        assert needle in body
+        assert needle in hay, needle
 
 
 def test_install_script_rejects_unknown_or_used_code(client, configured):
@@ -536,6 +565,25 @@ def test_extract_dae_picks_the_binary_and_refuses_junk(tmp_path, monkeypatch):
     assert not ok3 and "ELF" in detail3, detail3
 
 
+def test_runtime_artifacts_are_shipped_by_the_panel(client, configured):
+    """运行时装机件 (client/runtime/) 由面板分发 —— 装机时路由器从这里取回来落盘。
+
+    契约与 /c/ui、/c/bin、/c/geo 一样: 匿名可达 (装机时路由器还没有凭据)、名字走白名单、
+    内容不含任何机密。这些文件以前是安装脚本用 heredoc 现场生成的 —— 改不动、也测不了;
+    现在它们是仓库里版本化的文件, 面板发出去的就是仓库里那一份 (只把版本占位符替掉)。
+    """
+    from zeroproxy import router_client
+
+    _login(client)
+    for name in router_client.RUNTIME_FILES:
+        res = client.get(f"/c/rt/{name}")
+        assert res.status_code == 200, name
+        assert res.text.strip(), name
+        assert "__ZP_CLIENT_VERSION__" not in res.text, f"{name} 里的版本占位符要替掉"
+    assert client.get("/c/rt/nope.sh").status_code == 404
+    assert client.get("/c/rt/live.sh").text == _runtime_file("live.sh")
+
+
 def test_ui_files_are_written_atomically_and_luci_has_a_builtin_fallback():
     """界面文件的落盘必须是**原子**的 —— 一次失败的请求不许毁掉一份能用的文件。
 
@@ -551,7 +599,8 @@ def test_ui_files_are_written_atomically_and_luci_has_a_builtin_fallback():
     from zeroproxy import router_client
 
     path = router_client.script_path()
-    text = open(path, encoding="utf-8").read()
+    # 整个客户端: 安装脚本 + 随面板分发的装机件 (CLI 里才有 `ui fix`, LuCI 兜底还在安装脚本里)
+    text = _client_source()
     code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
     luci_dir = os.path.join(os.path.dirname(path), "luci")
 
@@ -599,7 +648,7 @@ def test_install_script_builds_the_perf_mode_switch_the_honest_way():
     """
     from zeroproxy import router_client
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
     code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
 
     for needed in ("zp_perf_enter", "zp_perf_leave", "zp_perf_live", "zp_perf_tick", "zp_perf_prepare"):
@@ -761,7 +810,7 @@ def test_install_while_perf_mode_is_on_does_not_misdiagnose():
     """
     from zeroproxy import router_client
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
     assert "数据面: 内核态 eBPF (dae)" in text, "DATAPATH 的 case 里要有 ebpf 那一支"
     assert "模式     内核态 eBPF (性能模式" in text, "摘要的「模式」那一行也要认这一档"
     assert 'ACTIVE_MODE="ebpf"' in text, "verify() 的性能模式分支要设 ACTIVE_MODE"
@@ -1126,7 +1175,7 @@ def test_install_script_probes_capabilities_and_reports_honestly():
     """
     from zeroproxy import router_client
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
 
     # ① 每一级都往内核里真做一次
     assert "ip tuntap add dev zp0probe mode tun" in text, "TUN 要真建一个设备再删掉"
@@ -1148,6 +1197,40 @@ def test_install_script_probes_capabilities_and_reports_honestly():
     assert "datapath_live" in text, "生效与否看设备/表在不在, 不看命令退出码"
 
 
+def test_router_live_state_has_a_single_source():
+    """数据面"现场"的判据只能有一份。
+
+    真机教训: 同一个问题 (现在哪一级真的在接管) 被四处各算一遍 —— 安装脚本、控制 agent
+    的心跳、运维 CLI (status / doctor)、本地界面 (zpcore)。靠注释里的"必须一致"维持,
+    而它已经漂了: 性能模式 (eBPF / dae) 下 mihomo 是停的, CLI 的 status 只看 zp-tun /
+    nft / iptables, 于是报"未生效"; doctor 也把在跑的 dae 说成"服务没在跑"。现在收敛到
+    live.sh (zp_live_mode / zp_live_covered / zp_level_live) —— 谁都别再多抄一份。
+
+    这条测试钉住的是**结构**: 判据落在一个单独的文件里、每个消费者都从它取。否则下一次
+    加一级数据面, 又会有人漏改其中一处, 而真机上没人看得出来。
+    """
+    text = _client_source()
+
+    # ① 唯一判据落在一个单独的、由面板分发的文件里: client/runtime/live.sh
+    live = _runtime_file("live.sh")
+    assert "zp_live_mode()" in live and "zp_live_covered()" in live and "zp_level_live()" in live
+    # ② eBPF (dae) 那一档必须在判据里 —— 漂移正是从它开始的; 且复用 perf.sh 那一份判定
+    assert "zp_dae_running" in live and "zp_perf_live" in live, "dae 在不在复用 perf.sh 那一份"
+    # ③ 安装脚本是**取**它 (随面板分发), 不是自己 heredoc 生成
+    assert "install_runtime" in text and "runtime_put" in text
+    assert "/c/rt/" in text, "装机件由面板分发 (与内核 / 分流数据 / zpcore 同一条路)"
+    assert 'cat > "$ZP_DIR/live.sh" <<' not in text, "live.sh 不该再被 heredoc 生成"
+    # ④ 每个消费者都从它取, 不再各写一遍
+    assert 'if [ -r "$ZP_DIR/live.sh" ]; then zp_live_covered; return 0; fi' in text, \
+        "agent 的覆盖范围要取自 live.sh"
+    assert 'DP_REPORT="$(zp_live_mode' in text, "心跳报的 mode 要取自现场 (不是 caps 里的意图)"
+    assert '_lm="$(zp_live_mode' in text, "CLI 的 status 要取自同一份判据"
+    assert '_live="$(zp_live_mode' in text, "doctor 要取自同一份判据"
+    assert 'zp_level_live "$1"' in text, "安装脚本的 datapath_live 要委派给 live.sh"
+    # ⑤ 能力探测 (caps.chosen) 仍由面板用来渲染配置 —— 但"现场"是另一件事, 别再合并回去
+    assert "datapath_flag" in text, "面板要哪份配置仍看 caps 里的意图 (chosen)"
+
+
 def test_tun_firewall_allow_replaces_the_half_of_auto_redirect_we_drop():
     """8.74: auto-redirect 被拿去之后, 它本该写的**防火墙放行**必须由我们补上。
 
@@ -1162,7 +1245,7 @@ def test_tun_firewall_allow_replaces_the_half_of_auto_redirect_we_drop():
     """
     from zeroproxy import router_client
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
 
     # ① 补的那一半在, 两个方向都有, 且没有 fw4 的 fw3 机器也有一条路
     assert "zp_tunfw_allow" in text and "zp_tunfw_live" in text and "zp_tunfw_clear" in text
@@ -1191,15 +1274,12 @@ def test_generated_tunfw_helper_is_idempotent_and_symmetric(tmp_path):
     import re
     import subprocess
 
-    from zeroproxy import router_client
-
-    text = open(router_client.script_path(), encoding="utf-8").read()
-    m = re.search(r"cat > \"\$ZP_DIR/tunfw\.sh\" <<'TUNFWEOF'\n(.*?)\nTUNFWEOF", text, re.S)
-    assert m, "找不到 tunfw.sh 的生成块"
+    body = _runtime_file("tunfw.sh")
+    assert "zp_tunfw_allow" in body, "tunfw.sh 应当是随面板分发的装机件"
 
     home = tmp_path / "home"
     home.mkdir()
-    (home / "tunfw.sh").write_text(m.group(1), encoding="utf-8")
+    (home / "tunfw.sh").write_text(body, encoding="utf-8")
     fakebin = tmp_path / "bin"
     fakebin.mkdir()
     state = tmp_path / "state"
@@ -1310,7 +1390,7 @@ def test_geo_fetch_falls_back_to_mirrors_and_enforces_the_size_gate(tmp_path):
 
     from zeroproxy import router_client
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
     funcs = []
     for fn in ("zp_hsize", "start_progress", "stop_progress", "http_fetch_to",
                "show_body", "geo_size_for", "geo_mirrors_for", "geo_fetch_one"):
@@ -1411,7 +1491,7 @@ def test_install_script_never_fetches_geo_from_the_internet():
     """
     from zeroproxy import router_client
 
-    raw = open(router_client.script_path(), encoding="utf-8").read()
+    raw = _client_source()
     text = "\n".join(line for line in raw.splitlines() if not line.lstrip().startswith("#"))
     assert "/c/geo/" in text, "分流数据要从面板取"
     for host in ("github.com", "githubusercontent", "jsdelivr", "MetaCubeX", "ghproxy", "gh-proxy"):
@@ -1491,7 +1571,7 @@ def test_install_script_only_repairs_credentials_on_a_real_refusal():
     """
     from zeroproxy import router_client
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
     # 退出码必须先接住: `if ! cmd` 里的 $? 是取反之后的结果 (永远是 0), 那样判不出东西
     assert "_cfg_rc=$?" in text
     # 重新配对只挂在"HTTP 层面被拒"上
@@ -1527,7 +1607,7 @@ def test_optional_local_control_plane_never_breaks_the_install():
 
     from zeroproxy import router_client
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
     body = re.search(r"^install_zpcore\(\) \{.*?\n\}", text, re.S | re.M)
     assert body, "安装脚本里应当有 install_zpcore"
     assert "return 1" not in body.group(0), "可选件不许用非 0 返回 (set -e 会掐断整个安装)"
@@ -1552,7 +1632,7 @@ def test_installed_artifacts_are_replaced_when_the_panel_bumps_its_version():
     """
     from zeroproxy import router_client
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
     # 内核: 除了"能跑", 还要和面板要的那一版一致
     assert "core_version_ok" in text, "内核复用要看版本"
     assert "core_reusable && core_version_ok" in text
@@ -1598,13 +1678,10 @@ def test_heredoc_scripts_define_every_variable_they_use():
     """
     import re
 
-    from zeroproxy import router_client
-
-    text = open(router_client.script_path(), encoding="utf-8").read()
-    for marker in ("CLIEOF", "AGENTEOF"):
-        got = re.search(rf"<<'{marker}'\n(.*?)\n{marker}\n", text, re.S)
-        assert got, f"安装脚本里应当有 {marker} 这一段"
-        body = got.group(1)
+    # 这两段现在是随面板分发的装机件 (client/runtime/) —— 以前长在安装脚本的 heredoc 里。
+    for name in ("cli", "agent.sh"):
+        body = _runtime_file(name)
+        assert body, f"应当能读到装机件 {name}"
         # 这一段里自己赋值过的大写变量 (含大小写混排的自定义变量)
         assigned = set(re.findall(r"^\s*([A-Za-z_][A-Za-z0-9_]*)=", body, re.M))
         # 带默认值的引用 (${ZP_X:-…}) 不算 —— 它本来就允许为空, 那是"可选开关"的写法。
@@ -1613,7 +1690,7 @@ def test_heredoc_scripts_define_every_variable_they_use():
             re.findall(r"\$\{?(ZP_[A-Za-z0-9_]+)(:[-=+?])?", body)
             if not defaulted and name not in assigned
         })
-        assert not missing, f"{marker} 里用了但没定义的变量: {missing} (跨文件作用域不共享)"
+        assert not missing, f"{name} 里用了但没定义的变量: {missing} (跨文件作用域不共享)"
 
 
 def test_tun_mtu_follows_the_wan_and_is_clamped(client, configured):
@@ -1672,7 +1749,7 @@ def test_install_script_probes_the_wan_for_mtu_and_offload():
     """性能那一半的两条现场判据: WAN 的实际 MTU, 以及转发卸载会不会把代理绕过去。"""
     from zeroproxy import router_client
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
     # MTU: 只能从**本机**取 (面板不知道外面是 PPPoE 还是以太网), 而且要按 table main 取 ——
     # tun 的 auto-route 会把默认路由挪到自己那张表里, 重跑安装时按"默认路由"取会取到
     # zp-tun (1500), 那就成了"拿代理自己的 MTU 去算代理的 MTU"。
@@ -1743,7 +1820,7 @@ def test_doctor_answers_whether_traffic_actually_flows():
 
     from zeroproxy import router_client
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
     assert "doctor() {" in text and re.search(r"^\s*doctor$", text, re.M), "要定义并派发它"
     assert "doctor|status|ui|servers" in text, "用法里要列出它"
     # ① 现场核对 caps 里那一档是不是真的在 (不看命令退出码)
@@ -1818,7 +1895,7 @@ def test_local_override_lets_the_router_be_switched_without_the_panel():
 
     from zeroproxy import router_client
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
     assert "local.override" in text and "local-auto" in text
 
     # ① 覆盖优先: 读到 on/off 就压过面板算出来的 DESIRED_ALL
@@ -1887,7 +1964,7 @@ def test_one_click_update_is_wired_everywhere():
     """
     from zeroproxy import router_client
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
     assert "update-log)" in text and "update)" in text
     assert "/c/install.sh" in text, "更新走的是面板的固定更新命令"
     assert 'update.log' in text and "logger -t zeroproxy" in text
@@ -1954,7 +2031,7 @@ def test_revert_compares_against_the_install_baseline(tmp_path):
 
     from zeroproxy import router_client
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
     body = re.search(r"^revert_report\(\) \{.*?\n\}", text, re.S | re.M)
     assert body, "安装脚本里应当有 revert_report"
     assert "snapshot_baseline" in text, "快照要在装机时拍"
@@ -1998,7 +2075,7 @@ def test_install_ui_always_makes_a_token_and_prints_it():
     """
     from zeroproxy import router_client
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
     # 只在 install_ui 这一段里比顺序: "有没有 LuCI"这个判断现在别处也有 (doctor 里那条
     # 体检项、luci_install 自己那道闸门), 全文 index 会指到别处去 —— 而这一条要钉的是
     # **install_ui 内部**的顺序 (令牌先于 LuCI 分支无条件生成)。
@@ -2027,7 +2104,7 @@ def test_install_ui_verifies_and_falls_back_to_its_own_httpd():
     """
     from zeroproxy import router_client
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
 
     # 判据是页面里的 <title> —— cgi 脚本里没有它, 所以"脚本被当文件下载"不会误判成通过
     assert "UI_MARK='<title>ZeroProxy'" in text, "自检要看页面内容, 不能只看状态码"
@@ -2131,7 +2208,7 @@ def test_ui_probe_checks_content_not_just_the_status_code(tmp_path):
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         return srv, f"http://127.0.0.1:{srv.server_address[1]}/cgi-bin/zeroproxy"
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
     fn = re.search(r"ui_probe\(\) \{.*?\n\}", text, re.S)
     assert fn, "安装脚本里应当有 ui_probe"
     mark = re.search(r"UI_MARK='([^']*)'", text)
@@ -2173,7 +2250,7 @@ def test_local_httpd_init_script_only_binds_the_lan_address(tmp_path):
 
     from zeroproxy import router_client
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
     got = re.search(r"cat > \"\$ZP_INIT_UI\" <<'UIINITEOF'\n(.*?)\nUIINITEOF\n", text, re.S)
     assert got, "安装脚本里应当有兜底 httpd 的 init 脚本"
     init_body = (got.group(1)
@@ -2236,7 +2313,7 @@ def test_install_script_parses_booleans_on_any_sed():
 
     from zeroproxy import router_client
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
     body = re.search(r"json_get_bool\(\) \{.*?\n\}", text, re.S)
     assert body, "安装脚本里应当有 json_get_bool"
     script = body.group(0) + (
@@ -2265,7 +2342,7 @@ def test_install_script_sticks_to_busybox_tools():
 
     from zeroproxy import router_client
 
-    raw = open(router_client.script_path(), encoding="utf-8").read()
+    raw = _client_source()
     # 只看真正的命令行: 注释里当然可以提到 od (解释"为什么不能用它"的那段)
     text = "\n".join(line for line in raw.splitlines() if not line.lstrip().startswith("#"))
     for tool in ("od", "hexdump", "xxd", "readelf", "jq", "python3", "perl", "dpkg", "apt"):
@@ -2287,7 +2364,7 @@ def test_install_script_self_heals_rejected_credentials():
     """
     from zeroproxy import router_client
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
     assert "do_pair()" in text, "配对逻辑要能被复用 (首次接入与凭据失效重接走同一条路)"
     assert "用本次配对码重新接入" in text, "凭据被拒时必须自动重接, 而不是直接失败"
     assert "重新接入失败" in text and "重新生成一条安装命令" in text, "重接也失败时要给出可执行的下一步"
@@ -2306,7 +2383,7 @@ def test_install_script_handles_openwrt_25_and_never_hangs_on_the_core():
     """
     from zeroproxy import router_client
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
     code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
 
     # 一、两代包管理器
@@ -2351,7 +2428,7 @@ def test_install_script_picks_the_right_package_manager_per_firmware():
     """
     from zeroproxy import router_client
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
     code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
 
     # 两代都认 (旧行为保留)
@@ -2389,7 +2466,7 @@ def test_install_script_auto_fixes_missing_kernel_btf():
     """
     from zeroproxy import router_client
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
     code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
 
     # 候选路径: 与 libbpf / cilium-ebpf 的 findVMLinux 一致 (sysfs 那份排第一, 补进来的在
@@ -2577,7 +2654,7 @@ def test_install_script_ships_a_lan_only_redirect_datapath():
     """
     from zeroproxy import router_client
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
 
     # 探测与落地都要有
     assert "redirect_ok()" in text and "zp_redirect_apply" in text and "zp_redirect_clear" in text
@@ -2613,7 +2690,7 @@ def test_datapath_ladder_helpers_run_on_any_sh():
 
     from zeroproxy import router_client
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
     parts = []
     for name in ("ladder_below", "rung_usable"):
         match = re.search(rf"^{name}\(\) \{{.*?\n\}}", text, re.S | re.M)
@@ -2646,7 +2723,7 @@ def test_datapath_wiring_is_complete_and_caps_says_what_it_chose(tmp_path):
 
     from zeroproxy import router_client
 
-    text = open(router_client.script_path(), encoding="utf-8").read()
+    text = _client_source()
 
     # 一、verify 这条链上用到的函数一个都不能缺 (纯静态, 便宜且直接命中 not found)
     defined = set(re.findall(r"^([A-Za-z_][A-Za-z0-9_]*)\(\) \{", text, re.M))

@@ -37,14 +37,17 @@ const usage = `zpcore —— ZeroProxy 路由器本地控制面
 
 用法:
   zpcore serve [选项]      起本地管理界面 (只绑局域网地址)
+  zpcore state [--json]    打印这台机器现在的状态 (现场 + 能力): shell 与面板读它
   zpcore version           打印版本
 
-serve 选项:
+通用选项 (serve / state / config 都认):
   --dir <路径>       运行目录 (默认 /etc/zeroproxy)
-  --bind <地址>      监听地址 (默认自动找局域网 IP; 找不到就拒绝启动)
-  --port <端口>      监听端口 (默认读 <dir>/ui.port, 再退回 8399)
   --cli <路径>       执行手动动作的 CLI (默认 /usr/bin/zeroproxy)
   --init <路径>      内核的 init 脚本 (默认 /etc/init.d/zeroproxy; 用它判断内核在不在跑)
+
+serve 另加:
+  --bind <地址>      监听地址 (默认自动找局域网 IP; 找不到就拒绝启动)
+  --port <端口>      监听端口 (默认读 <dir>/ui.port, 再退回 8399)
   --allow-wan        允许绑非局域网地址 (默认**拒绝**: 管理界面不该挂到 WAN 上)
 `
 
@@ -66,6 +69,16 @@ func main() {
 			fmt.Fprintln(os.Stderr, "zpcore: 启动失败:", err)
 			os.Exit(1)
 		}
+	case "state":
+		common, asJSON, err := parseState(args)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "zpcore:", err)
+			os.Exit(2)
+		}
+		if err := printState(common, asJSON); err != nil {
+			fmt.Fprintln(os.Stderr, "zpcore: 读状态失败:", err)
+			os.Exit(1)
+		}
 	case "version", "-v", "--version":
 		fmt.Printf("zpcore %s\n", agentVersion)
 	case "-h", "--help", "help":
@@ -76,22 +89,89 @@ func main() {
 	}
 }
 
+// commonConfig 是三个子命令共用的那几件东西: 运行目录、手动动作的 CLI、内核 init。
+type commonConfig struct {
+	dir   string
+	cli   string
+	initd string
+}
+
 type serveConfig struct {
-	dir      string
+	commonConfig
 	bind     string
 	port     int
-	cli      string
-	initd    string
 	allowWAN bool
 	token    string
 }
 
-func parseServe(args []string) (serveConfig, error) {
-	cfg := serveConfig{
+// parseCommon 认 --dir / --cli / --init 三个通用选项, 返回 (配置, 认不出来的参数)。
+// 单独拆出来是因为 state / config 也要它们, 而它们既不需要令牌也不需要监听地址。
+func parseCommon(args []string) (commonConfig, []string, error) {
+	cfg := commonConfig{
 		dir:   "/etc/zeroproxy",
-		port:  0,
 		cli:   "/usr/bin/zeroproxy",
 		initd: "/etc/init.d/zeroproxy",
+	}
+	rest := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		next := func() (string, error) {
+			if i+1 >= len(args) {
+				return "", fmt.Errorf("%s 后面缺少参数", arg)
+			}
+			i++
+			return args[i], nil
+		}
+		switch arg {
+		case "--dir":
+			v, err := next()
+			if err != nil {
+				return cfg, nil, err
+			}
+			cfg.dir = v
+		case "--cli":
+			v, err := next()
+			if err != nil {
+				return cfg, nil, err
+			}
+			cfg.cli = v
+		case "--init":
+			v, err := next()
+			if err != nil {
+				return cfg, nil, err
+			}
+			cfg.initd = v
+		default:
+			rest = append(rest, arg)
+		}
+	}
+	return cfg, rest, nil
+}
+
+// parseState 认通用选项 + --json。
+func parseState(args []string) (commonConfig, bool, error) {
+	common, rest, err := parseCommon(args)
+	if err != nil {
+		return common, false, err
+	}
+	asJSON := false
+	for _, arg := range rest {
+		if arg != "--json" {
+			return common, false, fmt.Errorf("不认识的选项: %q", arg)
+		}
+		asJSON = true
+	}
+	return common, asJSON, nil
+}
+
+func parseServe(args []string) (serveConfig, error) {
+	cfg := serveConfig{
+		commonConfig: commonConfig{
+			dir:   "/etc/zeroproxy",
+			cli:   "/usr/bin/zeroproxy",
+			initd: "/etc/init.d/zeroproxy",
+		},
+		port: 0,
 	}
 	for i := 0; i < len(args); i++ {
 		arg := args[i]

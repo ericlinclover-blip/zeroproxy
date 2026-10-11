@@ -1,0 +1,87 @@
+#!/bin/sh /etc/rc.common
+# ZeroProxy 代理内核 (mihomo)
+START=99
+STOP=05
+USE_PROCD=1
+
+ZP_DIR=/etc/zeroproxy
+CONF="$ZP_DIR/config.yaml"
+
+# 按 caps 里的 chosen 落数据面规则。三件事要一起做: 撤掉**别的**模式的规则 (昨天 tun、
+# 今天 redirect 时不留残渣), 落当前这一套, 再刷一次 dnsmasq 让它丢掉旧缓存。
+zp_apply_datapath() {
+    _mode="$(sed -n 's/^chosen=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
+    case "$_mode" in
+        tun|tproxy|redirect) ;;
+        *)
+            # 老版本升级上来的 caps 没有 chosen: 保留原来的判据 (tun 能力位 + 设备节点)
+            if [ -f "$ZP_DIR/caps" ]; then
+                if grep -q '^tun=1' "$ZP_DIR/caps" 2>/dev/null; then _mode=tun; else _mode=tproxy; fi
+            elif [ ! -c /dev/net/tun ]; then
+                _mode=tproxy
+            else
+                _mode=tun
+            fi
+            ;;
+    esac
+
+    # 撤掉不用的那两套 (只动我们自己的表/链)
+    if [ "$_mode" != "tproxy" ]; then
+        nft delete table inet zp_router 2>/dev/null || true
+    fi
+    if [ "$_mode" != "redirect" ] && [ -f "$ZP_DIR/redirect.sh" ]; then
+        . "$ZP_DIR/redirect.sh"
+        zp_redirect_clear 2>/dev/null || true
+    fi
+    if [ "$_mode" != "tun" ] && [ -f "$ZP_DIR/tunfw.sh" ]; then
+        . "$ZP_DIR/tunfw.sh"
+        zp_tunfw_clear 2>/dev/null || true
+    fi
+
+    # 落当前这一套
+    if [ "$_mode" = "tproxy" ]; then
+        nft -f "$ZP_DIR/tproxy.nft" 2>/dev/null || true
+    elif [ "$_mode" = "redirect" ] && [ -f "$ZP_DIR/redirect.sh" ]; then
+        . "$ZP_DIR/redirect.sh"
+        zp_redirect_apply 2>/dev/null || true
+    elif [ "$_mode" = "tun" ] && [ -f "$ZP_DIR/tunfw.sh" ]; then
+        # tun 由内核接管路由; 但 auto-redirect 没跑成时, **转发进/出 tun 要靠防火墙放行**
+        # (见 tunfw.sh 顶部) —— 少了这一步, 局域网就被丢包, 而路由器自己一切正常。
+        . "$ZP_DIR/tunfw.sh"
+        zp_tunfw_allow 2>/dev/null || true
+    fi
+    killall -HUP dnsmasq 2>/dev/null || true
+}
+
+start_service() {
+    [ -x "$ZP_DIR/mihomo" ] || return 0
+    [ -f "$CONF" ] || return 0
+
+    # TUN 模式: 由内核接管路由与 DNS, 不需要动防火墙。
+    # 走哪一级由 caps 里的 chosen 决定 (装机时探测 + 必要时降级), 而不是"节点在不在":
+    # 原厂固件上 /dev/net/tun 存在但内核建不出设备, 那时该走 tproxy / redirect 而不是空转。
+    zp_apply_datapath
+
+    procd_open_instance
+    procd_set_param command "$ZP_DIR/mihomo" -d "$ZP_DIR" -f "$CONF"
+    procd_set_param respawn 3600 5 5
+    procd_set_param file "$CONF"
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
+
+stop_service() {
+    nft delete table inet zp_router 2>/dev/null || true
+    if [ -f "$ZP_DIR/redirect.sh" ]; then
+        . "$ZP_DIR/redirect.sh"
+        zp_redirect_clear 2>/dev/null || true
+    fi
+    if [ -f "$ZP_DIR/tunfw.sh" ]; then
+        . "$ZP_DIR/tunfw.sh"
+        zp_tunfw_clear 2>/dev/null || true
+    fi
+    killall -HUP dnsmasq 2>/dev/null || true
+}
+
+service_triggers() { procd_add_reload_trigger zeroproxy; }

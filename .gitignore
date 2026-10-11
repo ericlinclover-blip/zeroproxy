@@ -19,3 +19,6 @@ hysteria/key.pem
 
 # 本地临时文件
 work/
+
+# Go 构建时落在源码目录里的可执行文件 (制品由 scripts/build-agent.sh 产出到 dist/)
+backend/zeroproxy/client/agent/zpcore

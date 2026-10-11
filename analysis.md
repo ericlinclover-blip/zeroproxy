@@ -1,6 +1,6 @@
 # ZeroProxy 架构现状
 
-> 快照: **2026-10-10** · 面板 **v2.11.36** · 路由器客户端 **v1.4.32** · `state.json` schema **v5**
+> 快照: **2026-10-11** · 面板 **v2.11.40** · 路由器客户端 **v1.4.35** (zpcore **1.3.0**) · `state.json` schema **v5**
 > 本文回答"**现在是什么样**"。另外两份文档分工不同, 不要混读:
 > `README.md` 是逐版开发日志 (4000+ 行, 每一版为什么这么改、哪次真机踩的坑);
 > `docs/RESEARCH.md` 与 `docs/ROUTER-CLIENT-REDESIGN.md` 是竞品调研与设计依据。
@@ -323,6 +323,24 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
   (家里网出问题时恰恰是面板最容易联系不上的时候); `zeroproxy revert` 停用后与装机前的防火墙/策略路由
   **快照逐条比对**, 给出「一致 / 还有残留 + 差在哪一项」的结论。`zeroproxy doctor` 用带 `counter` 的规则
   回答「规则存在 ≠ 有流量经过」。
+* **"现场"判据只有一份**: "现在哪一级真的在接管"由 `/etc/zeroproxy/live.sh` 独家回答
+  (`zp_live_mode` / `zp_live_covered` / `zp_level_live`, 判据一律是现场 —— dae 进程 / `zp-tun` /
+  nft 表 / iptables 链)。安装脚本、agent 心跳、CLI(`status`/`doctor`)、本地界面(zpcore) 都 `source`
+  它, 不再各写一遍 —— 以前那份判据被抄了四遍, 而 eBPF 那一档下 mihomo 是停的, 于是"只看
+  `zp-tun`/nft/iptables"的副本会把在跑的 dae 报成"未生效"(8.88)。心跳报的 `mode` 也改成现场,
+  与 `covered` 同源(面板要"渲染哪份配置"时另问 `caps` 里的意图 `chosen`)。
+* **装机件是制品, 不是现场生成的**: live.sh / nft 规则 / 数据面脚本 (redirect / tunfw / perf) /
+  agent / CLI / 三个 init 脚本, 都放在 `client/runtime/` 里随面板分发 (`/c/rt/<name>`, 匿名 +
+  白名单), 安装脚本只做"取回来 → 替两个占位符 → 落盘"(`install_runtime` / `runtime_put`)。
+  以前它们是安装脚本用 heredoc 现场捏的: 每个文件都改不动、也单测不了, 而 `router-install.sh`
+  长到 5578 行 —— 现在 3040 行。取不到时保留本机已有的那份 (8.79 的规矩)。面板侧
+  `router_client.RUNTIME_FILES` / `runtime_file()` 是那份清单; 演练用 `ZP_RUNTIME_DIR` 指到
+  一份"路径已改写"的副本上 (与 `patch_for_local_run` 同一套替换)。
+* **状态只有一个生产者**: `zpcore state [--json]` 独家回答"这台机器现在是怎么个情况" ——
+  一处解析 `caps`、一处探现场、一处算覆盖, 再带性能模式那几张牌与接口计数。shell 按 `caps`
+  那套 `key=value` 读它 (`live.sh` 先看调用方有没有把整份取下来 → 再问 `zpcore state` →
+  都没有才用内联判据), `agent.sh` 的 `caps_get` 也从这份快照读; 本地界面的 status 与它由
+  同一个 snapshot 组装。zpcore 因此**仍是可选件** (8.91)。
 * **IPv6 一并接管**: 设备装机时探一次这一档数据面能否覆盖 v6, 能就给双栈配置, 接不了如实上报。
 * **界面文件原子落盘**: LuCI 那三件套 (菜单 / 权限 / 承载页) 与 cgi、页面文件都走
   "临时文件 → 校验 → mv"; 取不到就保留本机原来那份 (一次失败的请求不许毁掉能用的文件)。
@@ -421,9 +439,9 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
 
 | 脚本 | 覆盖 |
 |---|---|
-| `backend/tests/` (pytest) | **323 通过 + 6 skip** (无真实内核二进制时跳过)。dry-run 全流程 + 安全边界 + 状态迁移 |
+| `backend/tests/` (pytest) | **325 通过 + 6 skip** (无真实内核二进制时跳过)。dry-run 全流程 + 安全边界 + 状态迁移 + 装机件端点契约 |
 | `scripts/verify.py` | 用真实 Xray/Hysteria/mihomo/sing-box 校验生成的配置与订阅 (含**两台机器真跑一条链**) |
-| `scripts/router_install_check.py` | **182 项**。真的用 shell 跑一遍路由器安装脚本: 七类机器 (含 OpenWrt 25.12 / apk 三态 / BTF 两种现场 / 性能模式的进-出-回退) / 本机覆盖 / revert 比对 / zpcore 真跑 / **第一跳** (面板生成的那一行命令外面顶一个 uclient-fetch 替身: 丢包重试、自签面板按证书状态跳过校验、配对码失效时读得到原因; 旧写法的"什么都没有发生"与命令长度都钉在测试里)。性能模式那一节的假 dae **照真机复刻两条硬规矩** (0644 拒 / node 键带引号拒) 并先自证一次 —— 它以前无条件 exit 0, 于是这两类事故在演练里永远是绿的; 另有"停不掉的 mihomo"(真进程)、"切换期间 agent 不许拉起标准模式"、"出口等于本机 WAN 地址时不算通"与"cgi 的 status 必须带 perf.live" |
+| `scripts/router_install_check.py` | **199 项**。真的用 shell 跑一遍路由器安装脚本: 七类机器 (含 OpenWrt 25.12 / apk 三态 / BTF 两种现场 / 性能模式的进-出-回退) / 本机覆盖 / revert 比对 / zpcore 真跑 / **第一跳** (面板生成的那一行命令外面顶一个 uclient-fetch 替身: 丢包重试、自签面板按证书状态跳过校验、配对码失效时读得到原因; 旧写法的"什么都没有发生"与命令长度都钉在测试里)。性能模式那一节的假 dae **照真机复刻两条硬规矩** (0644 拒 / node 键带引号拒) 并先自证一次 —— 它以前无条件 exit 0, 于是这两类事故在演练里永远是绿的; 另有"停不掉的 mihomo"(真进程)、"切换期间 agent 不许拉起标准模式"、"出口等于本机 WAN 地址时不算通"与"cgi 的 status 必须带 perf.live"。**四个现场入口的一致性矩阵** (8.90): 四档 mihomo 数据面各跑一遍, CLI `status` / `doctor` / 本地界面 (zpcore) / agent 心跳必须报同一档 mode 与同一档 covered —— 假工具按一个状态文件说话, 所以四档只起一次 zpcore、装一次机器; 外加 `zpcore state` 的 key=value 与 `--json` 两个契约 |
 | `scripts/browser_check.cjs` | **157 项**, 真 Chromium 走「初始化 → 仪表盘」全流程 + 交互 + CSP + 截图 |
 | `scripts/clients_check.cjs` | 真实浏览器点客户端开关 |
 | `scripts/router_ui_check.cjs` | **62 项**。路由器本地界面 (含「没有更新记录时不许凭空长出进度面板」这类判据, 以及性能模式那块**速率表**: 真实浏览器里点一次, 看刻度/切换五段/真实读数/出口/熄火)。8.86 重做表盘时这一节的断言按新契约改过, 但**这台机器上没有 playwright, 没能在这里跑** —— 只做了静态更新 (下一次在有浏览器的地方跑时要留意) |
@@ -437,7 +455,7 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
 
 ## 16. 已知技术债 / 待办
 
-* **超长单文件**: `routes.py` (3293 行) / `router-install.sh` (~4 220 行) / `scripts/browser_check.cjs` (~82 KB)。
+* **超长单文件**: `routes.py` (~3 320 行) / `router-install.sh` (~3 040 行, 8.89 把运行时装机件搬去了 `client/runtime/`, 从 5578 行降下来) / `scripts/browser_check.cjs` (~82 KB) / `scripts/router_install_check.py` (~2 300 行, 仍在长)。
   注释密度很高、内部有分区, 但单文件到这个体量, 后续定位成本会持续上升。
 * **文档重叠**: README (逐版日志) 与本文、`docs/` 三份之间有信息重叠; README 面向历史, 本文面向现状,
   长期需要保持本文随代码更新 (否则又会退回「过期快照」)。

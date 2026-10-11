@@ -1,0 +1,48 @@
+table inet zp_router {
+    set local4 {
+        type ipv4_addr
+        flags interval
+        elements = { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8,
+                     169.254.0.0/16, 172.16.0.0/12, 192.0.0.0/24, 192.168.0.0/16,
+                     224.0.0.0/4, 240.0.0.0/4, 198.18.0.0/16 }
+    }
+    # IPv6 那一半。**不能只做 v4**: 局域网设备从运营商那里拿到原生 v6, 而只接管 v4 的
+    # 透明代理对 v6 是不存在的 —— 那些流量会直接出去 (真机上看起来一切正常, 但目标网站
+    # 看到的是你的真实 v6 地址, 代理等于没装)。mihomo 自己的 `ipv6: false` 也挡不住它
+    # (上游 issue #2254: "TUN interface does not disable IPv6 protocol stack"), 所以这里
+    # 必须显式接管: 私有地址与链路本地先放行 (局域网互访 / 邻居发现), 其余进代理。
+    set local6 {
+        type ipv6_addr
+        flags interval
+        elements = { ::1/128, fc00::/7, fe80::/10, ff00::/8 }
+    }
+    chain pre {
+        type filter hook prerouting priority -150; policy accept;
+        ip daddr @local4 return
+        ip6 daddr @local6 return
+        meta mark 0x1ff return
+        meta l4proto { tcp, udp } th dport { 22, 53, 7890, 7874, 9092, 9090 } return
+        # counter 不是可有可无的装饰: **规则存在 ≠ 有流量经过**。接口名写错时规则照样
+        # "装上", 却一个包都不命中 —— 这个计数是唯一能证明"真的接管了"的现场证据,
+        # `zeroproxy doctor` 读的就是它。
+        #
+        # **家族必须写出来** (`tproxy ip` / `tproxy ip6`), 不能省成 `tproxy to :7893`。
+        # 省掉之后它在 inet 表里是"未指定家族", 而这条规则要同时管 v4 与 v6 —— 真机上
+        # 试过: 加了 `ip6` 限定再省家族, nft 直接报 "conflicting protocols specified:
+        # ip6 vs. unknown. You must specify ip or ip6 family in tproxy statement"。
+        # 与其推断"未指定是不是等于两个都管", 不如写死两条 (代价是各多一条规则)。
+        meta nfproto ipv4 meta l4proto tcp counter meta mark set 0x1ff tproxy ip to :7893 accept
+        meta nfproto ipv4 meta l4proto udp counter meta mark set 0x1ff tproxy ip to :7893 accept
+        meta nfproto ipv6 meta l4proto tcp counter meta mark set 0x1ff tproxy ip6 to :7893 accept
+        meta nfproto ipv6 meta l4proto udp counter meta mark set 0x1ff tproxy ip6 to :7893 accept
+    }
+    chain dns {
+        type nat hook prerouting priority -105; policy accept;
+        ip daddr @local4 return
+        ip6 daddr @local6 return
+        # DNS 单独计数: "局域网设备真的把 DNS 发给了路由器吗"这个问题只有它能回答
+        # (dnsmasq 我们一个字节都没改, 所以这件事必须验, 不能假设)。
+        udp dport 53 counter redirect to :7874
+        tcp dport 53 counter redirect to :7874
+    }
+}

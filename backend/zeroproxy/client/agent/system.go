@@ -104,10 +104,12 @@ func isLANIP(ip string) bool {
 // liveMode 判断内核**现在**接管到哪 —— 看现场 (设备/表在不在), 不看 caps 里的意图。
 // 与安装脚本的 datapath_live / agent.sh 的 actual_covered 是同一条判据, 三处必须一致,
 // 否则面板、路由界面、CLI 会各说各话。
-func liveMode() (mode string, covered string) {
+// initd 是内核的 init 脚本路径; **性能模式那一个**按同样的约定取 (zeroproxy → zeroproxy-perf),
+// 于是 dae 的"在不在"有一条不依赖 /proc 的退路 (macOS 上没有 /proc, 而真机上 procd 才是权威)。
+func liveMode(initd string) (mode string, covered string) {
 	// 性能模式排第一: 它开着的时候 mihomo 是停的 (下面几条都不会命中), 但顺序上先说清楚 ——
 	// "谁在接管"是界面上最该回答的问题。判据同样是现场: dae 进程在不在。
-	if daeRunning() {
+	if daeRunning(initd) {
 		return "ebpf", "full"
 	}
 	if ok(probeTimeout, "ip", "link", "show", "zp-tun") {
@@ -122,28 +124,33 @@ func liveMode() (mode string, covered string) {
 	return "none", "none"
 }
 
-// daeRunning 判断性能模式的内核 (dae) 在不在 —— 直接翻 /proc, 不起进程。
-// 为什么不用 pidof: 这个函数在每一次界面轮询里都会被走到 (表盘要按状态刷新), 而路由器上
-// fork 是要花钱的; 读 /proc 一次就够, 而且对"进程名被截断"这类固件差异更稳。
-func daeRunning() bool {
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
+// daeRunning 判断性能模式的内核 (dae) 在不在。三条判据, 与 perf.sh 的 zp_perf_live 同一套
+// 优先级 (进程优先, 服务兜底) —— 两边必须给出同一个答案, 否则界面与命令行又会对不上:
+//   1. 有 pidof → 只认它 (busybox 上就有; 路由器上 fork 一次不贵, 而它最直接);
+//   2. 没有 pidof 但有 /proc → 直接翻 comm, 不起进程 (每一次界面轮询都会走到这里);
+//   3. 两者都没有 (macOS 这类) → 问性能模式自己的服务 (真机上 procd 才是权威)。
+func daeRunning(initd string) bool {
+	if path, err := exec.LookPath("pidof"); err == nil {
+		_, good := run(probeTimeout, path, "dae")
+		return good
+	}
+	if entries, err := os.ReadDir("/proc"); err == nil {
+		for _, entry := range entries {
+			name := entry.Name()
+			if name == "" || name[0] < '0' || name[0] > '9' {
+				continue
+			}
+			comm, err := os.ReadFile(filepath.Join("/proc", name, "comm"))
+			if err != nil {
+				continue
+			}
+			if strings.TrimSpace(string(comm)) == "dae" {
+				return true
+			}
+		}
 		return false
 	}
-	for _, entry := range entries {
-		name := entry.Name()
-		if name == "" || name[0] < '0' || name[0] > '9' {
-			continue
-		}
-		comm, err := os.ReadFile(filepath.Join("/proc", name, "comm"))
-		if err != nil {
-			continue
-		}
-		if strings.TrimSpace(string(comm)) == "dae" {
-			return true
-		}
-	}
-	return false
+	return ok(probeTimeout, initd+"-perf", "running")
 }
 
 // wanBytes 是 WAN 口的收+发字节数。界面那块表盘的转速就是它算出来的 —— 真流量才有转速,

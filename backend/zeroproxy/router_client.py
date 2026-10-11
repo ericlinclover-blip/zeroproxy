@@ -130,7 +130,20 @@ from .config import paths
 #:         摘要的「模式」那一行都补 `ebpf` 那一支、verify() 在性能模式分支里要设 ACTIVE_MODE、
 #:         探测结论不采信 (回填 caps 里空机探测过的能力位, 否则那台机器的底子会被这次探测
 #:         冲掉); 装机输出里那个"出口"也照 8.86 的口径标 (本机) (8.87)。
-SCRIPT_VERSION = "1.4.32"
+#: 1.4.33: "现在哪一级真的在接管"这个判据以前被四处各写一遍 (安装脚本 / agent 心跳 / CLI
+#:         的 status 与 doctor / 本地界面 zpcore), 靠注释里的"必须一致"维持 —— 真机上它漂了:
+#:         性能模式 (eBPF / dae) 下 mihomo 是停的, CLI 的 status 只看 zp-tun / nft / iptables,
+#:         于是报"未生效"; doctor 也把在跑的 dae 说成"服务没在跑"。现在收敛到一份单独的
+#:         live.sh (zp_live_mode / zp_live_covered / zp_level_live), 四个消费者都从它取;
+#:         心跳报的 mode 也改成**现场** (以前报的是 caps 里的意图, 与 covered 会打架) (8.88)。
+#: 1.4.34: 运行时装机件 (live.sh / nft 规则 / 数据面脚本 / agent / CLI / init 脚本) 从安装
+#:         脚本的 heredoc 里搬出来, 变成仓库里版本化的文件 (client/runtime/), 随面板分发
+#:         (`/c/rt/<name>`)。安装脚本因此从 5578 行缩到 3040 行, 而每个装机件终于能单独
+#:         shellcheck / 单测; 取不到时保留本机已有的那份 (升级不许毁掉能用的东西) (8.89)。
+#: 1.4.35: 状态收进唯一的生产者 (zpcore 1.3.0 的 `state`): live.sh 与 agent.sh 都从它取
+#:         现场 (取不到才用各自那份等价的内联判据) —— 于是"谁在接管"这台机器上只有一个
+#:         地方算 (8.91)。
+SCRIPT_VERSION = "1.4.35"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"
@@ -1405,6 +1418,56 @@ def ui_file(name: str) -> tuple[str, str, str] | None:
         return fh.read(), media, os.path.basename(rel)
 
 
+# ---------------------------------------------------------------- 运行时装机件 (client/runtime/)
+# 这些是安装脚本**以前用 heredoc 现场生成**的文件: live.sh / nft 规则 / 数据面脚本
+# (redirect / tunfw / perf) / 控制 agent / 运维 CLI / 三个 init 脚本。它们一直是客户端里
+# 最要命的那部分, 却因为"长在 heredoc 里"而没法单独 shellcheck、没法单测, 安装脚本自己
+# 也长成一个 5000 行的单体。现在它们是仓库里版本化的文件, 跟着面板分发 —— 与内核 / 分流
+# 数据 / zpcore 同一条路 (路由器只访问面板一个地址)。
+#
+# 名字走白名单: 这个端点匿名可达 (装机时路由器还没有凭据), 不能变成任意文件读取。
+# 内容不含任何机密 —— 就是脚本本身。
+RUNTIME_FILES = (
+    "live.sh",
+    "tproxy.nft",
+    "redirect.sh",
+    "tunfw.sh",
+    "perf.sh",
+    "agent.sh",
+    "cli",
+    "zeroproxy.init",
+    "zeroproxy-agent.init",
+    "zeroproxy-perf.init",
+)
+
+
+def runtime_dir() -> str:
+    # ZP_RUNTIME_DIR 是给演练用的 (与 ZP_AGENT_DIR 同一个用法): 真机上是 client/runtime/;
+    # 演练要把整套东西装到临时根目录里跑, 所以它会指到一份"路径已改写"的副本上。
+    explicit = os.environ.get("ZP_RUNTIME_DIR", "").strip()
+    if explicit:
+        return explicit
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "client", "runtime")
+
+
+def runtime_file(name: str) -> tuple[str, str] | None:
+    """读一份运行时装机件。返回 (正文, 文件名), 未登记的名字返回 None。
+
+    `__ZP_CLIENT_VERSION__` 在这里替换成真实版本 (与 render_script 对安装脚本做的是同一步),
+    于是客户端拿到的就是能直接落盘的正文; 机器相关的 `__ZP_LANIF__` 留给客户端替换 ——
+    面板不知道对面是哪一台机器、它的局域网接口叫什么。
+    """
+    if name not in RUNTIME_FILES:
+        return None
+    path = os.path.join(runtime_dir(), name)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            body = fh.read()
+    except OSError:
+        return None
+    return body.replace("__ZP_CLIENT_VERSION__", SCRIPT_VERSION), name
+
+
 def render_script(base: str, code: str) -> str:
     """把面板地址与配对码烘进安装脚本。
 
@@ -1461,7 +1524,11 @@ def summary() -> dict:
 #: 路由器会一直拿到旧二进制, 而"界面少了一块表盘 / 少一种模式"这种问题在真机上极难看出来。
 #: 1.2.2: 认性能模式 (dae) 这一档 —— mode=ebpf / covered=full, status 多一组 perf 字段
 #:        与 WAN 字节数, 并多分发一个 perf.js (那块跑车仪表盘)。
-AGENT_VERSION = os.environ.get("ZP_AGENT_VERSION", "1.2.2")
+#: 1.3.0: zpcore 成了**状态的唯一生产者** (`zpcore state`): 一处解析 caps、一处探现场、
+#:        一处算覆盖, 本地界面与 shell (live.sh / agent.sh) 都从它取 —— 以前这份状态被
+#:        四处各拼一遍, 真机上漂过 (8.88)。新增 `state [--json]` 子命令与 --dir/--cli/--init
+#:        通用选项; `serve` 的 status 与 `state` 由同一份 snapshot 组装 (8.91)。
+AGENT_VERSION = os.environ.get("ZP_AGENT_VERSION", "1.3.0")
 
 #: 小于这个大小的一律不当二进制 (一份正常的 zpcore.gz 约 2.5 MB)。演练里可以用
 #: ZP_AGENT_MIN_BYTES 调低。

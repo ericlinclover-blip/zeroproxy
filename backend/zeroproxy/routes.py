@@ -3418,6 +3418,29 @@ def client_ui_file(name: str, request: Request):
     return Response(body, media_type=media, headers={"cache-control": "no-store"})
 
 
+@router.get("/c/rt/{name}")
+def client_runtime_file(name: str, request: Request):
+    """运行时装机件 (live.sh / 数据面脚本 / agent / CLI / init 脚本 / nft 规则)。
+
+    与 /c/ui/{name}、/c/bin、/c/geo 同一性质: 匿名可达, 名字走白名单, 内容不含任何凭据 ——
+    装机时路由器还没有凭据, 而这些正是它要落盘的东西。以前它们是安装脚本用 heredoc 现场
+    生成的 (每个文件都改不动、也测不了); 现在它们是仓库里版本化的文件 (client/runtime/),
+    安装脚本只负责取回来 + 替换本机占位符 + 落盘。
+    """
+    state = load_state()
+    if not state["configured"]:
+        return _err("面板尚未初始化", 409)
+    got = router_client.runtime_file(name)
+    if got is None:
+        return _err("没有这个装机件", 404)
+    body, _filename = got
+    return Response(
+        body,
+        media_type="text/plain; charset=utf-8",
+        headers={"cache-control": "no-store"},
+    )
+
+
 @router.post("/c/pair")
 def client_pair(payload: DeviceRegisterIn, request: Request):
     """一次性配对码 → 设备凭据 (只在这次响应里出现, 服务端只存 hash)。"""

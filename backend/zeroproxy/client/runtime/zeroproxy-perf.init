@@ -1,0 +1,36 @@
+#!/bin/sh /etc/rc.common
+# ZeroProxy 性能模式内核 (dae)
+START=98
+STOP=04
+USE_PROCD=1
+
+ZP_DIR=/etc/zeroproxy
+PERF_DIR="$ZP_DIR/perf"
+DAE="$PERF_DIR/dae"
+CONF="$PERF_DIR/dae.dae"
+
+start_service() {
+    [ -x "$DAE" ] || return 0
+    [ -f "$CONF" ] || return 0
+    # 防御: 两个数据面不许同时跑 (谁后起谁把对方的包抢走, 现象是"时通时不通")。
+    # 换模式的正规路径会先把 mihomo 停掉并 disable (见 perf.sh 的 zp_perf_enter);
+    # 走到这里还开着, 说明是开机顺序或人为 enable —— 那就**不起 dae**, 别把家里搞乱。
+    if /etc/init.d/zeroproxy enabled >/dev/null 2>&1; then
+        logger -t zeroproxy-perf "标准模式的服务还开着, 不启动 dae (换模式请用 zeroproxy perf on)"
+        return 0
+    fi
+    procd_open_instance
+    # --disable-pidfile: /var/run/dae.pid 在"上次崩过"之后会挡着下一次启动 (经典坑);
+    # 存活性交给 procd。dae 自己在退出路径里会卸掉 eBPF 与 tproxy 口, 所以 respawn
+    # 之前不留残渣 —— 这一条是它的设计, 不是我们的假设 (见 docs/en/user-guide/run-as-daemon.md)。
+    procd_set_param command "$DAE" run -c "$CONF" \
+        --logfile "$PERF_DIR/dae.log" --logfile-maxsize 1 --logfile-maxbackups 1 \
+        --disable-pidfile
+    # 分流数据 (geoip.dat / geosite.dat) 与配置放在一起; 显式指给 dae (它也会看配置目录,
+    # 这里是双保险 —— 与 Xray 的 XRAY_LOCATION_ASSET 同一个用法)。
+    procd_set_param env DAE_LOCATION_ASSET="$PERF_DIR"
+    procd_set_param respawn 3600 5 5
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
