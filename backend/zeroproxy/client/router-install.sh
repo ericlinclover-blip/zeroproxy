@@ -2104,19 +2104,65 @@ runtime_put() {  # $1=名字  $2=落盘路径  $3=期望的首字符 ('' = 只�
     die "取不到装机件 $_name ($ZP_BASE/c/rt/$_name 没有回话), 而本机也没有 —— 无法继续"
 }
 
+#: 装机件的清单 (与面板的 router_client.RUNTIME_FILES 一一对应)。
+RUNTIME_NAMES="live.sh tproxy.nft redirect.sh tunfw.sh perf.sh agent.sh cli zeroproxy.init zeroproxy-agent.init zeroproxy-perf.init"
+
+# 装机件的名字 → 落盘路径。三份 init 与 CLI 要进 /etc/init.d 与 /usr/bin, 名字跟落盘路径
+# 不一样; 其余都在运行目录里。
+runtime_dest() {
+    case "$1" in
+        cli)                  printf '%s' "$ZP_CLI" ;;
+        zeroproxy.init)       printf '%s' "$ZP_INIT" ;;
+        zeroproxy-agent.init) printf '%s' "$ZP_AGENT_INIT" ;;
+        zeroproxy-perf.init)  printf '%s' "$ZP_PERF_INIT" ;;
+        *)                    printf '%s' "$ZP_DIR/$1" ;;
+    esac
+}
+
+# 一次取回整套 (面板把 client/runtime/ 打成一份 tar.gz) —— **优先走这条**。
+# 为什么: 十几次往返在丢包的线路上就是十几次失败机会 (真机 GL-MT3000 上, 到面板的线每
+# 几分钟就要丢一次), 每次还带 5 次重试 —— 串起来能把"落运行时装机件"这一行卡住好几分钟。
+# 一次取回 = 一次失败机会。返回 1 = 这条路没走通, 调用方退回逐个取 (那条路更耐单点失败)。
+runtime_from_bundle() {
+    _b="$ZP_DIR/.rt.tar.gz"
+    _stage="$ZP_DIR/.rt.stage"
+    http_fetch_to "$ZP_BASE/c/rt/bundle" "$_b" 120 0 || { rm -f "$_b"; return 1; }
+    [ -s "$_b" ] || { rm -f "$_b"; return 1; }
+    rm -rf "$_stage"; mkdir -p "$_stage"
+    # busybox 的 tar 绝大多数固件都有; 真没有 (或这份包坏了) 就退回逐个取 —— 那才是兜底,
+    # 所以这里**不 die**。
+    if ! gzip -dc "$_b" | tar -xf - -C "$_stage" 2>/dev/null; then
+        rm -rf "$_stage" "$_b"; return 1
+    fi
+    rm -f "$_b"
+    for _f in $RUNTIME_NAMES; do
+        [ -s "$_stage/$_f" ] || { warn "装机件包里缺 $_f —— 改成逐个取"; rm -rf "$_stage"; return 1; }
+    done
+    for _f in $RUNTIME_NAMES; do
+        _dst="$(runtime_dest "$_f")"
+        sed -e "s/__ZP_CLIENT_VERSION__/$ZP_CLIENT_VERSION/g" \
+            -e "s/__ZP_LANIF__/$LAN_IFACE/g" "$_stage/$_f" > "$_stage/$_f.new" \
+            && mv "$_stage/$_f.new" "$_dst"
+        case "$_f" in
+            tproxy.nft) chmod 644 "$_dst" ;;
+            *)          chmod 755 "$_dst" ;;
+        esac
+    done
+    rm -rf "$_stage"
+    return 0
+}
+
 install_runtime() {
     step "落运行时装机件"
     LAN_IFACE="$(lan_iface 2>/dev/null || true)"
-    runtime_put live.sh              "$ZP_DIR/live.sh"   '#' 1
-    runtime_put tproxy.nft           "$ZP_DIR/tproxy.nft" ''  0
-    runtime_put redirect.sh          "$ZP_DIR/redirect.sh" '#' 1
-    runtime_put tunfw.sh             "$ZP_DIR/tunfw.sh"   '#' 1
-    runtime_put perf.sh              "$ZP_DIR/perf.sh"    '#' 1
-    runtime_put agent.sh             "$ZP_DIR/agent.sh"   '#' 1
-    runtime_put cli                  "$ZP_CLI"            '#' 1
-    runtime_put zeroproxy.init       "$ZP_INIT"           '#' 1
-    runtime_put zeroproxy-agent.init "$ZP_AGENT_INIT"     '#' 1
-    runtime_put zeroproxy-perf.init  "$ZP_PERF_INIT"      '#' 1
+    if runtime_from_bundle; then return 0; fi
+    note "整套装机件没一次取回来 —— 改成逐个取 (多几次往返, 但单件失败不拖垮其余)"
+    for _f in $RUNTIME_NAMES; do
+        case "$_f" in
+            tproxy.nft) runtime_put "$_f" "$(runtime_dest "$_f")" ''  0 ;;
+            *)          runtime_put "$_f" "$(runtime_dest "$_f")" '#' 1 ;;
+        esac
+    done
 }
 
 write_files() {

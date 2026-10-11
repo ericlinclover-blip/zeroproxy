@@ -3418,6 +3418,29 @@ def client_ui_file(name: str, request: Request):
     return Response(body, media_type=media, headers={"cache-control": "no-store"})
 
 
+@router.get("/c/rt/bundle")
+def client_runtime_bundle(request: Request):
+    """整套运行时装机件打成一个 tar.gz。
+
+    **注册顺序**: 它必须在 `/c/rt/{name}` **前面** —— 否则 "bundle" 会被当成一个装机件的
+    名字 (与 `/c/perf/config` 排在 `/c/perf/{arch}` 前面同一个坑)。
+
+    为什么要有它: 十几次往返在丢包的线路上就是十几次失败机会 (真机上卡在
+    `落运行时装机件` 那一行好几分钟)。一次取回把这个数压成一次。
+    """
+    state = load_state()
+    if not state["configured"]:
+        return _err("面板尚未初始化", 409)
+    blob = router_client.runtime_bundle()
+    if blob is None:
+        return _err("面板这一侧没有准备完整的装机件", 500)
+    return Response(
+        blob,
+        media_type="application/gzip",
+        headers={"cache-control": "no-store"},
+    )
+
+
 @router.get("/c/rt/{name}")
 def client_runtime_file(name: str, request: Request):
     """运行时装机件 (live.sh / 数据面脚本 / agent / CLI / init 脚本 / nft 规则)。

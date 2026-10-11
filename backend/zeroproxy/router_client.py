@@ -13,9 +13,11 @@ release 域名经常不可达, 用户看到的是"装到一半卡住"。所以�
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import re
+import tarfile
 import threading
 import time
 import urllib.error
@@ -147,7 +149,10 @@ from .config import paths
 #:         每 5 秒刷一行 `can't open …: no such file`, 一直等到 CORE_WAIT 360 秒, 既不换路
 #:         也没说清在等什么)。现在连着两次 0 字节就换直连镜像, 并把那句话说出来; 顺带把
 #:         三处 `wc -c < 可能不存在的文件` 的**重定向噪音**按 start_progress 里那条规矩收掉 (8.92)。
-SCRIPT_VERSION = "1.4.36"
+#: 1.4.37: 装机件改成**一次取回** (`/c/rt/bundle`, 一份 tar.gz): 十几次往返在丢包的线路上
+#:         就是十几次失败机会 (真机卡在"落运行时装机件"好几分钟), 一次取回把它压成一次;
+#:         包取不到时退回逐个取, 单件失败仍不拖垮其余 (8.93)。
+SCRIPT_VERSION = "1.4.37"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"
@@ -1470,6 +1475,36 @@ def runtime_file(name: str) -> tuple[str, str] | None:
     except OSError:
         return None
     return body.replace("__ZP_CLIENT_VERSION__", SCRIPT_VERSION), name
+
+
+#: 装机件的落盘模式: 要执行的那几个 755, 其余 644。
+def _runtime_mode(name: str) -> int:
+    return 0o755 if (name.endswith(".sh") or name.endswith(".init") or name == "cli") else 0o644
+
+
+def runtime_bundle() -> bytes | None:
+    """整套运行时装机件打成一个 tar.gz —— 装机时**一次取回**, 而不是十几次。
+
+    为什么要有它: 这些文件有十几个, 而用户到面板的线路会丢包 (真机实测: 同一条命令里
+    第一跳就超时过一次)。每多一次往返就多一次失败机会, 十几次串起来 (每次还带 5 次重试)
+    在丢包的线上能耗掉好几分钟 —— 真机上就是卡在 `落运行时装机件` 那一行不动。
+    打成一个包, "面板这条路"从十几次失败机会压成一次。
+
+    取不到任何一份就返回 None (面板侧不完整), 客户端会退回"逐个取"。
+    """
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name in RUNTIME_FILES:
+            got = runtime_file(name)
+            if got is None:
+                return None
+            raw = got[0].encode("utf-8")
+            info = tarfile.TarInfo(name)
+            info.size = len(raw)
+            info.mode = _runtime_mode(name)
+            info.mtime = 0
+            tar.addfile(info, io.BytesIO(raw))
+    return buf.getvalue()
 
 
 def render_script(base: str, code: str) -> str:

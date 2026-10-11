@@ -583,6 +583,22 @@ def test_runtime_artifacts_are_shipped_by_the_panel(client, configured):
     assert client.get("/c/rt/nope.sh").status_code == 404
     assert client.get("/c/rt/live.sh").text == _runtime_file("live.sh")
 
+    # 还有一条**打包**的路: 一次取回整套。十几次往返在丢包的线路上就是十几次失败机会
+    # (真机上"落运行时装机件"那一行卡了好几分钟), 一次取回把这个数压成一次。
+    # 注意它必须排在 /c/rt/{name} **前面** —— 否则 "bundle" 会被当成一个装机件的名字。
+    import io
+    import tarfile
+
+    res = client.get("/c/rt/bundle")
+    assert res.status_code == 200, res.text
+    blob = res.content if hasattr(res, "content") else res.read()
+    assert blob[:2] == b"\x1f\x8b", "应当是 gzip"
+    tar = tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz")
+    assert sorted(tar.getnames()) == sorted(router_client.RUNTIME_FILES)
+    assert tar.getmember("live.sh").mode == 0o755
+    assert tar.getmember("tproxy.nft").mode == 0o644
+    assert b"__ZP_CLIENT_VERSION__" not in blob, "版本占位符要替换掉 (与单件那条路一致)"
+
 
 def test_ui_files_are_written_atomically_and_luci_has_a_builtin_fallback():
     """界面文件的落盘必须是**原子**的 —— 一次失败的请求不许毁掉一份能用的文件。

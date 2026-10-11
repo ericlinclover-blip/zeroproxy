@@ -578,6 +578,39 @@ def main() -> int:
               and "zp_live_mode" in _rt_body, f"HTTP {_rt_status}")
         check("/c/rt/<name> 走白名单 (未登记的名字 404)",
               panel.req_raw("GET", "/c/rt/nope.sh")[0] == 404)
+        # 还有"一次取回整套"那条路: 十几次往返在丢包的线路上就是十几次失败机会 (真机上
+        # "落运行时装机件"那一行卡了好几分钟), 一次取回把它压成一次。
+        _bundle = urllib.request.urlopen(panel.base + "/c/rt/bundle", timeout=30).read()
+        check("/c/rt/bundle 一次给整套装机件 (gzip 的 tar)",
+              _bundle[:2] == b"\x1f\x8b" and len(_bundle) > 1000, f"{len(_bundle)} 字节")
+        # 打包那条路走不通时, 必须**退回逐个取**, 而且单件失败不能拖垮这一次 (本机已有
+        # 的那份留着)。用一个"什么都 404"的本地服务模拟"面板给不出包" —— 它同时保证这条
+        # 兜底路不会烂在代码里没人跑过 (这一节以前就吃过"没人跑过的分支"的亏)。
+        # 别名导入: 这个文件里 `http` 是"打面板接口"的那个函数, 直接 `import http.server`
+        # 会把它盖掉 (刚刚就踩了一次: 后面的 /c/install.sh 变成 "module object is not callable")。
+        import http.server as _httpsrv
+
+        class _NotFound(_httpsrv.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b"nope")
+
+            def log_message(self, *a):
+                pass
+
+        _nf = _httpsrv.ThreadingHTTPServer(("127.0.0.1", 0), _NotFound)
+        threading.Thread(target=_nf.serve_forever, daemon=True).start()
+        try:
+            ok_nf, out_nf = run_install(
+                "rt-offline", root=fake_root, base=f"http://127.0.0.1:{_nf.server_address[1]}",
+                main_only="detect_http; install_runtime")
+            check("整套取不回来时退回逐个取 (单件失败不拖垮其余, 本机已有的那份留着)",
+                  ok_nf and "改成逐个取" in out_nf
+                  and "无法继续" not in out_nf and "保留本机已有的那份" in out_nf,
+                  [ln.strip() for ln in out_nf.splitlines() if "逐个取" in ln][:1])
+        finally:
+            _nf.shutdown()
         caps_text = open(os.path.join(fake_root, "caps"), encoding="utf-8").read()
         check("caps 是 schema 2 (chosen / covered / why)",
               "schema=2" in caps_text and "chosen=" in caps_text and "covered=" in caps_text)
