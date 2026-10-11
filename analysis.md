@@ -1,6 +1,6 @@
 # ZeroProxy 架构现状
 
-> 快照: **2026-10-11** · 面板 **v2.11.40** · 路由器客户端 **v1.4.35** (zpcore **1.3.0**) · `state.json` schema **v5**
+> 快照: **2026-10-11** · 面板 **v2.11.41** · 路由器客户端 **v1.4.36** (zpcore **1.3.0**) · `state.json` schema **v5**
 > 本文回答"**现在是什么样**"。另外两份文档分工不同, 不要混读:
 > `README.md` 是逐版开发日志 (4000+ 行, 每一版为什么这么改、哪次真机踩的坑);
 > `docs/RESEARCH.md` 与 `docs/ROUTER-CLIENT-REDESIGN.md` 是竞品调研与设计依据。
@@ -439,7 +439,7 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
 
 | 脚本 | 覆盖 |
 |---|---|
-| `backend/tests/` (pytest) | **325 通过 + 6 skip** (无真实内核二进制时跳过)。dry-run 全流程 + 安全边界 + 状态迁移 + 装机件端点契约 |
+| `backend/tests/` (pytest) | **326 通过 + 6 skip** (无真实内核二进制时跳过)。dry-run 全流程 + 安全边界 + 状态迁移 + 装机件端点契约 + 面板直传"一个字节都没拿到"时的让位 (8.92) |
 | `scripts/verify.py` | 用真实 Xray/Hysteria/mihomo/sing-box 校验生成的配置与订阅 (含**两台机器真跑一条链**) |
 | `scripts/router_install_check.py` | **199 项**。真的用 shell 跑一遍路由器安装脚本: 七类机器 (含 OpenWrt 25.12 / apk 三态 / BTF 两种现场 / 性能模式的进-出-回退) / 本机覆盖 / revert 比对 / zpcore 真跑 / **第一跳** (面板生成的那一行命令外面顶一个 uclient-fetch 替身: 丢包重试、自签面板按证书状态跳过校验、配对码失效时读得到原因; 旧写法的"什么都没有发生"与命令长度都钉在测试里)。性能模式那一节的假 dae **照真机复刻两条硬规矩** (0644 拒 / node 键带引号拒) 并先自证一次 —— 它以前无条件 exit 0, 于是这两类事故在演练里永远是绿的; 另有"停不掉的 mihomo"(真进程)、"切换期间 agent 不许拉起标准模式"、"出口等于本机 WAN 地址时不算通"与"cgi 的 status 必须带 perf.live"。**四个现场入口的一致性矩阵** (8.90): 四档 mihomo 数据面各跑一遍, CLI `status` / `doctor` / 本地界面 (zpcore) / agent 心跳必须报同一档 mode 与同一档 covered —— 假工具按一个状态文件说话, 所以四档只起一次 zpcore、装一次机器; 外加 `zpcore state` 的 key=value 与 `--json` 两个契约 |
 | `scripts/browser_check.cjs` | **157 项**, 真 Chromium 走「初始化 → 仪表盘」全流程 + 交互 + CSP + 截图 |

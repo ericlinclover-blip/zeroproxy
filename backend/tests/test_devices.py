@@ -1159,6 +1159,48 @@ def test_router_profile_degrades_when_panel_has_no_geo_data(client, configured):
     assert "DOMAIN-SUFFIX,qq.com,🎯 全球直连" in "\n".join(skeleton["rules"])
 
 
+def test_core_panel_direct_gives_up_quickly_when_nothing_arrives(tmp_path):
+    """面板直传**一个字节都没拿到**时, 不能把它当成"面板还在准备"干等。
+
+    真机 (GL-MT3000 · OpenWrt 24.10 · opkg, 到面板的线路丢包): `/c/bin/<arch>` 那份 19.8 MB
+    连都没连上, 输出文件压根没建起来。旧判据只认两种情况该"换路": HTTP 200, 或者攒到了
+    半个内核 (≥256 KB)。而这条路上 uclient-fetch 拿不到状态码、文件又是空的 —— 于是它掉进
+    "面板给了一句话, 按 503/502 等它"那一支: 每 5 秒刷一行
+    `can't open /etc/zeroproxy/.mihomo.gz: no such file`, 一直等到 `CORE_WAIT` (360 秒),
+    既不换路, 也没说清在等什么。现在连着两次 0 字节就换直连镜像。
+
+    这一条把 `core_from_panel` 原样抽出来, 拿一个"从来不下任何东西"的 `core_download` 喂它 ——
+    断言三件事: 快速放弃 (只重试一次)、说清是"没连上 / 换直连镜像"、**不再有那句重定向噪音**
+    (它在 `wc -c < 不存在的文件` 上, `2>/dev/null` 挡不住)。
+    """
+    from zeroproxy import router_client
+
+    text = open(router_client.script_path(), encoding="utf-8").read()
+    found = re.search(r"^core_from_panel\(\) \{.*?\n\}", text, re.S | re.M)
+    assert found, "找不到 core_from_panel"
+    stub = (
+        'ZP_BASE=http://panel; ARCH=arm64; CORE_WAIT=360; CORE_PANEL_BUDGET=90\n'
+        '_tmp="$ZP_DIR/.mihomo.gz"; DL_SECONDS=3; DL_KBPS=0; HTTP_CODE=""\n'
+        'warn() { echo "! $*"; }\n'
+        'sleep() { :; }\n'
+        'core_min_rate() { echo 8; }\n'
+        'core_read_panel() { :; }\n'
+        'core_wait_note() { :; }\n'
+        'show_body() { echo "BODY:$*"; }\n'
+        'core_verify() { return 1; }\n'
+        # 面板直传: 从来不下任何东西 (文件连建都不建) —— 就是真机上那个现场
+        'core_download() { rm -f "$2"; return 1; }\n'
+        'rc=0\n' + found.group(0) + '\ncore_from_panel || rc=$?\necho "RC=$rc"\n'
+    )
+    proc = subprocess.run(["sh", "-c", stub], capture_output=True, text=True,
+                          env={**os.environ, "ZP_DIR": str(tmp_path)})
+    out = proc.stdout + proc.stderr
+    assert "RC=1" in out, out
+    assert "换直连镜像" in out, out
+    assert out.count("再试一次") == 1, f"只该重试一次 (别耗 CORE_WAIT): {out}"
+    assert "can't open" not in out and "No such file" not in out, f"重定向噪音还在: {out}"
+
+
 def test_install_script_probes_capabilities_and_reports_honestly():
     """数据面这件事上的硬要求: 探得起、说得细、失败别报成功。
 

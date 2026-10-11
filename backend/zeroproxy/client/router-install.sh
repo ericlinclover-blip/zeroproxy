@@ -1586,7 +1586,13 @@ core_download() {
     stop_progress
     DL_SECONDS=$(( $(date +%s 2>/dev/null || echo 0) - DL_START ))
     [ "$DL_SECONDS" -gt 0 ] 2>/dev/null || DL_SECONDS=1
-    DL_BYTES="$(wc -c < "$2" 2>/dev/null | tr -d ' ' || true)"
+    # 文件可能压根没建起来 (连都没连上) —— 那是**重定向**失败, 那句 "No such file" 由
+    # shell 自己打到 stderr, `2>/dev/null` 挡不住 (与 start_progress 里同一条规矩)。
+    if [ -f "$2" ]; then
+        DL_BYTES="$(wc -c < "$2" 2>/dev/null | tr -d ' ' || true)"
+    else
+        DL_BYTES=0
+    fi
     [ -n "$DL_BYTES" ] || DL_BYTES=0
     DL_KBPS=$((DL_BYTES / 1024 / DL_SECONDS))
     return "$_rc"
@@ -1625,7 +1631,11 @@ core_version_ok() {
 # 落盘前的校验: 大小像内核, 且 (面板给了摘要时) sha256 对得上。
 # 为什么还要哈希: 直连镜像是第三方 —— 它们中间任何一跳都可能给你别的东西。
 core_verify() {
-    _size="$(wc -c < "$_tmp" 2>/dev/null | tr -d ' ' || true)"
+    if [ -f "$_tmp" ]; then
+        _size="$(wc -c < "$_tmp" 2>/dev/null | tr -d ' ' || true)"
+    else
+        _size=0
+    fi
     if [ "${_size:-0}" -lt "$CORE_MIN_BYTES" ]; then
         return 1
     fi
@@ -1664,6 +1674,7 @@ core_wait_note() {
 # 拿到 200 之后如果传得太慢 (预算内没下完), 让位给直连镜像。
 core_from_panel() {
     _waited=0
+    _conn_fail=0
     while [ "$_waited" -lt "$CORE_WAIT" ]; do
         _min="$(core_min_rate "$CORE_PANEL_BUDGET")"
         if core_download "$ZP_BASE/c/bin/$ARCH" "$_tmp" "$CORE_PANEL_BUDGET" "$_min"; then
@@ -1675,7 +1686,11 @@ core_from_panel() {
             warn "面板给的这份没通过校验, 换条路再试"
             return 1
         fi
-        _size="$(wc -c < "$_tmp" 2>/dev/null | tr -d ' ' || true)"
+        if [ -f "$_tmp" ]; then
+            _size="$(wc -c < "$_tmp" 2>/dev/null | tr -d ' ' || true)"
+        else
+            _size=0
+        fi
         [ -n "$_size" ] || _size=0
         # 200 = 拿到了正文却没下完 (线太慢或中途断) → 换条路;
         # 503/502/000 = 面板给的是一句话 → 按那句话处理 (等待或报错)。
@@ -1685,6 +1700,23 @@ core_from_panel() {
             # 说"用了多久"而不是"没能在 N 秒内完成" —— 被速率闸门掐断时那句会自相矛盾。
             warn "面板直传太慢 (${DL_SECONDS} 秒只下到 $((_size / 1024)) KB, ${DL_KBPS} KB/s) —— 换直连镜像"
             return 1
+        fi
+        # 一个字节都没拿到 (文件根本没建起来) = **连都没连上** (丢包 / 超时), 不是
+        # "面板给了一句话"。这一档以前会掉进下面那个「面板还在准备, 等它」的分支: 真机
+        # (GL-MT3000 到面板的线路丢包) 上就表现为每 5 秒刷一行 `can't open …: no such file`,
+        # 一直等到 CORE_WAIT (360 秒) —— 既不换路, 也没说清在等什么。它该按"这条路这次不通"
+        # 处理: 立刻让位给直连镜像 (镜像表里不止一个地址, 那边有自己的重试)。
+        if [ "$_size" = "0" ]; then
+            # 一次 0 字节可能是丢包打个嗝, 再给它一次机会 (但不按"面板在准备"那样长等);
+            # 连着两次就是这条路这次不通 —— 换直连镜像, 别耗 CORE_WAIT。
+            _conn_fail=$((_conn_fail + 1))
+            if [ "$_conn_fail" -ge 2 ]; then
+                warn "面板直传连不上 (${_conn_fail} 次 0 字节, ${DL_KBPS} KB/s) —— 换直连镜像"
+                return 1
+            fi
+            warn "面板直传没连上 (${DL_SECONDS} 秒 0 字节), 再试一次…"
+            sleep 2
+            continue
         fi
         # 不是内核 = 面板给了一句话 (503 正在准备 / 502 取不到)
         _body="$(cat "$_tmp" 2>/dev/null || true)"

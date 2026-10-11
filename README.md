@@ -81,7 +81,7 @@ curl -fsSL https://github.i3.pub/https://raw.githubusercontent.com/ericlinclover
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` **325 项通过 + 6 skip** (带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (105 项, 含**两台机器真跑一条链** 与**四档数据面 × IPv6 的路由器配置过真 mihomo**) + `scripts/router_install_check.py` (**199 项**, 真的用 shell 跑一遍路由器安装脚本, 内含四类机器 / 本机覆盖 / revert 比对 / zpcore 真跑 / **四档数据面下四个现场入口的一致性矩阵**) + `scripts/browser_check.cjs` (157 项) + `scripts/clients_check.cjs` (26 项, 真实浏览器点开关) + `scripts/router_ui_check.cjs` (18 项) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` **326 项通过 + 6 skip** (带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (105 项, 含**两台机器真跑一条链** 与**四档数据面 × IPv6 的路由器配置过真 mihomo**) + `scripts/router_install_check.py` (**199 项**, 真的用 shell 跑一遍路由器安装脚本, 内含四类机器 / 本机覆盖 / revert 比对 / zpcore 真跑 / **四档数据面下四个现场入口的一致性矩阵**) + `scripts/browser_check.cjs` (157 项) + `scripts/clients_check.cjs` (26 项, 真实浏览器点开关) + `scripts/router_ui_check.cjs` (18 项) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 | **看得懂的界面 (v2.6.0)** | 控制台布局: 左侧锚点导航 (带计数角标 + 滚动高亮) + 顶部指标条 (健康节点 / 落地出口 IP / 平均延迟 + 迷你折线 / 运行时长) + 节点密集表格 (名称 / 地址状态 / **握手延迟条** / **上下行双轨** / 开关与复制) + **流量卡 (双弧圆环 + 实时速率曲线 + 逐节点双色流量条)** + 链式链路拓扑 (你的设备 → 本机入口 → 落地端) + 程序更新闭环; 动效全部走 `transform`/自绘 rAF 并受 `prefers-reduced-motion` 约束 |
 
@@ -5278,3 +5278,37 @@ shell 一侧只留两件事: `live.sh` 先看调用方有没有把整份状态�
 `client/agent/dist/` 里的 6 个架构重新构建为 **zpcore 1.3.0**, 旧的 1.2.2 制品删掉)。
 真机上要看的: 装完之后 `zpcore state` 与 `zeroproxy status` 说的是同一句话, 本地界面那块
 仪表盘也与它们一致。
+
+---
+
+### 8.92 v2.11.41 (客户端 v1.4.36): 面板那份内核连都没连上时, 它却在"等面板准备好"
+
+真机 (GL-MT3000 · OpenWrt 24.10 · opkg · 内核 6.6.110) 上的第一次升级跑成这个样子:
+
+```
+==> 下载代理内核 (mihomo · arm64)
+/tmp/zp-install.sh: line 1589: can't open /etc/zeroproxy/.mihomo.gz: no such file
+/tmp/zp-install.sh: line 1678: can't open /etc/zeroproxy/.mihomo.gz: no such file
+… (每 5 秒一轮)
+ 已下载 [                    ]  0% 0 B / 19.8 MB 0 KB/s
+```
+
+那条链路上到面板的线路在丢包 (同一屏里, 第一跳的安装脚本也先超时了一次才算拉下来), 于是
+`/c/bin/arm64` 这份 19.8 MB **连都没连上** —— 输出文件压根没建起来。问题不在"慢", 在我们
+**把它当成了另一回事**:
+
+旧判据只认两种"该换路"的情况: HTTP 200 (下了一半被掐断), 或者攒到了半个内核 (≥256 KB)。
+而这条路上用的是 `uclient-fetch` —— 它拿不到 HTTP 状态码, 文件又是空的, 于是代码掉进
+「面板给了一句话 (503 正在准备 / 502 取不到), 那就等它」那一支: 每 5 秒刷一轮, 一直等到
+`CORE_WAIT` (**360 秒**)。既不换路, 也没说清在等什么; 那两行 `can't open …: no such file`
+还挂在屏幕上, 看着像安装脚本自己坏了。
+
+现在分清楚了: **一个字节都没拿到 = 这条路这次不通**, 连着两次就换直连镜像 (镜像表里不止
+一个地址, 那边有自己的重试)。第一次 0 字节仍再试一次 —— 丢包打个嗝不该让我们放弃一条本来
+能走的路。顺带按 `start_progress` 里早就写着的那条规矩, 把三处
+`wc -c < 可能不存在的文件` 的**重定向噪音**收掉: 那句是 shell 自己打的, `2>/dev/null`
+挡不住, 得先判存在性。
+
+回归: `pytest` **325 → 326 项** (把 `core_from_panel` 原样抽出来, 拿一个"从来不下任何东西"
+的 `core_download` 喂它: 只重试一次、说清"没连上/换直连镜像"、且不再有那句噪音)。
+演练那一节 (`router_install_check.py` 的慢面板用例) 走的是"下了一半"那条路, 不受影响。
