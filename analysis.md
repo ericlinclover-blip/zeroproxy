@@ -1,6 +1,6 @@
 # ZeroProxy 架构现状
 
-> 快照: **2026-10-12** · 面板 **v2.11.44** · 路由器客户端 **v1.4.37** (zpcore **1.3.0**) · `state.json` schema **v5**
+> 快照: **2026-10-12** · 面板 **v2.11.45** · 路由器客户端 **v1.4.37** (zpcore **1.3.0**) · `state.json` schema **v5**
 > 本文回答"**现在是什么样**"。另外两份文档分工不同, 不要混读:
 > `README.md` 是逐版开发日志 (4000+ 行, 每一版为什么这么改、哪次真机踩的坑);
 > `docs/RESEARCH.md` 与 `docs/ROUTER-CLIENT-REDESIGN.md` 是竞品调研与设计依据。
@@ -416,6 +416,10 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
 * **`install.sh`** (Ubuntu/Debian): BBR + 内核参数 → 依赖 (git/curl/wget/unzip/nginx/certbot) →
   Xray + Hysteria 2 二进制 → venv → nginx 引导配置 (8899 自签 + **80 明文初始化页**) → systemd →
   防火墙 → 引导令牌 → 打印 `http://<IP>/?token=…` (备用 `https://<IP>:8899/?token=…`)。
+  **会话自保**: 从远程脚本跑且在 SSH 会话里 (不在 tmux 里) 时, 先取一份自己的副本交给
+  `setsid` 独立会话重跑, 前台只 tail 日志 (`$ZP_HOME/data/install.log`) —— SSH 断线不再中断
+  安装; 小内存机器 (< 1 GB 且无 swap) 顺带补 1 GB swap 并 `vm.swappiness=10`, 那一段**从不
+  fail**。两条对应真机上的同一现象: "走到装依赖那一步会话断了, 一点报错都没有" (README 8.96)。
   GitHub 取文件走**多前缀表** (自建反代排第一, 最后才直连; 拿到的必须是非空文件)。
   识别到 OpenWrt 会**当场停下**并说明「面板装在服务器上, 路由器端用面板生成的那一行命令」——
   在路由器上跑它以前只会留下一句 `dpkg: command not found` (真机截图)。

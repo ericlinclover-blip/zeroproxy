@@ -3630,6 +3630,113 @@ def test_install_sh_waits_for_the_panel_and_self_checks_the_first_hop():
     assert _bash_syntax_ok(path)
 
 
+def test_install_sh_hands_a_dropping_ssh_session_off_to_a_detached_run(tmp_path):
+    """SSH 断线不该把安装掐掉 —— 而且"为什么停了"要留得住证据。
+
+    真机反馈: 在 SSH 里 `curl … | bash`, 走到"创建 Python 虚拟环境并安装依赖"那一步会话断
+    了 (`[session closed (code 0)]`), 安装停在那儿 —— **没有报错**, 用户也不知道为什么 (而那
+    一步要下几十 MB 的 wheel, 是整条安装最慢的一段)。
+
+    改法: 只要是在 SSH 会话里、从**远程脚本**跑的, install.sh 先取一份自己的副本, 放进
+    **独立会话** (setsid) 重跑, 前台只 tail 日志 —— 断线不再影响安装, 证据留在
+    `$ZP_HOME/data/install.log`。
+
+    这里把那一整段真跑一遍 (setsid 与取副本都用桩): 断言子进程真的跑了、输出真的落在日志里、
+    本进程交出去之后就不再往下走; 再断言几条"不该动"的路照旧原地跑 —— tmux 里 (本来就不怕
+    断线)、`ZP_DETACHED=1` (子进程自己)、**本地代码目录**里跑 (开发 / 复现, 免得把本地改动
+    换成了远端那份)、以及明确要求留在前台的 `ZP_NO_DETACH=1`。
+    """
+    import subprocess
+
+    path = os.path.join(REPO_ROOT, "install.sh")
+    text = open(path, encoding="utf-8").read()
+    block = text[text.index("# --- ZP_SESSION_GUARD") : text.index("# --- /ZP_SESSION_GUARD ---")]
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    # macOS 上没有 setsid (util-linux 的); Linux 上直接用真的。这一步只验"活交给了子进程"
+    stub_setsid = bin_dir / "setsid"
+    stub_setsid.write_text('#!/bin/sh\nexec "$@"\n', encoding="utf-8")
+    stub_setsid.chmod(0o755)
+
+    harness = tmp_path / "guard.sh"
+    harness.write_text(
+        "set -Eeuo pipefail\n"
+        'ZP_HOME="${H_HOME}"\n'
+        'SCRIPT_DIR="${H_SRC_DIR}"\n'
+        # 镜像表非空: 真实的 install.sh 里它至少有自建反代一条 (bash 3.2 下空数组 + set -u
+        # 会报 unbound, 而 macOS 自带的就是 3.2)
+        'GH="https://github.com"\nGH_PROXIES=("https://mirror.example")\n'
+        'ZP_REPO="owner/repo"\nZP_DEFAULT_REF="main"\n'
+        'ZP_REF=""\n'
+        "info() { printf '[info] %s\\n' \"$*\"; }\n"
+        "ok() { printf '[ok] %s\\n' \"$*\"; }\n"
+        "warn() { printf '[warn] %s\\n' \"$*\"; }\n"
+        "fail() { printf '[fail] %s\\n' \"$*\"; exit 1; }\n"
+        'zp_url() { if [ -z "$1" ]; then printf %s "$2"; else printf %s/%s "$1" "$2"; fi; }\n'
+        # 桩: "取回来的那份脚本" = 一个只往标准输出写一行的真脚本 (那一行注释是为了过
+        # install.sh 的"内容得像一份 install.sh"这道 sanity check)
+        'fetch_github_file() { printf \'#!/usr/bin/env bash\\n# ZP_DETACHED\\necho CHILD-RAN\\n\' > "$2"; }\n'
+        + block
+        + "echo IN-PLACE-RAN\n",
+        encoding="utf-8",
+    )
+
+    def run(**extra):
+        env = {
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "H_HOME": str(tmp_path / "home"),
+            "H_SRC_DIR": str(tmp_path / "no-src"),
+            **extra,
+        }
+        return subprocess.run(
+            ["bash", str(harness)], env=env, capture_output=True, text=True, timeout=60
+        )
+
+    # (a) SSH 会话里: 交给独立会话, 子进程的输出落在日志里, 本进程到此为止
+    done = run(SSH_CONNECTION="1.2.3.4 5000 5.6.7.8 22")
+    assert done.returncode == 0, done.stdout + done.stderr
+    log = (tmp_path / "home" / "data" / "install.log").read_text(encoding="utf-8")
+    assert "CHILD-RAN" in log, log
+    assert "独立会话" in done.stdout, done.stdout
+    assert "IN-PLACE-RAN" not in done.stdout, "已经交出去了, 不该再往下跑"
+
+    # (b) tmux / screen 里 (本来就不怕断线)、(c) 子进程自己、(d) 本地代码目录、(e) 明确要求前台
+    ssh = {"SSH_CONNECTION": "1.2.3.4 5000 5.6.7.8 22"}
+    assert "IN-PLACE-RAN" in run(**ssh, TMUX="/tmp/tmux-0").stdout
+    assert "IN-PLACE-RAN" in run(**ssh, ZP_DETACHED="1").stdout
+    assert "IN-PLACE-RAN" in run(**ssh, H_SRC_DIR=REPO_ROOT).stdout
+    assert "IN-PLACE-RAN" in run(**ssh, ZP_NO_DETACH="1").stdout
+
+
+def test_install_sh_adds_swap_on_a_tiny_box_and_never_fails_the_install():
+    """小内存机器上补一块 swap —— 而这一步**不许**把安装搞挂。
+
+    为什么要有它: OOM killer 挑进程时常常挑到 sshd (小机上它是大内存进程), 用户看到的现象
+    与"断线"一模一样: 会话突然断了、安装停在装依赖那一步、一点报错都没有。so 两条路都要堵:
+    一条是上一节那个"独立会话", 一条是这块 swap。
+
+    规矩 (静态钉住): 只在"内存 < 1 GB + 本来没有 swap + 磁盘放得下"时动手; 每一步失败只 warn,
+    **绝不 fail** —— 装不上 swap 是小事, 装不上面板是大事; 想不动它: `ZP_NO_SWAP=1`。
+    """
+    import re
+
+    text = open(os.path.join(REPO_ROOT, "install.sh"), encoding="utf-8").read()
+    block = text[
+        text.index("# ---------------- 2a. 小内存机器补一块 swap ----------------") :
+        text.index("# ---------------- 3. 依赖 ----------------")
+    ]
+    assert "ZP_NO_SWAP" in block, "要留一个「别动我的机器」的开关"
+    assert "MemTotal" in block and "SwapTotal" in block, "判据要真读现场 (内存 / 已有的 swap)"
+    assert "df -Pm /" in block, "磁盘放不下就别建"
+    assert "mkswap" in block and "swapon" in block and "/etc/fstab" in block
+    assert not re.search(r"\bfail\b", block), "补 swap 失败绝不能让安装停下来"
+    uninstall = open(os.path.join(REPO_ROOT, "uninstall.sh"), encoding="utf-8").read()
+    assert "/swapfile" in uninstall, "卸载脚本要说清这块 swap 不会被它动"
+    assert "vm.swappiness" in text, "有 swap 也别让内核平时就往盘上倒"
+
+
 def test_first_paint_says_what_it_is_waiting_for():
     """首屏到"选好视图"之间的空档要有话说。
 

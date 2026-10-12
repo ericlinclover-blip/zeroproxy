@@ -69,6 +69,9 @@ fi
 echo
 ok "ZeroProxy 已卸载。"
 echo "  未触碰: nginx / certbot / BBR 内核参数 (如需还原: 删除 /etc/sysctl.d/99-zeroproxy.conf 后 sysctl --system)"
+if [ -e /swapfile ]; then
+  echo "  也未触碰 /swapfile (install.sh 给 1 GB 以下的小机加的; 想撤: swapoff /swapfile, 再删掉 /swapfile 与 /etc/fstab 里那一行)"
+fi
 if [ "${ZP_KEEP_DATA:-0}" = "1" ]; then
   echo "  数据保留在: $ZP_HOME/data"
 fi

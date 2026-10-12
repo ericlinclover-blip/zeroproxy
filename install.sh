@@ -73,6 +73,55 @@ fail() { printf '\033[1;31m[ZeroProxy]\033[0m %s\n' "$*"; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || fail "请以 root 运行 (sudo bash install.sh)"
 
+# --- ZP_SESSION_GUARD (断线自保; 下面 ---- 之间的两行标记给回归脚本取这一段) ---
+# 真机反馈: 在 SSH 里跑 `curl … | bash`, 走到"创建 Python 虚拟环境并安装依赖"那一步会话
+# 断了 (`[session closed (code 0)]`), 安装就停在那儿 —— **没有报错**, 用户也不知道为什么。
+# 那一步要下几十 MB 的 wheel (整条安装最慢的一段), 而这条路本来就容易抖。所以: 只要是在
+# SSH 会话里、从**远程脚本**跑的, 就把活交给一个**独立会话** (setsid) 去做, 前台只 tail
+# 日志 —— 断线不再影响安装; 回来 `tail -f` 一下就知道装到哪、装完没有。
+#   * 想留在前台原地跑:  ZP_NO_DETACH=1
+#   * 已经在独立会话里:  ZP_DETACHED=1 (子进程自己带着这个标记重跑, 不再套娃)
+#   * tmux / screen 里本来就不怕断线 —— 不动
+#   * 本地代码目录里跑 (开发 / 复现) —— 不动, 免得把本地改动换成了远端那份
+if [ -z "${ZP_DETACHED:-}" ] && [ -z "${ZP_NO_DETACH:-}" ] && [ -n "${SSH_CONNECTION:-}" ] \
+   && [ -z "${TMUX:-}" ] && [ ! -f "$SCRIPT_DIR/backend/zeroproxy/main.py" ] \
+   && command -v setsid >/dev/null 2>&1; then
+  mkdir -p "$ZP_HOME/data"
+  ZP_LOG="$ZP_HOME/data/install.log"
+  ZP_SELF="/tmp/zp-install-$$.sh"
+  ZP_SELF_OK=0
+  # 取一份自己: 与用户手上这份同源 (同一仓库 / 同一 ref), 走同一张镜像表
+  for _p in "${GH_PROXIES[@]}" ""; do
+    if fetch_github_file "$(zp_url "$_p" "$GH/$ZP_REPO/${ZP_REF:-$ZP_DEFAULT_REF}/install.sh")" "$ZP_SELF" \
+       && grep -q "ZP_DETACHED" "$ZP_SELF"; then
+      ZP_SELF_OK=1
+      break
+    fi
+  done
+  if [ "$ZP_SELF_OK" = "1" ]; then
+    printf '\n[ZeroProxy] ===== %s 这次安装放到独立会话里跑 (SSH 断线不影响) =====\n' \
+      "$(date '+%F %T')" >>"$ZP_LOG"
+    info "检测到 SSH 会话: 安装改在**独立会话**里继续 —— 中途断线也不会中断"
+    info "实时看进度: tail -f $ZP_LOG   (Ctrl-C 只停这个 tail, 安装继续)"
+    setsid env ZP_DETACHED=1 bash "$ZP_SELF" >>"$ZP_LOG" 2>&1 </dev/null &
+    ZP_CHILD=$!
+    tail -n 1 -f "$ZP_LOG" &
+    ZP_TAIL=$!
+    ZP_RC=0
+    wait "$ZP_CHILD" || ZP_RC=$?
+    kill "$ZP_TAIL" 2>/dev/null || true
+    rm -f "$ZP_SELF"
+    if [ "$ZP_RC" = "0" ]; then
+      ok "安装结束 (退出码 0); 全文日志: $ZP_LOG"
+    else
+      warn "安装以退出码 $ZP_RC 结束 —— 原因在日志里: $ZP_LOG"
+    fi
+    exit "$ZP_RC"
+  fi
+  warn "取不到自己的副本 (镜像都不通?) —— 就在当前会话里继续; 中途断线会中断安装, 重跑本脚本即可 (已装的部分会保留)"
+fi
+# --- /ZP_SESSION_GUARD ---
+
 # ---------------- 1. 系统检测 ----------------
 . /etc/os-release
 DISTRO="${ID:-unknown}"
@@ -110,12 +159,47 @@ net.ipv4.tcp_wmem = 4096 65536 67108864
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_fastopen = 3
 fs.file-max = 1000000
+# 有 swap 时 (见下面 2a) 也别急着往盘上倒: 内存尖峰照旧能用, 平时优先留在内存里
+vm.swappiness = 10
 SYSCTL
 sysctl --system >/dev/null 2>&1 || true
 if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" = "bbr" ]; then
   ok "BBR 已启用"
 else
   warn "BBR 不可用 (旧内核?), 使用默认拥塞控制"
+fi
+
+# ---------------- 2a. 小内存机器补一块 swap ----------------
+# 为什么做这件事: 这类面板大多装在 512 MB / 1 GB 的小机上, 而 `pip install` 解 wheel、以及
+# 面板自己合并 30 MB 的分流数据, 都是内存尖峰。内存打满时 Linux 的 OOM killer 会挑一个进程
+# 杀 —— 在"大内存进程"里 **sshd 常常中选**: 用户看到的现象就是"SSH 会话突然断了, 安装停在
+# 装依赖那一步, 一点报错都没有" (真机反馈: 走到"创建 Python 虚拟环境并安装依赖"就
+# `[session closed]`)。一块 swap 是最便宜的兜底。
+# 只在"真的小 + 本来就没有 swap + 磁盘放得下"时做; 任何一步失败都不影响安装;
+# 不想动: ZP_NO_SWAP=1。
+if [ -z "${ZP_NO_SWAP:-}" ]; then
+  MEM_MB="$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || true)"
+  SWAP_MB="$(awk '/^SwapTotal:/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || true)"
+  FREE_MB="$(df -Pm / 2>/dev/null | awk 'NR==2 {print int($4)}' || true)"
+  MEM_MB="${MEM_MB:-0}"
+  SWAP_MB="${SWAP_MB:-0}"
+  FREE_MB="${FREE_MB:-0}"
+  if [ "$MEM_MB" -gt 0 ] && [ "$MEM_MB" -lt 1024 ] && [ "$SWAP_MB" -lt 128 ] \
+     && [ ! -e /swapfile ] && [ "$FREE_MB" -ge 3072 ]; then
+    info "内存只有 ${MEM_MB} MB 且没有 swap: 加一块 1 GB swap (装依赖与合并分流数据时的尖峰有地方去)"
+    if fallocate -l 1G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=1024 status=none 2>/dev/null; then
+      chmod 600 /swapfile
+      if mkswap /swapfile >/dev/null 2>&1 && swapon /swapfile 2>/dev/null; then
+        grep -q '^/swapfile ' /etc/fstab 2>/dev/null || printf '/swapfile none swap sw 0 0\n' >>/etc/fstab
+        ok "swap 已启用 (1 GB; 想撤掉: swapoff /swapfile, 删掉 /swapfile 与 /etc/fstab 里那一行)"
+      else
+        rm -f /swapfile
+        warn "swap 启用失败 (不影响安装; 内存吃紧时装依赖可能被 OOM 杀掉 —— 查: dmesg | grep -i oom)"
+      fi
+    else
+      warn "swap 文件建不出来 (磁盘空间不够?) —— 不影响安装"
+    fi
+  fi
 fi
 
 # ---------------- 3. 依赖 ----------------
@@ -595,4 +679,6 @@ echo "  链式代理 (两台机器接成一条链) 在面板「链式代理」�
 echo "  它用到的额外端口 (默认 8447/tcp 与自动分配的入站端口) 会在面板里自动 ufw 放行,"
 echo "  云厂商安全组需自行放行 —— 云端没放行是链式连不通最常见的原因。"
 echo "  卸载: bash $ZP_HOME/uninstall.sh  (或重新下载仓库里的 uninstall.sh)"
+echo "  提示: 这次安装如果中途断过 SSH —— 重跑本脚本是安全的 (已装的部分会保留), 日志在"
+echo "        $ZP_HOME/data/install.log"
 echo
