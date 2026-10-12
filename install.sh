@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # ============================================================
-#  ZeroProxy 一键部署脚本  —  Ubuntu / Debian
+#  ZeroProxy 一键部署脚本  —  Ubuntu 22.04+ / Debian 12+
+#
+#  支持面就是上面这一行, 判据是**系统自带的 Python**: 面板要求 Python ≥ 3.10
+#  (Debian 12 = 3.11 / Debian 13 = 3.13 / Ubuntu 22.04 = 3.10 / Ubuntu 24.04 = 3.12)。
+#  Debian 11 与 Ubuntu 20.04 自带 3.9, 面板在 import 阶段就会崩 (见下面的版本闸门)。
 #
 #  用法 (服务器上, root):
 #    curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/install.sh | bash
@@ -121,6 +125,35 @@ apt-get update -y >/dev/null
 apt-get install -y curl wget unzip git nginx openssl python3 python3-pip python3-venv cron >/dev/null
 apt-get install -y certbot 2>/dev/null || warn "certbot 安装失败 (面板将回退自签证书)"
 systemctl enable --now nginx
+
+# ---------------- 3a. Python 版本闸门 ----------------
+# 面板代码的语法下限是 **Python 3.10** (Debian 12 = 3.11 / Debian 13 = 3.13 /
+# Ubuntu 22.04 = 3.10 / Ubuntu 24.04 = 3.12 都在这条线之上; Debian 11 与 Ubuntu 20.04
+# 自带 3.9)。低于这条线时坏掉的不是"某个功能", 而是**整个面板**: 进程在 import 阶段就
+# SyntaxError, systemd 反复重启, 用户看到的现象只是"面板打不开", 而那条日志没人会读。
+# v2.11.42 真的踩到了 (一行 f-string 用了 3.12 才允许的写法): 开发机是 3.14, 326 项
+# 回归全绿, 而 Debian 12 上装完就是起不来。所以拦在这里, 一句话说清是哪一类问题,
+# 而不是把一堆 SyntaxError 留给用户 (见 README 8.94)。
+# 挑解释器: 从新到旧看一遍, 取**第一个够版本**的。为什么不是直接用 `python3` ——
+# "装一个 3.10+" 这条建议在 Debian 11 / Ubuntu 20.04 上通常意味着再装一个 python3.11,
+# 而那时 `python3` 还是 3.9: 死认 python3 会把这类机器永远挡在门外 (装了解释器也没用)。
+# 注: Debian 12 自带 `python3.11` 与 `python3` 两个名字, Ubuntu 22.04 自带 `python3.10`。
+PY=""
+for _cand in python3.13 python3.12 python3.11 python3.10 python3; do
+  command -v "$_cand" >/dev/null 2>&1 || continue
+  if "$_cand" -c 'import sys; sys.exit(0 if sys.version_info[:2] >= (3, 10) else 1)' 2>/dev/null; then
+    PY="$_cand"
+    break
+  fi
+done
+if [ -z "$PY" ]; then
+  fail "本机没有 Python 3.10+ (python3 是 $(python3 -V 2>&1 || echo '不存在')).
+  面板要求 Python >= 3.10, 支持的系统: Debian 12+ / Ubuntu 22.04+。
+  Debian 11 与 Ubuntu 20.04 自带的 Python 3.9 装不了面板 (代码里的类型写法在那上面
+  直接 TypeError)。请先升级系统, 或装一个 3.10+ 的解释器 (Debian/Ubuntu:
+  apt-get install -y python3.11 python3.11-venv) 后重跑本脚本 —— 脚本会自己挑最高的那个。"
+fi
+info "Python: $("$PY" -V 2>&1)"
 
 # ---------------- 4. Xray Core (VLESS Reality / WS / Trojan) ----------------
 # 资产命名历代不一致 (64 / arm64-v8a), 统一从 release JSON 解析下载地址
@@ -276,7 +309,9 @@ rm -rf /tmp/zp.tar.gz /tmp/zp-src
 ok "面板核心已就位 ($(basename "$ZP_REPO") @ ${ZP_REF_RESOLVED:-本地目录})"
 
 info "创建 Python 虚拟环境并安装依赖 ..."
-python3 -m venv "$ZP_HOME/venv"
+# 用上面那道闸门挑出来的解释器 ($PY)。venv 建好之后 python3 是多少就无关了 ——
+# 面板进程、apply、geodata 走的都是这个 venv 里的 python。
+"$PY" -m venv "$ZP_HOME/venv"
 "$ZP_HOME/venv/bin/pip" install -q --upgrade pip
 "$ZP_HOME/venv/bin/pip" install -q -r "$ZP_HOME/requirements.txt"
 

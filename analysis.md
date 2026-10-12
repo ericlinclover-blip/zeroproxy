@@ -1,6 +1,6 @@
 # ZeroProxy 架构现状
 
-> 快照: **2026-10-11** · 面板 **v2.11.42** · 路由器客户端 **v1.4.37** (zpcore **1.3.0**) · `state.json` schema **v5**
+> 快照: **2026-10-12** · 面板 **v2.11.43** · 路由器客户端 **v1.4.37** (zpcore **1.3.0**) · `state.json` schema **v5**
 > 本文回答"**现在是什么样**"。另外两份文档分工不同, 不要混读:
 > `README.md` 是逐版开发日志 (4000+ 行, 每一版为什么这么改、哪次真机踩的坑);
 > `docs/RESEARCH.md` 与 `docs/ROUTER-CLIENT-REDESIGN.md` 是竞品调研与设计依据。
@@ -423,6 +423,14 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
   只换程序代码, 密钥 / 订阅令牌 / 节点开关原样保留, **订阅地址不变**。
   面板内升级由 `systemd-run --no-block` 放进独立 cgroup (面板自身重启不打断), 进度落在
   `data/update.json` + `data/update.log`, 面板重启后照常能读。
+* **Python 下限 = 3.10, 支持面 = Debian 12+ / Ubuntu 22.04+**: 判据是发行版自带的 Python
+  (Debian 12 = 3.11 / Debian 13 = 3.13 / Ubuntu 22.04 = 3.10 / 24.04 = 3.12; Debian 11 与
+  Ubuntu 20.04 的 3.9 不支持)。`install.sh` 有一道**前置闸门** (低于 3.10 当场停下说清原因,
+  而不是让面板在 systemd 里反复 SyntaxError), 闸门同时**从新到旧挑解释器** (装了个 3.11
+  而 `python3` 仍是 3.9 的机器不会被永久挡在门外), venv 用挑出来的那个建。语法下限另由
+  `backend/tests/test_python_compat.py` 用 `ast.parse(feature_version=(3,10))` 守着 ——
+  开发机是 3.14, 没有这道闸门时"本机全绿"与"装到 Debian 12 上能起来"是两件事
+  (v2.11.42 踩过, 见 README 8.94)。
 * **`uninstall.sh`**: 与安装对称, 可选保留数据 / 证书。
 * **`dev.sh`**: 本地开发启动 (macOS 可跑, 无 systemd 时自动 dry-run)。`cli.py` 提供终端兜底入口 `z`。
 * systemd 单元: `zeroproxy.service` (面板, `Restart=always`) / `xray.service` / `hysteria2.service`;

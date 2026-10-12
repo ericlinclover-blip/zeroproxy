@@ -919,7 +919,11 @@ def socks5_http_get(
             return "", "隧道已建立, 但对端没有返回数据"
         head, _, body = raw.partition(b"\r\n\r\n")
         if b"200" not in head.split(b"\r\n", 1)[0]:
-            return "", f"目标站返回异常: {head.split(b'\r\n', 1)[0].decode('latin1')}"
+            # 状态行先解析出来再拼 —— **不能把带反斜杠的表达式写进 f-string 里**:
+            # 那是 Python 3.12 (PEP 701) 才允许的写法, 而面板要装在 Debian 12
+            # (Python 3.11) 上, 在那里整个模块 import 就 SyntaxError (见 README 8.94)。
+            status_line = head.split(b"\r\n", 1)[0].decode("latin1")
+            return "", f"目标站返回异常: {status_line}"
         if re.search(rb"transfer-encoding:\s*chunked", head, re.I):
             body = _dechunk(body)
         return body.decode("utf-8", "replace").strip(), "HTTP 往返成功"
