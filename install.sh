@@ -421,6 +421,24 @@ if [ "$PANEL_INITIALIZED" = "1" ]; then
 else
 NGINX_PANEL_BIND="${ZP_BIND_PORT:-9900}"
 info "配置 nginx 面板反向代理 (:$PANEL_PORT → 127.0.0.1:$NGINX_PANEL_BIND) ..."
+
+# 引导期"面板还没起来"时返回的那一页 (下面两个 server 块共用这一份)。
+# 为什么需要它: install.sh 打印链接的那一刻, 面板可能还在 import fastapi / cryptography
+# (1 核小机上要几秒), 也可能刚崩过、正在被 systemd 拉起来 —— 那时 nginx 回的是它自己的
+# **502 页**, 用户以为装坏了, 于是对着它一遍遍手动刷新 ("要刷新很多次页面才会跳出",
+# 真机反馈)。这一页自己每 3 秒重试一次, 并把 `?token=` 原样带回去 (不带回去的话, 重试
+# 之后初始化页会提示"请用带 ?token= 的链接打开本页")。
+# 用 quoted heredoc 生成: 里面的 HTML 一个 shell 变量都不展开, 于是引号一个都不用转义。
+ZP_BOOTING_BLOCK="$(cat <<'ZPBOOTING'
+    # 面板正在启动 (冷启动 / 崩了正在重启): 给一页自己会重试的话, 而不是 nginx 的 502
+    error_page 502 503 504 = @zp_booting;
+    location @zp_booting {
+        default_type text/html;
+        return 200 '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>ZeroProxy · 面板正在启动</title></head><body style="font-family:-apple-system,Segoe UI,sans-serif;max-width:34rem;margin:12vh auto;padding:0 1.4rem;text-align:center;color:#333"><h2 style="font-weight:650">面板正在启动…</h2><p style="color:#666">这一页每 3 秒自动重试一次, 不需要手动刷新, 也不用重新打开链接。</p><p id="zpwait" style="color:#999;font-size:.9rem"></p><p style="color:#999;font-size:.85rem">停在这里超过一分钟: SSH 到本机执行 journalctl -u zeroproxy -n 30 看面板为什么没起来。</p><script>var n=0;var el=document.getElementById("zpwait");setInterval(function(){n+=3;el.textContent="已等待 "+n+" 秒";},1000);setTimeout(function(){location.replace(location.pathname+location.search);},3000);</script></body></html>';
+    }
+ZPBOOTING
+)"
+
 cat > /etc/nginx/conf.d/zeroproxy.conf <<NGINX
 # 由 ZeroProxy install.sh 生成的引导配置 — 面板完成 setup 后会覆盖本文件
 upstream zeroproxy_panel {
@@ -433,6 +451,7 @@ server {
     ssl_certificate $ZP_HOME/panel/cert.pem;
     ssl_certificate_key $ZP_HOME/panel/key.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
+${ZP_BOOTING_BLOCK}
     location / {
         proxy_pass http://zeroproxy_panel;
         proxy_http_version 1.1;
@@ -460,6 +479,7 @@ server {
     location ^~ /.well-known/acme-challenge/ {
         root $ZP_HOME/www;
     }
+${ZP_BOOTING_BLOCK}
     location / {
         proxy_pass http://zeroproxy_panel;
         proxy_http_version 1.1;
@@ -509,6 +529,41 @@ if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active
   ok "防火墙已放行 80/443/$PANEL_PORT/8443/8444/8445/tcp, 30001-32001/udp"
 else
   warn "请确认防火墙/安全组放行: 80,443,$PANEL_PORT,8443,8444,8445 (TCP) 与 30001-32001 (UDP)"
+fi
+
+# ---------------- 9b. 第一跳自检 (链接现在就通吗) ----------------
+# 打印链接之前先确认**那条链接此刻真的通**。以前这里 `systemctl restart` 完就直接打印 ——
+# 而面板冷启动 (import uvicorn / fastapi / cryptography) 在一台 1 核小机上要几秒, 用户
+# 正好在那几秒点开链接, 拿到的是 nginx 的 502 (引导配置里现在会回"面板正在启动"的重试页,
+# 见上面的 ZP_BOOTING_BLOCK); 而用户不知道那是"等几秒就好", 只知道要一遍遍刷新。
+# 这里做两件事: ① 等面板进程真的回话 (最多 30 秒); ② 经 nginx 按**用户那一跳**取一次
+# 面板自己报的版本 —— 两条入口各判一次, 判据是 JSON 里的 "name" (那页启动页里没有这个
+# 串, 所以 502 的重试页不会被误判成"通了")。自检不过就把该查哪里印在终端上。
+BIND_PORT="${NGINX_PANEL_BIND:-${ZP_BIND_PORT:-9900}}"
+PANEL_READY=0
+for _try in $(seq 1 30); do
+  if curl -fsS --max-time 3 "http://127.0.0.1:$BIND_PORT/api/info" 2>/dev/null | grep -q '"name"'; then
+    PANEL_READY=1
+    break
+  fi
+  sleep 1
+done
+HOP_HTTP="no"
+HOP_TLS="no"
+if curl -fsS --max-time 8 -H "Host: $SERVER_IP" "http://127.0.0.1/api/info" 2>/dev/null | grep -q '"name"'; then
+  HOP_HTTP="yes"
+fi
+# TLS 那一跳从本机回环打 (-k: 自签证书, 且 SNI 是 127.0.0.1): 只确认 nginx → 面板这一段
+if curl -fsSk --max-time 8 -H "Host: $SERVER_IP" "https://127.0.0.1:$PANEL_PORT/api/info" 2>/dev/null | grep -q '"name"'; then
+  HOP_TLS="yes"
+fi
+if [ "$HOP_HTTP" = "yes" ] || [ "$HOP_TLS" = "yes" ]; then
+  ok "初始化页自检: 80 端口 $HOP_HTTP · $PANEL_PORT TLS $HOP_TLS (nginx 到面板这一段是通的)"
+  [ "$PANEL_READY" = "1" ] || info "面板进程那条直连探测没通 (端口被自定义过时会这样), 但经 nginx 的入口是通的"
+elif [ "$PANEL_READY" = "0" ]; then
+  warn "面板 30 秒内没有回话 —— 打开链接会看到「面板正在启动」, 那一页会自己重试。查原因: journalctl -u zeroproxy -n 30"
+else
+  warn "初始化页自检没过 (nginx 到面板这一段不通): journalctl -u zeroproxy -n 30 · tail -20 /var/log/nginx/error.log"
 fi
 
 # ---------------- 10. 完成 ----------------

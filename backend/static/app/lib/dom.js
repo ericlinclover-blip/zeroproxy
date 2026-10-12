@@ -47,6 +47,9 @@ export async function copyText(text) {
 export function show(id) {
   ["view-setup", "view-login", "view-dash"].forEach((v) => $("#" + v).classList.add("hidden"));
   $("#" + id).classList.remove("hidden");
+  // 视图一旦选好, 首屏那句"正在连接面板…"就撤掉 (它在等 /api/status 的那段时间里顶着)
+  const boot = $("#bootNote");
+  if (boot) boot.classList.add("hidden");
 }
 
 /** 把某个板块滚到眼前, 并短暂高亮一下。

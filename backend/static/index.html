@@ -27,6 +27,12 @@
     <button class="theme-btn" id="themeBtn" title="切换深浅色">◐</button>
   </div>
 
+  <!-- 首屏到"选好视图"之间的空档: 页面已经到手, 但 boot() 还在等 /api/status
+       (面板刚重启 / 正在升级时会停在这里)。不给一句话的话, 用户看到的是一页只有 logo
+       的空白 —— 于是"要刷新很多次才出来"。任何一个视图显示出来时它会被 show() 收掉
+       (见 lib/dom.js)。 -->
+  <div class="boot-note" id="bootNote">正在连接面板…</div>
+
   <!-- ============ 视图 1: 初始化 ============ -->
   <section id="view-setup" class="hidden">
     <div class="hero">

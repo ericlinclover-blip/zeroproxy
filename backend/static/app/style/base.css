@@ -11,6 +11,19 @@ body {
 }
 .wrap { max-width: 1220px; margin: 0 auto; padding: 0 22px 80px; }
 .hidden { display: none !important; }
+
+/* 首屏到"选好视图"之间那一句 (面板重启 / 升级中会停在这儿)。
+   没有它就是"一页只有 logo 的空白", 用户只会想到刷新 —— 见 lib/dom.js 的 show()。 */
+.boot-note {
+  margin: 0 0 14px;
+  padding: 12px 16px;
+  border-radius: 12px;
+  background: var(--card);
+  border: 1px solid var(--border-soft);
+  color: var(--sub);
+  font-size: var(--fs-sm);
+  text-align: center;
+}
 .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
 .muted { color: var(--sub); }
 .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }

@@ -1384,20 +1384,55 @@ def subscription_userinfo(traffic: dict | None) -> str | None:
     return f"upload={up}; download={down}; total=0; expire=0"
 
 
+def _entry_port(request) -> str:
+    """这一次请求是打在哪个端口上的 (从 Host 头取; 没有端口就是空串)。"""
+    host = request.headers.get("host") or request.url.netloc or ""
+    return host.rpartition(":")[2] if ":" in host else ""
+
+
+def panel_scheme(request) -> str:
+    """面板对外基址用哪种 scheme。
+
+    **面板自己那个端口 (PANEL_PORT) 在生产上只有 nginx 的 TLS 在听** (install.sh 的
+    引导块与 `nginx_config.py` 都是 `listen <port> ssl`), 所以那个端口的地址一律 https。
+
+    为什么不能只跟着请求的 scheme 走: 初始化是在 **80 端口的明文页面**上做的 —— 那是
+    故意的设计 (打开就是初始化页, 没有证书警告, 见 README 8.80), 于是那时的
+    `X-Forwarded-Proto` 就是 http。而"初始化完成后把人送到域名面板"这一步要跳到
+    `<域名>:8899`: 拿明文的 scheme 拼出来就是 `http://<域名>:8899/` —— 一个**明文请求
+    打在 TLS 端口上**, nginx 只会回
+    `400 The plain HTTP request was sent to HTTPS port`。用户点完「一键生成」看到的就是
+    这个 400 (真机截图), 得自己把 http 改成 https 才进得去。
+
+    判据用 `X-Forwarded-Proto` (install.sh 的引导块与 `nginx_config._PANEL_PROXY` 都
+    设了它, 面板侧 uvicorn 也开着 `proxy_headers`): **没有这个头 = 没经过 nginx**
+    (本地 dev.sh / 回归脚本的面板自己就听在明文端口上) → 照旧跟着请求走, 不把开发
+    验证赶去没有人听的 https。
+    """
+    fwd = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    if fwd == "https":
+        return "https"
+    if fwd == "http":
+        # 经 nginx 的明文请求只可能来自 80 端口的引导页; 万一有人拿明文反代顶在面板
+        # 端口上 (Host 里就是这个端口), 那照实跟着走 —— 只认现场, 不猜。
+        return "http" if _entry_port(request) == str(config.PANEL_PORT) else "https"
+    return request.url.scheme
+
+
 def panel_base_url(request, state: dict) -> str:
     """面板对外基址。
 
     已配置域名时优先用域名: 配合面板 TLS 的 SNI 真实证书, https://<域名>:<port>
-    即为浏览器可信地址; 否则回退到请求本身 (bootstrap 阶段用 IP:端口)。
+    即为浏览器可信地址; 否则回退到请求本身 (bootstrap 阶段用 IP:端口 —— 那正是用户
+    此刻正打开着的地址, 换 scheme 只会把他送到一个没人听的端口上)。
     """
-    scheme = request.url.scheme
     domain = (state.get("domain") or "").strip()
     if not domain:
-        return f"{scheme}://{request.headers.get('host', request.url.netloc)}"
+        return f"{request.url.scheme}://{request.headers.get('host', request.url.netloc)}"
     # 以面板对外端口为准 (经 nginx 反代时 Host 头不含端口)
     port = config.PANEL_PORT
     netloc = domain if port in (80, 443) else f"{domain}:{port}"
-    return f"{scheme}://{netloc}"
+    return f"{panel_scheme(request)}://{netloc}"
 
 
 def subscription_url(request, state: dict) -> str:

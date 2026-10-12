@@ -132,6 +132,61 @@ def test_setup_does_not_force_https_on_the_panels_own_port(client, token, home, 
     assert body["redirect"]["secure_url"] == "", body["redirect"]
 
 
+def test_panel_url_on_the_panel_port_is_https_even_when_initialized_from_port_80(
+    client, token, home, monkeypatch
+):
+    """初始化是在 80 端口的**明文**页面上做的 (引导块设 `X-Forwarded-Proto: http`),
+    而"初始化完成后把人送到域名面板"要跳到 `<域名>:8899` —— 那个端口在生产上只有 nginx
+    的 TLS 在听。
+
+    所以这一跳必须是 https: 拿明文 scheme 拼出来的 `http://<域名>:8899/` 是一个**明文
+    请求打在 TLS 端口上**, nginx 只会回
+    `400 The plain HTTP request was sent to HTTPS port` —— 用户点完「一键生成」看到的
+    就是这个 400 (真机截图), 还得自己把 http 改成 https 才进得去。
+
+    两个可能被前端用到的字段 (`url` / `secure_url`) 一起钉住。
+    """
+    from zeroproxy import services
+
+    monkeypatch.setattr(services, "is_prod", lambda: True)
+    payload = {"domain": DOMAIN, "username": USERNAME, "password": PASSWORD, "token": token}
+    body = client.post("/api/setup", json=payload, headers={"x-forwarded-proto": "http"}).json()
+    assert body["redirect"]["url"] == f"https://{DOMAIN}:{config.PANEL_PORT}", body["redirect"]
+    assert (
+        body["redirect"]["secure_url"] == f"https://testserver:{config.PANEL_PORT}/"
+    ), body["redirect"]
+
+
+def test_panel_url_stays_https_when_the_page_itself_is_https(client, token, home):
+    """本来就是 https 进来 (域名面板 / https://<IP>:8899) 时, 基址当然还是 https。"""
+    payload = {"domain": DOMAIN, "username": USERNAME, "password": PASSWORD, "token": token}
+    body = client.post(
+        "/api/setup",
+        json=payload,
+        headers={"x-forwarded-proto": "https", "host": f"{DOMAIN}:{config.PANEL_PORT}"},
+    ).json()
+    assert body["redirect"]["url"] == f"https://{DOMAIN}:{config.PANEL_PORT}", body["redirect"]
+
+
+def test_panel_url_follows_the_request_when_there_is_no_nginx(client, token, home):
+    """没有 `X-Forwarded-Proto` = 没经过 nginx (本地 dev.sh / 回归脚本的面板自己就听在
+    明文端口上): 照旧跟着请求的 scheme 走 —— 别把开发验证赶去一个没有人听的 https。"""
+    payload = {"domain": DOMAIN, "username": USERNAME, "password": PASSWORD, "token": token}
+    body = client.post("/api/setup", json=payload).json()
+    assert body["redirect"]["url"] == f"http://{DOMAIN}:{config.PANEL_PORT}", body["redirect"]
+
+
+def test_subscription_links_are_https_on_the_panel_port_behind_nginx(client, configured):
+    """订阅地址与"面板基址"是同一处算出来的 —— 初始化那一步修好了, 这里也要跟着对:
+    从 80 端口的明文页面打开仪表盘时给出的订阅地址必须是 `https://<域名>:8899/sub/…`,
+    否则用户把它粘进客户端只会拿到 nginx 的 400。"""
+    body = client.get("/api/dashboard", headers={"x-forwarded-proto": "http"}).json()
+    assert body["panel_url"] == f"https://{DOMAIN}:{config.PANEL_PORT}", body["panel_url"]
+    assert body["subscription_formats"]["base64"].startswith(
+        f"https://{DOMAIN}:{config.PANEL_PORT}/sub/"
+    ), body["subscription_formats"]
+
+
 # ---------------------------------------------------------------- 鉴权
 
 def test_dashboard_requires_auth(client, configured):
@@ -3542,6 +3597,57 @@ def test_install_puts_the_bootstrap_page_on_plain_http_port_80():
     assert 'PANEL_URL_TLS="https://${SERVER_IP}:$PANEL_PORT/?token=${ZP_TOKEN}"' in text
     assert 'ok "  初始化页:  $PANEL_URL"' in text
     assert _bash_syntax_ok(path)
+
+
+def test_install_sh_waits_for_the_panel_and_self_checks_the_first_hop():
+    """引导期"面板还没起来"的那一小段: 不要甩 502, 也不要让用户以为要刷新很多次。
+
+    真机反馈: 点开带令牌的链接, 初始化页要刷新很多次才出来。install.sh 打印链接的那一刻,
+    面板可能还在 import uvicorn / fastapi / cryptography (1 核小机上要几秒), 也可能刚崩过、
+    正在被 systemd 拉起来 —— 那时 nginx 回的是它自己的 502 页, 用户只会一遍遍手动刷新。
+    两处补上:
+      ① 引导配置里 502/503/504 落到一页**自己会重试**的话上, 并把 `?token=` 原样带回去
+         (不带回去的话, 重试之后初始化页会提示"请用带 ?token= 的链接打开本页");
+      ② 打印链接之前先等面板真的回话, 再**按用户那一跳** (经 nginx) 自检一次, 把结论印在
+         终端上 —— 而不是让用户对着 502 去猜。
+    """
+    import re
+
+    path = os.path.join(REPO_ROOT, "install.sh")
+    text = open(path, encoding="utf-8").read()
+
+    # ① 启动中的重试页: 一份定义 (ZP_BOOTING_BLOCK), 两个 server 块各挂一次
+    assert "error_page 502 503 504 = @zp_booting;" in text, "面板没起来时要给重试页, 不是 502"
+    assert re.search(r"location @zp_booting \{", text)
+    assert "location.replace(location.pathname+location.search)" in text, "重试要把 ?token= 带回去"
+    assert text.count("error_page 502 503 504 = @zp_booting;") == 1, "共用一份定义"
+    assert text.count("${ZP_BOOTING_BLOCK}") == 2, "80 与面板端口两个 server 块都要挂"
+
+    # ② 打印链接前: 等面板回话 + 自检那两条入口
+    assert "for _try in $(seq 1 30); do" in text, "要先等面板进程就绪"
+    assert '$BIND_PORT/api/info' in text
+    assert '-H "Host: $SERVER_IP" "http://127.0.0.1/api/info"' in text, "要按用户那一跳自检"
+    assert _bash_syntax_ok(path)
+
+
+def test_first_paint_says_what_it_is_waiting_for():
+    """首屏到"选好视图"之间的空档要有话说。
+
+    面板刚重启 / 正在升级时, 页面已经到手, 但 boot() 还在等 `/api/status` —— 三个视图都带
+    `.hidden`, 那一屏只剩一个 logo, 看着就像没打开 (真机反馈里的"要刷新很多次")。
+    """
+    import re
+
+    html = open(os.path.join(REPO_ROOT, "backend", "static", "index.html"), encoding="utf-8").read()
+    assert 'id="bootNote"' in html and "正在连接面板" in html
+    dom = open(
+        os.path.join(REPO_ROOT, "backend", "static", "app", "lib", "dom.js"), encoding="utf-8"
+    ).read()
+    assert re.search(r'const boot = \$\("#bootNote"\)', dom), "show() 要把它收掉"
+    css = open(
+        os.path.join(REPO_ROOT, "backend", "static", "app", "style", "base.css"), encoding="utf-8"
+    ).read()
+    assert ".boot-note" in css
 
 
 def test_boot_never_routes_an_unconfigured_panel_to_the_login_page():

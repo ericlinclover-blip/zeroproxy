@@ -1,6 +1,6 @@
 # ZeroProxy 架构现状
 
-> 快照: **2026-10-12** · 面板 **v2.11.43** · 路由器客户端 **v1.4.37** (zpcore **1.3.0**) · `state.json` schema **v5**
+> 快照: **2026-10-12** · 面板 **v2.11.44** · 路由器客户端 **v1.4.37** (zpcore **1.3.0**) · `state.json` schema **v5**
 > 本文回答"**现在是什么样**"。另外两份文档分工不同, 不要混读:
 > `README.md` 是逐版开发日志 (4000+ 行, 每一版为什么这么改、哪次真机踩的坑);
 > `docs/RESEARCH.md` 与 `docs/ROUTER-CLIENT-REDESIGN.md` 是竞品调研与设计依据。
@@ -419,6 +419,15 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
   GitHub 取文件走**多前缀表** (自建反代排第一, 最后才直连; 拿到的必须是非空文件)。
   识别到 OpenWrt 会**当场停下**并说明「面板装在服务器上, 路由器端用面板生成的那一行命令」——
   在路由器上跑它以前只会留下一句 `dpkg: command not found` (真机截图)。
+* **第一跳与面板基址的 scheme**: 引导期初始化页挂在 **80 端口明文 HTTP** (主链接, 没有证书
+  警告) 与**面板端口的 TLS** (备用) 上, 面板完成 setup 后那份引导配置被整体覆盖。引导期
+  "面板还没起来"时两个入口都回一页**自己会重试**的话 (3 秒一跳, 把 `?token=` 带回去);
+  打印链接前 install.sh 还会先等面板回话, 再**按用户那一跳** (经 nginx) 自检并把结论印出来。
+  面板端口在生产上**只有 nginx 的 TLS**, 所以 `share_links.panel_base_url()` 用
+  `X-Forwarded-Proto` 判 scheme: 从 80 端口的明文页初始化完之后, 那一跳是
+  `https://<域名>:<面板端口>` —— 跟着请求走会拼出 `http://<域名>:8899/`, 被 nginx 回
+  `400 The plain HTTP request was sent to HTTPS port` (真机截图, README 8.95)。订阅地址 /
+  客户端安装命令 / "打开面板"都出自这个函数, 所以它们一起正。
 * **`upgrade.sh`**: 备份代码与 `state.json` → 换代码 → 按现有 `state.json` 重新落地配置 → 任一步失败**自动回滚**。
   只换程序代码, 密钥 / 订阅令牌 / 节点开关原样保留, **订阅地址不变**。
   面板内升级由 `systemd-run --no-block` 放进独立 cgroup (面板自身重启不打断), 进度落在
