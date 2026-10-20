@@ -103,6 +103,106 @@ def test_generated_files_have_safe_permissions(client, configured, home):
     assert "iptables" in text and "nft" in text
     assert "MASQUERADE" in text and "10.66.66.0/24" in text
     assert peer["public_key"] in wg_conf.read_text()
+    up = home / "wireguard" / "userspace-up.sh"
+    down = home / "wireguard" / "userspace-down.sh"
+    assert up.is_file() and down.is_file()
+    assert oct(up.stat().st_mode)[-3:] == "700"
+    assert "wg setconf" in up.read_text()
+
+
+def test_runtime_mode_falls_back_to_userspace(monkeypatch):
+    state = _state()
+    wireguard.bucket(state)["mode"] = "auto"
+    monkeypatch.setattr(wireguard, "tools_available", lambda: True)
+    monkeypatch.setattr(wireguard, "kernel_probe", lambda: (False, "Operation not permitted"))
+    monkeypatch.setattr(wireguard, "userspace_available", lambda: True)
+    mode, detail = wireguard.runtime_mode(state)
+    assert mode == "userspace" and "wireguard-go" in detail
+
+    monkeypatch.setattr(wireguard, "userspace_available", lambda: False)
+    mode, detail = wireguard.runtime_mode(state)
+    assert mode == "none"
+    assert "内核不支持" in detail and "TUN" in detail
+
+
+def test_forced_modes(monkeypatch):
+    state = _state()
+    wireguard.bucket(state)["mode"] = "kernel"
+    monkeypatch.setattr(wireguard, "tools_available", lambda: True)
+    monkeypatch.setattr(wireguard, "kernel_probe", lambda: (False, "Protocol not supported"))
+    mode, detail = wireguard.runtime_mode(state)
+    assert mode == "none" and "强制内核" in detail
+
+    wireguard.bucket(state)["mode"] = "userspace"
+    monkeypatch.setattr(wireguard, "userspace_available", lambda: True)
+    assert wireguard.runtime_mode(state)[0] == "userspace"
+
+
+def test_mode_setting_is_validated(client, configured):
+    bad = client.post("/api/wireguard/settings", json={"mode": "magic"})
+    assert bad.status_code == 400
+    ok = client.post("/api/wireguard/settings", json={"enabled": True, "mode": "userspace"})
+    assert ok.status_code == 200
+    assert ok.json()["wireguard"]["mode"] == "userspace"
+
+
+def test_sync_selects_userspace_unit(home, monkeypatch):
+    from zeroproxy import services
+
+    state = _state()
+    wg = wireguard.bucket(state)
+    wg["enabled"] = True
+    wg["mode"] = "auto"
+    wireguard.add_peer(state, "phone")
+    calls: list[list[str]] = []
+    started = {"ok": False}
+
+    monkeypatch.setattr(services, "is_prod", lambda: True)
+    monkeypatch.setattr(wireguard, "ensure_tools", lambda timeout=180: (True, "ok"))
+    monkeypatch.setattr(wireguard, "active_service", lambda: "")
+    monkeypatch.setattr(wireguard, "runtime_mode", lambda s: ("userspace", "fallback"))
+    monkeypatch.setattr(wireguard, "userspace_available", lambda: True)
+    monkeypatch.setattr(wireguard, "service_state", lambda name="x": "inactive")
+    monkeypatch.setattr(wireguard, "interface_exists", lambda: started["ok"])
+
+    def fake_run(cmd, timeout=120, env=None):
+        calls.append(list(cmd))
+        if cmd[:2] == ["systemctl", "start"] and cmd[2] == wireguard.SERVICE_USERSPACE:
+            started["ok"] = True
+        return True, ""
+
+    monkeypatch.setattr(services, "run", fake_run)
+    ok, detail = wireguard.sync(state)
+    assert ok is True, detail
+    assert any(c[:3] == ["systemctl", "start", wireguard.SERVICE_USERSPACE] for c in calls)
+    assert any(c[:3] == ["systemctl", "enable", wireguard.SERVICE_USERSPACE] for c in calls)
+    assert wg["active_mode"] == "userspace"
+
+
+def test_sync_failure_surfaces_journal(home, monkeypatch):
+    from zeroproxy import services
+
+    state = _state()
+    wg = wireguard.bucket(state)
+    wg["enabled"] = True
+    wg["mode"] = "kernel"
+    monkeypatch.setattr(services, "is_prod", lambda: True)
+    monkeypatch.setattr(wireguard, "ensure_tools", lambda timeout=180: (True, "ok"))
+    monkeypatch.setattr(wireguard, "active_service", lambda: "")
+    monkeypatch.setattr(wireguard, "runtime_mode", lambda s: ("kernel", ""))
+    monkeypatch.setattr(wireguard, "service_state", lambda name="x": "inactive")
+    monkeypatch.setattr(wireguard, "interface_exists", lambda: False)
+    monkeypatch.setattr(wireguard, "journal_tail", lambda name="x", lines=20: "protocol not supported")
+
+    def fake_run(cmd, timeout=120, env=None):
+        if cmd[:2] == ["systemctl", "start"]:
+            return False, "Job for zeroproxy-wg.service failed"
+        return True, ""
+
+    monkeypatch.setattr(services, "run", fake_run)
+    ok, detail = wireguard.sync(state)
+    assert ok is False
+    assert "Job for" in detail and "protocol not supported" in detail
 
 
 def test_api_lifecycle_and_one_time_link(client, configured):

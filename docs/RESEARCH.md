@@ -99,6 +99,11 @@ WireGuard 不是一个能挂到 Xray 入站上的代理协议，同类产品的�
 把 WireGuard 塞进 Clash / sing-box 订阅：mihomo 支持 WG 出站，但 sing-box 1.11 起把它标记为
 废弃、1.13 移除（改成 endpoint），混进统一 `outbounds` 会让新版客户端拒绝整份配置。
 
+另一条来自真机的经验：`wg-quick` 的内核回退只判断 `/sys/module/wireguard`，对"模块在、
+但容器没有 NET_ADMIN"这一档不可靠。Debian 12 / Ubuntu 22.04+ 都提供 `wireguard-go` 包，
+所以本项目改成"实际建一个临时接口"来探测内核，失败后走独立的 `wireguard-go` systemd 单元；
+如果连 `/dev/net/tun` 都没有（部分 OpenVZ），则明确告知该环境无法承载 WireGuard。
+
 ---
 
 ## 3. 一手证据: 本项目采信的上游事实

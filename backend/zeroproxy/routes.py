@@ -796,7 +796,10 @@ def _system_view(state: dict) -> dict:
             "version": services.service_version("hysteria2"),
         },
         "wireguard": {
-            "state": wireguard.service_state() if wireguard.enabled(state) else "inactive"
+            "state": (wireguard.active_service() or "inactive")
+            if wireguard.enabled(state)
+            else "inactive",
+            "mode": str((state.get("wireguard") or {}).get("active_mode") or ""),
         },
         "nginx": {"state": services.service_state("nginx")},
         "server": services.server_info(),
@@ -2759,6 +2762,7 @@ def chain_exit_qr(request: Request, size: int = 6, img: str = "png"):
 
 class WireGuardSettingsIn(BaseModel):
     enabled: bool | None = None
+    mode: str | None = None
     port: int | None = None
     subnet: str | None = None
     mtu: int | None = None
@@ -2818,6 +2822,12 @@ def wireguard_settings(payload: WireGuardSettingsIn, request: Request):
             return _err("未登录", 401)
         wg = wireguard.bucket(state)
         updates: dict = {}
+
+        if payload.mode is not None:
+            try:
+                updates["mode"] = wireguard.validate_mode(payload.mode)
+            except ValueError as exc:
+                return _err(str(exc))
 
         if payload.port is not None:
             try:

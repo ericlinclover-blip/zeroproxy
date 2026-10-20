@@ -281,7 +281,7 @@ def restart_services(
     wg_failed = False
     wg_in_use = (
         wireguard.enabled(state)
-        or wireguard.service_state() in ("active", "activating")
+        or bool(wireguard.active_service())
     )
     if wg_in_use:
         try:
@@ -514,7 +514,7 @@ def verify_listeners(state: dict, timeout: int = 0) -> tuple[bool, str]:
             problems.append("WireGuard 已启用但 wg0 接口不存在")
         elif not wireguard.nat_rule_present():
             problems.append("WireGuard 的 NAT/MASQUERADE 规则不存在 (客户端会连上但上不了网)")
-    elif wireguard.service_state() in ("active", "activating"):
+    elif wireguard.active_service():
         problems.append("WireGuard 已停用但服务仍在运行")
     if problems:
         return False, "; ".join(problems)

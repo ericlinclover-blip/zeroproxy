@@ -1,0 +1,20 @@
+[Unit]
+Description=ZeroProxy - WireGuard (userspace fallback for containers / kernels without the module)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# 当 `ip link add ... type wireguard` 不可用时使用。wireguard-go 需要
+# /dev/net/tun 以及容器的 NET_ADMIN；面板会在启动前探测这两项。
+Type=simple
+ExecStart=/usr/bin/wireguard-go -f wg0
+ExecStartPost=/bin/sh /opt/zeroproxy/wireguard/userspace-up.sh
+ExecReload=/bin/sh /opt/zeroproxy/wireguard/reload.sh
+ExecStopPost=/bin/sh /opt/zeroproxy/wireguard/userspace-down.sh
+Restart=on-failure
+RestartSec=3
+TimeoutStartSec=30
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

@@ -31,6 +31,7 @@ from .config import paths
 
 INTERFACE = "wg0"
 SERVICE = "zeroproxy-wg"
+SERVICE_USERSPACE = "zeroproxy-wg-userspace"
 
 DEFAULT_PORT = 51820
 DEFAULT_SUBNET = "10.66.66.0/24"
@@ -191,6 +192,13 @@ def validate_keepalive(value: int) -> int:
     if not 0 <= keepalive <= 65535:
         raise ValueError("Keepalive 需在 0-65535 秒之间")
     return keepalive
+
+
+def validate_mode(value: str) -> str:
+    mode = str(value or "auto").strip().lower()
+    if mode not in ("auto", "kernel", "userspace"):
+        raise ValueError("运行方式只能是 auto / kernel / userspace")
+    return mode
 
 
 def normalize_dns(value: str) -> str:
@@ -620,6 +628,60 @@ def reload_script(state: dict) -> str:
     return "\n".join(lines)
 
 
+def userspace_up_script(state: dict) -> str:
+    """wireguard-go 的 ExecStartPost: 接口建好后把配置与地址灌进去。"""
+    wg = bucket(state)
+    v4, v6 = server_addresses(state)
+    lines = [
+        "#!/bin/sh",
+        "# 由 ZeroProxy 自动生成 — wireguard-go 用户态接口初始化",
+        "set -eu",
+        f'IFACE="{INTERFACE}"',
+        "i=0",
+        'while [ "$i" -lt 50 ]; do',
+        '  ip link show dev "$IFACE" >/dev/null 2>&1 && break',
+        "  i=$((i+1))",
+        "  sleep 0.1",
+        "done",
+        'ip link show dev "$IFACE" >/dev/null 2>&1 || { '
+        'echo "wireguard-go 没有建立 wg0" >&2; exit 1; }',
+        f'wg setconf "$IFACE" "{paths()["wireguard_runtime"]}"',
+        f'want4="{v4}"',
+        f'cur4="$(ip -4 addr show dev {INTERFACE} | awk \'/inet /{{print $2; exit}}\')"',
+        'if [ "$cur4" != "$want4" ]; then',
+        f'  ip -4 addr flush dev {INTERFACE} scope global || true',
+        f'  ip -4 addr add "$want4" dev {INTERFACE}',
+        "fi",
+    ]
+    if v6:
+        lines += [
+            f'want6="{v6}"',
+            f'cur6="$(ip -6 addr show dev {INTERFACE} | awk \'/inet6 /{{print $2; exit}}\')"',
+            'if [ "$cur6" != "$want6" ]; then',
+            f'  ip -6 addr flush dev {INTERFACE} scope global || true',
+            f'  ip -6 addr add "$want6" dev {INTERFACE}',
+            "fi",
+        ]
+    lines += [
+        f'ip link set dev {INTERFACE} mtu {int(wg.get("mtu") or DEFAULT_MTU)} up',
+        f'"{paths()["wireguard_firewall"]}" up',
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def userspace_down_script(state: dict) -> str:
+    return "\n".join(
+        [
+            "#!/bin/sh",
+            "# 由 ZeroProxy 自动生成 — wireguard-go 停止后的清理",
+            f'"{paths()["wireguard_firewall"]}" down || true',
+            f"ip link delete dev {INTERFACE} 2>/dev/null || true",
+            "",
+        ]
+    )
+
+
 def _write(path: str, text: str, mode: int) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -649,6 +711,8 @@ def generate(state: dict) -> tuple[bool, str]:
     _write(paths()["wireguard_runtime"], server_config(state, runtime=True), 0o600)
     _write(paths()["wireguard_firewall"], firewall_script(state), 0o700)
     _write(paths()["wireguard_reload"], reload_script(state), 0o700)
+    _write(paths()["wireguard_userspace_up"], userspace_up_script(state), 0o700)
+    _write(paths()["wireguard_userspace_down"], userspace_down_script(state), 0o700)
     active = len(active_peers(state))
     total = len(peers(state))
     note = f"已生成 · {active}/{total} 个客户端启用 · {endpoint_text(state) or '(尚未确定地址)'}"
@@ -661,15 +725,22 @@ def tools_available() -> bool:
     return bool(shutil.which("wg") and shutil.which("wg-quick"))
 
 
-def ensure_tools(timeout: int = 180) -> tuple[bool, str]:
-    if tools_available():
-        return True, "WireGuard 工具已安装"
-    if not services.is_prod():
-        return False, "本地开发环境没有 wg / wg-quick（生产机会自动安装）"
+def firewall_tool_available() -> bool:
+    return bool(shutil.which("iptables") or shutil.which("nft"))
+
+
+def userspace_available() -> bool:
+    """wireguard-go 与 TUN 都在才谈得上用户态回退。"""
+    return bool(shutil.which("wireguard-go") and os.path.exists("/dev/net/tun"))
+
+
+def _apt_install(packages: list[str], timeout: int) -> tuple[bool, str]:
+    if not packages:
+        return True, ""
     if not shutil.which("apt-get"):
-        return False, "未安装 wireguard-tools，请手动安装 wg / wg-quick"
+        return False, "本机没有 apt-get, 请手动安装: " + " ".join(packages)
     ok, out = services.run(
-        ["apt-get", "install", "-y", "wireguard-tools", "iptables"],
+        ["apt-get", "install", "-y", *packages],
         timeout=timeout,
         env={"DEBIAN_FRONTEND": "noninteractive"},
     )
@@ -680,23 +751,45 @@ def ensure_tools(timeout: int = 180) -> tuple[bool, str]:
             env={"DEBIAN_FRONTEND": "noninteractive"},
         )
         ok, out = services.run(
-            ["apt-get", "install", "-y", "wireguard-tools", "iptables"],
+            ["apt-get", "install", "-y", *packages],
             timeout=timeout,
             env={"DEBIAN_FRONTEND": "noninteractive"},
         )
-    if ok and tools_available():
-        return True, "已安装 wireguard-tools + iptables"
-    return False, f"wireguard-tools 安装失败: {' '.join(out.split())[:160]}"
+    return ok, " ".join(out.split())[:200]
 
 
-def service_state() -> str:
+def ensure_tools(timeout: int = 180) -> tuple[bool, str]:
+    if not services.is_prod():
+        return False, "本地开发环境没有 wg / wg-quick（生产机会自动安装）"
+    need: list[str] = []
+    if not tools_available() or not shutil.which("ip"):
+        need += ["wireguard-tools", "iproute2"]
+    if not firewall_tool_available():
+        need.append("iptables")
+    if need:
+        ok, out = _apt_install(need, timeout)
+        if not ok or not tools_available():
+            return False, f"WireGuard 工具安装失败: {out}"
+    detail = "wireguard-tools 已就绪"
+    detail += " · wireguard-go 可用" if shutil.which("wireguard-go") else " · wireguard-go 未安装"
+    return True, detail
+
+
+def service_state(name: str = SERVICE) -> str:
     if not services.is_prod():
         return "dry-run"
     if not shutil.which("systemctl"):
         return "unavailable"
-    ok, out = services.run(["systemctl", "is-active", SERVICE], timeout=10)
+    ok, out = services.run(["systemctl", "is-active", name], timeout=10)
     state = (out or "").strip().splitlines()[0] if out.strip() else "unknown"
     return state or "inactive"
+
+
+def active_service() -> str:
+    for name in (SERVICE, SERVICE_USERSPACE):
+        if service_state(name) in ("active", "activating"):
+            return name
+    return ""
 
 
 def interface_exists() -> bool:
@@ -704,6 +797,58 @@ def interface_exists() -> bool:
         return False
     ok, _ = services.run(["ip", "link", "show", "dev", INTERFACE], timeout=5)
     return ok
+
+
+def kernel_probe() -> tuple[bool, str]:
+    """真正建一个临时 WireGuard 接口再删掉 —— 只看 /sys/module 会误判。
+
+    容器里常见两种情况: 模块根本不存在; 或者宿主机加载了模块, 但容器没有
+    NET_ADMIN (`Operation not permitted`)。两者的处理都是改走 wireguard-go。
+    """
+    probe = "zpwgprobe0"
+    services.run(["ip", "link", "delete", "dev", probe], timeout=5)
+    ok, out = services.run(
+        ["ip", "link", "add", "dev", probe, "type", "wireguard"], timeout=10
+    )
+    services.run(["ip", "link", "delete", "dev", probe], timeout=5)
+    if ok:
+        return True, ""
+    lines = [line.strip() for line in (out or "").splitlines() if line.strip()]
+    return False, (lines[-1] if lines else "ip link add 失败")[:200]
+
+
+def runtime_mode(state: dict) -> tuple[str, str]:
+    """决定这次用内核还是 wireguard-go。返回 (kernel|userspace|none, 说明)。"""
+    wg = bucket(state)
+    try:
+        pref = validate_mode(wg.get("mode") or "auto")
+    except ValueError:
+        pref = "auto"
+    if pref == "kernel":
+        if not tools_available():
+            return "none", "强制内核模式, 但 wg / wg-quick 未安装"
+        ok, err = kernel_probe()
+        if not ok:
+            return "none", f"强制内核模式, 但内核无法创建 WireGuard 接口: {err}"
+        return "kernel", ""
+    if pref == "userspace":
+        if userspace_available():
+            return "userspace", "强制用户态 (wireguard-go)"
+        return "none", (
+            "强制用户态, 但缺少 wireguard-go 或 /dev/net/tun "
+            "(容器需要 --device /dev/net/tun 并允许 TUN)"
+        )
+    if tools_available():
+        ok, err = kernel_probe()
+        if ok:
+            return "kernel", ""
+        if userspace_available():
+            return "userspace", f"内核不可用 ({err}); 自动改用 wireguard-go"
+        return "none", (
+            f"内核不支持 WireGuard ({err}); 且没有可用的 wireguard-go / TUN。"
+            "这是容器或受限内核最常见的失败原因。"
+        )
+    return "none", "wg / wg-quick 未安装"
 
 
 def _interface_public_key() -> str:
@@ -746,6 +891,48 @@ def nat_rule_present() -> bool:
     return bool(ok and "masquerade" in out)
 
 
+def journal_tail(name: str = SERVICE, lines: int = 20) -> str:
+    """把 systemd 的"control process exited"换成真正的原因。"""
+    if not services.is_prod():
+        return ""
+    ok, out = services.run(
+        ["journalctl", "-u", name, "-n", str(int(lines)), "--no-pager"], timeout=15
+    )
+    if not ok:
+        return ""
+    rows = [" ".join(line.split()) for line in out.splitlines() if line.strip()]
+    return " | ".join(rows[-6:])[:600]
+
+
+def _stop_unit(name: str, timeout: int) -> tuple[bool, str]:
+    if service_state(name) not in ("active", "activating", "reloading"):
+        return True, ""
+    ok, out = services.run(["systemctl", "disable", "--now", name], timeout=timeout)
+    return ok, " ".join(out.split())[:200]
+
+
+def _teardown_interface(state: dict, timeout: int) -> tuple[bool, str]:
+    """拆掉 wg0，兼容内核接口与 wireguard-go 的 TUN 接口。"""
+    if not interface_exists():
+        return True, ""
+    existing = _interface_public_key()
+    if existing and existing != str(bucket(state).get("server_public_key") or ""):
+        return False, (
+            f"{INTERFACE} 已存在且不是本面板管理的接口, 未做改动 "
+            f"(公钥 {existing[:12]}…)"
+        )
+    ok, out = services.run(
+        ["wg-quick", "down", paths()["wireguard_config"]], timeout=timeout
+    )
+    if ok and not interface_exists():
+        return True, ""
+    services.run(["ip", "link", "delete", "dev", INTERFACE], timeout=timeout)
+    services.run(["sh", paths()["wireguard_firewall"], "down"], timeout=timeout)
+    if interface_exists():
+        return False, f"wg0 无法拆除: {' '.join(out.split())[:160]}"
+    return True, ""
+
+
 def sync(state: dict, timeout: int = 90) -> tuple[bool, str]:
     ok, detail = generate(state)
     if not ok:
@@ -754,72 +941,95 @@ def sync(state: dict, timeout: int = 90) -> tuple[bool, str]:
     if not wg.get("enabled"):
         if not services.is_prod():
             return True, detail + " · WireGuard 未启用 (本地开发跳过服务操作)"
-        if service_state() in ("active", "activating"):
-            ok, out = services.run(["systemctl", "disable", "--now", SERVICE], timeout=timeout)
+        for name in (SERVICE, SERVICE_USERSPACE):
+            ok, out = _stop_unit(name, timeout)
             if not ok:
-                return False, f"停用 WireGuard 失败: {' '.join(out.split())[:160]}"
-            if interface_exists():
-                return False, "服务已停用但 wg0 仍存在, 可能有其它进程在管理同名接口"
-            return True, "已停用 WireGuard (wg0 已拆除)"
+                return False, f"停用 {name} 失败: {out}"
         if interface_exists():
-            existing = _interface_public_key()
-            if existing and existing != str(wg.get("server_public_key") or ""):
-                return False, (
-                    f"{INTERFACE} 已存在且不是本面板管理的接口, 未做改动 "
-                    f"(公钥 {existing[:12]}…)"
-                )
-            ok, out = services.run(
-                ["wg-quick", "down", paths()["wireguard_config"]], timeout=timeout
-            )
+            ok, out = _teardown_interface(state, timeout)
             if not ok:
-                return False, f"wg0 仍在但无法拆除: {' '.join(out.split())[:160]}"
-            if interface_exists():
-                return False, "wg-quick down 返回成功但 wg0 仍在"
-            return True, "已拆除遗留的 wg0"
-        return True, "WireGuard 未启用"
+                return False, out
+        wg["active_mode"] = ""
+        return True, "已停用 WireGuard (wg0 已拆除)"
     if not services.is_prod():
         return True, detail + " · 本地开发跳过服务操作"
+
     tools_ok, tools_detail = ensure_tools(timeout=max(timeout, 180))
     if not tools_ok:
         return False, tools_detail
-    active = service_state() in ("active", "activating")
-    if interface_exists():
-        # 同名接口可能属于别的服务 (或上一版残留)。只接管公钥与本面板一致的
-        # wg0; 不一致时宁可报错, 也不要把别人的隧道 syncconf 掉。
-        existing = _interface_public_key()
-        if existing and existing != str(wg.get("server_public_key") or ""):
+
+    pref = validate_mode(wg.get("mode") or "auto")
+    active_name = active_service()
+    mode_detail = ""
+    if pref == "auto" and active_name and interface_exists():
+        # 已经在跑就不要每次加 peer 都重新探测内核 (探测会建/删临时接口)
+        mode = "kernel" if active_name == SERVICE else "userspace"
+    else:
+        mode, mode_detail = runtime_mode(state)
+        if mode == "none" and pref != "kernel" and not shutil.which("wireguard-go"):
+            # 只有真的走不通内核时才去装用户态, 不让正常服务器每次同步都碰 apt
+            _apt_install(["wireguard-go"], timeout)
+            if userspace_available():
+                mode, mode_detail = runtime_mode(state)
+    if mode == "none":
+        return False, mode_detail
+    if mode == "userspace" and not userspace_available():
+        _apt_install(["wireguard-go"], timeout)
+        if not userspace_available():
             return False, (
-                f"{INTERFACE} 已存在且不是本面板管理的接口 "
-                f"(公钥 {existing[:12]}…), 请先确认 / 移除冲突接口"
+                "用户态 WireGuard 需要 wireguard-go 与 /dev/net/tun; "
+                "容器请确认已映射 /dev/net/tun 并允许 TUN"
             )
-        if not active:
-            services.run(["wg-quick", "down", paths()["wireguard_config"]], timeout=timeout)
+
+    unit = SERVICE if mode == "kernel" else SERVICE_USERSPACE
+    other = SERVICE_USERSPACE if mode == "kernel" else SERVICE
+    if service_state(other) in ("active", "activating", "reloading"):
+        ok, out = _stop_unit(other, timeout)
+        if not ok:
+            return False, f"切换运行方式时停止 {other} 失败: {out}"
+        for _ in range(20):
+            if not interface_exists():
+                break
+            time.sleep(0.1)
+
+    active = service_state(unit) in ("active", "activating", "reloading")
     if active and not interface_exists():
-        # 服务 active 但接口没了 (被手工删 / 异常): 完整重启一次重建
-        ok, out = services.run(["systemctl", "restart", SERVICE], timeout=timeout)
+        ok, out = services.run(["systemctl", "restart", unit], timeout=timeout)
         action = "重启"
     elif active:
-        ok, out = services.run(["systemctl", "reload", SERVICE], timeout=timeout)
+        ok, out = services.run(["systemctl", "reload", unit], timeout=timeout)
         action = "重载"
     else:
-        ok, out = services.run(["systemctl", "start", SERVICE], timeout=timeout)
+        if interface_exists():
+            ok, out = _teardown_interface(state, timeout)
+            if not ok:
+                return False, out
+        ok, out = services.run(["systemctl", "start", unit], timeout=timeout)
         action = "启动"
         if ok:
             # 起得来才写开机自启: 配置/内核不支持时不要留下一个每次开机都失败的单元
-            services.run(["systemctl", "enable", SERVICE], timeout=30)
+            services.run(["systemctl", "enable", unit], timeout=30)
     if not ok:
-        return False, f"WireGuard {action}失败: {' '.join(out.split())[:200]}"
+        tail = journal_tail(unit)
+        message = f"{unit} {action}失败: {' '.join(out.split())[:300]}"
+        if tail:
+            message += f" · 最近日志: {tail}"
+        return False, message
     for _ in range(25):
         if interface_exists():
             break
         time.sleep(0.1)
     if not interface_exists():
-        return False, (
-            f"WireGuard {action}后 wg0 仍未建立 "
-            f"(查看 journalctl -u {SERVICE} -n 30)"
-        )
+        tail = journal_tail(unit)
+        message = f"{unit} {action}后 wg0 仍未建立"
+        if tail:
+            message += f" · 最近日志: {tail}"
+        return False, message
+    wg["active_mode"] = mode
+    suffix = f" · {mode_detail}" if mode_detail else ""
     return True, (
-        f"WireGuard {action}成功 · {len(active_peers(state))} 个客户端 · {endpoint_text(state)}"
+        f"WireGuard {action}成功{suffix} · {len(active_peers(state))} 个客户端 · "
+        f"{endpoint_text(state)}"
     )
 
 
@@ -922,7 +1132,12 @@ def view(state: dict, now: int | None = None) -> dict:
         )
     tools = tools_available()
     running = interface_exists() if is_enabled else False
-    service = service_state() if is_enabled else ("inactive" if prod else "dry-run")
+    active = active_service() if is_enabled else ""
+    service = active or ("inactive" if prod else "dry-run")
+    try:
+        mode_pref = validate_mode(wg.get("mode") or "auto")
+    except ValueError:
+        mode_pref = "auto"
     reason = ""
     if wg.get("enabled") and not prod:
         reason = "本地开发环境: 配置已生成, 不启动内核接口"
@@ -932,6 +1147,9 @@ def view(state: dict, now: int | None = None) -> dict:
         reason = f"服务未运行（{service}）"
     return {
         "enabled": bool(wg.get("enabled")),
+        "mode": mode_pref,
+        "active_mode": str(wg.get("active_mode") or ""),
+        "userspace_available": userspace_available(),
         "port": int(wg.get("port") or DEFAULT_PORT),
         "subnet": str(wg.get("subnet") or DEFAULT_SUBNET),
         "mtu": int(wg.get("mtu") or DEFAULT_MTU),
@@ -968,8 +1186,21 @@ def diagnose(state: dict) -> tuple[bool, str]:
         return True, "本地开发环境, 跳过接口检查"
     if not tools_available():
         return False, "未安装 wireguard-tools（wg / wg-quick 不存在）"
+    if not firewall_tool_available():
+        return False, "未安装 iptables / nftables, 无法建立 NAT 转发"
     if not interface_exists():
-        return False, f"{INTERFACE} 不存在 — 服务状态 {service_state()}"
+        mode, mode_detail = runtime_mode(state)
+        states = (
+            f"{SERVICE}={service_state(SERVICE)} / "
+            f"{SERVICE_USERSPACE}={service_state(SERVICE_USERSPACE)}"
+        )
+        if mode == "none":
+            return False, mode_detail
+        message = f"{INTERFACE} 不存在 — {states}; 可用方式: {mode} {mode_detail}".strip()
+        tail = journal_tail(SERVICE_USERSPACE if mode == "userspace" else SERVICE)
+        if tail:
+            message += f" · 最近日志: {tail}"
+        return False, message
     port = int(wg.get("port") or DEFAULT_PORT)
     listening = services.udp_port_listening(port)
     if listening is False:
@@ -980,4 +1211,6 @@ def diagnose(state: dict) -> tuple[bool, str]:
             "客户端会显示已连接却上不了网"
         )
     active = len(active_peers(state))
-    return True, f"{INTERFACE} 运行中 · UDP {port} · {active} 个启用客户端"
+    mode = str(bucket(state).get("active_mode") or "")
+    mode_text = f" · {mode}" if mode else ""
+    return True, f"{INTERFACE} 运行中{mode_text} · UDP {port} · {active} 个启用客户端"

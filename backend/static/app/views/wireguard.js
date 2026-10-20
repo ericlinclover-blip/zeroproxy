@@ -109,6 +109,7 @@ function enabledView(wg) {
         ${statusPill(wg)}
         <span class="wg-endpoint">${esc(wg.endpoint || "尚未确定地址")}</span>
         <span class="muted fs-xs">接口 ${esc(wg.interface)} · MTU ${esc(wg.mtu)}</span>
+        ${wg.active_mode ? `<span class="tag-chip">${wg.active_mode === "userspace" ? "用户态 (wireguard-go)" : "内核"}</span>` : ""}
       </div>
       ${wg.reason ? `<div class="muted fs-xs mt-1">${esc(wg.reason)}</div>` : ""}
     </div>
@@ -121,6 +122,17 @@ function enabledView(wg) {
       <div class="field">
         <label>监听端口 (UDP)</label>
         <input id="wg-port" class="mono" inputmode="numeric" value="${escAttr(wg.port)}">
+      </div>
+      <div class="field">
+        <label>运行方式</label>
+        <select id="wg-mode">
+          <option value="auto" ${wg.mode === "auto" ? "selected" : ""}>自动 (内核优先, 失败退用户态)</option>
+          <option value="kernel" ${wg.mode === "kernel" ? "selected" : ""}>仅内核</option>
+          <option value="userspace" ${wg.mode === "userspace" ? "selected" : ""}>仅用户态 (wireguard-go)</option>
+        </select>
+        <div class="muted fs-xs mt-1">
+          ${wg.userspace_available ? "wireguard-go 与 /dev/net/tun 已就绪" : "未检测到 wireguard-go 或 /dev/net/tun"}
+        </div>
       </div>
       <div class="field">
         <label>隧道网段${hasPeers ? " (有客户端时锁定)" : ""}</label>
@@ -324,6 +336,7 @@ function bind(wg) {
 
 async function saveSettings(wg, btn) {
   const port = parseInt($("#wg-port").value, 10);
+  const mode = $("#wg-mode").value;
   const subnetEl = $("#wg-subnet");
   const mtu = parseInt($("#wg-mtu").value, 10);
   const dns = $("#wg-dns").value.trim();
@@ -331,6 +344,7 @@ async function saveSettings(wg, btn) {
   const keepalive = parseInt($("#wg-keepalive").value, 10);
   const ipv6 = $("#wg-ipv6").checked;
   const payload = {};
+  if (mode !== (wg.mode || "auto")) payload.mode = mode;
   if (port !== wg.port) payload.port = port;
   if (subnetEl && !subnetEl.disabled && subnetEl.value.trim() !== wg.subnet) {
     payload.subnet = subnetEl.value.trim();

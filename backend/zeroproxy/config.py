@@ -211,6 +211,9 @@ DEFAULTS: dict = {
     # 会拒绝整份配置。每台设备一条独立 peer, 私钥 / PSK 只在本机 state.json (0600)。
     "wireguard": {
         "enabled": False,
+        # auto: 先试内核, 失败自动退到 wireguard-go 用户态; kernel / userspace 可强制
+        "mode": "auto",
+        "active_mode": "",         # 上次成功启动用的是 kernel / userspace
         "port": 51820,             # UDP 监听端口
         "subnet": "10.66.66.0/24", # 隧道网段; 服务端固定用 .1
         "ipv6": False,             # 可选 IPv6 隧道 (ULA), 默认关
@@ -270,6 +273,8 @@ def paths() -> dict:
         "wireguard_runtime": f"{h}/wireguard/wg0.runtime.conf",
         "wireguard_firewall": f"{h}/wireguard/firewall.sh",
         "wireguard_reload": f"{h}/wireguard/reload.sh",
+        "wireguard_userspace_up": f"{h}/wireguard/userspace-up.sh",
+        "wireguard_userspace_down": f"{h}/wireguard/userspace-down.sh",
         # 链式代理的内层 QUIC (Hysteria 2) — 配置 / 进程日志 / 临时测速都放这里
         "chain_quic_dir": f"{h}/data/chain-quic",
         "chain_quic_cert": f"{h}/data/chain-quic/cert.pem",

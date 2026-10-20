@@ -60,7 +60,7 @@ curl -fsSL https://github.i3.pub/https://raw.githubusercontent.com/ericlinclover
 | **一键更新** | 面板「程序更新」按钮, 或服务器上 `upgrade.sh` 一条命令: 自动备份代码与 `state.json` → 替换 → 按现有 `state.json` 重新落地配置 → 失败自动回滚; 面板内更新由 systemd 瞬时单元托管, 面板自身重启不会打断升级 |
 | **配置落地可验证** | 每次应用配置都用真实二进制校验 (`xray -test` / `nginx -t`) 并**复查端口是否真的在监听**; 任一步失败会在面板顶部标红, 不再出现「服务全绿但节点全不通」 |
 | **5 个订阅节点 + 原生 WireGuard** | VLESS Reality (TCP+Vision)、VLESS XHTTP Reality、VLESS WebSocket、Trojan TLS、Hysteria 2 (QUIC+端口跳跃); 另有一个独立的 WireGuard `wg0` 入站 (官方客户端 `.conf` / 二维码) |
-| **原生 WireGuard** | 官方 iOS / Android / Windows / macOS 客户端直接连接: 面板生成标准 `.conf` 与二维码, 每台设备独立密钥 + PSK, 支持启用/停用/改名/轮换/删除、到期自动回收、一次性下载链接、握手与上下行实时统计、可选 IPv6 隧道。配置变更走 `wg syncconf` 增量同步, 不会踢掉在线设备; 独立 `wg0` 接口 + nftables/iptables NAT, 与 Xray / Hysteria 2 互不影响 |
+| **原生 WireGuard** | 官方 iOS / Android / Windows / macOS 客户端直接连接: 面板生成标准 `.conf` 与二维码, 每台设备独立密钥 + PSK, 支持启用/停用/改名/轮换/删除、到期自动回收、一次性下载链接、握手与上下行实时统计、可选 IPv6 隧道。配置变更走 `wg syncconf` 增量同步, 不会踢掉在线设备; 独立 `wg0` 接口 + nftables/iptables NAT, 与 Xray / Hysteria 2 互不影响。内核不可用时自动回退到 `wireguard-go` 用户态 (容器需 `/dev/net/tun`), 也支持强制指定运行方式 |
 | **链式代理 (中转 → 落地)** | 两台机器各装一份本面板, 在面板里用一行**配对码**把它们接成一条链: 近的机器做入口 (延迟低), 远的机器做落地 (出口 IP 换成它)。对客户端只是「订阅里多了一个普通节点」——不用手写 Clash relay / sing-box detour, 手机也能用; 落地凭据是**独立 UUID + 独立端口**, 可单独轮换 / 吊销, 不影响自己的订阅 |
 | **客户端 (路由器全自动)** | 面板「客户端」页生成一行命令, 在路由器终端粘一次: 自动配对 → 装 mihomo 静态内核 → **按能力阶梯探测并落地数据面** → 自检。此后这台路由器下的**所有设备** (手机/电脑/电视) 自动走分流代理, 不用每台各装客户端; 面板上一个总开关控制全屋, 开关颜色取自**设备回报的真实状态** (不是前端点一下就变绿), 并标出**真的接管到哪** (TUN / tproxy / 仅局域网 TCP / 未接管)。每台设备独立凭据, 可单独改名 / 换分流模板 / 吊销。**内核与分流数据库 (GeoIP/GeoSite) 都由面板分发** —— 装机时路由器还没有代理可用, 整条链路只访问面板一个地址, 不需要它能连 GitHub |
 | **五级数据面阶梯** | `tun` → `tproxy` → **`iptables REDIRECT`** → 不接管 (另有 eBPF 只探不选)。每一级都**真做一次**再判 (建一个设备再删、加一条规则再撤), 结论连同"为什么不行"的内核原话写进 `caps`; 起不来的那一级自动往下让位。**21.02 / 内核 5.4 / 原厂精简固件**那一代机器因此第一次有了可用的路 (局域网 TCP), 而不是只能报"未生效" |
@@ -160,7 +160,8 @@ zeroproxy/
     ├── zeroproxy.service          # 面板 (仅监听 127.0.0.1:9900, nginx 在 8899 终结 TLS)
     ├── xray.service
     ├── hysteria2.service
-    └── zeroproxy-wg.service       # 原生 WireGuard (wg0; reload 走 syncconf)
+    ├── zeroproxy-wg.service       # 原生 WireGuard 内核模式 (wg0; reload 走 syncconf)
+    └── zeroproxy-wg-userspace.service  # 容器/无内核模块时的 wireguard-go 回退
 ```
 
 运行时布局 (服务器):
@@ -177,6 +178,8 @@ zeroproxy/
 ├── wireguard/wg0.conf             # 原生 WireGuard 服务端配置 (0600)
 ├── wireguard/wg0.runtime.conf     # wg syncconf 用的运行时配置
 ├── wireguard/firewall.sh          # 幂等 NAT / FORWARD 脚本 (iptables 优先, nft 兜底)
+├── wireguard/userspace-up.sh      # wireguard-go 拉起后的配置 / 地址 / NAT
+├── wireguard/userspace-down.sh    # 用户态停止后的清理
 ├── certs/                         # 自签兜底证书
 ├── www/                           # ACME webroot + 443 伪装主页
 └── nginx/zeroproxy.conf           # 配置副本 (同一份也会写入 /etc/nginx/conf.d/)
@@ -5547,11 +5550,18 @@ install.sh 打印链接的那一刻, 面板可能还在 import uvicorn / fastapi
 - **NAT 与转发**: 独立 `firewall.sh` 生成幂等的 FORWARD + MASQUERADE 规则；iptables 优先
   （与 ufw 共用 nft 后端，跳转插在 FORWARD 最前面，避免 ufw 默认 drop 把转发挡掉），
   没有 iptables 时退回独立 nftables 表。`sysctl ip_forward` 在接口启动时设置。
+- **内核 / 用户态自动回退**: 启动前不是只看 `/sys/module/wireguard`，而是真的建一个临时
+  `ip link add ... type wireguard` 再删掉。失败时自动改用 `wireguard-go` 用户态单元
+  `zeroproxy-wg-userspace`（容器需要 `/dev/net/tun` 与 NET_ADMIN）。面板可选择
+  「自动 / 仅内核 / 仅用户态」，卡片上会标出当前实际模式。
+- **失败原因可见**: `systemctl` 只给 "control process exited" 时，面板会把
+  `journalctl -u zeroproxy-wg[-userspace]` 的最后几行拼进步骤详情和「一键诊断」，
+  不再只有一个笼统结论。
 - **不破坏既有链路**: WireGuard 的 UDP 端口与 Hysteria 2 做冲突校验；改端口 / MTU / DNS
   只同步 `wg0`，不重启 Xray / Hysteria 2 / nginx；节点全部停用也不影响 WireGuard。
-- **诊断与安装**: `install.sh` 安装 `wireguard-tools` + `iptables` 并放行 `51820/udp`；
+- **诊断与安装**: `install.sh` 安装 `wireguard-tools` / `wireguard-go` / `iptables` 并放行 `51820/udp`；
   老部署升级后首次启用会自动尝试补装。`/api/diagnose` 增加 WireGuard 入站一项，
-  检查工具、`wg0` 接口、UDP 监听与 NAT/MASQUERADE 规则 (避免"连上但上不了网")。
+  检查工具、内核探测、`wg0` 接口、UDP 监听与 NAT/MASQUERADE 规则 (避免"连上但上不了网")。
 
 #### 为什么不放进统一订阅
 
@@ -5563,8 +5573,8 @@ Clash / sing-box 用户继续用原来的订阅，互不影响。
 
 #### 回归
 
-- `pytest`: **346 通过 / 6 skip**（新增 11 项 WireGuard 专项：密钥向量、地址回收、配置内容、
-  文件权限、API 生命周期、一次性链接、私钥不外泄、参数校验）；
+- `pytest`: **351 通过 / 6 skip**（新增 16 项 WireGuard 专项：密钥向量、地址回收、配置内容、
+  文件权限、API 生命周期、一次性链接、私钥不外泄、参数校验、内核/用户态回退与日志回传）；
 - 落地步骤从 6 步变为 7 步（新增「重新生成 WireGuard 配置」），链式 / GeoIP / 升级任务的
   进度总数都按 `len(apply.STEP_NAMES)` 自动跟随；
 - 浏览器检查已渲染到新侧栏与 `sec-wireguard` 区块（该轮后续卡在既有的链式探测确认框，
@@ -5573,3 +5583,43 @@ Clash / sing-box 用户继续用原来的订阅，互不影响。
 **真机仍未验**: 本机是 macOS，无法启动内核 WireGuard 接口。真正要验的是 Linux 上
 `systemctl start zeroproxy-wg` 后 `wg show wg0` 有 peer、手机扫码能握手，
 以及 `iptables -t nat -L POSTROUTING -n -v` 的 MASQUERADE 计数在增长。
+
+---
+
+### 8.98 v2.12.1: 容器/受限内核上 WireGuard 起不来 —— 不再只报 systemd 的"exited"
+
+真机反馈: 一台服务器上 Xray / Hysteria 2 / 链式都正常，WireGuard 却启动失败:
+
+```text
+Job for zeroproxy-wg.service failed because the control process exited with error code.
+WireGuard 51820/udp 未监听; wg0 不存在
+```
+
+面板当时只拿到了 `systemctl` 的外层报错，`wg-quick` 真正的原因在 journal 里；一键诊断也只能
+看到"wg0 不存在"。这类机器通常是 **容器 / 受限内核**：宿主可能有 `wireguard` 模块，但容器
+没有 `NET_ADMIN`，或者内核根本没有模块。`wg-quick` 的自动回退只认"模块是否出现在
+`/sys/module`"，对"模块在但没权限"并不可靠。
+
+#### 这一版的两条修复
+
+1. **真实能力探测**: 不再信任 `/sys/module/wireguard`。启动前实际执行一次
+   `ip link add dev zpwgprobe0 type wireguard`，成功再删掉；失败就说明内核接口不可用。
+2. **`wireguard-go` 用户态回退**: 新增 `zeroproxy-wg-userspace.service`
+   (`wireguard-go -f wg0` + `userspace-up.sh` + `userspace-down.sh`)。面板可选
+   「自动 / 仅内核 / 仅用户态」；自动模式在内核探测失败时切到用户态。容器需要
+   `/dev/net/tun` 且允许 TUN/NET_ADMIN —— 缺任何一项时面板会直接说明，而不是只报
+   "服务失败"。
+3. **把 journal 带回面板**: `systemctl start/reload` 失败时追加
+   `journalctl -u … -n 20` 的最后几行到步骤详情；「一键诊断」在 `wg0` 不存在时也会带上
+   同一段日志。这样下次再遇到环境差异，不需要 SSH 才能知道原因。
+4. `install.sh` 安装 `wireguard-go`；老部署首次启用时由面板按需补装，正常内核模式的服务器
+   不会因此多碰一次 apt。
+
+#### 回归
+
+- `pytest`: **351 通过 / 6 skip**，新增内核/用户态选择、启动单元选择、失败日志回传等专项；
+- `userspace-up.sh` / `userspace-down.sh` / `firewall.sh` / `reload.sh` 全部通过 `sh -n`；
+- 浏览器验证了「自动 / 仅内核 / 仅用户态」选择器与保存后的状态回灌，无 console 错误。
+
+**真机仍需确认**: 如果那台机器连 `/dev/net/tun` 都没有（部分 OpenVZ 容器），用户态也无法
+建立接口；面板会明确写"内核不支持且没有 TUN"，此时只能用 Xray / Hysteria 2 节点。

@@ -210,6 +210,9 @@ apt-get install -y curl wget unzip git nginx openssl python3 python3-pip python3
 # 原生 WireGuard 节点需要 wg / wg-quick；装不上不让整个部署失败 (面板会显示缺少工具)
 apt-get install -y wireguard-tools iptables >/dev/null 2>&1 \
   || warn "wireguard-tools 安装失败 (WireGuard 节点需手动安装; 其余协议不受影响)"
+# 用户态回退 (容器 / 内核没有 WireGuard 模块时)。装不上不影响内核模式。
+apt-get install -y wireguard-go >/dev/null 2>&1 \
+  || warn "wireguard-go 安装失败 (内核没有 WireGuard 模块的容器将无法启用 WireGuard)"
 apt-get install -y certbot 2>/dev/null || warn "certbot 安装失败 (面板将回退自签证书)"
 systemctl enable --now nginx
 
