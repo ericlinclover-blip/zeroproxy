@@ -1,6 +1,6 @@
 # ZeroProxy 架构现状
 
-> 快照: **2026-10-20** · 面板 **v2.12.1** · 路由器客户端 **v1.4.37** (zpcore **1.3.0**) · `state.json` schema **v6**
+> 快照: **2026-10-20** · 面板 **v2.12.2** · 路由器客户端 **v1.4.37** (zpcore **1.3.0**) · `state.json` schema **v6**
 > 本文回答"**现在是什么样**"。另外两份文档分工不同, 不要混读:
 > `README.md` 是逐版开发日志 (4000+ 行, 每一版为什么这么改、哪次真机踩的坑);
 > `docs/RESEARCH.md` 与 `docs/ROUTER-CLIENT-REDESIGN.md` 是竞品调研与设计依据。
@@ -140,8 +140,8 @@ WireGuard 到期客户端回收 (60 秒检查一次; 只处理设置了到期时
 
 | 模块 | 行数 | 职责 |
 |---|---:|---|
-| `routes.py` | 4038 | 全部 API: 初始化 / 认证 / 仪表盘 / 设置 / 订阅 / 二维码 / 备份 / 诊断 / 探测 / 升级 / 链式 / 设备 / **WireGuard** / 设备侧 `/c/*`。含异步落地任务表与会话管理 |
-| `wireguard.py` | 1216 | 原生 WireGuard: 密钥派生 / 地址池 / wg0 配置 / NAT 脚本 / 内核探测与 `wireguard-go` 用户态回退 / `wg syncconf` / 握手与流量 / 一次性链接 / 到期回收 |
+| `routes.py` | 4047 | 全部 API: 初始化 / 认证 / 仪表盘 / 设置 / 订阅 / 二维码 / 备份 / 诊断 / 探测 / 升级 / 链式 / 设备 / **WireGuard** / 设备侧 `/c/*`。含异步落地任务表与会话管理 |
+| `wireguard.py` | 1237 | 原生 WireGuard: 密钥派生 / 地址池 / wg0 配置 / NAT 脚本 / 内核探测与 `wireguard-go` 用户态回退 / GL.iNet 兼容模式 / `wg syncconf` / 握手与流量 / 一次性链接 / 到期回收 |
 | `services.py` | 1248 | 系统适配层: systemctl / certbot / 自签证书 / 流量统计 (Stats API) / 真实握手探测 / 诊断; 非 Linux 自动 dry-run |
 | `share_links.py` | 1398 | 单节点分享链接 + 三种订阅格式 + 三档分流模板 + 设备专属订阅 |
 | `router_client.py` | 854 | 路由器安装脚本渲染 (`__ZP_BASE__`/`__ZP_CODE__` 占位替换) + mihomo 内核多镜像缓存分发 |
@@ -478,7 +478,7 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
 
 | 脚本 | 覆盖 |
 |---|---|
-| `backend/tests/` (pytest) | **351 通过 + 6 skip** (无真实内核二进制时跳过)。dry-run 全流程 + 安全边界 + 状态迁移 + WireGuard 密钥/配置/API/内核与用户态回退 + 装机件端点契约 + 面板直传"一个字节都没拿到"时的让位 (8.92) |
+| `backend/tests/` (pytest) | **353 通过 + 6 skip** (无真实内核二进制时跳过)。dry-run 全流程 + 安全边界 + 状态迁移 + WireGuard 密钥/配置/API/内核与用户态回退/GL.iNet 兼容模式 + 装机件端点契约 + 面板直传"一个字节都没拿到"时的让位 (8.92) |
 | `scripts/verify.py` | 用真实 Xray/Hysteria/mihomo/sing-box 校验生成的配置与订阅 (含**两台机器真跑一条链**) |
 | `scripts/router_install_check.py` | **201 项**。真的用 shell 跑一遍路由器安装脚本: 七类机器 (含 OpenWrt 25.12 / apk 三态 / BTF 两种现场 / 性能模式的进-出-回退) / 本机覆盖 / revert 比对 / zpcore 真跑 / **第一跳** (面板生成的那一行命令外面顶一个 uclient-fetch 替身: 丢包重试、自签面板按证书状态跳过校验、配对码失效时读得到原因; 旧写法的"什么都没有发生"与命令长度都钉在测试里)。性能模式那一节的假 dae **照真机复刻两条硬规矩** (0644 拒 / node 键带引号拒) 并先自证一次 —— 它以前无条件 exit 0, 于是这两类事故在演练里永远是绿的; 另有"停不掉的 mihomo"(真进程)、"切换期间 agent 不许拉起标准模式"、"出口等于本机 WAN 地址时不算通"与"cgi 的 status 必须带 perf.live"。**四个现场入口的一致性矩阵** (8.90): 四档 mihomo 数据面各跑一遍, CLI `status` / `doctor` / 本地界面 (zpcore) / agent 心跳必须报同一档 mode 与同一档 covered —— 假工具按一个状态文件说话, 所以四档只起一次 zpcore、装一次机器; 外加 `zpcore state` 的 key=value 与 `--json` 两个契约 |
 | `scripts/browser_check.cjs` | **157 项**, 真 Chromium 走「初始化 → 仪表盘」全流程 + 交互 + CSP + 截图 |

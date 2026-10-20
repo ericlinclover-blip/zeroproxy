@@ -324,6 +324,7 @@ def add_peer(
     name: str = "",
     allowed_ips: str = "",
     expires_days: int = 0,
+    compat: bool = False,
 ) -> dict:
     wg = bucket(state)
     if len(peers(state)) >= MAX_PEERS:
@@ -341,6 +342,9 @@ def add_peer(
         "address6": "",
         "allowed_ips": normalize_allowed_ips(allowed_ips, bool(wg.get("ipv6"))),
         "enabled": True,
+        # GL.iNet 等路由器固件对 PresharedKey / MTU / 多 DNS 的解析有已知问题。
+        # 兼容模式会同时在服务端和客户端省略 PSK, 并生成最保守的字段顺序。
+        "compat": bool(compat),
         "created_at": now,
         "expires_at": now + int(expires_days) * 86400 if int(expires_days or 0) > 0 else 0,
         "expired_at": 0,
@@ -413,33 +417,49 @@ def _peer_allowed(peer: dict, ipv6: bool) -> str:
 def client_config(state: dict, peer: dict) -> str:
     wg = bucket(state)
     net = validate_subnet(wg.get("subnet") or DEFAULT_SUBNET)
+    compat = bool(peer.get("compat"))
     address = f"{peer.get('address')}/{net.prefixlen}"
-    if wg.get("ipv6") and peer.get("address6"):
+    if wg.get("ipv6") and peer.get("address6") and not compat:
         net6 = validate_ipv6_subnet(wg.get("ipv6_subnet") or DEFAULT_IPV6_SUBNET)
         address += f", {peer['address6']}/{net6.prefixlen}"
     lines = [
-        f"# ZeroProxy WireGuard · {peer.get('name') or 'device'}",
         "[Interface]",
         f"PrivateKey = {peer.get('private_key')}",
         f"Address = {address}",
     ]
     dns = str(wg.get("dns") or "").strip()
     if dns:
-        lines.append(f"DNS = {dns}")
-    lines += [
-        f"MTU = {int(wg.get('mtu') or DEFAULT_MTU)}",
-        "",
-        "[Peer]",
-        f"PublicKey = {wg.get('server_public_key')}",
-    ]
-    if peer.get("preshared_key"):
-        lines.append(f"PresharedKey = {peer['preshared_key']}")
-    lines += [
-        f"Endpoint = {endpoint_text(state)}",
-        f"AllowedIPs = {peer.get('allowed_ips') or DEFAULT_ALLOWED_IPS}",
-        f"PersistentKeepalive = {int(wg.get('keepalive') or 0)}",
-        "",
-    ]
+        # GL.iNet 的部分固件只接受单个 DNS；兼容模式只写第一个。
+        lines.append(f"DNS = {dns.split(',')[0].strip() if compat else dns}")
+    if not compat:
+        lines.append(f"MTU = {int(wg.get('mtu') or DEFAULT_MTU)}")
+    allowed = str(peer.get("allowed_ips") or DEFAULT_ALLOWED_IPS)
+    if compat:
+        allowed = ", ".join(
+            part.strip() for part in allowed.split(",")
+            if part.strip() and ":" not in part
+        ) or DEFAULT_ALLOWED_IPS
+        # 尽量贴近 GL.iNet 自己导出的字段顺序，减少固件解析差异。
+        lines += [
+            "",
+            "[Peer]",
+            f"AllowedIPs = {allowed}",
+            f"Endpoint = {endpoint_text(state)}",
+            f"PersistentKeepalive = {int(wg.get('keepalive') or 0)}",
+            f"PublicKey = {wg.get('server_public_key')}",
+        ]
+    else:
+        lines += [
+            "",
+            "[Peer]",
+            f"PublicKey = {wg.get('server_public_key')}",
+            f"Endpoint = {endpoint_text(state)}",
+            f"AllowedIPs = {allowed}",
+        ]
+        if peer.get("preshared_key"):
+            lines.append(f"PresharedKey = {peer['preshared_key']}")
+        lines.append(f"PersistentKeepalive = {int(wg.get('keepalive') or 0)}")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -477,7 +497,7 @@ def server_config(state: dict, runtime: bool = False) -> str:
             "[Peer]",
             f"PublicKey = {peer.get('public_key')}",
         ]
-        if peer.get("preshared_key"):
+        if peer.get("preshared_key") and not peer.get("compat"):
             lines.append(f"PresharedKey = {peer['preshared_key']}")
         lines.append(f"AllowedIPs = {_peer_allowed(peer, ipv6)}")
     lines.append("")
@@ -1119,6 +1139,7 @@ def view(state: dict, now: int | None = None) -> dict:
                 "address6": peer.get("address6") or "",
                 "allowed_ips": peer.get("allowed_ips") or DEFAULT_ALLOWED_IPS,
                 "enabled": bool(peer.get("enabled", True)),
+                "compat": bool(peer.get("compat")),
                 "expired": expired,
                 "expires_at": int(peer.get("expires_at") or 0),
                 "created_at": int(peer.get("created_at") or 0),

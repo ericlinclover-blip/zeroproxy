@@ -190,6 +190,8 @@ function howTo() {
       <b>iOS / Android</b>: 安装官方 WireGuard App → 右上角 <b>+</b> → 从二维码创建 / 扫描二维码。<br>
       <b>Windows / macOS</b>: 安装官方 WireGuard → 左下角「导入隧道」→ 选择下载的
       <code class="mono">.conf</code> 文件。<br>
+      <b>GL.iNet / 路由器</b>: 如果一直停在「连接中」，编辑这台设备并勾选
+      <b>GL.iNet / 路由器兼容模式</b>，重新下载 <code class="mono">.conf</code> 再导入。<br>
       <b>一次给多台设备</b>: 每台单独添加一条 peer；不要把同一份配置复制到多台设备
       (它们会争用同一个隧道地址)。
     </div>
@@ -221,6 +223,7 @@ function peerCard(p) {
     </div>
     <div class="wg-peer-meta">
       <span class="tag-chip" title="客户端侧 AllowedIPs">${esc(p.allowed_ips)}</span>
+      ${p.compat ? `<span class="tag-chip" title="GL.iNet 兼容模式：服务端/客户端都不使用 PSK，单 DNS、无 MTU">路由器兼容</span>` : ""}
       ${expiry}
       ${p.endpoint ? `<span class="tag-chip mono">${esc(p.endpoint)}</span>` : ""}
     </div>
@@ -379,18 +382,24 @@ function addPeer(wg) {
         <option value="0.0.0.0/0">全流量 (0.0.0.0/0)</option>
         <option value="vpn">只走隧道网段 (${esc(wg.subnet)})</option>
       </select>
-      <div class="muted fs-xs mt-1">全流量 = 这台设备的默认路由改到服务器；只走网段 = 普通上网不变。</div>`,
+      <div class="muted fs-xs mt-1">全流量 = 这台设备的默认路由改到服务器；只走网段 = 普通上网不变。</div>
+      <label class="chk mt-2"><input type="checkbox" id="wg-new-compat">
+        GL.iNet / 路由器兼容模式（无 PSK、单 DNS、无 MTU、仅 IPv4）</label>
+      <div class="muted fs-xs mt-1">
+        GL.iNet 部分固件遇到 PresharedKey 会一直停在“连接中”；勾选后服务端也会同步去掉这台设备的 PSK。
+      </div>`,
     okLabel: "生成配置",
     onOk: async () => {
       const name = ($("#wg-new-name") || {}).value || "";
       const days = parseInt(($("#wg-new-expires") || {}).value || "0", 10);
       const mode = ($("#wg-new-mode") || {}).value || "0.0.0.0/0";
+      const compat = !!($("#wg-new-compat") || {}).checked;
       const allowed = mode === "vpn" ? wg.subnet : "0.0.0.0/0";
       try {
         const body = await api("/api/wireguard/peers", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ name, allowed_ips: allowed, expires_days: days }),
+          body: JSON.stringify({ name, allowed_ips: allowed, expires_days: days, compat }),
         });
         await settleApply(body);
         toast("设备已添加");
@@ -422,13 +431,23 @@ function editPeer(wg, id) {
       <input id="wg-edit-days" class="mono" inputmode="numeric" value="${days}">
       <label class="mt-2">AllowedIPs</label>
       <input id="wg-edit-allowed" class="mono" value="${escAttr(peer.allowed_ips)}">
-      <div class="muted fs-xs mt-1">多个网段用逗号分隔；这是客户端侧路由，不是服务端 ACL。</div>`,
+      <div class="muted fs-xs mt-1">多个网段用逗号分隔；这是客户端侧路由，不是服务端 ACL。</div>
+      <label class="chk mt-2"><input type="checkbox" id="wg-edit-compat" ${peer.compat ? "checked" : ""}>
+        GL.iNet / 路由器兼容模式（无 PSK、单 DNS、无 MTU、仅 IPv4）</label>`,
     okLabel: "保存",
     onOk: async () => {
       const name = ($("#wg-edit-name") || {}).value || "";
       const d = parseInt(($("#wg-edit-days") || {}).value || "0", 10);
       const allowed = ($("#wg-edit-allowed") || {}).value || "";
-      await updatePeer(id, { name, expires_days: d, allowed_ips: allowed }, null, "保存中…");
+      const compat = !!($("#wg-edit-compat") || {}).checked;
+      const before = !!peer.compat;
+      const body = await updatePeer(
+        id, { name, expires_days: d, allowed_ips: allowed, compat }, null, "保存中…"
+      );
+      if (body && body.config && compat !== before) {
+        showConfigQr(name || peer.name, body.config, id);
+        toast("兼容模式已更新，请用新配置重新导入路由器");
+      }
     },
   });
 }
@@ -444,8 +463,10 @@ async function updatePeer(id, payload, btn, busyText) {
     });
     await settleApply(body);
     toast("已更新");
+    return body;
   } catch (e) {
     toast("更新失败: " + e.message);
+    return null;
   } finally {
     if (btn && document.body.contains(btn)) {
       btn.disabled = false;

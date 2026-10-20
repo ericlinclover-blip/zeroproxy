@@ -72,6 +72,21 @@ def test_disabled_and_expired_peers_are_removed_from_server_config():
     assert old["enabled"] is False
 
 
+def test_gl_inet_compat_omits_psk_mtu_and_extra_dns(home):
+    state = _state()
+    peer = wireguard.add_peer(state, "GL-iNet", "0.0.0.0/0, ::/0", compat=True)
+    wireguard.generate(state)
+    client = wireguard.client_config(state, peer)
+    assert "PresharedKey" not in client
+    assert "MTU" not in client
+    assert "DNS = 1.1.1.1" in client and "8.8.8.8" not in client
+    assert "Endpoint = proxy.example.com:51820" in client
+    assert "AllowedIPs = 0.0.0.0/0" in client and "::/0" not in client
+    server = wireguard.server_config(state)
+    assert peer["public_key"] in server
+    assert "PresharedKey" not in server
+
+
 def test_optional_ipv6_tunnel(home):
     state = _state()
     wireguard.bucket(state)["ipv6"] = True
@@ -282,6 +297,20 @@ def test_peer_patch_rejects_bad_allowed_ips(client, configured):
         f"/api/wireguard/peers/{peer_id}", json={"allowed_ips": "definitely-not-cidr"}
     )
     assert bad.status_code == 400
+
+
+def test_peer_compat_toggle_updates_both_sides(client, configured):
+    client.post("/api/wireguard/settings", json={"enabled": True})
+    body = client.post("/api/wireguard/peers", json={"name": "router"}).json()
+    peer_id = body["peer_id"]
+    assert "PresharedKey" in body["config"]
+    changed = client.post(
+        f"/api/wireguard/peers/{peer_id}", json={"compat": True}
+    ).json()
+    assert changed["wireguard"]["peers"][0]["compat"] is True
+    assert "PresharedKey" not in changed["config"]
+    server = wireguard.server_config(config.load_state())
+    assert "PresharedKey" not in server
 
 
 def test_toggling_ipv6_realigns_full_tunnel_allowed_ips(client, configured):

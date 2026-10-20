@@ -2777,6 +2777,7 @@ class WireGuardPeerIn(BaseModel):
     name: str = ""
     allowed_ips: str = ""
     expires_days: int = 0
+    compat: bool = False
 
 
 class WireGuardPeerPatch(BaseModel):
@@ -2784,6 +2785,7 @@ class WireGuardPeerPatch(BaseModel):
     enabled: bool | None = None
     allowed_ips: str | None = None
     expires_days: int | None = None
+    compat: bool | None = None
 
 
 def _wg_text_response(text: str, filename: str, inline: bool = False) -> Response:
@@ -2934,7 +2936,8 @@ def wireguard_peer_add(payload: WireGuardPeerIn, request: Request):
             return _err("有效期需在 0-3650 天之间 (0 = 永久)")
         try:
             peer = wireguard.add_peer(
-                state, payload.name, payload.allowed_ips, int(payload.expires_days or 0)
+                state, payload.name, payload.allowed_ips, int(payload.expires_days or 0),
+                compat=bool(payload.compat),
             )
         except ValueError as exc:
             return _err(str(exc))
@@ -2999,6 +3002,9 @@ def wireguard_peer_update(peer_id: str, payload: WireGuardPeerPatch, request: Re
                 peer["expires_at"] = 0
                 peer["expired_at"] = 0
             changed.append(f"enabled={bool(payload.enabled)}")
+        if payload.compat is not None and bool(payload.compat) != bool(peer.get("compat")):
+            peer["compat"] = bool(payload.compat)
+            changed.append(f"compat={bool(payload.compat)}")
         if not changed:
             return _err("没有需要修改的内容")
         started = time.time()
@@ -3015,7 +3021,10 @@ def wireguard_peer_update(peer_id: str, payload: WireGuardPeerPatch, request: Re
             state, "wireguard_peer_update",
             f"{peer.get('name')}: {', '.join(changed)}", actor=_client_ip(request),
         )
-        return _wg_reply(state, request, steps)
+        body = _wg_reply(state, request, steps)
+        body["peer_id"] = peer["id"]
+        body["config"] = wireguard.client_config(state, peer)
+        return body
 
 
 @router.delete("/api/wireguard/peers/{peer_id}")
