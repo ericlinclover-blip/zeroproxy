@@ -416,12 +416,13 @@ def _peer_allowed(peer: dict, ipv6: bool) -> str:
 
 def client_config(state: dict, peer: dict) -> str:
     wg = bucket(state)
-    net = validate_subnet(wg.get("subnet") or DEFAULT_SUBNET)
     compat = bool(peer.get("compat"))
-    address = f"{peer.get('address')}/{net.prefixlen}"
+    # 客户端侧固定用 /32 (/128): GL.iNet 4.9.0 会把 10.x/24 当成 classful /8,
+    # 把整个 10.0.0.0/8 路由进隧道 (连上游 DNS/网关一起吞掉), 表现为一直"连接中"。
+    # /32 是点对点隧道端点的标准写法, 路由由 AllowedIPs 负责, 不影响全流量/分流。
+    address = f"{peer.get('address')}/32"
     if wg.get("ipv6") and peer.get("address6") and not compat:
-        net6 = validate_ipv6_subnet(wg.get("ipv6_subnet") or DEFAULT_IPV6_SUBNET)
-        address += f", {peer['address6']}/{net6.prefixlen}"
+        address += f", {peer['address6']}/128"
     lines = [
         "[Interface]",
         f"PrivateKey = {peer.get('private_key')}",

@@ -1,6 +1,6 @@
 # ZeroProxy 架构现状
 
-> 快照: **2026-10-20** · 面板 **v2.12.2** · 路由器客户端 **v1.4.37** (zpcore **1.3.0**) · `state.json` schema **v6**
+> 快照: **2026-10-20** · 面板 **v2.12.3** · 路由器客户端 **v1.4.37** (zpcore **1.3.0**) · `state.json` schema **v6**
 > 本文回答"**现在是什么样**"。另外两份文档分工不同, 不要混读:
 > `README.md` 是逐版开发日志 (4000+ 行, 每一版为什么这么改、哪次真机踩的坑);
 > `docs/RESEARCH.md` 与 `docs/ROUTER-CLIENT-REDESIGN.md` 是竞品调研与设计依据。
@@ -141,7 +141,7 @@ WireGuard 到期客户端回收 (60 秒检查一次; 只处理设置了到期时
 | 模块 | 行数 | 职责 |
 |---|---:|---|
 | `routes.py` | 4047 | 全部 API: 初始化 / 认证 / 仪表盘 / 设置 / 订阅 / 二维码 / 备份 / 诊断 / 探测 / 升级 / 链式 / 设备 / **WireGuard** / 设备侧 `/c/*`。含异步落地任务表与会话管理 |
-| `wireguard.py` | 1237 | 原生 WireGuard: 密钥派生 / 地址池 / wg0 配置 / NAT 脚本 / 内核探测与 `wireguard-go` 用户态回退 / GL.iNet 兼容模式 / `wg syncconf` / 握手与流量 / 一次性链接 / 到期回收 |
+| `wireguard.py` | 1238 | 原生 WireGuard: 密钥派生 / 地址池 / wg0 配置 / NAT 脚本 / 内核探测与 `wireguard-go` 用户态回退 / GL.iNet 兼容模式 (`/32`) / `wg syncconf` / 握手与流量 / 一次性链接 / 到期回收 |
 | `services.py` | 1248 | 系统适配层: systemctl / certbot / 自签证书 / 流量统计 (Stats API) / 真实握手探测 / 诊断; 非 Linux 自动 dry-run |
 | `share_links.py` | 1398 | 单节点分享链接 + 三种订阅格式 + 三档分流模板 + 设备专属订阅 |
 | `router_client.py` | 854 | 路由器安装脚本渲染 (`__ZP_BASE__`/`__ZP_CODE__` 占位替换) + mihomo 内核多镜像缓存分发 |

@@ -42,7 +42,7 @@ def test_server_and_client_configs(home):
     assert f"PrivateKey = {peer['private_key']}" in client
     assert f"PresharedKey = {peer['preshared_key']}" in client
     assert f"PublicKey = {state['wireguard']['server_public_key']}" in client
-    assert "Address = 10.66.66.2/24" in client
+    assert "Address = 10.66.66.2/32" in client
     assert "Endpoint = proxy.example.com:51820" in client
     assert "AllowedIPs = 0.0.0.0/0" in client
     assert "PersistentKeepalive = 25" in client
@@ -94,7 +94,7 @@ def test_optional_ipv6_tunnel(home):
     assert peer["address6"] == "fd66:66:66::2"
     wireguard.generate(state)
     client = wireguard.client_config(state, peer)
-    assert "Address = 10.66.66.2/24, fd66:66:66::2/64" in client
+    assert "Address = 10.66.66.2/32, fd66:66:66::2/128" in client
     server = wireguard.server_config(state)
     assert "Address = 10.66.66.1/24, fd66:66:66::1/64" in server
     assert "AllowedIPs = 10.66.66.2/32, fd66:66:66::2/128" in server
