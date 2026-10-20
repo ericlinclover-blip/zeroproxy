@@ -74,6 +74,31 @@
 | sing-box | 1.14.2 | 校验 sing-box 订阅可被真实客户端解析 |
 | sing-box | 1.13.21 | 同一份订阅在"上一个稳定大版本"上复测 (1.14 才加入的字段会在这里暴露兼容性代价) |
 
+### 2.5 WireGuard 面板: wg-easy v15 / wg-ui / wg-dashboard (2026-10 复核)
+
+WireGuard 不是一个能挂到 Xray 入站上的代理协议，同类产品的做法高度一致：
+
+| 项目 | 形态 | 值得吸收的能力 |
+|---|---|---|
+| [wg-easy v15](https://github.com/wg-easy/wg-easy) | WireGuard + Web UI (Nuxt/Vue, SQLite) | 每客户端二维码 / `.conf` 下载、启用/停用、Tx/Rx 图表、**一次性链接**、**到期时间**、IPv6 / 自定义 CIDR、Prometheus、每客户端防火墙 |
+| [EmbarkStudios/wg-ui](https://github.com/EmbarkStudios/wg-ui) | 自助客户端配置 (★1.5k, 2026-10 仍活跃) | 自助配置、服务端只读管理 |
+| [wg-dashboard/wg-dashboard](https://github.com/wg-dashboard/wg-dashboard) | 传统 Web 面板 | peer 表格、二维码 / 下载、在线状态 |
+
+共同结论:
+
+1. **配置分发是一等公民**。官方客户端只吃标准 `.conf` 或二维码，不接受订阅链接；
+   面板要给的是「这一台设备的一份配置」，不是一条全局 URI。
+2. **改 peer 用 `wg syncconf`**，不是 `wg-quick down/up`。后者会把所有在线 peer 一起踢掉，
+   在「加一个手机」这种操作上代价完全没必要。
+3. **一次性链接 / 到期时间**是长期维护里最实用的两个小能力：前者避免把私钥留在聊天记录里，
+   后者让临时设备自己失效。
+4. **服务端只存公钥、客户端私钥按需下发**。本项目的面板 JSON 不返回私钥 / PSK；只有
+   配置下载、二维码、一次性链接三个动作会给出。
+
+本项目没有照搬 wg-easy 的容器 + SQLite 形态（我们的单一事实来源是 `state.json`），也没有
+把 WireGuard 塞进 Clash / sing-box 订阅：mihomo 支持 WG 出站，但 sing-box 1.11 起把它标记为
+废弃、1.13 移除（改成 endpoint），混进统一 `outbounds` 会让新版客户端拒绝整份配置。
+
 ---
 
 ## 3. 一手证据: 本项目采信的上游事实

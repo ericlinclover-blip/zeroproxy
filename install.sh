@@ -207,6 +207,9 @@ info "安装依赖 (nginx / certbot / python3) ..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y >/dev/null
 apt-get install -y curl wget unzip git nginx openssl python3 python3-pip python3-venv cron >/dev/null
+# 原生 WireGuard 节点需要 wg / wg-quick；装不上不让整个部署失败 (面板会显示缺少工具)
+apt-get install -y wireguard-tools iptables >/dev/null 2>&1 \
+  || warn "wireguard-tools 安装失败 (WireGuard 节点需手动安装; 其余协议不受影响)"
 apt-get install -y certbot 2>/dev/null || warn "certbot 安装失败 (面板将回退自签证书)"
 systemctl enable --now nginx
 
@@ -295,7 +298,7 @@ rm -f /tmp/hysteria-dl /tmp/hysteria
 
 # ---------------- 6. 面板核心 ----------------
 info "安装面板核心 → $ZP_HOME ..."
-mkdir -p "$ZP_HOME"/{xray,hysteria,data,www,certs,nginx,panel,geo}
+mkdir -p "$ZP_HOME"/{xray,hysteria,data,www,certs,nginx,panel,geo,wireguard}
 
 # 解析要安装的版本: ZP_REF 优先; 否则取最新 release tag; 仓库没有 release 时退回默认分支。
 resolve_zp_ref() {
@@ -610,9 +613,10 @@ if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active
   ufw allow 8444/tcp >/dev/null
   ufw allow 8445/tcp >/dev/null          # VLESS XHTTP + Reality
   ufw allow 30001:32001/udp >/dev/null   # Hysteria 2 + 端口跳跃
-  ok "防火墙已放行 80/443/$PANEL_PORT/8443/8444/8445/tcp, 30001-32001/udp"
+  ufw allow 51820/udp >/dev/null         # 原生 WireGuard
+  ok "防火墙已放行 80/443/$PANEL_PORT/8443/8444/8445/tcp, 30001-32001/udp, 51820/udp"
 else
-  warn "请确认防火墙/安全组放行: 80,443,$PANEL_PORT,8443,8444,8445 (TCP) 与 30001-32001 (UDP)"
+  warn "请确认防火墙/安全组放行: 80,443,$PANEL_PORT,8443,8444,8445 (TCP) 与 30001-32001,51820 (UDP)"
 fi
 
 # ---------------- 9b. 第一跳自检 (链接现在就通吗) ----------------
@@ -678,6 +682,8 @@ echo "  管理用户名与密码, 点击「一键生成」, 即可得到全部�
 echo "  链式代理 (两台机器接成一条链) 在面板「链式代理」里配置: 落地端生成配对码, 入口端粘贴即用;"
 echo "  它用到的额外端口 (默认 8447/tcp 与自动分配的入站端口) 会在面板里自动 ufw 放行,"
 echo "  云厂商安全组需自行放行 —— 云端没放行是链式连不通最常见的原因。"
+echo "  WireGuard 在面板「WireGuard」卡片里一键启用; 每个客户端扫码或下载 .conf 即可,"
+echo "  默认 51820/udp, 云厂商安全组同样要放行该 UDP 端口。"
 echo "  卸载: bash $ZP_HOME/uninstall.sh  (或重新下载仓库里的 uninstall.sh)"
 echo "  提示: 这次安装如果中途断过 SSH —— 重跑本脚本是安全的 (已装的部分会保留), 日志在"
 echo "        $ZP_HOME/data/install.log"

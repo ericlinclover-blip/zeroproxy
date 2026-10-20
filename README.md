@@ -59,7 +59,8 @@ curl -fsSL https://github.i3.pub/https://raw.githubusercontent.com/ericlinclover
 | **一条命令部署** | `install.sh` 自动完成 BBR、依赖、Xray/Hysteria 2 二进制、venv、nginx 引导配置、systemd、防火墙 |
 | **一键更新** | 面板「程序更新」按钮, 或服务器上 `upgrade.sh` 一条命令: 自动备份代码与 `state.json` → 替换 → 按现有 `state.json` 重新落地配置 → 失败自动回滚; 面板内更新由 systemd 瞬时单元托管, 面板自身重启不会打断升级 |
 | **配置落地可验证** | 每次应用配置都用真实二进制校验 (`xray -test` / `nginx -t`) 并**复查端口是否真的在监听**; 任一步失败会在面板顶部标红, 不再出现「服务全绿但节点全不通」 |
-| **5 个节点** | VLESS Reality (TCP+Vision)、VLESS XHTTP Reality、VLESS WebSocket、Trojan TLS、Hysteria 2 (QUIC+端口跳跃) |
+| **5 个订阅节点 + 原生 WireGuard** | VLESS Reality (TCP+Vision)、VLESS XHTTP Reality、VLESS WebSocket、Trojan TLS、Hysteria 2 (QUIC+端口跳跃); 另有一个独立的 WireGuard `wg0` 入站 (官方客户端 `.conf` / 二维码) |
+| **原生 WireGuard** | 官方 iOS / Android / Windows / macOS 客户端直接连接: 面板生成标准 `.conf` 与二维码, 每台设备独立密钥 + PSK, 支持启用/停用/改名/轮换/删除、到期自动回收、一次性下载链接、握手与上下行实时统计、可选 IPv6 隧道。配置变更走 `wg syncconf` 增量同步, 不会踢掉在线设备; 独立 `wg0` 接口 + nftables/iptables NAT, 与 Xray / Hysteria 2 互不影响 |
 | **链式代理 (中转 → 落地)** | 两台机器各装一份本面板, 在面板里用一行**配对码**把它们接成一条链: 近的机器做入口 (延迟低), 远的机器做落地 (出口 IP 换成它)。对客户端只是「订阅里多了一个普通节点」——不用手写 Clash relay / sing-box detour, 手机也能用; 落地凭据是**独立 UUID + 独立端口**, 可单独轮换 / 吊销, 不影响自己的订阅 |
 | **客户端 (路由器全自动)** | 面板「客户端」页生成一行命令, 在路由器终端粘一次: 自动配对 → 装 mihomo 静态内核 → **按能力阶梯探测并落地数据面** → 自检。此后这台路由器下的**所有设备** (手机/电脑/电视) 自动走分流代理, 不用每台各装客户端; 面板上一个总开关控制全屋, 开关颜色取自**设备回报的真实状态** (不是前端点一下就变绿), 并标出**真的接管到哪** (TUN / tproxy / 仅局域网 TCP / 未接管)。每台设备独立凭据, 可单独改名 / 换分流模板 / 吊销。**内核与分流数据库 (GeoIP/GeoSite) 都由面板分发** —— 装机时路由器还没有代理可用, 整条链路只访问面板一个地址, 不需要它能连 GitHub |
 | **五级数据面阶梯** | `tun` → `tproxy` → **`iptables REDIRECT`** → 不接管 (另有 eBPF 只探不选)。每一级都**真做一次**再判 (建一个设备再删、加一条规则再撤), 结论连同"为什么不行"的内核原话写进 `caps`; 起不来的那一级自动往下让位。**21.02 / 内核 5.4 / 原厂精简固件**那一代机器因此第一次有了可用的路 (局域网 TCP), 而不是只能报"未生效" |
@@ -72,7 +73,7 @@ curl -fsSL https://github.i3.pub/https://raw.githubusercontent.com/ericlinclover
 | **3 种订阅格式** | 同一订阅地址 `?format=` 切换: Base64 通用 / Clash(mihomo) YAML / sing-box JSON |
 | **3 档分流模板** | 智能分流 (国内 App/域名/IP 直连 + 广告拦截, 含微信/支付宝/公众号/小程序) / 全局代理 / 全部直连; 面板一键切换或 `?rules=` 单客户端覆盖, 切换不重启服务; 国内 App 那一层是**不依赖分流数据库**的显式域名规则, 降级时也生效 |
 | **引导令牌保护** | 初始化必须带 `?token=`, 公网暴露时别人抢不走你的面板; 初始化成功即作废 |
-| **一键自检自愈** | `/api/diagnose` 检查 8 项 (服务、配置、入站一致性、GeoIP 一致性、证书、端口、伪装目标可达性) + `/api/repair` 重新生成并重启 |
+| **一键自检自愈** | `/api/diagnose` 检查 8 项基础项 (服务、配置、入站一致性、GeoIP 一致性、证书、端口、伪装目标可达性) + 启用后的 WireGuard 接口/UDP 专项 + `/api/repair` 重新生成并重启 |
 | **节点测速** | `/api/probe` 对每个节点做**真实握手** (Reality / Trojan 走完整 TLS, 失败即说明配置不对), 并测服务器到伪装目标的出口延迟 |
 | **GeoIP 分流防护** | 私有地址防护 (阻止客户端借道访问服务器内网) + 广告域名拦截; 数据每周自动更新, 缺失时自动不下发规则 |
 | **备份 / 恢复** | 一键导出含全部密钥与令牌的备份, 换机或重装后一键还原 (校验和校验, 篡改即拒绝) |
@@ -121,6 +122,7 @@ zeroproxy/
 │   │       │   ├── traffic.js     #   流量可视化 + 高级设置 + 系统卡片
 │   │       │   ├── chain.js       #   链式代理 (配对码 / 探测 / 内层传输 / 默认出口)
 │   │       │   ├── clients.js     #   客户端 (路由器一键接入 / 全屋总开关 / 手机电脑订阅)
+│   │       │   ├── wireguard.js   #   WireGuard (原生 .conf / 二维码 / 一次性链接 / 到期)
 │   │       │   ├── update.js      #   程序更新 (版本对比 → 确认 → 进度 → 结果)
 │   │       │   ├── diag.js        #   一键诊断 / 修复 / 重新应用
 │   │       │   ├── audit.js       #   操作记录 (筛选 / 搜索 / id 游标分页)
@@ -128,7 +130,7 @@ zeroproxy/
 │   │       └── style/             # tokens.css → base.css → components.css
 │   └── zeroproxy/
 │       ├── main.py                # FastAPI 入口 + 安全响应头中间件
-│       ├── config.py              # 状态模型 (state.json v4) / 文件锁 / 引导令牌 / 审计日志 / 备份还原
+│       ├── config.py              # 状态模型 (state.json v6) / 文件锁 / 引导令牌 / 审计日志 / 备份还原
 │       ├── crypto.py              # VLESS UUID 派生 / Reality X25519 密钥对 / PBKDF2
 │       ├── xray_config.py         # Xray 配置生成 (Reality / XHTTP / WS / Trojan + Stats API)
 │       ├── chain.py               # 链式代理 (配对码打包 / 解析 / 落地端口分配 / 真实出口 IP 探测)
@@ -142,6 +144,7 @@ zeroproxy/
 │       ├── geodata.py             # GeoIP/GeoSite 下载与校验 + 分流规则 (硬前置: 数据缺失不下发) + 启动前自愈 CLI
 │       ├── nginx_config.py        # Nginx 生成 (ACME + 443 WS 反代 + 伪装主页 + 8899 面板 TLS)
 │       ├── hysteria_config.py     # Hysteria 2 配置生成 (端口跳跃 + masquerade 伪装)
+│       ├── wireguard.py           # 原生 WireGuard: 密钥 / 地址池 / wg0 配置 / NAT / 测速
 │       ├── apply.py               # 配置落地闭环 (生成 → xray -test / nginx -t → 重载 → 复查端口监听), 面板与 upgrade.sh 共用
 │       ├── update.py              # 面板自更新 (远端版本检查 + 触发 upgrade.sh + 回读升级进度)
 │       ├── services.py            # systemctl / certbot / 自签证书 / 流量统计 / 节点握手探测 / 诊断
@@ -156,7 +159,8 @@ zeroproxy/
 └── systemd/
     ├── zeroproxy.service          # 面板 (仅监听 127.0.0.1:9900, nginx 在 8899 终结 TLS)
     ├── xray.service
-    └── hysteria2.service
+    ├── hysteria2.service
+    └── zeroproxy-wg.service       # 原生 WireGuard (wg0; reload 走 syncconf)
 ```
 
 运行时布局 (服务器):
@@ -170,6 +174,9 @@ zeroproxy/
 ├── panel/cert.pem key.pem         # 面板 HTTPS 引导自签证书
 ├── xray/config.json               # 由面板生成
 ├── hysteria/config.yaml + cert.pem/key.pem
+├── wireguard/wg0.conf             # 原生 WireGuard 服务端配置 (0600)
+├── wireguard/wg0.runtime.conf     # wg syncconf 用的运行时配置
+├── wireguard/firewall.sh          # 幂等 NAT / FORWARD 脚本 (iptables 优先, nft 兜底)
 ├── certs/                         # 自签兜底证书
 ├── www/                           # ACME webroot + 443 伪装主页
 └── nginx/zeroproxy.conf           # 配置副本 (同一份也会写入 /etc/nginx/conf.d/)
@@ -215,6 +222,13 @@ zeroproxy/
 - **GeoIP 分流是"硬前置"的**: Xray 在配置构建阶段就要求 `geoip.dat` / `geosite.dat` 存在,
   缺文件时不是跳过规则而是**整份配置加载失败**。因此本项目把"数据齐备"作为下发 geo 规则的前提
   (`geodata.usable()`), 数据被删也只会退化成"没有这两条规则", 不会让核心起不来。
+- **WireGuard 是独立入站, 不进 Xray 节点表**: 官方 WireGuard App 只认标准 `.conf` / 二维码,
+  不认 vless://; 而 sing-box 1.11 起把 WireGuard 出站标记为废弃、1.13 移除 (改成 endpoint),
+  塞进统一订阅会让新版客户端拒绝整份配置。所以面板单独维护 `wg0` + 每台设备一条 peer:
+  服务端只存公钥, 私钥/PSK 只在下载配置、二维码、一次性链接时出现; 改 peer 用
+  `wg syncconf` 增量同步, 不会把所有在线设备一起踢下线。标准 WireGuard 的握手特征比较
+  明显, 在强干扰网络下可能被识别/阻断 —— 这种情况继续用 Reality / Hysteria 2 节点即可,
+  两种入站互不影响。
 
 ---
 
@@ -351,7 +365,7 @@ POST /c/report                     → 心跳: 上报实际状态, 取回期望�
 用户操作 (开关节点 / 改端口 / 改伪装 / 续期证书)
         │  POST /api/...   (config.locked() 事务)
         ▼
-state.json (唯一事实来源, schema v4, 旧版本自动升级)
+state.json (唯一事实来源, schema v6, 旧版本自动升级)
         │
         ├──► 重新生成 xray/config.json + hysteria/config.yaml + nginx conf
         │            │
@@ -5509,3 +5523,53 @@ install.sh 打印链接的那一刻, 面板可能还在 import uvicorn / fastapi
 
 **真机仍未验**: 两条路都只能到"代码级 + 本机回归"这一步 —— 真正的验证是那台机器再装一次:
 它现在会自己换个会话把活干完, 日志留在 `/opt/zeroproxy/data/install.log`。
+
+---
+
+### 8.97 v2.12.0: 原生 WireGuard —— 官方客户端扫码即用
+
+用户要的是"WireGuard 客户端能直接连"。WireGuard 与现有四个 Xray 节点有一个根本区别:
+**它不是能挂到 Xray 入站上的代理协议**，而是 UDP + 内核接口；官方 WireGuard App
+不解析 vless:// / trojan:// / 订阅 YAML，只认标准 `.conf` 或二维码。因此这一版没有把它
+硬塞进节点表，而是新增一个独立的「WireGuard」区块。
+
+#### 做了什么
+
+- **服务端 `wg0`**: 面板生成 `PrivateKey / ListenPort / Address / MTU / PostUp / PostDown`
+  与每个 peer 的 `PublicKey / PresharedKey / AllowedIPs`；systemd 单元 `zeroproxy-wg` 负责
+  开机启动与停止，`reload.sh` 用 `wg syncconf` 增量同步（改一个客户端不会踢掉其它在线设备）。
+- **每台设备独立凭据**: 私钥 + PSK 独立生成，公钥显示在面板；地址从隧道网段确定性分配
+  （服务端 `.1`，客户端 `.2` 起），删除后回收。支持改名、停用/启用、轮换密钥、删除。
+- **交付方式**: 标准 `.conf` 下载、二维码（官方 App 扫码）、一次性链接（默认 10 分钟、
+  取一次即作废）。面板的仪表盘 JSON **绝不包含**私钥或 PSK，只有配置接口/二维码/一次性链接会给出。
+- **成熟案例里的实用能力**: 到期时间与自动回收（后台每 60 秒检查一次）、握手时间与
+  ↑/↓ 流量、客户端在线状态、可选 IPv6 ULA 隧道、自定义 DNS / MTU / Endpoint / Keepalive。
+- **NAT 与转发**: 独立 `firewall.sh` 生成幂等的 FORWARD + MASQUERADE 规则；iptables 优先
+  （与 ufw 共用 nft 后端，跳转插在 FORWARD 最前面，避免 ufw 默认 drop 把转发挡掉），
+  没有 iptables 时退回独立 nftables 表。`sysctl ip_forward` 在接口启动时设置。
+- **不破坏既有链路**: WireGuard 的 UDP 端口与 Hysteria 2 做冲突校验；改端口 / MTU / DNS
+  只同步 `wg0`，不重启 Xray / Hysteria 2 / nginx；节点全部停用也不影响 WireGuard。
+- **诊断与安装**: `install.sh` 安装 `wireguard-tools` + `iptables` 并放行 `51820/udp`；
+  老部署升级后首次启用会自动尝试补装。`/api/diagnose` 增加 WireGuard 入站一项，
+  检查工具、`wg0` 接口、UDP 监听与 NAT/MASQUERADE 规则 (避免"连上但上不了网")。
+
+#### 为什么不放进统一订阅
+
+调研了 wg-easy v15、wg-ui、wg-dashboard 等成熟项目的共同做法：**每客户端一条 peer +
+标准配置分发**，而不是把客户端私钥混进一个共享订阅。另一个硬约束来自 sing-box：
+WireGuard 出站在 1.11 标记废弃、1.13 移除（改成 endpoint），把 WG 节点写进现有
+`outbounds` 会让新版 sing-box 拒绝整份订阅。需要 WireGuard 的设备走独立 `.conf`，
+Clash / sing-box 用户继续用原来的订阅，互不影响。
+
+#### 回归
+
+- `pytest`: **346 通过 / 6 skip**（新增 11 项 WireGuard 专项：密钥向量、地址回收、配置内容、
+  文件权限、API 生命周期、一次性链接、私钥不外泄、参数校验）；
+- 落地步骤从 6 步变为 7 步（新增「重新生成 WireGuard 配置」），链式 / GeoIP / 升级任务的
+  进度总数都按 `len(apply.STEP_NAMES)` 自动跟随；
+- 浏览器检查已渲染到新侧栏与 `sec-wireguard` 区块（该轮后续卡在既有的链式探测确认框，
+  与 WireGuard 无关）。
+
+**真机仍未验**: 本机是 macOS，无法启动内核 WireGuard 接口。真正要验的是 Linux 上
+`systemctl start zeroproxy-wg` 后 `wg show wg0` 有 peer、手机扫码能握手，
+以及 `iptables -t nat -L POSTROUTING -n -v` 的 MASQUERADE 计数在增长。

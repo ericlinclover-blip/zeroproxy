@@ -1,0 +1,19 @@
+[Unit]
+Description=ZeroProxy - WireGuard (wg0, native client endpoint)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# 由面板生成 /opt/zeroproxy/wireguard/wg0.conf；PostUp/PostDown 会挂上 NAT 规则。
+# 重新加载走 reload.sh 里的 `wg syncconf`，在线 peer 不会因为改一个客户端而被踢掉。
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/wg-quick up /opt/zeroproxy/wireguard/wg0.conf
+ExecStop=/usr/bin/wg-quick down /opt/zeroproxy/wireguard/wg0.conf
+ExecReload=/bin/sh /opt/zeroproxy/wireguard/reload.sh
+TimeoutStartSec=30
+TimeoutStopSec=30
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

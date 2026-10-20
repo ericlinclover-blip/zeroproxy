@@ -1105,14 +1105,14 @@ async function main() {
     }
 
     console.log("\n[3h] 后台落地任务的实时进度 (v2.6.9)");
-    // 改配置 = 重新生成三份配置 → 重启内核 → 验端口, 真机上 2~4 秒, 而重启 Xray 会
+    // 改配置 = 重新生成四份配置 → 重启内核 → 验端口, 真机上 2~4 秒, 而重启 Xray 会
     // 掐断"走本机链路上网"的浏览器。现在接口立刻回执 + 后台任务 + 进度条轮询。
     await page.click("#btn-apply");
     await page.waitForSelector("#apply-strip .bar", { timeout: 20000 });
     const stripText = (await page.locator("#apply-strip").innerText()).replace(/\s*\n\s*/g, " · ");
     check(
       "点改配置立刻出现实时进度 (接口不再阻塞)",
-      /正在应用配置|配置已应用/.test(stripText) && /\/6 步/.test(stripText),
+      /正在应用配置|配置已应用/.test(stripText) && /\/7 步/.test(stripText),
       stripText
     );
     await page.waitForFunction(

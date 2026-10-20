@@ -19,7 +19,7 @@ warn() { printf '\033[1;33m[ZeroProxy]\033[0m %s\n' "$*"; }
 [ "$(id -u)" -eq 0 ] || { echo "请以 root 运行 (sudo bash uninstall.sh)"; exit 1; }
 
 info "停止并禁用服务 ..."
-for unit in zeroproxy xray hysteria2; do
+for unit in zeroproxy zeroproxy-wg xray hysteria2; do
   systemctl disable --now "$unit" 2>/dev/null || true
   rm -f "/etc/systemd/system/${unit}.service"
 done
@@ -64,6 +64,7 @@ if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active
   ufw delete allow 8444/tcp >/dev/null 2>&1 || true
   ufw delete allow 8445/tcp >/dev/null 2>&1 || true
   ufw delete allow 30001:32001/udp >/dev/null 2>&1 || true
+  ufw delete allow 51820/udp >/dev/null 2>&1 || true
 fi
 
 echo

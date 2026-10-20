@@ -3042,6 +3042,7 @@ def test_apply_reapply_persists_steps(client, configured, home):
         "重新生成 Xray 配置",
         "重新生成 Nginx 配置",
         "重新生成 Hysteria 2 配置",
+        "重新生成 WireGuard 配置",
         "重载服务 (nginx/xray/hysteria2)",
         "验证端口监听",
     ]
@@ -3108,11 +3109,11 @@ def test_apply_skips_services_whose_config_did_not_change(client, configured, ho
     # 5) 端到端: 第一次配置确实变了才重启, 第二次一模一样 → 一个都不重启
     (home / "xray" / "config.json").write_text("{}\n", encoding="utf-8")
     calls.clear()
-    assert apply.reapply(config.load_state())[4]["ok"] is True
+    assert apply.reapply(config.load_state())[5]["ok"] is True
     assert calls == ["xray"], calls
     calls.clear()
     again = apply.reapply(config.load_state())
-    assert again[4]["ok"] is True and "无需重启" in again[4]["detail"], again
+    assert again[5]["ok"] is True and "无需重启" in again[5]["detail"], again
     assert calls == [], calls
 
 

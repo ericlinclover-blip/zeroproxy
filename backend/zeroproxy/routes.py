@@ -48,6 +48,7 @@ from . import (
     services,
     share_links,
     update,
+    wireguard,
     xray_config,
 )
 from .config import (
@@ -429,7 +430,7 @@ def apply_job(id: str, request: Request):
 def _landing_body(state: dict, request: Request, after=None) -> dict:
     """改配置后的统一回执: 仪表盘数据 + 同步步骤 / 后台任务描述。
 
-    同步模式 (ZP_APPLY_ASYNC=0) 里 `steps` 是完整的六步结果; 异步模式里
+    同步模式 (ZP_APPLY_ASYNC=0) 里 `steps` 是完整的七步结果; 异步模式里
     `steps` 为空数组、`job` 有值, 前端据此轮询进度 —— 两种形状前端都认。
     """
     steps, job = _reapply_job(state, request, after=after)
@@ -794,6 +795,9 @@ def _system_view(state: dict) -> dict:
             "state": services.service_state("hysteria2"),
             "version": services.service_version("hysteria2"),
         },
+        "wireguard": {
+            "state": wireguard.service_state() if wireguard.enabled(state) else "inactive"
+        },
         "nginx": {"state": services.service_state("nginx")},
         "server": services.server_info(),
         "prod": services.is_prod(),
@@ -843,6 +847,8 @@ def _dashboard_body(state: dict, request: Request, traffic: dict | None = None) 
         "chain": _chain_view(state),
         # 客户端设备 (路由器/手机/电脑) + 路由器安装脚本的元信息
         "devices": devices.view(state),
+        # 原生 WireGuard 入站 (官方客户端 .conf / 二维码 / 一次性链接)
+        "wireguard": wireguard.view(state),
         # update_command 一起带上: 面板上那条"固定的更新命令"必须与生成安装命令的
         # 那一份**同一处渲染** —— 界面里手写一份的话, 改了命令这边就会漂移。
         # `insecure` 由面板按自己的证书状态决定 (自签 / 用 IP 打开时跳过校验, 见
@@ -1074,6 +1080,15 @@ def update_settings(payload: SettingsIn, request: Request):
                     f"端口 {port}/{proto} 被 {seen[(port, proto)]} 与 {key} 同时占用, 请换一个"
                 )
             seen[(port, proto)] = key
+        # 原生 WireGuard 走 UDP，和 Hysteria 2 共享同一个协议号空间 —— 端口撞了
+        # 两个服务只能起来一个, 客户端看到的是"另一个能用, 这个全超时"。
+        wg_cfg = state.get("wireguard") or {}
+        if wg_cfg.get("enabled") and wg_cfg.get("port"):
+            wg_port = int(wg_cfg["port"])
+            if (wg_port, "udp") in seen:
+                return _err(
+                    f"UDP {wg_port} 已被 WireGuard 占用, 请给 {seen[(wg_port, 'udp')]} 换一个端口"
+                )
         # 链式代理的入站 / 落地端与 nginx 占着的端口也不允许被节点抢走
         chain_cfg = state.get("chain") or {}
         exit_cfg = chain_cfg.get("exit") or {}
@@ -1834,6 +1849,12 @@ def _diagnose(state: dict) -> list[dict]:
             "(日志在 data/chain-quic/*.log; 点「一键修复」会重新拉起)",
             fixable=True,
         )
+
+    # 9. 原生 WireGuard 入站 —— 启用后单独报接口 / 端口状态。它不在 Xray 的
+    #    服务状态里, 只看 xray / hysteria2 / nginx 三项会漏掉整条隧道。
+    if (state.get("wireguard") or {}).get("enabled"):
+        wg_ok, wg_detail = wireguard.diagnose(state)
+        add("WireGuard 入站", wg_ok, wg_detail, fixable=True)
 
     return checks
 
@@ -2727,6 +2748,380 @@ def chain_exit_qr(request: Request, size: int = 6, img: str = "png"):
     if not code:
         return _err("本机还没有作为落地端的凭据, 请先生成配对码", 409)
     return _qr_response(code, size, img)
+
+
+# ---------------------------------------------------------------- 原生 WireGuard
+#
+# 与订阅是两条路径: 官方 WireGuard 客户端要的是标准 .conf / 二维码, 不是
+# vless:// 链接。每台设备一条 peer (独立私钥 + PSK), 面板只保存公钥到展示层,
+# 私钥只在下载配置 / 二维码 / 一次性链接时出现。
+
+
+class WireGuardSettingsIn(BaseModel):
+    enabled: bool | None = None
+    port: int | None = None
+    subnet: str | None = None
+    mtu: int | None = None
+    dns: str | None = None
+    keepalive: int | None = None
+    endpoint: str | None = None
+    ipv6: bool | None = None
+    ipv6_subnet: str | None = None
+
+
+class WireGuardPeerIn(BaseModel):
+    name: str = ""
+    allowed_ips: str = ""
+    expires_days: int = 0
+
+
+class WireGuardPeerPatch(BaseModel):
+    name: str | None = None
+    enabled: bool | None = None
+    allowed_ips: str | None = None
+    expires_days: int | None = None
+
+
+def _wg_text_response(text: str, filename: str, inline: bool = False) -> Response:
+    disposition = "inline" if inline else "attachment"
+    return Response(
+        text,
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "cache-control": "no-store",
+            "content-disposition": f'{disposition}; filename="{filename}"',
+        },
+    )
+
+
+def _wg_reply(state: dict, request: Request, steps: list[dict]) -> dict:
+    state["steps"] = steps
+    save_state(state)
+    body = _dashboard_body(state, request)
+    body["steps"] = steps
+    return body
+
+
+@router.get("/api/wireguard")
+def wireguard_status(request: Request):
+    state = load_state()
+    if not _require_auth(state, request):
+        return _err("未登录", 401)
+    return {"wireguard": wireguard.view(state)}
+
+
+@router.post("/api/wireguard/settings")
+def wireguard_settings(payload: WireGuardSettingsIn, request: Request):
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        wg = wireguard.bucket(state)
+        updates: dict = {}
+
+        if payload.port is not None:
+            try:
+                port = wireguard.validate_port(payload.port)
+            except (TypeError, ValueError) as exc:
+                return _err(str(exc))
+            hysteria_ports = {
+                int(state["ports"].get("hysteria") or 0),
+                *[int(p) for p in state.get("hysteria_ports") or []],
+            }
+            if port in hysteria_ports:
+                return _err(f"UDP {port} 已被 Hysteria 2 占用, 请换一个端口")
+            updates["port"] = port
+
+        if payload.subnet is not None:
+            try:
+                subnet = str(wireguard.validate_subnet(payload.subnet))
+            except ValueError as exc:
+                return _err(str(exc))
+            if subnet != str(wg.get("subnet") or "") and wireguard.peers(state):
+                return _err("已有 WireGuard 客户端时不能改隧道网段 — 客户端地址会全部失效")
+            updates["subnet"] = subnet
+
+        if payload.mtu is not None:
+            try:
+                updates["mtu"] = wireguard.validate_mtu(payload.mtu)
+            except (TypeError, ValueError) as exc:
+                return _err(str(exc))
+
+        if payload.keepalive is not None:
+            try:
+                updates["keepalive"] = wireguard.validate_keepalive(payload.keepalive)
+            except (TypeError, ValueError) as exc:
+                return _err(str(exc))
+
+        if payload.dns is not None:
+            try:
+                updates["dns"] = wireguard.normalize_dns(payload.dns)
+            except ValueError as exc:
+                return _err(str(exc))
+
+        if payload.endpoint is not None:
+            value = payload.endpoint.strip().lower().rstrip(".").strip("[]")
+            if value and not (_DOMAIN_RE.match(value) or _is_ip(value)):
+                return _err("Endpoint 需为域名或 IP (留空表示使用面板域名)")
+            updates["endpoint"] = value
+
+        if payload.ipv6 is not None:
+            updates["ipv6"] = bool(payload.ipv6)
+        if payload.ipv6_subnet is not None:
+            try:
+                updates["ipv6_subnet"] = str(wireguard.validate_ipv6_subnet(payload.ipv6_subnet))
+            except ValueError as exc:
+                return _err(str(exc))
+        if payload.enabled is not None:
+            updates["enabled"] = bool(payload.enabled)
+
+        changed = [f"{key}={value}" for key, value in updates.items() if wg.get(key) != value]
+        if not changed:
+            return _err("没有需要修改的内容")
+        wg.update(updates)
+        # 开关 IPv6 时把"全流量"客户端的 AllowedIPs 一起对齐: 否则新配置虽然多分了一个
+        # v6 地址, 客户端仍只把 v4 塞进隧道, 看起来"启用了 IPv6 却没生效"。
+        if "ipv6" in updates:
+            for peer in wireguard.peers(state):
+                if updates["ipv6"] and peer.get("allowed_ips") == "0.0.0.0/0":
+                    peer["allowed_ips"] = "0.0.0.0/0, ::/0"
+                elif not updates["ipv6"] and peer.get("allowed_ips") == "0.0.0.0/0, ::/0":
+                    peer["allowed_ips"] = "0.0.0.0/0"
+
+        started = time.time()
+        ok, detail = wireguard.sync(state, timeout=180)
+        steps = [
+            {
+                "name": "WireGuard 配置",
+                "ok": bool(ok),
+                "detail": detail,
+                "ms": int((time.time() - started) * 1000),
+            }
+        ]
+        if ok and wg.get("enabled"):
+            steps.append(
+                {
+                    "name": "放行 WireGuard 端口",
+                    "ok": True,
+                    "detail": services.open_firewall_port(int(wg["port"]), "udp"),
+                    "ms": 0,
+                }
+            )
+        config.audit(state, "wireguard_settings", ", ".join(changed), actor=_client_ip(request))
+        return _wg_reply(state, request, steps)
+
+
+@router.post("/api/wireguard/peers")
+def wireguard_peer_add(payload: WireGuardPeerIn, request: Request):
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        wg = wireguard.bucket(state)
+        if not wg.get("enabled"):
+            return _err("请先启用 WireGuard", 409)
+        if not 0 <= int(payload.expires_days or 0) <= 3650:
+            return _err("有效期需在 0-3650 天之间 (0 = 永久)")
+        try:
+            peer = wireguard.add_peer(
+                state, payload.name, payload.allowed_ips, int(payload.expires_days or 0)
+            )
+        except ValueError as exc:
+            return _err(str(exc))
+        started = time.time()
+        ok, detail = wireguard.sync(state)
+        steps = [
+            {
+                "name": "添加 WireGuard 客户端",
+                "ok": bool(ok),
+                "detail": f"{peer['name']} · {peer['address']} · {detail}",
+                "ms": int((time.time() - started) * 1000),
+            }
+        ]
+        config.audit(
+            state, "wireguard_peer_add", f"{peer['name']} ({peer['address']})",
+            actor=_client_ip(request),
+        )
+        body = _wg_reply(state, request, steps)
+        body["peer_id"] = peer["id"]
+        body["config"] = wireguard.client_config(state, peer)
+        return body
+
+
+@router.post("/api/wireguard/peers/{peer_id}")
+def wireguard_peer_update(peer_id: str, payload: WireGuardPeerPatch, request: Request):
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        wg = wireguard.bucket(state)
+        peer = wireguard.find_peer(state, peer_id)
+        if peer is None:
+            return _err("客户端不存在", 404)
+        changed: list[str] = []
+        if payload.name is not None:
+            name = str(payload.name).strip()[:40] or "设备"
+            if name != peer.get("name"):
+                peer["name"] = name
+                changed.append(f"name={name}")
+        if payload.allowed_ips is not None:
+            try:
+                allowed = wireguard.normalize_allowed_ips(payload.allowed_ips, bool(wg.get("ipv6")))
+            except ValueError as exc:
+                return _err(str(exc))
+            if allowed != peer.get("allowed_ips"):
+                peer["allowed_ips"] = allowed
+                changed.append(f"allowed_ips={allowed}")
+        if payload.expires_days is not None:
+            days = int(payload.expires_days)
+            if not 0 <= days <= 3650:
+                return _err("有效期需在 0-3650 天之间 (0 = 永久)")
+            peer["expires_at"] = int(time.time()) + days * 86400 if days else 0
+            peer["expired_at"] = 0
+            changed.append(f"expires_days={days}")
+        if payload.enabled is not None:
+            if payload.enabled and not wg.get("enabled"):
+                return _err("请先启用 WireGuard", 409)
+            peer["enabled"] = bool(payload.enabled)
+            if payload.enabled and wireguard.peer_expired(peer):
+                # 重新启用一个已过期的客户端 = 明确表示要它继续用, 直接改成永久;
+                # 想继续限时就在同一个弹窗里选一个有效期。
+                peer["expires_at"] = 0
+                peer["expired_at"] = 0
+            changed.append(f"enabled={bool(payload.enabled)}")
+        if not changed:
+            return _err("没有需要修改的内容")
+        started = time.time()
+        ok, detail = wireguard.sync(state)
+        steps = [
+            {
+                "name": "更新 WireGuard 客户端",
+                "ok": bool(ok),
+                "detail": f"{peer.get('name')} · {detail}",
+                "ms": int((time.time() - started) * 1000),
+            }
+        ]
+        config.audit(
+            state, "wireguard_peer_update",
+            f"{peer.get('name')}: {', '.join(changed)}", actor=_client_ip(request),
+        )
+        return _wg_reply(state, request, steps)
+
+
+@router.delete("/api/wireguard/peers/{peer_id}")
+def wireguard_peer_delete(peer_id: str, request: Request):
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        peer = wireguard.remove_peer(state, peer_id)
+        if peer is None:
+            return _err("客户端不存在", 404)
+        started = time.time()
+        ok, detail = wireguard.sync(state)
+        steps = [
+            {
+                "name": "移除 WireGuard 客户端",
+                "ok": bool(ok),
+                "detail": f"{peer.get('name')} · {detail}",
+                "ms": int((time.time() - started) * 1000),
+            }
+        ]
+        config.audit(
+            state, "wireguard_peer_remove",
+            f"{peer.get('name')} ({peer.get('address')})", actor=_client_ip(request),
+        )
+        return _wg_reply(state, request, steps)
+
+
+@router.post("/api/wireguard/peers/{peer_id}/rotate")
+def wireguard_peer_rotate(peer_id: str, request: Request):
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        peer = wireguard.rotate_peer(state, peer_id)
+        if peer is None:
+            return _err("客户端不存在", 404)
+        started = time.time()
+        ok, detail = wireguard.sync(state)
+        steps = [
+            {
+                "name": "轮换 WireGuard 密钥",
+                "ok": bool(ok),
+                "detail": f"{peer.get('name')} · 旧配置已失效 · {detail}",
+                "ms": int((time.time() - started) * 1000),
+            }
+        ]
+        config.audit(
+            state, "wireguard_peer_rotate", str(peer.get("name")), actor=_client_ip(request)
+        )
+        body = _wg_reply(state, request, steps)
+        body["peer_id"] = peer["id"]
+        body["config"] = wireguard.client_config(state, peer)
+        return body
+
+
+@router.get("/api/wireguard/peers/{peer_id}/config")
+def wireguard_peer_config(peer_id: str, request: Request, inline: int = 0):
+    state = load_state()
+    if not _require_auth(state, request):
+        return _err("未登录", 401)
+    peer = wireguard.find_peer(state, peer_id)
+    if peer is None:
+        return _err("客户端不存在", 404)
+    text = wireguard.client_config(state, peer)
+    return _wg_text_response(
+        text, f"zeroproxy-wg-{peer_id}.conf", inline=bool(inline)
+    )
+
+
+@router.get("/api/wireguard/peers/{peer_id}/qr")
+def wireguard_peer_qr(peer_id: str, request: Request, size: int = 8, img: str = "png"):
+    state = load_state()
+    if not _require_auth(state, request):
+        return _err("未登录", 401)
+    peer = wireguard.find_peer(state, peer_id)
+    if peer is None:
+        return _err("客户端不存在", 404)
+    return _qr_response(wireguard.client_config(state, peer), size, img)
+
+
+@router.post("/api/wireguard/peers/{peer_id}/link")
+def wireguard_peer_one_time(peer_id: str, request: Request):
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        peer = wireguard.find_peer(state, peer_id)
+        if peer is None:
+            return _err("客户端不存在", 404)
+        token = wireguard.one_time_create(state, peer_id)
+        if token is None:
+            return _err("客户端不存在", 404)
+        config.audit(
+            state, "wireguard_one_time", str(peer.get("name")), actor=_client_ip(request)
+        )
+        save_state(state)
+        url = f"{share_links.panel_base_url(request, state)}/wg/one/{token}"
+        return {
+            "url": url,
+            "expires_at": int(time.time()) + wireguard.ONE_TIME_TTL,
+            "ttl": wireguard.ONE_TIME_TTL,
+        }
+
+
+@router.get("/wg/one/{token}")
+def wireguard_one_time_config(token: str):
+    """一次性配置下载。链接本身就是凭据：用一次即作废，默认 10 分钟过期。"""
+    with config.locked():
+        state = load_state()
+        got = wireguard.one_time_consume(state, token)
+        if got is None:
+            return _err("链接无效、已使用或已过期", 404)
+        _peer, text = got
+        save_state(state)
+        return _wg_text_response(text, "zeroproxy-wireguard.conf")
 
 
 # ---------------------------------------------------------------- 客户端设备

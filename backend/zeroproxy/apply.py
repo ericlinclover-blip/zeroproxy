@@ -34,6 +34,7 @@ from . import (
     hysteria_config,
     nginx_config,
     services,
+    wireguard,
     xray_config,
 )
 from .config import XRAY_NODE_IDS, load_state, paths, save_state
@@ -44,6 +45,7 @@ STEP_NAMES = (
     "重新生成 Xray 配置",
     "重新生成 Nginx 配置",
     "重新生成 Hysteria 2 配置",
+    "重新生成 WireGuard 配置",
     "重载服务 (nginx/xray/hysteria2)",
     "验证端口监听",
 )
@@ -200,6 +202,15 @@ def gen_hysteria(state: dict, timeout: int = 0) -> tuple[bool, str]:
     return True, "已生成"
 
 
+def gen_wireguard(state: dict, timeout: int = 0) -> tuple[bool, str]:
+    """生成原生 WireGuard 的服务端配置、客户端 peer 与防火墙脚本。
+
+    这一步只写文件；真正把配置同步进内核在 restart_services 里做（用
+    `wg syncconf` 增量同步，不会把在线 peer 全部踢掉）。
+    """
+    return wireguard.generate(state)
+
+
 def restart_services(
     state: dict, timeout: int = 0, changed: set[str] | None = None
 ) -> tuple[bool, str]:
@@ -263,13 +274,32 @@ def restart_services(
     except Exception as exc:  # noqa: BLE001 - 内层 QUIC 不能拖垮整次落地
         quic_note = f"✗ 内层 QUIC 同步异常: {exc}"
 
+    # 原生 WireGuard 不进上面的 systemctl 并发列表: 它要的是 syncconf 而不是
+    # restart (restart 会把整条隧道拆掉重来)。只在"确实在用它"时才动它 ——
+    # 从没启用过的机器不该因为升级多出一行 "wireguard 未运行" 的噪声。
+    wg_note = ""
+    wg_failed = False
+    wg_in_use = (
+        wireguard.enabled(state)
+        or wireguard.service_state() in ("active", "activating")
+    )
+    if wg_in_use:
+        try:
+            wg_ok, wg_detail = wireguard.sync(state, timeout=timeout or 90)
+        except Exception as exc:  # noqa: BLE001 - 不能让 WireGuard 拖垮其它服务
+            wg_ok, wg_detail = False, f"同步异常: {exc}"
+        wg_failed = not wg_ok
+        wg_note = f"wireguard {'✓' if wg_ok else '✗'} {wg_detail}"
+
     if not jobs:
-        # 同样只看核心服务: 三份配置都没变、服务都在跑, 这一步就是成功的 ——
+        # 同样只看核心服务: 配置都没变、服务都在跑, 这一步就是成功的 ——
         # 内层 QUIC 起不来只是把它写进说明, 不改变结论 (理由见下面 core_failed 那段)
-        return True, (
-            "三份配置都没有变化, 无需重启 (服务都在正常运行)"
-            + (f"; {quic_note}" if quic_note else "")
-        )
+        detail = "配置都没有变化, 无需重启 (服务都在正常运行)"
+        if quic_note:
+            detail += f"; {quic_note}"
+        if wg_note:
+            detail += f"; {wg_note}"
+        return (not wg_failed), detail
 
     results: dict[str, str] = {}
 
@@ -305,7 +335,7 @@ def restart_services(
     # 结束, upgrade.sh 会判定第 6 步失败并**回滚整次升级** —— 那台机器就再也升不了级
     # (真机踩到过: 落地端 8448/udp 被面板自己起的进程占着)。QUIC 的实际状态另有出处:
     # 面板链式卡片会显示"内层 QUIC 没在跑", 「一键诊断」也有独立一项。
-    core_failed = any("✗" in row for row in ordered)
+    core_failed = any("✗" in row for row in ordered) or wg_failed
     if quic_note:
         # 挂在 Xray 那一行 (QUIC 进程就是给它当出站用的); 这一轮没重启 Xray 时
         # (比如只改了落地端的 QUIC 开关) 就单独占一行, 免得状态被吞掉。
@@ -315,6 +345,8 @@ def restart_services(
             ]
         else:
             ordered.append(quic_note)
+    if wg_note:
+        ordered.append(wg_note)
     return (not core_failed), "; ".join(ordered)
 
 
@@ -342,6 +374,9 @@ def _wanted_ports(state: dict) -> list[tuple[int, str, str]]:
         # 去验跳跃端口, 会把正常的跳跃配置判成失败 —— v2.6.5 真机升级就是这么挂在
         # 第 6 步的。转发规则另用 `_hop_redirect_note` 尽力确认, 只作说明不影响成败。
         want.append((int(ports["hysteria"]), "udp", "Hysteria 2"))
+    wg = state.get("wireguard") or {}
+    if wg.get("enabled") and wg.get("port"):
+        want.append((int(wg["port"]), "udp", "WireGuard"))
     # 链式代理的两端都是真实对外端口, 同样要验证真的起来了
     chain_cfg = state.get("chain") or {}
     exit_cfg = chain_cfg.get("exit") or {}
@@ -471,6 +506,16 @@ def verify_listeners(state: dict, timeout: int = 0) -> tuple[bool, str]:
             "以下端口已停用却仍在监听 (内核没按新配置重启, 或被其它进程占用): "
             + ", ".join(still_open)
         )
+    # WireGuard 的接口本身也要在: 端口是内核 UDP socket, 接口没建起来时端口可能
+    # 还被一个半启动的进程占着, 只看端口会误判成"已生效"。
+    wg = state.get("wireguard") or {}
+    if wg.get("enabled"):
+        if not wireguard.interface_exists():
+            problems.append("WireGuard 已启用但 wg0 接口不存在")
+        elif not wireguard.nat_rule_present():
+            problems.append("WireGuard 的 NAT/MASQUERADE 规则不存在 (客户端会连上但上不了网)")
+    elif wireguard.service_state() in ("active", "activating"):
+        problems.append("WireGuard 已停用但服务仍在运行")
     if problems:
         return False, "; ".join(problems)
     detail = f"{len(want)} 个端口全部在监听"
@@ -508,11 +553,12 @@ def _config_digests() -> dict[str, str | None]:
         "xray": _digest(p["xray_config"]),
         "nginx": _digest(nginx),
         "hysteria": _digest(p["hysteria_config"]),
+        "wireguard": _digest(p["wireguard_config"]),
     }
 
 
 def reapply(state: dict, timeout: int = 0, progress=None) -> list[dict]:
-    """完整闭环: 重新生成三份配置 → 校验 → 重载服务 → 验证端口。
+    """完整闭环: 重新生成配置 → 校验 → 重载服务 → 验证端口。
 
     `progress` 可选, 形如 `fn(index, total, name)`: 每进入一步回调一次 ——
     面板把整条闭环放到后台跑, 就靠它给用户画实时进度。
@@ -533,8 +579,9 @@ def reapply(state: dict, timeout: int = 0, progress=None) -> list[dict]:
         (STEP_NAMES[1], gen_xray, 0),
         (STEP_NAMES[2], gen_nginx, 0),
         (STEP_NAMES[3], gen_hysteria, 0),
-        (STEP_NAMES[4], restart_step, 180),
-        (STEP_NAMES[5], verify_listeners, 12),
+        (STEP_NAMES[4], gen_wireguard, 0),
+        (STEP_NAMES[5], restart_step, 180),
+        (STEP_NAMES[6], verify_listeners, 12),
     )
     for index, (name, fn, t) in enumerate(plan):
         if progress is not None:

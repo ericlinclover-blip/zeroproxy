@@ -40,7 +40,7 @@ export function renderApplyStrip(st) {
   const bad = !running && (st.state === "failed" || !!st.error || stepFails > 0);
   // GeoIP 下载和"改配置落地"共用这条进度条, 文案要跟着任务类型走
   const geo = st.kind === "geodata";
-  const total = st.total || 6;
+  const total = st.total || 7;
   const index = Math.max(1, Math.min(st.index || 1, total));
   const pct = Math.round((index / total) * 100);
   const secs = ((st.elapsed_ms || 0) / 1000).toFixed(1);
@@ -119,7 +119,7 @@ export async function settleApply(body) {
 
 /* 改动类接口的统一入口 (端口跳跃 / 链式代理): 回来后用服务器返回的完整仪表盘
  * 数据整体重渲染, 并把落地的步骤结果转成提示 */
-export async function applyAction(method, path, payload, btn, busyText) {
+export async function applyAction(method, path, payload, btn, busyText, okText) {
   await waitPendingApply();   // 上一次还在落地: 排队等它, 别把这次点了没反应
   const original = btn ? btn.textContent : "";
   const before = S.dash ? JSON.stringify(S.dash) : "";   // 用于"断线后其实已经生效"的比对
@@ -136,7 +136,11 @@ export async function applyAction(method, path, payload, btn, busyText) {
     if (S.lastApplyJob && S.lastApplyJob.state === "failed") {
       toast("应用失败: " + (S.lastApplyJob.error || "后台任务异常"));   // 步骤清单没有, 至少别报"已应用"
     } else {
-      toast(failed.length ? `已应用, 但有 ${failed.length} 步告警: ${failed[0].name}` : "已应用, 订阅内容已刷新");
+          toast(
+            failed.length
+              ? `已应用, 但有 ${failed.length} 步告警: ${failed[0].name}`
+              : (okText || "已应用, 订阅内容已刷新")
+          );
     }
   } catch (e) {
     if (e.dropped) {

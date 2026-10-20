@@ -25,7 +25,8 @@ except ImportError:  # pragma: no cover
 
 #: state.json 结构版本 — 新增字段时 +1, `_merge` 会自动补齐缺失键
 #: v5: 新增 devices (客户端设备注册表, 见 devices.py)
-STATE_VERSION = 5
+#: v6: 新增 wireguard (原生 WireGuard 入站 / 每设备 peer, 见 wireguard.py)
+STATE_VERSION = 6
 
 DEFAULT_HOME = "/opt/zeroproxy"
 #: 面板对外端口 (nginx 监听, 默认 8899) — 用于生成订阅/面板链接
@@ -203,6 +204,26 @@ DEFAULTS: dict = {
         "items": [],
         "pair_codes": [],
     },
+    # 原生 WireGuard 入站 (官方 iOS / Android / Windows / macOS 客户端直接连接)。
+    #
+    # 它不属于 Xray 的节点表: WireGuard 是 UDP + 内核接口, 客户端要的是标准 .conf,
+    # 不是订阅链接; 若把 peer 私钥塞进统一订阅, 新版 sing-box (1.13 起移除 WG 出站)
+    # 会拒绝整份配置。每台设备一条独立 peer, 私钥 / PSK 只在本机 state.json (0600)。
+    "wireguard": {
+        "enabled": False,
+        "port": 51820,             # UDP 监听端口
+        "subnet": "10.66.66.0/24", # 隧道网段; 服务端固定用 .1
+        "ipv6": False,             # 可选 IPv6 隧道 (ULA), 默认关
+        "ipv6_subnet": "fd66:66:66::/64",
+        "mtu": 1420,
+        "dns": "1.1.1.1, 8.8.8.8",
+        "keepalive": 25,           # 客户端 PersistentKeepalive
+        "endpoint": "",            # 留空 = 用面板域名
+        "server_private_key": "",
+        "server_public_key": "",
+        "peers": [],               # [{id,name,private_key,public_key,preshared_key,address,...}]
+        "one_time_links": [],      # [{token,peer_id,created_at,expires_at}]
+    },
     "cert": {
         "type": "none",  # none | letsencrypt | selfsigned
         "issuer": "",
@@ -243,6 +264,12 @@ def paths() -> dict:
         "hysteria_config": f"{h}/hysteria/config.yaml",
         "hysteria_cert": f"{h}/hysteria/cert.pem",
         "hysteria_key": f"{h}/hysteria/key.pem",
+        # 原生 WireGuard: 服务端配置 / 运行时配置 / 防火墙与增量同步脚本
+        "wireguard_dir": f"{h}/wireguard",
+        "wireguard_config": f"{h}/wireguard/wg0.conf",
+        "wireguard_runtime": f"{h}/wireguard/wg0.runtime.conf",
+        "wireguard_firewall": f"{h}/wireguard/firewall.sh",
+        "wireguard_reload": f"{h}/wireguard/reload.sh",
         # 链式代理的内层 QUIC (Hysteria 2) — 配置 / 进程日志 / 临时测速都放这里
         "chain_quic_dir": f"{h}/data/chain-quic",
         "chain_quic_cert": f"{h}/data/chain-quic/cert.pem",
@@ -272,7 +299,7 @@ def _ensure_dirs() -> None:
     p = paths()
     for key in (
         "data_dir", "xray_dir", "hysteria_dir", "cert_dir", "nginx_dir", "www", "panel_dir",
-        "geo_dir", "chain_quic_dir",
+        "geo_dir", "chain_quic_dir", "wireguard_dir",
     ):
         os.makedirs(p[key], exist_ok=True)
 
@@ -441,6 +468,13 @@ AUDIT_ACTIONS: dict[str, tuple[str, str]] = {
     "device_toggle": ("客户端总开关", "device"),
     "device_template": ("客户端分流模板", "device"),
     "device_remove": ("移除客户端", "device"),
+    "wireguard_settings": ("WireGuard 设置", "config"),
+    "wireguard_peer_add": ("新增 WireGuard 客户端", "device"),
+    "wireguard_peer_update": ("修改 WireGuard 客户端", "device"),
+    "wireguard_peer_remove": ("移除 WireGuard 客户端", "device"),
+    "wireguard_peer_rotate": ("轮换 WireGuard 密钥", "device"),
+    "wireguard_one_time": ("生成 WireGuard 一次性链接", "device"),
+    "wireguard_expire": ("WireGuard 客户端到期", "device"),
     "geodata_update": ("更新 GeoIP 数据", "data"),
     "geodata_update_failed": ("GeoIP 更新失败", "data"),
     "geodata_auto": ("自动更新 GeoIP", "data"),
@@ -469,6 +503,7 @@ AUDIT_FAILING = {"login_failed", "geodata_update_failed"}
 #: 设备被移除 = 那台机器上的代理立刻失效 (不能靠"再装一次"恢复), 值得单独标出来。
 AUDIT_RISK = {
     "setup", "restore", "update", "logout_all", "chain_delete", "audit_clear", "device_remove",
+    "wireguard_peer_remove", "wireguard_peer_rotate",
 }
 
 AUDIT_MAX = 500             # state.json 里保留的条数 (再老的滚进 audit.log)

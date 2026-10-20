@@ -21,7 +21,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__, chain_quic, config, geodata, routes, services
+from . import __version__, chain_quic, config, geodata, routes, services, wireguard
 
 #: GeoIP 数据自动更新的检查间隔 (6 小时检查一次; 是否真的下载由 TTL 决定)
 GEODATA_CHECK_INTERVAL = 6 * 3600
@@ -29,6 +29,9 @@ GEODATA_CHECK_INTERVAL = 6 * 3600
 GEODATA_FIRST_DELAY = 90
 #: 设 ZP_GEODATA_AUTO=0 可关闭后台自动更新 (测试 / 无外网环境)
 GEODATA_AUTO_ENV = "ZP_GEODATA_AUTO"
+
+#: WireGuard 到期客户端的回收间隔（秒）。只处理设置了 expires_at 的 peer。
+WIREGUARD_CHECK_INTERVAL = 60
 
 
 def _geodata_once() -> None:
@@ -107,6 +110,30 @@ def _geodata_loop(stop: threading.Event) -> None:
             return
 
 
+def _wireguard_loop(stop: threading.Event) -> None:
+    """到期 peer 自动停用：从内核里摘掉，而不是只在面板上标红。"""
+    if os.environ.get("ZP_WIREGUARD_AUTO", "1") == "0":
+        return
+    while not stop.wait(WIREGUARD_CHECK_INTERVAL):
+        try:
+            with config.locked():
+                state = config.load_state()
+                if not state.get("configured") or not wireguard.enabled(state):
+                    continue
+                if not wireguard.reap_expired(state):
+                    continue
+                ok, detail = wireguard.sync(state)
+                config.audit(
+                    state,
+                    "wireguard_expire",
+                    ("自动停用到期客户端 · " if ok else "到期客户端停用失败 · ") + detail[:160],
+                    actor="scheduler",
+                )
+                config.save_state(state)
+        except Exception:  # noqa: BLE001 — 后台任务不能因单次异常退出
+            pass
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     """后台维护任务: GeoIP/GeoSite 自动更新 + 链式内层 QUIC 进程看门。"""
@@ -119,6 +146,10 @@ async def lifespan(app: FastAPI):
         target=chain_quic.supervisor_loop, args=(stop,), daemon=True, name="zp-chain-quic"
     )
     keeper.start()
+    # WireGuard 到期回收 (每 60 秒看一次; 没有启用或没有到期 peer 时什么也不做)
+    threading.Thread(
+        target=_wireguard_loop, args=(stop,), daemon=True, name="zp-wireguard"
+    ).start()
     # 顶部「出口 IP」卡片要显示本机公网 IP, 而云主机的公网 IP 不在网卡上 (NAT /
     # 弹性 IP), 只能问一次外部回显服务。启动时先读, 免得用户打开面板看到一片"—";
     # 之后由 services 按 TTL 在后台自己刷。ZP_PUBLIC_IP=0 可整体关闭 (测试离线跑)。

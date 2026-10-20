@@ -443,6 +443,7 @@ export function renderSystem(d) {
     <div class="card">
       ${svcRow("Xray 核心", sys.xray)}
       ${svcRow("Hysteria 2", sys.hysteria2)}
+      ${d.wireguard ? `<div class="kv"><span class="k">WireGuard</span><span><span class="dot ${d.wireguard.enabled ? stateClass(sys.wireguard.state) : "other"}"></span> ${d.wireguard.enabled ? (STATE_TXT[sys.wireguard.state] || esc(sys.wireguard.state)) : "未启用"}</span></div>` : ""}
       <div class="kv"><span class="k">Nginx</span><span><span class="dot ${stateClass(sys.nginx.state)}"></span> ${STATE_TXT[sys.nginx.state] || esc(sys.nginx.state)}</span></div>
       <div class="kv"><span class="k">服务器</span><span>${esc(sys.server.os)} · ${esc(sys.server.arch)} · 在线 ${fmtUptime(sys.server.uptime_s)}</span></div>
       <div class="kv"><span class="k">端口跳跃</span><span>${d.hysteria_hopping ? "已启用 (" + d.hysteria_ports.join(" / ") + ")" : "未启用"}</span></div>
