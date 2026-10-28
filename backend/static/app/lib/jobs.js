@@ -42,8 +42,13 @@ export function renderApplyStrip(st) {
     : running ? (geo ? "正在下载 GeoIP 数据" : "正在应用配置")
       : geo ? "GeoIP 数据已更新并生效" : "配置已应用";
 
-  // 只更新变化的文本/类名，不重建整个 innerHTML
-  // 用 data-* 属性 + innerText 模式，比 innerHTML 快得多
+  // 第一次任务开始时容器是空的。先建一次固定骨架，之后只增量更新。
+  let banner = box.querySelector(".banner");
+  if (!banner) {
+    box.innerHTML = '<div class="banner"><span class="ico"></span><span class="grow"></span></div>';
+    banner = box.querySelector(".banner");
+  }
+  banner.className = `banner ${bad ? "bad" : running ? "info" : "good"}`;
   box.dataset.state = running ? "running" : (bad ? "bad" : "good");
   box.querySelector(".ico").textContent = bad ? "✗" : running ? "⟳" : "✓";
 

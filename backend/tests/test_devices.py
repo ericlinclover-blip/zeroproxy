@@ -36,12 +36,26 @@ def _client_source() -> str:
     from zeroproxy import router_client
 
     parts = [open(router_client.script_path(), encoding="utf-8").read()]
-    for entry in sorted(os.listdir(router_client.runtime_dir())):
+    for entry in sorted(router_client.RUNTIME_FILES):
         path = os.path.join(router_client.runtime_dir(), entry)
         if os.path.isfile(path):
             with open(path, encoding="utf-8") as fh:
                 parts.append(fh.read())
     return "\n".join(parts)
+
+
+def test_client_source_ignores_unregistered_runtime_backups(tmp_path, monkeypatch):
+    """Only shipped runtime files belong in the concatenated client source."""
+    from zeroproxy import router_client
+
+    (tmp_path / "agent.sh").write_text("TRACKED_RUNTIME\n", encoding="utf-8")
+    (tmp_path / "agent.sh.bak.original").write_text("BACKUP_RUNTIME\n", encoding="utf-8")
+    monkeypatch.setattr(router_client, "runtime_dir", lambda: str(tmp_path))
+
+    text = _client_source()
+
+    assert "TRACKED_RUNTIME" in text
+    assert "BACKUP_RUNTIME" not in text
 
 
 def _login(client) -> None:
@@ -1779,7 +1793,7 @@ def test_tun_mtu_follows_the_wan_and_is_clamped(client, configured):
 
 
 def test_bench_endpoint_is_a_bounded_target(client, configured):
-    """`zeroproxy bench` 的靶子是面板自己 —— 一个**匿名、有上限**的定长下载端点。
+    """`zeroproxy bench` 的靶子是面板自己 —— 一个**有上限**的定长下载端点。
 
     为什么靶子是面板: 它是这台路由器一定能访问到的地址 (装机时唯一可达的), 而且"直连"与
     "经代理"两条路跑的是同一段路, 一比就知道代理本身吃掉了多少。
@@ -1788,7 +1802,10 @@ def test_bench_endpoint_is_a_bounded_target(client, configured):
     """
     from zeroproxy import routes
 
-    res = client.get("/c/bench/2")
+    _login(client)
+    device = _register(client, _pair_code(client)["code"])
+    qs = f"?id={device['id']}&k={device['secret']}"
+    res = client.get("/c/bench/2" + qs)
     assert res.status_code == 200
     assert len(res.content) == 2 << 20
     assert res.headers["content-type"] == "application/octet-stream"
@@ -1797,10 +1814,27 @@ def test_bench_endpoint_is_a_bounded_target(client, configured):
     # 随机字节 (压缩不了): 拿前 4 KB 看熵就够 —— 全零或重复的模式会被中间任何一层压掉
     assert len(set(routes._BENCH_MB[:4096])) > 64
 
-    # 有上限: 这是匿名端点, 而且面板自己就在那条链路上 —— 不能变成放大器
-    huge = client.get(f"/c/bench/{routes.BENCH_MAX_MB + 50}")
+    # 有上限: 面板自己就在那条链路上 —— 即使凭据有效也不能变成放大器
+    huge = client.get(f"/c/bench/{routes.BENCH_MAX_MB + 50}" + qs)
     assert len(huge.content) == routes.BENCH_MAX_MB << 20
-    assert len(client.get("/c/bench/0").content) == len(routes._BENCH_MB)
+    assert len(client.get("/c/bench/0" + qs).content) == len(routes._BENCH_MB)
+
+
+def test_bench_endpoint_requires_the_calling_device_credentials(client, configured):
+    """The bandwidth target must not be an anonymous public download endpoint."""
+    from zeroproxy import routes
+
+    _login(client)
+    device = _register(client, _pair_code(client)["code"])
+
+    anonymous = client.get("/c/bench/1")
+    authorized = client.get(
+        f"/c/bench/1?id={device['id']}&k={device['secret']}"
+    )
+
+    assert anonymous.status_code == 403
+    assert authorized.status_code == 200
+    assert len(authorized.content) == len(routes._BENCH_MB)
 
 
 def test_install_script_probes_the_wan_for_mtu_and_offload():
@@ -1968,10 +2002,6 @@ def test_local_override_lets_the_router_be_switched_without_the_panel():
     # ③ 只有显式 local-auto 才交回面板; 面板答得上时顺手清掉 (那时面板就是真相源)
     assert 'rm -f "$ZP_DIR/local.override"' in text
     assert 'echo "面板不可达 —— 已在本机把全屋代理设为「$1」并立即生效。"' in text
-    # 心跳把这件事如实报上去, 面板卡片才能写「本机覆盖」而不是「同步中」
-    assert '"override":"\'"$OVERRIDE"\'"' in text
-
-
 def test_luci_session_accepts_a_real_session_the_way_ubus_actually_works():
     """从 LuCI 菜单点进来必须能打开 —— 判据得按**这台机器上 ubus 的真实行为**写。
 

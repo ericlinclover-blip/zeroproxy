@@ -476,11 +476,10 @@ def _cert_not_after(cert_file: str) -> int:
 
 # ---------------------------------------------------------------- 流量统计
 
-#: 流量统计短时缓存: 同一分钟内重复读取直接返回旧值。
-#: xray stats 每 20s 读一次, 但 20s 内的差值极小 (< 1KB), 缓存可以减少
-#: 不必要的 xray api 子进程 fork + JSON 解析开销。
+#: 同一时刻并发展开多个仪表盘请求时, 用几秒缓存合并重复读取。
+#: 不能跨过前端 20 秒采样窗口: 累计值不前进会让速率曲线先平后尖。
 _stats_cache: dict = {}
-_STATS_TTL = 60  # 缓存 60 秒
+_STATS_TTL = 5
 
 
 def xray_stats(state: dict) -> Optional[dict]:
@@ -489,18 +488,18 @@ def xray_stats(state: dict) -> Optional[dict]:
     返回 {"uplink", "downlink", "total", "by_node"} (字节); 未安装 xray /
     非生产环境 / API 不可达时返回 None, 调用方应展示「不可用」。
     
-    优化: 短时缓存 (60s)。20s 轮询期间流量差值极小, 缓存减少子进程开销。
+    优化: 5s 合并并发读取, 但保证下一次 20s 仪表盘采样能拿到新累计值。
     """
-    # 缓存命中: 直接返回
-    now = int(time.time())
-    cached = _stats_cache.get("data")
-    if cached and (now - _stats_cache.get("ts", 0)) < _STATS_TTL:
-        return cached
-    
     binary = bin_path("xray")
     if binary is None:
         return None
     api_port = int(state["ports"].get("api", 10085))
+    cache_key = (binary, api_port, tuple(sorted(traffic_tags(state))))
+    now = int(time.time())
+    cached = _stats_cache.get(cache_key)
+    if cached and (now - cached.get("ts", 0)) < _STATS_TTL:
+        return cached.get("data")
+
     # 先做一次 0.4s 的 TCP 预检: 端口没开时 `xray api` 自己要等 2-3 秒才报错,
     # 而仪表盘每次渲染都会调这里 (20s 轮询), 不预检会白白拖慢整个面板。
     if not _tcp_reachable("127.0.0.1", api_port, timeout=0.4):
@@ -543,8 +542,7 @@ def xray_stats(state: dict) -> Optional[dict]:
         "available": True,
     }
     # 写缓存
-    _stats_cache["data"] = result
-    _stats_cache["ts"] = now
+    _stats_cache[cache_key] = {"data": result, "ts": now}
     
     return result
 

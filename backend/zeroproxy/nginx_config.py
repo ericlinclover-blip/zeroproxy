@@ -14,14 +14,12 @@
 from __future__ import annotations
 
 import os
-import time
 
 from . import config
 from .config import paths, WS_PATH
 
 _TEMPLATE = """\
 # 由 ZeroProxy 面板自动生成 — 修改请通过面板, 本文件会被覆盖
-# generated: @TIMESTAMP@
 
 upstream zeroproxy_vless_ws {
     server 127.0.0.1:@WS_PORT@;
@@ -151,7 +149,6 @@ def build_nginx_conf(state: dict) -> str:
     # 未配置域名时去掉域名面板块 (只有默认自签块, 供引导阶段用)
     conf = _TEMPLATE.replace("@PANEL_DOMAIN_BLOCK@", _PANEL_DOMAIN_BLOCK if domain else "")
     subs = {
-        "TIMESTAMP": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
         "DOMAIN": domain,
         "WS_PORT": state["ports"]["ws_internal"],
         "WSPATH": WS_PATH,

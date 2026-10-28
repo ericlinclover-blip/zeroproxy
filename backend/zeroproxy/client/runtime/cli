@@ -892,7 +892,7 @@ EOF
         # 还有没有意义"。结果落在 $ZP_DIR/bench, agent 会随心跳带给面板。
         [ -n "$FIRST" ] || { echo "还没有接入任何服务器"; exit 1; }
         command -v curl >/dev/null 2>&1 || { echo "这台固件上没有 curl —— 跑不了基准"; exit 1; }
-        _url="$(field_of "$FIRST" base)/c/bench/$BENCH_MB"
+        _url="$(field_of "$FIRST" base)/c/bench/$BENCH_MB?id=$(field_of "$FIRST" id)&k=$(field_of "$FIRST" secret)"
         echo "路由器基准测试 (靶子是面板, ${BENCH_MB} MB —— 经代理那一趟会算节点流量)"
         printf '  直连   … '
         _dr="$(bench_run "$_url" direct)"

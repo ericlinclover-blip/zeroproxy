@@ -331,6 +331,21 @@ perf_intending() {
 
 flush_dns() { killall -HUP dnsmasq 2>/dev/null || /etc/init.d/dnsmasq reload 2>/dev/null || true; }
 
+# 本地控制口只用单次、短超时探测。这里不能复用 http_get: 后者面向面板网络，
+# 自带 5 次重试；套进外层轮询会把 15 秒放大成几分钟。
+local_api_ready() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSk --connect-timeout 1 --max-time 1 \
+            "http://127.0.0.1:9090/version" >/dev/null 2>&1
+    elif command -v uclient-fetch >/dev/null 2>&1; then
+        uclient-fetch -q -T 1 -O /dev/null "http://127.0.0.1:9090/version" >/dev/null 2>&1
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -T 1 -O /dev/null "http://127.0.0.1:9090/version" >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
 # ---------------------------------------------------------------- 修复1: switch_core 等 mihomo API 真正就绪再设 core.up
 # 原来的实现: start → sleep 2 → touch core.up
 # 问题: mihomo 从 start 到 API 9090 可用通常需要 3~8 秒, sleep 2 秒太短, 下一轮心跳
@@ -342,7 +357,7 @@ switch_core() {
         # 等 mihomo API 真正就绪 (最多等 15 秒), 而不是固定等 2 秒
         _wait=0
         while [ "$_wait" -lt 15 ]; do
-            if http_get "http://127.0.0.1:9090/version" >/dev/null 2>&1; then
+            if local_api_ready; then
                 touch "$ZP_DIR/core.up"
                 flush_dns
                 return 0
@@ -350,9 +365,9 @@ switch_core() {
             sleep 1
             _wait=$((_wait + 1))
         done
-        # API 超时没起来, 保底设标记 (下一轮心跳会重试)
-        touch "$ZP_DIR/core.up"
-        flush_dns
+        rm -f "$ZP_DIR/core.up"
+        log "内核启动后 API 未就绪 (15 秒), 不标记为已启动"
+        return 1
     else
         rm -f "$ZP_DIR/core.up"
         /etc/init.d/zeroproxy stop >/dev/null 2>&1 || true
@@ -386,8 +401,11 @@ apply_config() {
         _cfg_wait=0
         while [ "$_cfg_wait" -lt 15 ]; do
             if ! kill -0 "$_cfg_pid" 2>/dev/null; then
-                wait "$_cfg_pid" 2>/dev/null
-                _config_ok=0  # 正常退出
+                if wait "$_cfg_pid" 2>/dev/null; then
+                    _config_ok=0
+                else
+                    _config_ok=$?
+                fi
                 break
             fi
             sleep 1
@@ -397,7 +415,7 @@ apply_config() {
             kill "$_cfg_pid" 2>/dev/null || true
             wait "$_cfg_pid" 2>/dev/null || true
             _config_ok=28  # 超时
-            log "配置校验超时 (30秒), 保留旧配置"
+            log "配置校验超时 (15秒), 保留旧配置"
         fi
     fi
     
@@ -495,6 +513,28 @@ tun_mtu_flag() {
     esac
 }
 
+report_fields_json() {
+    _ipv6="$(ipv6_flag)"
+    _mtu="$(tun_mtu_flag)"
+    _offload="$(caps_get offload)"
+    _bench_direct="$(sed -n 's/^direct_kbps=//p' "$ZP_DIR/bench" 2>/dev/null | head -n1)"
+    _bench_proxy="$(sed -n 's/^proxy_kbps=//p' "$ZP_DIR/bench" 2>/dev/null | head -n1)"
+    case "$_bench_direct" in ''|*[!0-9]*) _bench_direct=0 ;; esac
+    case "$_bench_proxy" in ''|*[!0-9]*) _bench_proxy=0 ;; esac
+    _why=""
+    if [ "$COV_REPORT" = "none" ]; then
+        for _lv in tun tproxy redirect; do
+            _reason="$(caps_get "why.$_lv")"
+            if [ -n "$_reason" ]; then
+                _why="${_why:+$_why · }$_lv: $_reason"
+            fi
+        done
+    fi
+    printf '{"mode":"%s","covered":"%s","why":"%s","client":"%s","override":"%s","ipv6":"%s","mtu":"%s","offload":"%s","bench_direct":"%s","bench_proxy":"%s"}' \
+        "$DP_REPORT" "$COV_REPORT" "$(json_escape "$_why")" "$ZP_VERSION" "$OVERRIDE" \
+        "$_ipv6" "$_mtu" "$(json_escape "$_offload")" "$_bench_direct" "$_bench_proxy"
+}
+
 # 从面板取配置 (config 模式: 打印到 stdout; 默认模式: 拉取并落盘)。
 # 配置只在内容变化 (或距上次拉取超过 6 小时) 时更新。
 
@@ -590,32 +630,10 @@ while true; do
     # TUN + auto-redirect 没跑成时, "转发进/出 tun" 的放行规则是**易失**的 (直接插在 fw4
     # 的链上, 一次 `fw4 reload` 就没了)。内核在跑就顺手补一次 —— 幂等, 而且**按需**:
     # 健康机器 (autoredirect=1) 在这里一个 nft 都不会调用。少了它, 家里会静默地再断一次。
-    WHY_REPORT=""
     if [ "$DP_REPORT" = "tun" ] && core_up && [ -f "$ZP_DIR/tunfw.sh" ]; then
         . "$ZP_DIR/tunfw.sh"
         if [ "$DP_REPORT" = "tun" ]; then zp_tunfw_allow 2>/dev/null || true; fi
     fi
-    # 出口探针 (性能模式下验证 dae 生效): 每轮都发, 面板据此算出口 IP。
-    BENCH_D=""
-    BENCH_P=""
-    for _f in $(server_files); do
-        _b="$(field_of "$_f" base)"
-        [ -n "$_b" ] || continue
-        _ip="$(curl -fsSk -m 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p' | head -n1)"
-        [ -n "$_ip" ] && BENCH_D="$_ip"
-    done
-    for _f in $(server_files); do
-        _b="$(field_of "$_f" base)"
-        _i="$(field_of "$_f" id)"
-        _k="$(field_of "$_f" secret)"
-        [ -n "$_b" ] || continue
-        _url="$_b/c/bench?i=$_i&k=$_k"
-        _ip="$(curl -fsSk -m 10 "$_url" 2>/dev/null | sed -n 's/^ip=//p' | head -n1)"
-        if [ -n "$_ip" ]; then
-            BENCH_P="$_ip"
-            break
-        fi
-    done
 
     # ---------------------------------------------------------------- 心跳上报 (多服务器)
     # 修复4: 多服务器心跳容错 —— 至少一台成功才算面板可达
@@ -631,12 +649,7 @@ while true; do
         if proxy_up; then BODY="$BODY"',"actual":true'; else BODY="$BODY"',"actual":false'; fi
         [ -n "$UI_URL_REPORT" ] && BODY="$BODY"',"ui":"'"$UI_URL_REPORT"'"'
         [ -n "$LAST_REV" ] && BODY="$BODY"',"rev":"'"$LAST_REV"'"'
-        BODY="$BODY"',"report":{"mode":"'"$DP_REPORT"'","covered":"'"$COV_REPORT"'"'
-        BODY="$BODY"',"why":"'"$(json_escape "$WHY_REPORT")"'"'
-        BODY="$BODY"',"client":"'"$ZP_VERSION"'","override":"'"$OVERRIDE"'"'
-        BODY="$BODY"',"ipv6":"'"$IPV6_REPORT"'","mtu":"'"$MTU_REPORT"'"'
-        BODY="$BODY"',"offload":"'"$OFFLOAD_REPORT"'"'
-        BODY="$BODY"',"bench_direct":"'"${BENCH_D:-0}"'","bench_proxy":"'"${BENCH_P:-0}"'"}}'
+        BODY="$BODY"',"report":'"$(report_fields_json)"'}'
         RESP="$(http_post "$_b/c/report" "$BODY" || true)"
         if [ -z "$RESP" ]; then
             FAILS=$((FAILS + 1))

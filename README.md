@@ -82,7 +82,7 @@ curl -fsSL https://github.i3.pub/https://raw.githubusercontent.com/ericlinclover
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` **326 项通过 + 6 skip** (带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (105 项, 含**两台机器真跑一条链** 与**四档数据面 × IPv6 的路由器配置过真 mihomo**) + `scripts/router_install_check.py` (**201 项**, 真的用 shell 跑一遍路由器安装脚本, 内含四类机器 / 本机覆盖 / revert 比对 / zpcore 真跑 / **四档数据面下四个现场入口的一致性矩阵**) + `scripts/browser_check.cjs` (157 项) + `scripts/clients_check.cjs` (26 项, 真实浏览器点开关) + `scripts/router_ui_check.cjs` (18 项) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` **364 项通过 + 6 skip** (带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (105 项, 含**两台机器真跑一条链** 与**四档数据面 × IPv6 的路由器配置过真 mihomo**) + `scripts/router_install_check.py` (**201 项**, 真的用 shell 跑一遍路由器安装脚本, 内含四类机器 / 本机覆盖 / revert 比对 / zpcore 真跑 / **四档数据面下四个现场入口的一致性矩阵**) + `scripts/browser_check.cjs` (157 项) + `scripts/clients_check.cjs` (26 项, 真实浏览器点开关) + `scripts/router_ui_check.cjs` (18 项) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 | **看得懂的界面 (v2.6.0)** | 控制台布局: 左侧锚点导航 (带计数角标 + 滚动高亮) + 顶部指标条 (健康节点 / 落地出口 IP / 平均延迟 + 迷你折线 / 运行时长) + 节点密集表格 (名称 / 地址状态 / **握手延迟条** / **上下行双轨** / 开关与复制) + **流量卡 (双弧圆环 + 实时速率曲线 + 逐节点双色流量条)** + 链式链路拓扑 (你的设备 → 本机入口 → 落地端) + 程序更新闭环; 动效全部走 `transform`/自绘 rAF 并受 `prefers-reduced-motion` 约束 |
 
@@ -5368,19 +5368,6 @@ gzip 的 tar; 以及**把"包取不到"这条兜底真跑一遍** —— 用一�
 
 ---
 
-### 8.94 v2.12.5 (客户端 v1.4.38): 路由器客户端稳定性大修
-- **agent.sh 恢复命令行模式分派**: `case "${1:-}"` 补齐 config/geo/once 三路，
-  安装脚本调用 `agent.sh config` 不再进入无限心跳循环 (装不上)。
-- **心跳间隔自适应**: 不稳定态 5 秒 / 稳定态最长 30 秒，固定 15 秒 → 降低网络开销。
-- **多服务器心跳容错**: 至少一台成功应答即算"面板可达"，FAILS 只在全量失败时累加。
-- **配置拉取去重 + 校验超时**: 同一轮心跳内只拉一次; `mihomo -t` 最长等 30 秒，
-  防止大配置阻塞心跳循环。
-- **switch_core 后等 API 就绪**: `procd start` 后轮询 9090 真正监听再设 `core.up`，
-  避免"假启动"触发重启风暴。
-- **安装脚本优化**: `wait_datapath` 30→15s / `wait_core_api` 15→10s /
-  `CORE_PANEL_BUDGET` 90→30s; `apply_datapath()` 中 `mihomo -t` 加 30s 后台超时;
-  `tun_retry_without_redirect` 改为最多重试两次 (间隔 5s)。
-
 ### 8.94a v2.11.43: Debian 12 上装完打不开 —— 面板的语法下限比 Debian 12 的 Python 还新
 
 `install.sh` 的抬头一直写着 "Ubuntu / Debian", 而真机验证记录里只有一台 **Ubuntu 24.04**
@@ -5711,3 +5698,16 @@ PublicKey = ...
 缓存了旧的 `/24` 地址和 `/8` 路由，单纯换文件不一定能清掉。
 
 回归仍为 **353 通过 / 6 skip**；客户端配置内容测试已改为断言 `/32` / `/128`。
+
+### 8.101 v2.12.6 (客户端 v1.4.39): 路由器客户端稳定性大修
+- **agent.sh 恢复命令行模式分派**: `case "${1:-}"` 补齐 config/geo/once 三路，
+  安装脚本调用 `agent.sh config` 不再进入无限心跳循环 (装不上)。
+- **心跳间隔自适应**: 不稳定态 5 秒 / 稳定态最长 30 秒，固定 15 秒 → 降低网络开销。
+- **多服务器心跳容错**: 至少一台成功应答即算"面板可达"，FAILS 只在全量失败时累加。
+- **配置拉取去重 + 校验超时**: 同一轮心跳内只拉一次; `mihomo -t` 失败保留旧配置，
+  校验进程快速退出时不再固定等满 30 秒。
+- **switch_core 后等 API 就绪**: `procd start` 后轮询 9090 真正监听再设 `core.up`，
+  避免"假启动"触发重启风暴。
+- **状态恢复**: 心跳重新带上 IPv6、MTU、转发卸载、未接管原因与实测吞吐。
+- **安装脚本优化**: 本地 API 用单次短探测，配置校验快速返回，TUN 自愈最多重试两次。
+- **压测端点收紧**: `/c/bench` 改为需要设备凭据，避免匿名拉取 8 MB 数据。

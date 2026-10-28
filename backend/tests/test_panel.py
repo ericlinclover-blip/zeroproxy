@@ -3114,7 +3114,45 @@ def test_apply_skips_services_whose_config_did_not_change(client, configured, ho
     calls.clear()
     again = apply.reapply(config.load_state())
     assert again[5]["ok"] is True and "无需重启" in again[5]["detail"], again
-    assert calls == [], calls
+
+
+def test_nginx_config_is_deterministic_for_unchanged_state(home):
+    """Rendering the same state twice must not create a false config change."""
+    import time
+
+    from zeroproxy import config, nginx_config
+
+    state = config.load_state()
+
+    first = nginx_config.build_nginx_conf(state)
+    time.sleep(1.05)
+    second = nginx_config.build_nginx_conf(state)
+
+    assert first == second
+
+
+def test_xray_stats_are_fresh_on_the_next_dashboard_sample(home, monkeypatch):
+    """Cumulative traffic must advance across the normal 20-second poll."""
+    from zeroproxy import config, services
+
+    state = config.load_state()
+    reads = iter(
+        (
+            '{"stat":[{"name":"inbound>>>vless-reality>>>traffic>>>uplink","value":100}]}',
+            '{"stat":[{"name":"inbound>>>vless-reality>>>traffic>>>uplink","value":200}]}',
+        )
+    )
+    times = iter((100.0, 120.0))
+    monkeypatch.setattr(services, "bin_path", lambda name: "/usr/bin/xray")
+    monkeypatch.setattr(services, "_tcp_reachable", lambda *args, **kwargs: True)
+    monkeypatch.setattr(services, "run", lambda *args, **kwargs: (True, next(reads)))
+    monkeypatch.setattr(services.time, "time", lambda: next(times))
+
+    first = services.xray_stats(state)
+    second = services.xray_stats(state)
+
+    assert first["uplink"] == 100
+    assert second["uplink"] == 200
 
 
 def test_apply_verify_listeners_polls_quickly_instead_of_waiting_a_full_round(

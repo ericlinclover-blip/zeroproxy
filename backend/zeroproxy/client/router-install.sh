@@ -185,6 +185,24 @@ http_get() {
     done
 }
 
+http_probe_once() {
+    _url="$1"
+    case "$HTTP" in
+        curl)
+            if [ "$TLS_OPTS" = "insecure" ]; then
+                curl -fsSk --connect-timeout 1 --max-time 2 "$_url" >/dev/null 2>&1
+            else
+                curl -fsS --connect-timeout 1 --max-time 2 "$_url" >/dev/null 2>&1
+            fi ;;
+        *)
+            if [ "$TLS_OPTS" = "insecure" ]; then
+                "$HTTP" -q --no-check-certificate -T 2 -O /dev/null "$_url" >/dev/null 2>&1
+            else
+                "$HTTP" -q -T 2 -O /dev/null "$_url" >/dev/null 2>&1
+            fi ;;
+    esac
+}
+
 http_post() {
     _url="$1"; _body="$2"
     case "$HTTP" in
@@ -201,6 +219,23 @@ http_post() {
                 "$HTTP" -q -O - --post-data "$_body" "$_url"
             fi ;;
     esac
+}
+
+run_with_timeout() {
+    _timeout_s="$1"; shift
+    "$@" &
+    _timeout_pid=$!
+    _timeout_elapsed=0
+    while kill -0 "$_timeout_pid" 2>/dev/null; do
+        if [ "$_timeout_elapsed" -ge "$_timeout_s" ]; then
+            kill "$_timeout_pid" 2>/dev/null || true
+            wait "$_timeout_pid" 2>/dev/null || true
+            return 124
+        fi
+        sleep 1
+        _timeout_elapsed=$((_timeout_elapsed + 1))
+    done
+    wait "$_timeout_pid"
 }
 
 # 把下载结果存进文件, 并且**尽量**带回 HTTP 状态码 (放进 HTTP_CODE)。
@@ -2744,7 +2779,7 @@ wait_datapath() {
 wait_core_api() {
     _i=0
     while [ "$_i" -lt 10 ]; do
-        if http_get "http://$ZP_API/version" >/dev/null 2>&1; then return 0; fi
+        if http_probe_once "http://$ZP_API/version"; then return 0; fi
         sleep 1
         _i=$((_i + 1))
     done
@@ -2765,7 +2800,7 @@ apply_datapath() {
     set_datapath "$_want"
     if ! "$ZP_DIR/agent.sh" config > "$ZP_CONF.new" 2>/dev/null \
         || ! grep -q '^proxy-groups:' "$ZP_CONF.new" 2>/dev/null \
-        || ! ( "$ZP_BIN" -t -d "$ZP_DIR" -f "$ZP_CONF.new" >/dev/null 2>&1 & _vt=$!; sleep 30; kill $_vt 2>/dev/null; wait $_vt >/dev/null 2>&1 ); then
+        || ! run_with_timeout 30 "$ZP_BIN" -t -d "$ZP_DIR" -f "$ZP_CONF.new" >/dev/null 2>&1; then
         rm -f "$ZP_CONF.new"
         DATAPATH="$_prev_dp"; COVERED="$_prev_cov"; write_caps
         if [ -n "$_bak" ]; then mv "$_bak" "$ZP_CONF" 2>/dev/null || true; fi
@@ -2841,7 +2876,7 @@ tun_retry_without_redirect() {
         fi
         # 与 fetch_config 同一道闸门: 拿到的必须像一份配置, 而且要能被内核自己校验通过
         if ! grep -q '^proxy-groups:' "$ZP_CONF.new" 2>/dev/null \
-            || ! ( "$ZP_BIN" -t -d "$ZP_DIR" -f "$ZP_CONF.new" >/dev/null 2>&1 & _vt=$!; sleep 30; kill $_vt 2>/dev/null; wait $_vt >/dev/null 2>&1 ); then
+            || ! run_with_timeout 30 "$ZP_BIN" -t -d "$ZP_DIR" -f "$ZP_CONF.new" >/dev/null 2>&1; then
             rm -f "$ZP_CONF.new"
             caps_write 1
             _attempt=$((_attempt + 1))

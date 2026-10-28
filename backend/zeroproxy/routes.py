@@ -3735,14 +3735,22 @@ BENCH_MAX_MB = int(os.environ.get("ZP_BENCH_MAX_MB", "8"))
 
 
 @router.get("/c/bench/{mb}")
-def client_bench(mb: int, request: Request):
+def client_bench(mb: int, request: Request, id: str = "", k: str = ""):
     """给路由器 `zeroproxy bench` 用的定长数据 (测"直连"与"经代理"两条路的吞吐)。
 
     为什么靶子是面板自己: 它是这台路由器**一定能访问到**的那个地址 (装机时唯一可达的),
     而且两条路跑的是同一段路 —— 一比就知道代理本身吃掉了多少。
 
-    匿名可达, 与 `/c/bin` 同性质: 不给凭据, 也不泄露任何东西 (纯随机字节)。
+    必须带调用设备的凭据。早期版本把它做成匿名端点, 但单次最多 8 MB 的下载量足以被
+    公网滥用; 设备配对后本来就有独立 secret, 不需要再开一个匿名放大器。
     """
+    with config.locked():
+        state = load_state()
+        if not state["configured"]:
+            return _err("面板尚未初始化", 409)
+        device = devices.find(state, id)
+        if not devices.check_secret(device, k):
+            return _err("设备凭据无效", 403)
     # 注意不是 `mb or 4`: 那个写法会把 0 当成"没给"(Python 里 0 是假值), 于是
     # /c/bench/0 返回 4 MB —— 一个看起来"很小"的请求反而拿到最多的数据。钳到 [1, 上限]。
     size = min(max(int(mb), 1), BENCH_MAX_MB)

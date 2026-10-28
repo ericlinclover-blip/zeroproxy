@@ -23,8 +23,8 @@
 
 ### 3. 后端流量统计缓存 (services.py)
 - **问题:** 每次 dashboard 渲染都 fork `xray api` 子进程 + 解析 JSON, 即使 20s 内流量差值 < 1KB
-- **方案:** 添加 60s TTL 的内存缓存, 同一分钟内直接返回旧值
-- **效果:** 安静期 xray api 子进程调用减少 80%+, CPU 和内存开销降低
+- **方案:** 添加 5s TTL 的内存缓存, 只合并同一时刻的并发读取
+- **效果:** 保留并发去重, 同时保证 20s 采样能反映真实速率变化
 
 ### 4. CSS 紧凑模式支持 (tokens.css)
 - **问题:** 低端 ARM 路由器的 Chromium 上大量 transition/animation 拖帧
