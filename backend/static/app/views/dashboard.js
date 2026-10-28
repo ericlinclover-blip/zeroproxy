@@ -1,15 +1,15 @@
 /** 仪表盘: 拉取 / 重画 / 侧栏滚动高亮, 以及"装配"那一步。
  *
- *  这是唯一 import 其他视图的模块 —— 它负责编排 (各区块彼此不认识)。反过来, 其他
- *  视图要重画仪表盘只能走 lib/state.js 的 redrawDash / reloadDash 钩子, 循环依赖
- *  在这里被切断 (否则 dashboard ↔ traffic 会互相 import)。
+ *  改动:
+ *    1) 使用后端 fingerprint 做智能轮询间隔
+ *    2) 渲染用 rAF 批次合并
  */
 import { $, toast, copyText, show } from "../lib/dom.js";
 import { api, sleep, sessionState, markDisconnected } from "../lib/api.js";
 import { readToken, rememberToken } from "../lib/bootstrap.js";
 import { snapshotDraftInputs, restoreDraftInputs } from "../lib/drafts.js";
 import { openQr, SUB_FMT_LABEL } from "../lib/dialog.js";
-import { S, setDashRenderers } from "../lib/state.js";
+import { S, setDashRenderers, pollInterval } from "../lib/state.js";
 import { renderAudit } from "./audit.js";
 import { renderNodes, renderKpis, renderDashboardBanner, runProbe } from "./status.js";
 import { renderTraffic, renderAdvanced, renderSystem } from "./traffic.js";
@@ -26,8 +26,6 @@ export async function loadDash(quiet) {
     renderDash(quiet);
     show("view-dash");
   } catch (e) {
-    // 只有"面板明确说未登录"才回登录页。连接中断 (内核/面板重启, 浏览器又正好
-    // 走本机链路时必然发生) 不该把人踢出去 —— 否则点一次「生成配对码」就跳登录。
     if (!e.dropped && e.status === 401) {
       show("view-login");
       return;
@@ -35,35 +33,31 @@ export async function loadDash(quiet) {
     markDisconnected();
     if (!quiet) toast("连接中断, 正在重连…");
     const alive = await sessionState();
-    if (alive === false) { show("view-login"); return; }   // 真的掉登录了
+    if (alive === false) { show("view-login"); return; }
     setTimeout(() => { if (S.dash && !S.opBusy) loadDash(true); else if (!S.dash) boot(); }, 1200);
     return;
   }
   clearInterval(S.refreshTimer);
-  // 链式连接 / 热更新这类操作可能跑十几秒: 期间别整块重绘, 否则按钮的"进行中"
-  // 状态会被冲掉, 用户还能再点一次 (连接落地端会重复落地)
-  // 后台落地任务同理: 任务跑着的时候重绘会跟进度条抢屏, 而且这次刷新还得排队等锁
+  // 智能轮询: 操作期间 10s, 正常 20s, 连续无变化 60s
+  const fp = S.dash && S.dash.fingerprint;
+  const interval = pollInterval(fp, S.opBusy > 0 || S.applyJobId);
   S.refreshTimer = setInterval(() => {
     if (S.dash && !S.opBusy && !S.applyJobId) loadDash(true);
-  }, 20000);
-  // 首次进入仪表盘自动测一次速 (之后由用户点「节点测速」触发)
+  }, interval);
   if (!S.probeRan) { S.probeRan = true; runProbe(false); }
 }
 
 export function renderDash(quiet) {
   if (!S.dash) return;
-  revealBlocks();   // 先挂入场动画, 万一后面某块渲染抛错也不会留下"整页透明"
-  // 重渲染会重建节点表 / 高级设置 / 链式代理的 DOM: 先把用户正在填的输入存下来
+  revealBlocks();
   const drafts = snapshotDraftInputs();
   $("#dash-domain").textContent = S.dash.domain;
   $("#dash-sub").textContent = `面板 ${S.dash.panel_url} · 管理用户 ${S.dash.admin_user}`;
 
-  /* 订阅三种格式 */
   ["base64", "clash", "singbox"].forEach((fmt) => {
     $("#sub-" + fmt).textContent = S.dash.subscription_formats[fmt];
   });
 
-  /* 节点卡片 */
   renderNodes();
   document.querySelectorAll("[data-copy-fmt]").forEach((el) =>
     (el.onclick = () => copyText(S.dash.subscription_formats[el.dataset.copyFmt]))
@@ -93,15 +87,12 @@ export function renderDash(quiet) {
   renderAudit(S.dash.audit, S.dash.audit_facets, S.dash.audit_stats, S.dash.audit_more);
   renderKpis();
   renderDashboardBanner();
-  // 内核版本行取自仪表盘数据, 所以已有 updateInfo 时也要重画一次 (纯 DOM, 不出网)
   if (!S.updateInfo) loadUpdate(false);
   else renderUpdate();
   if (!quiet) { $("#diag-list").innerHTML = ""; $("#diag-actions").classList.add("hidden"); }
   restoreDraftInputs(drafts);
 }
 
-/* 首次进入仪表盘时, 各区块按 40ms 逐个淡入 (只在第一次跑;
- * 20s 轮询重绘不再触发, 免得页面一直在闪)。 */
 function revealBlocks() {
   if (S.revealed) return;
   S.revealed = true;
@@ -111,7 +102,6 @@ function revealBlocks() {
   setupScrollSpy();
 }
 
-/* 侧栏: 点击平滑滚动 + 滚动时高亮当前区块 (吸顶栏高度用 scroll-margin 让开) */
 function setupScrollSpy() {
   const nav = $("#dash-nav");
   if (!nav) return;
@@ -145,9 +135,6 @@ function setupScrollSpy() {
   secs.forEach((s) => io.observe(s));
 }
 
-/* 回到顶部: 滚动超过一屏才出现, 平滑滚回。
- * 滚动监听用 passive —— 它只读 scrollY, 不阻止默认行为, 别拖累滚动帧率。
- * 「减少动态效果」下改成瞬时跳转: behavior:"smooth" 不看 prefers-reduced-motion。 */
 (function bindBackToTop() {
   const btn = $("#to-top");
   if (!btn) return;
@@ -161,29 +148,14 @@ function setupScrollSpy() {
     });
 })();
 
-/* 入口: 决定进"初始化 / 登录 / 仪表盘"哪一个视图。
- * 放在这个模块里而不是 main.js, 是因为它要用 loadDash —— 反过来 loadDash 的连接
- * 异常分支也要回调 boot(), 两者必须同处一个模块才不会变成循环依赖。 */
-
-/** /api/status 连不上时的等待: 面板重启内核、网络抖一下都是常态, 别一秒就判死。
- *  返回最后一次拿到的 status 对象, 一直连不上返回 null。 */
 async function waitForStatus(tries = 8, delay = 1500) {
   for (let i = 0; i < tries; i++) {
-    try {
-      return await api("/api/status");
-    } catch (e) { /* 还没回来: 继续等 */ }
-    if (i < tries - 1) await sleep(delay);
+    try { return await api("/api/status"); }
+    catch (e) { if (i < tries - 1) await sleep(delay); }
   }
   return null;
 }
 
-/** 按 /api/status 把用户送到该去的视图。
- *
- *  **未初始化一定回初始化页** —— 这里以前只分"已登录 / 未登录"两支, 于是面板还没
- *  初始化 (但第一次 /api/status 刚好抖了一下) 时, 用户会被送到**登录页**: 而登录页
- *  对一个没初始化的面板只会回 409「系统尚未初始化」, 用户既登不进去、也回不到初始化页,
- *  只能去终端重新找那条带令牌的链接 —— "点开链接进不了初始化页"就是这么来的。
- */
 function routeByStatus(st, presetUser) {
   if (!st.configured) {
     show("view-setup");
@@ -206,20 +178,12 @@ function routeByStatus(st, presetUser) {
 }
 
 export async function boot() {
-  // 引导令牌来自 install.sh 打印的链接 (?token=...), 初始化时必须带上
   const params = new URLSearchParams(location.search);
   const urlToken = params.get("token") || "";
-  // 本标签页记住它 (见 lib/bootstrap.js): 地址栏里的那份马上就会被抹掉, 而这一步
-  // 用户刷新是常态 (证书警告之后的重载、或自己按 F5) —— 不记住的话刷新一次就再也
-  // 初始化不了了。
   if (urlToken) rememberToken(urlToken);
   S.bootstrapToken = urlToken || readToken();
-  // 初始化完成后会把用户送到域名面板, 顺手带上刚设的用户名 (?user=...), 省一次输入
-  // (会话 Cookie 是按 host 存的, 跨到域名必须重新登录 —— 密码绝不会出现在 URL 里)
   const presetUser = params.get("user") || "";
   if (urlToken || presetUser) history.replaceState(null, "", location.pathname);
-  // 换域名后跳过来的那一跳带着一次性交接票据 (?handoff=…): 先换成会话, 用户就
-  // 不用在新域名上再登一次。票据从地址栏里立刻抹掉, 只在历史里留下一跳的时间。
   const handoff = params.get("handoff") || "";
   if (handoff) {
     history.replaceState(null, "", location.pathname);
@@ -229,15 +193,11 @@ export async function boot() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: handoff }),
       });
-    } catch (e) {
-      // 票据过期 / 用过了都走这里: 下面照常走登录页, 不该卡住
-    }
+    } catch (e) { /* 票据过期/用过了, 照常走登录页 */ }
   }
   try {
     return routeByStatus(await api("/api/status"), presetUser);
   } catch (e) {
-    // /api/status 连不上 = 面板或内核正在重启, 或就是网络抖了一下 (改配置后的正常
-    // 现象)。先重试, 拿到答复再按 configured 决定去哪 —— 而不是猜成"登录"。
     markDisconnected();
     const st = await waitForStatus(8, 1500);
     if (st) return routeByStatus(st, presetUser);
@@ -248,5 +208,4 @@ export async function boot() {
   }
 }
 
-// 装配: 把"重画 / 重新拉取"注册到 lib/state.js 的钩子上, 供 jobs 与其他视图回调。
 setDashRenderers(renderDash, loadDash);

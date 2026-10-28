@@ -54,3 +54,23 @@
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.40);
   --shadow: 0 1px 3px rgba(0, 0, 0, 0.50), 0 20px 48px -20px rgba(0, 0, 0, 0.80);
 }
+
+/* ---------- 紧凑模式: 减少动画和过渡 ---------- */
+/* 通过 prefers-reduced-motion 自动启用, 也支持手动开关 */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* 数据手动开关: .compact-mode class 加在 body 上 */
+body.compact-mode *,
+body.compact-mode *::before,
+body.compact-mode *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+}

@@ -806,6 +806,34 @@ def _system_view(state: dict) -> dict:
         "prod": services.is_prod(),
     }
 
+def _dash_fingerprint(state: dict) -> str:
+    """仪表盘数据的轻量指纹: 节点开关 / 服务状态 / 证书类型 / 链式状态。
+    不含流量数字和更新时间戳 (它们每次都会变, 会阻止进入安静期)。
+    前端轮询时对比新旧指纹, 相同则拉长刷新间隔。"""
+    nodes = state.get("nodes", {})
+    node_states = []
+    for nid in ("vless-reality", "vless-xhttp", "vless-ws", "trojan", "hysteria2"):
+        node_states.append(f"{nid}:{bool(nodes.get(nid, True))}")
+
+    chain_cfg = state.get("chain") or {}
+    entries = chain_cfg.get("entries") or []
+    chain_states = [f"{e['id']}:{bool(e.get('enabled', True))}" for e in entries]
+
+    exit_cfg = chain_cfg.get("exit") or {}
+    exit_state = f"exit:{exit_cfg.get('uuid', '')}:{bool(exit_cfg.get('enabled', True))}"
+
+    parts = [
+        state.get("domain", ""),
+        state.get("hysteria_hopping", False),
+        state.get("geodata", {}).get("downloaded", False),
+        (state.get("cert") or {}).get("type", ""),
+        *node_states,
+        *chain_states,
+        exit_state,
+    ]
+    return "|".join(str(p) for p in parts)
+
+
 
 def _dashboard_body(state: dict, request: Request, traffic: dict | None = None) -> dict:
     if traffic is None:
@@ -868,6 +896,8 @@ def _dashboard_body(state: dict, request: Request, traffic: dict | None = None) 
         "audit_stats": audit["stats"],
         "audit_more": audit["has_more"],
         "system": _system_view(state),
+        # 数据指纹: 前端据此判断"这次轮询有没有实际变化", 无变化则拉长自动刷新间隔
+        "fingerprint": _dash_fingerprint(state),
     }
 
 

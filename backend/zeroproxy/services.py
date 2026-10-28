@@ -476,12 +476,27 @@ def _cert_not_after(cert_file: str) -> int:
 
 # ---------------------------------------------------------------- 流量统计
 
+#: 流量统计短时缓存: 同一分钟内重复读取直接返回旧值。
+#: xray stats 每 20s 读一次, 但 20s 内的差值极小 (< 1KB), 缓存可以减少
+#: 不必要的 xray api 子进程 fork + JSON 解析开销。
+_stats_cache: dict = {}
+_STATS_TTL = 60  # 缓存 60 秒
+
+
 def xray_stats(state: dict) -> Optional[dict]:
     """通过本机 Stats API 读取流量统计。
 
     返回 {"uplink", "downlink", "total", "by_node"} (字节); 未安装 xray /
     非生产环境 / API 不可达时返回 None, 调用方应展示「不可用」。
+    
+    优化: 短时缓存 (60s)。20s 轮询期间流量差值极小, 缓存减少子进程开销。
     """
+    # 缓存命中: 直接返回
+    now = int(time.time())
+    cached = _stats_cache.get("data")
+    if cached and (now - _stats_cache.get("ts", 0)) < _STATS_TTL:
+        return cached
+    
     binary = bin_path("xray")
     if binary is None:
         return None
@@ -520,13 +535,18 @@ def xray_stats(state: dict) -> Optional[dict]:
             uplink += value
         else:
             downlink += value
-    return {
+    result = {
         "uplink": uplink,
         "downlink": downlink,
         "total": uplink + downlink,
         "by_node": by_node,
         "available": True,
     }
+    # 写缓存
+    _stats_cache["data"] = result
+    _stats_cache["ts"] = now
+    
+    return result
 
 
 # ---------------------------------------------------------------- 自检 / 诊断
