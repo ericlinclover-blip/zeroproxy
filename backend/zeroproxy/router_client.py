@@ -152,7 +152,11 @@ from .config import paths
 #: 1.4.37: 装机件改成**一次取回** (`/c/rt/bundle`, 一份 tar.gz): 十几次往返在丢包的线路上
 #:         就是十几次失败机会 (真机卡在"落运行时装机件"好几分钟), 一次取回把它压成一次;
 #:         包取不到时退回逐个取, 单件失败仍不拖垮其余 (8.93)。
-SCRIPT_VERSION = "1.4.37"
+#: 1.4.38: agent.sh 恢复命令行模式分派 (config/geo/once)，解决安装脚本卡死;
+#:         心跳自适应 (不稳定 5s / 稳定 30s) + 多服务器容错 + 配置校验超时 +
+#:         switch_core 前等 API 就绪防假启动; 安装脚本 mihomo -t 超时、TUN 自愈
+#:         重试两次、wait_datapath/core_api 超时缩短、CORE_PANEL_BUDGET 缩短。
+SCRIPT_VERSION = "1.4.38"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"

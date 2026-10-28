@@ -1521,7 +1521,7 @@ CORE_MIN_BYTES="${ZP_CORE_MIN_BYTES:-65536}"
 #: 面板直传的观察窗口 (秒)。国内家宽到海外面板常常只有几十 KB/s —— 20 MB 要十几分钟,
 #: 而面板会把**它自己那张镜像表 + 官方直链**一起给出来 (见 /c/core/status), 直连往往
 #: 快得多。超过这个窗口还没下完, 就让位给直连镜像。设 0 = 不看这个窗口, 一直等面板。
-CORE_PANEL_BUDGET="${ZP_CORE_PANEL_BUDGET:-90}"
+CORE_PANEL_BUDGET="${ZP_CORE_PANEL_BUDGET:-30}"
 #: 每条直连镜像最多花多久 (秒)。
 CORE_MIRROR_BUDGET="${ZP_CORE_MIRROR_BUDGET:-240}"
 #: 整轮取内核的总上限 (秒): 面板 + 全部镜像加起来, 到点就报清楚。
@@ -2732,7 +2732,7 @@ datapath_live() {
 # 只查一次会误判成"没建出来", 于是错误地退回下一级并把两套规则叠在一起 (真机踩过)。
 wait_datapath() {
     _w=0
-    while [ "$_w" -lt 30 ]; do
+    while [ "$_w" -lt 15 ]; do
         if datapath_live "$1"; then return 0; fi
         sleep 1
         _w=$((_w + 1))
@@ -2743,7 +2743,7 @@ wait_datapath() {
 # 内核控制口在不在 (mihomo 真起来了没有)。冷启动到监听 9090 通常 2~5 秒, 给 15 秒。
 wait_core_api() {
     _i=0
-    while [ "$_i" -lt 15 ]; do
+    while [ "$_i" -lt 10 ]; do
         if http_get "http://$ZP_API/version" >/dev/null 2>&1; then return 0; fi
         sleep 1
         _i=$((_i + 1))
@@ -2765,7 +2765,7 @@ apply_datapath() {
     set_datapath "$_want"
     if ! "$ZP_DIR/agent.sh" config > "$ZP_CONF.new" 2>/dev/null \
         || ! grep -q '^proxy-groups:' "$ZP_CONF.new" 2>/dev/null \
-        || ! "$ZP_BIN" -t -d "$ZP_DIR" -f "$ZP_CONF.new" >/dev/null 2>&1; then
+        || ! ( "$ZP_BIN" -t -d "$ZP_DIR" -f "$ZP_CONF.new" >/dev/null 2>&1 & _vt=$!; sleep 30; kill $_vt 2>/dev/null; wait $_vt >/dev/null 2>&1 ); then
         rm -f "$ZP_CONF.new"
         DATAPATH="$_prev_dp"; COVERED="$_prev_cov"; write_caps
         if [ -n "$_bak" ]; then mv "$_bak" "$ZP_CONF" 2>/dev/null || true; fi
@@ -2824,37 +2824,48 @@ tun_retry_without_redirect() {
     [ -f "$ZP_CONF" ] || return 1
     _ar="$(sed -n 's/^autoredirect=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
     case "$_ar" in 1) ;; *) return 1 ;; esac
-    cp "$ZP_CONF" "$ZP_CONF.ar.bak" 2>/dev/null || return 1
-    caps_write 0
-    if ! "$ZP_DIR/agent.sh" config > "$ZP_CONF.new" 2>/dev/null; then
-        rm -f "$ZP_CONF.new"
-        caps_write 1
-        return 1
-    fi
-    # 与 fetch_config 同一道闸门: 拿到的必须像一份配置, 而且要能被内核自己校验通过
-    if ! grep -q '^proxy-groups:' "$ZP_CONF.new" 2>/dev/null \
-        || ! "$ZP_BIN" -t -d "$ZP_DIR" -f "$ZP_CONF.new" >/dev/null 2>&1; then
-        rm -f "$ZP_CONF.new"
-        caps_write 1
-        return 1
-    fi
-    mv "$ZP_CONF.new" "$ZP_CONF"
-    /etc/init.d/zeroproxy restart >/dev/null 2>&1 || true
-    _w=0
-    while [ "$_w" -lt 20 ]; do
-        if ip link show zp-tun >/dev/null 2>&1; then
-            rm -f "$ZP_CONF.ar.bak"
-            TUN_HEALED="no-auto-redirect"
-            return 0
+    # 最多重试两次: 某些固件第一次建 tun 会超时 (内核还没准备好), 等几秒再试就过了
+    _attempt=0
+    while [ "$_attempt" -lt 2 ]; do
+        if [ "$_attempt" -gt 0 ]; then
+            note "tun 重建重试 ($_attempt/2), 等待 5s ..."
+            sleep 5
         fi
-        sleep 1
-        _w=$((_w + 1))
+        cp "$ZP_CONF" "$ZP_CONF.ar.bak" 2>/dev/null || return 1
+        caps_write 0
+        if ! "$ZP_DIR/agent.sh" config > "$ZP_CONF.new" 2>/dev/null; then
+            rm -f "$ZP_CONF.new"
+            caps_write 1
+            _attempt=$((_attempt + 1))
+            continue
+        fi
+        # 与 fetch_config 同一道闸门: 拿到的必须像一份配置, 而且要能被内核自己校验通过
+        if ! grep -q '^proxy-groups:' "$ZP_CONF.new" 2>/dev/null \
+            || ! ( "$ZP_BIN" -t -d "$ZP_DIR" -f "$ZP_CONF.new" >/dev/null 2>&1 & _vt=$!; sleep 30; kill $_vt 2>/dev/null; wait $_vt >/dev/null 2>&1 ); then
+            rm -f "$ZP_CONF.new"
+            caps_write 1
+            _attempt=$((_attempt + 1))
+            continue
+        fi
+        mv "$ZP_CONF.new" "$ZP_CONF"
+        /etc/init.d/zeroproxy restart >/dev/null 2>&1 || true
+        _w=0
+        while [ "$_w" -lt 20 ]; do
+            if ip link show zp-tun >/dev/null 2>&1; then
+                rm -f "$ZP_CONF.ar.bak"
+                TUN_HEALED="no-auto-redirect"
+                return 0
+            fi
+            sleep 1
+            _w=$((_w + 1))
+        done
+        # 这次尝试失败: 配置与 caps 都退回原样 (这两件事必须一起回, 否则下次重建配置又会
+        # 拿一份不一样的配置去覆盖)
+        mv "$ZP_CONF.ar.bak" "$ZP_CONF" 2>/dev/null || true
+        caps_write 1
+        /etc/init.d/zeroproxy restart >/dev/null 2>&1 || true
+        _attempt=$((_attempt + 1))
     done
-    # 还是不行: 配置与 caps 都退回原样 (这两件事必须一起回, 否则下次重建配置又会
-    # 拿一份不一样的配置去覆盖)
-    mv "$ZP_CONF.ar.bak" "$ZP_CONF" 2>/dev/null || true
-    caps_write 1
-    /etc/init.d/zeroproxy restart >/dev/null 2>&1 || true
     return 1
 }
 

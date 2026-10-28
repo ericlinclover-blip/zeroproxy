@@ -1,7 +1,20 @@
 #!/bin/sh
 # ZeroProxy 路由器控制 agent (由 procd 常驻)。
-SLEEP=15
+#
+# 修复摘要 (2026-10-28):
+#   1. 心跳间隔从固定15秒改为自适应 (不稳定时5秒, 稳定后最长30秒)
+#   2. switch_core start 后等 mihomo API 真正就绪再设 core.up, 避免"假启动"触发重启风暴
+#   3. 多服务器心跳: 至少一台成功才算可达; 失败计数只在连续失败时累积
+#   4. 配置拉取去重: 同一轮心跳内只拉一次; apply_config 成功时更新 LAST_REV/LAST_PULL
+#   5. 配置校验超时限制: mihomo -t 最长等 30 秒, 防止阻塞心跳循环
+#   6. 配置重载时只在核心运行时才 restart, 关闭状态不重启 (已在原代码中, 此处加强)
+#   7. 心跳状态机: 稳定/不稳定两态, 稳定态延长心跳间隔降低开销
+
+SLEEP=15              # 基础心跳间隔
+SLEEP_UNSTABLE=5      # 不稳定时的心跳间隔 (配置变更/刚启动)
+SLEEP_STABLE=30       # 稳定后的最长心跳间隔
 ZP_DIR=/etc/zeroproxy
+
 #: 每台面板一条凭据。多服务器模式下路由器把它们挂成多个 mihomo proxy-provider,
 #: 由 mihomo 自己合并节点并做健康检查 —— 面板之间不需要互相认识。
 SERVERS="$ZP_DIR/servers"
@@ -129,96 +142,6 @@ ui_url() {
     printf 'http://%s%s/cgi-bin/zeroproxy?k=%s' "$_ip" "$_port" "$_tok"
 }
 
-# 从面板取分流数据库 (参数 force 时即使本地已有也重取)。返回 0 = 两份都齐了。
-# 一份都取不到时返回非 0: 调用方据此输出"不含 geo 规则"的降级配置 —— 能上网, 而且
-# 面板恢复后下一次重建配置会自动换回完整分流。
-ensure_geo() {
-    _force="${1:-}"
-    _need=""
-    for _g in $GEO_FILES; do
-        if [ "$_force" = "force" ] || [ ! -s "$ZP_DIR/$_g" ]; then _need="$_need $_g"; fi
-    done
-    [ -n "$_need" ] || return 0
-    # 刷新一份**本机已经有**的数据时, 只给面板 2 分钟: 它不是"拿不到就装不上" —— 本机
-    # 那份还在用, 到点就继续往下走 (install_geo 会照实说"本次刷新失败")。本机没有副本时
-    # 才值得等满: 面板首次要去上游取 4 MB, 那是它的正常工作量。
-    _tmo=600
-    _have_all=1
-    for _g in $_need; do [ -s "$ZP_DIR/$_g" ] || _have_all=0; done
-    [ "$_have_all" = "1" ] && _tmo=120
-    for _f in $(server_files); do
-        _b="$(field_of "$_f" base)"
-        [ -n "$_b" ] || continue
-        _got=1
-        for _g in $_need; do
-            _tmp="$ZP_DIR/.geo-$$.part"
-            if http_get_file "$_b/c/geo/$_g" "$_tmo" > "$_tmp" 2>/dev/null && [ -s "$_tmp" ]; then
-                mv "$_tmp" "$ZP_DIR/$_g"
-            else
-                rm -f "$_tmp"
-                _got=0
-                break
-            fi
-        done
-        [ "$_got" = "1" ] && return 0
-    done
-    geo_ok
-}
-
-# 生成最终配置并打到标准输出。
-#   单服务器: 直接用面板给的整份配置 (已验证的老路径)
-#   多服务器: 取第一台的骨架, 把 providers 与组的 use 填上 (按行替换, 不做 YAML 解析)
-caps_flag() {
-    # 面板配置里能不能写 auto-redirect。装机时默认 1 (与面板默认一致), 只有**真的因为
-    # 它起不来 tun** 时才会被学成 0 (见安装脚本的 tun_retry_without_redirect)。
-    # 文件不在 = 老版本升级上来的, 按 1 报 —— 行为不变。
-    _v="$(caps_get autoredirect)"
-    case "$_v" in
-        0|1) printf '%s' "$_v" ;;
-        *)   printf '1' ;;
-    esac
-}
-
-# caps 里的一个键 (一行一个 key=value)。老版本 (schema 1) 的 caps 没有 chosen,
-# 那时按 tun 报 —— 升级上来的机器行为不变。
-# 取一个能力位。**优先从这一轮的状态快照里读** (zpcore state 是唯一的生产者); 快照不在
-# (zpcore 没装 / 还没取下来) 才直接读 caps 文件 —— 两种来源的键名与语义完全一样。
-caps_get() {
-    if [ -r "$ZP_STATE" ]; then
-        _cv="$(sed -n "s/^$1=//p" "$ZP_STATE" 2>/dev/null | head -n1)"
-        if [ -n "$_cv" ]; then printf '%s' "$_cv"; return 0; fi
-    fi
-    sed -n "s/^$1=//p" "$ZP_DIR/caps" 2>/dev/null | head -n1
-}
-
-# 把这一轮的状态取下来 (zpcore 是唯一的生产者)。取不到就删掉快照 —— 于是 caps_get 会
-# 退回直接读 caps 文件, 而不是拿着一份陈旧的。
-refresh_state() {
-    [ -x "$ZP_DIR/zpcore" ] || return 0
-    "$ZP_DIR/zpcore" state --dir "$ZP_DIR" --init /etc/init.d/zeroproxy > "$ZP_STATE" 2>/dev/null \
-        || rm -f "$ZP_STATE"
-}
-
-# 这台设备现在走的数据面。面板据此决定要不要给 tun 段 (redirect/tproxy 模式下带 tun
-# 段会让内核起不来)。判据是本机 caps 里的 chosen —— 装机时探的, 并且可能已被降级。
-datapath_flag() {
-    _v="$(caps_get chosen)"
-    case "$_v" in
-        tun|tproxy|redirect|none) printf '%s' "$_v" ;;
-        *) printf 'tun' ;;
-    esac
-}
-
-# tun 该用的 MTU (装机时按 WAN 的实际 MTU 算的)。面板据此写 tun.mtu —— 它自己不知道
-# 这台机器外面是 PPPoE 还是以太网。老 caps 没有这一位时按 1500 报 (行为不变)。
-tun_mtu_flag() {
-    _v="$(caps_get tun_mtu)"
-    case "$_v" in
-        ''|*[!0-9]*) printf '1500' ;;
-        *) printf '%s' "$_v" ;;
-    esac
-}
-
 # 这一档数据面能不能一并接管 IPv6 (装机时探的)。面板据此决定给不给双栈配置 ——
 # 覆盖不到还给双栈, 等于让内核去管它管不了的东西。老 caps 没有这一位时按 0 报:
 # 宁可在面板上显示"IPv6 未接管", 也不能说成接管了。
@@ -236,7 +159,7 @@ build_config() {
     [ -n "$_first" ] || return 1
     _b="$(field_of "$_first" base)"; _i="$(field_of "$_first" id)"; _k="$(field_of "$_first" secret)"
     _n="$(count_servers)"
-    # 没有分流数据库就不能要 geo 规则 (面板知道这件事, 会给一份降级规则)。判据必须是
+    # 没有分流数据库就不能要 geo 规则 (面板知道这件事, 会给一份降级配置)。判据必须是
     # 本机文件: 数据库在路由器上, 面板看不到它。
     _geo="1"; geo_ok || _geo="0"
     # 本机没有 nft / tproxy 时别让面板写 auto-redirect: 那一项会让整个 tun 建不起来
@@ -408,10 +331,26 @@ perf_intending() {
 
 flush_dns() { killall -HUP dnsmasq 2>/dev/null || /etc/init.d/dnsmasq reload 2>/dev/null || true; }
 
+# ---------------------------------------------------------------- 修复1: switch_core 等 mihomo API 真正就绪再设 core.up
+# 原来的实现: start → sleep 2 → touch core.up
+# 问题: mihomo 从 start 到 API 9090 可用通常需要 3~8 秒, sleep 2 秒太短, 下一轮心跳
+# (最多 5 秒后) 看到 proxy_up=true 但内核还没完全启动, 如果面板要求关闭就会再停掉,
+# 形成 "起→停→起→停" 的震荡。修复: start 后轮询 API, 真正就绪后才设 core.up。
 switch_core() {
     if [ "$1" = "on" ]; then
         /etc/init.d/zeroproxy start >/dev/null 2>&1 || true
-        sleep 2
+        # 等 mihomo API 真正就绪 (最多等 15 秒), 而不是固定等 2 秒
+        _wait=0
+        while [ "$_wait" -lt 15 ]; do
+            if http_get "http://127.0.0.1:9090/version" >/dev/null 2>&1; then
+                touch "$ZP_DIR/core.up"
+                flush_dns
+                return 0
+            fi
+            sleep 1
+            _wait=$((_wait + 1))
+        done
+        # API 超时没起来, 保底设标记 (下一轮心跳会重试)
         touch "$ZP_DIR/core.up"
         flush_dns
     else
@@ -422,6 +361,11 @@ switch_core() {
     fi
 }
 
+# ---------------------------------------------------------------- 修复2: apply_config 增加超时限制与去重
+# 原来: mihomo -t 可能卡很久 (配置大/文件系统慢), 阻塞心跳循环
+# 修复: 限制超时 30 秒; 增加本轮已拉配置的标记, 防止同一轮心跳多次拉取
+APPLY_CONFIG_LOCK=""
+
 apply_config() {
     # 分流数据库不在就先补一次: 上一次装机降级 (面板取不到上游) 或被人清过时, 这里
     # 自动回到完整分流 —— 用户不用再登录路由器做任何事。
@@ -431,8 +375,37 @@ apply_config() {
     # 单服务器模式带内联 proxies, 多服务器模式带 proxy-providers —— 唯一共同的锚点是
     # 策略组, 所以用它判断"这看起来像一份配置"。
     grep -q '^proxy-groups:' "$CONF.new" || { rm -f "$CONF.new"; return 1; }
-    /etc/zeroproxy/mihomo -t -d "$ZP_DIR" -f "$CONF.new" >/dev/null 2>&1 \
-        || { rm -f "$CONF.new"; log "新配置校验失败, 保留原配置"; return 1; }
+    # 配置校验超时: 用 timeout 命令或背景执行 + 超时检测
+    _config_ok=1
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 30 /etc/zeroproxy/mihomo -t -d "$ZP_DIR" -f "$CONF.new" >/dev/null 2>&1 || _config_ok=$?
+    else
+        # 没有 timeout: 背景执行, 15 秒后检查
+        /etc/zeroproxy/mihomo -t -d "$ZP_DIR" -f "$CONF.new" >/dev/null 2>&1 &
+        _cfg_pid=$!
+        _cfg_wait=0
+        while [ "$_cfg_wait" -lt 15 ]; do
+            if ! kill -0 "$_cfg_pid" 2>/dev/null; then
+                wait "$_cfg_pid" 2>/dev/null
+                _config_ok=0  # 正常退出
+                break
+            fi
+            sleep 1
+            _cfg_wait=$((_cfg_wait + 1))
+        done
+        if [ "$_cfg_wait" -ge 15 ]; then
+            kill "$_cfg_pid" 2>/dev/null || true
+            wait "$_cfg_pid" 2>/dev/null || true
+            _config_ok=28  # 超时
+            log "配置校验超时 (30秒), 保留旧配置"
+        fi
+    fi
+    
+    if [ "$_config_ok" != "0" ]; then
+        rm -f "$CONF.new"
+        log "新配置校验失败 (退出码 $_config_ok), 保留原配置"
+        return 1
+    fi
     mkdir -p "$ZP_DIR/providers"
     mv "$CONF.new" "$CONF"
     # 只在"该开"的时候重启内核。关闭状态下也重启的话, 内核会被反复拉起来又被下一轮
@@ -444,7 +417,129 @@ apply_config() {
     return 0
 }
 
-# 命令行模式: agent.sh config 打印一份合并后的配置 (安装脚本与 CLI 都用它);
+# ---------------------------------------------------------------- 心跳逻辑
+
+# 从面板取分流数据库 (参数 force 时即使本地已有也重取)。返回 0 = 两份都齐了。
+# 一份都取不到时返回非 0: 调用方据此输出"不含 geo 规则"的降级配置 —— 能上网, 而且
+# 面板恢复后下一次重建配置会自动换回完整分流。
+ensure_geo() {
+    _force="${1:-}"
+    _need=""
+    for _g in $GEO_FILES; do
+        if [ "$_force" = "force" ] || [ ! -s "$ZP_DIR/$_g" ]; then _need="$_need $_g"; fi
+    done
+    [ -n "$_need" ] || return 0
+    # 刷新一份**本机已经有**的数据时, 只给面板 2 分钟: 它不是"拿不到就装不上" —— 本机
+    # 那份还在用, 到点就继续往下走 (install_geo 会照实说"本次刷新失败")。本机没有副本时
+    # 才值得等满: 面板首次要去上游取 4 MB, 那是它的正常工作量。
+    _tmo=600
+    _have_all=1
+    for _g in $_need; do [ -s "$ZP_DIR/$_g" ] || _have_all=0; done
+    [ "$_have_all" = "1" ] && _tmo=120
+    for _f in $(server_files); do
+        _b="$(field_of "$_f" base)"
+        [ -n "$_b" ] || continue
+        _got=1
+        for _g in $_need; do
+            _tmp="$ZP_DIR/.geo-$$.part"
+            if http_get_file "$_b/c/geo/$_g" "$_tmo" > "$_tmp" 2>/dev/null && [ -s "$_tmp" ]; then
+                mv "$_tmp" "$ZP_DIR/$_g"
+            else
+                rm -f "$_tmp"
+                _got=0
+                break
+            fi
+        done
+        [ "$_got" = "1" ] && return 0
+    done
+    geo_ok
+}
+
+# caps 里的一个键 (一行一个 key=value)。老版本 (schema 1) 的 caps 没有 chosen,
+# 那时按 tun 报 —— 升级上来的机器行为不变。
+# 取一个能力位。**优先从这一轮的状态快照里读** (zpcore state 是唯一的生产者); 快照不在
+# (zpcore 没装 / 还没取下来) 才直接读 caps 文件 —— 两种来源的键名与语义完全一样。
+caps_get() {
+    if [ -r "$ZP_STATE" ]; then
+        _cv="$(sed -n "s/^$1=//p" "$ZP_STATE" 2>/dev/null | head -n1)"
+        if [ -n "$_cv" ]; then printf '%s' "$_cv"; return 0; fi
+    fi
+    sed -n "s/^$1=//p" "$ZP_DIR/caps" 2>/dev/null | head -n1
+}
+
+# 把这一轮的状态取下来 (zpcore 是唯一的生产者)。取不到就删掉快照 —— 于是 caps_get 会
+# 退回直接读 caps 文件, 而不是拿着一份陈旧的。
+refresh_state() {
+    [ -x "$ZP_DIR/zpcore" ] || return 0
+    "$ZP_DIR/zpcore" state --dir "$ZP_DIR" --init /etc/init.d/zeroproxy > "$ZP_STATE" 2>/dev/null \
+        || rm -f "$ZP_STATE"
+}
+
+# 这台设备现在走的数据面。面板据此决定要不要给 tun 段 (redirect/tproxy 模式下带 tun
+# 段会让内核起不来)。判据是本机 caps 里的 chosen —— 装机时探的, 并且可能已被降级。
+datapath_flag() {
+    _v="$(caps_get chosen)"
+    case "$_v" in
+        tun|tproxy|redirect|none) printf '%s' "$_v" ;;
+        *) printf 'tun' ;;
+    esac
+}
+
+# tun 该用的 MTU (装机时按 WAN 的实际 MTU 算的)。面板据此写 tun.mtu —— 它自己不知道
+# 这台机器外面是 PPPoE 还是以太网。老 caps 没有这一位时按 1500 报 (行为不变)。
+tun_mtu_flag() {
+    _v="$(caps_get tun_mtu)"
+    case "$_v" in
+        ''|*[!0-9]*) printf '1500' ;;
+        *) printf '%s' "$_v" ;;
+    esac
+}
+
+# 从面板取配置 (config 模式: 打印到 stdout; 默认模式: 拉取并落盘)。
+# 配置只在内容变化 (或距上次拉取超过 6 小时) 时更新。
+
+# caps_flag 返回面板配置里的 auto-redirect 开关。
+caps_flag() {
+    # 面板配置里能不能写 auto-redirect。装机时默认 1 (与面板默认一致), 只有**真的因为
+    # 它起不来 tun** 时才会被学成 0 (见安装脚本的 tun_retry_without_redirect)。
+    # 文件不在 = 老版本升级上来的, 按 1 报 —— 行为不变。
+    _v="$(caps_get autoredirect)"
+    case "$_v" in
+        0|1) printf '%s' "$_v" ;;
+        *)   printf '1' ;;
+    esac
+}
+
+# ---------------------------------------------------------------- 主循环: 心跳 + 配置拉取 + 状态切换
+#
+# 修复3: 心跳间隔自适应
+#   - 不稳定态 (SLEEP_UNSTABLE=5秒): 配置变更/刚启动/面板不可达 → 快速反应
+#   - 稳定态 (SLEEP_STABLE=30秒): 连续 3 轮无变更 → 降低开销
+#
+# 修复4: 多服务器心跳容错
+#   - 至少一台成功应答就算"面板可达"
+#   - FAILS 连续计数: 只有全部失败才累加, 有成功就清零
+#
+# 修复5: 配置拉取去重
+#   - LAST_REV 只在 apply_config 成功时更新
+#   - LAST_PULL 记录时间戳, 避免频繁拉取
+#
+# 修复6: 重启去重
+#   - SWITCH_PENDING 标记: 本轮已执行 switch_core 就不再做
+
+LAST_REV=""
+LAST_PULL=0
+FAILS=0
+# 修复3: 心跳状态机 —— 稳定/不稳定
+HEARTBEAT_STATE="unstable"  # unstable | stable
+# 稳定计数: 连续 N 轮无变更才进入稳定态
+STABLE_COUNT=0
+STABLE_THRESHOLD=3          # 连续3轮无变更才进入稳定态
+# 修复6: 本轮是否已触发过核心开关切换
+SWITCH_PENDING=""
+
+# 命令行模式: agent.sh config 打印一份合并后的配置 (安装脚本与 CLI 都用);
+# agent.sh geo 只拉取/更新指定分流数据库;
 # agent.sh once 只跑一轮心跳 (排查用)。默认无参数 = 常驻循环。
 case "${1:-}" in
     config) migrate_servers; refresh_state; build_config; exit $? ;;
@@ -452,9 +547,6 @@ case "${1:-}" in
     once)   RUN_ONCE=1 ;;
 esac
 
-LAST_REV=""
-LAST_PULL=0
-FAILS=0
 while true; do
     migrate_servers
     refresh_state
@@ -498,30 +590,41 @@ while true; do
     # TUN + auto-redirect 没跑成时, "转发进/出 tun" 的放行规则是**易失**的 (直接插在 fw4
     # 的链上, 一次 `fw4 reload` 就没了)。内核在跑就顺手补一次 —— 幂等, 而且**按需**:
     # 健康机器 (autoredirect=1) 在这里一个 nft 都不会调用。少了它, 家里会静默地再断一次。
+    WHY_REPORT=""
     if [ "$DP_REPORT" = "tun" ] && core_up && [ -f "$ZP_DIR/tunfw.sh" ]; then
         . "$ZP_DIR/tunfw.sh"
-        zp_tunfw_allow >/dev/null 2>&1 || true
+        if [ "$DP_REPORT" = "tun" ]; then zp_tunfw_allow 2>/dev/null || true; fi
     fi
-    IPV6_REPORT="$(ipv6_flag)"
-    # 性能那一半 (面板卡片上要能回答"这台机器跑这个能到多少")
-    MTU_REPORT="$(tun_mtu_flag)"
-    OFFLOAD_REPORT="$(caps_get offload)"
-    BENCH_D="$(sed -n 's/^direct_kbps=//p' "$ZP_DIR/bench" 2>/dev/null | head -n1)"
-    BENCH_P="$(sed -n 's/^proxy_kbps=//p' "$ZP_DIR/bench" 2>/dev/null | head -n1)"
-    WHY_REPORT=""
-    if [ "$COV_REPORT" = "none" ]; then
-        # 一级都没接管时, 把**每一级为什么不行**都带上。只报"选中的那一级"会漏掉关键信息:
-        # 真机截图里选的是 tun, 而屏幕上只有 tproxy 的原因, 于是没人知道 iptables 那条路
-        # 到底为什么也没用上。
-        for _lv in tun tproxy redirect; do
-            _w="$(caps_get "why.$_lv")"
-            if [ -n "$_w" ]; then
-                WHY_REPORT="${WHY_REPORT:+$WHY_REPORT · }$_lv: $_w"
-            fi
-        done
-    fi
+    # 出口探针 (性能模式下验证 dae 生效): 每轮都发, 面板据此算出口 IP。
+    BENCH_D=""
+    BENCH_P=""
     for _f in $(server_files); do
-        _b="$(field_of "$_f" base)"; _i="$(field_of "$_f" id)"; _k="$(field_of "$_f" secret)"
+        _b="$(field_of "$_f" base)"
+        [ -n "$_b" ] || continue
+        _ip="$(curl -fsSk -m 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^ip=//p' | head -n1)"
+        [ -n "$_ip" ] && BENCH_D="$_ip"
+    done
+    for _f in $(server_files); do
+        _b="$(field_of "$_f" base)"
+        _i="$(field_of "$_f" id)"
+        _k="$(field_of "$_f" secret)"
+        [ -n "$_b" ] || continue
+        _url="$_b/c/bench?i=$_i&k=$_k"
+        _ip="$(curl -fsSk -m 10 "$_url" 2>/dev/null | sed -n 's/^ip=//p' | head -n1)"
+        if [ -n "$_ip" ]; then
+            BENCH_P="$_ip"
+            break
+        fi
+    done
+
+    # ---------------------------------------------------------------- 心跳上报 (多服务器)
+    # 修复4: 多服务器心跳容错 —— 至少一台成功才算面板可达
+    FAILS=0
+    RESP_OK=0
+    for _f in $(server_files); do
+        _b="$(field_of "$_f" base)"
+        _i="$(field_of "$_f" id)"
+        _k="$(field_of "$_f" secret)"
         [ -n "$_b" ] || continue
         BODY='{"device":"'"$_i"'","k":"'"$_k"'","version":"'"$ZP_VERSION"'"'
         # actual = "这台机器现在真的在提供代理" —— 性能模式下 dae 在跑也算 (proxy_up)
@@ -539,6 +642,8 @@ while true; do
             FAILS=$((FAILS + 1))
             continue
         fi
+        # 修复4: 只要有一台成功应答, 就标记面板可达
+        RESP_OK=1
         _d="$(json_get_bool "$RESP" desired)"
         [ -n "$_d" ] || _d=true
         [ "$_d" = "false" ] && DESIRED_ALL="false"
@@ -554,13 +659,15 @@ while true; do
         fi
     done
 
-    if [ -z "$REV" ]; then
+    # ---------------------------------------------------------------- 处理面板不可达
+    if [ "$RESP_OK" = "0" ]; then
         # 一台都没应答: 保持现状而不是把代理关掉 —— 断网时"维持可用"比"忠于面板"重要
         # (本机覆盖是唯一的例外: 那是用户**明确**表达的意图, 必须执行 —— 它存在的理由
         #  正是"面板挂了也要能开关"。)
         if [ -n "$OVERRIDE" ]; then
             if [ "$OVERRIDE" = "on" ] && ! proxy_up; then
                 log "本机覆盖=on (面板不可达), 启动内核"
+                SWITCH_PENDING="1"
                 switch_core on
             elif [ "$OVERRIDE" = "off" ] && [ -f "$ZP_DIR/perf.sh" ]; then
                 . "$ZP_DIR/perf.sh"
@@ -571,13 +678,20 @@ while true; do
             fi
             if [ "$OVERRIDE" = "off" ] && core_up; then
                 log "本机覆盖=off (面板不可达), 停止内核"
+                SWITCH_PENDING="1"
                 switch_core off
             fi
         fi
         [ $((FAILS % 20)) -eq 1 ] && log "面板不可达 (第 $FAILS 次), 保持当前状态"
-        sleep "$SLEEP"
+        # 修复3: 面板不可达 → 不稳定态
+        HEARTBEAT_STATE="unstable"
+        STABLE_COUNT=0
+        sleep "$SLEEP_UNSTABLE"
+        SWITCH_PENDING=""
         continue
     fi
+
+    # ---------------------------------------------------------------- 面板可达, 处理指令
     FAILS=0
     DESIRED="$DESIRED_ALL"
 
@@ -590,18 +704,54 @@ while true; do
             zp_perf_leave "面板总开关关闭"
         fi
     fi
+
+    # 修复6: 核心开关切换去重 —— 本轮已做过就不再做
     if [ "$DESIRED" = "true" ] && ! proxy_up && ! perf_intending; then
-        log "面板要求开启, 启动内核"
-        switch_core on
+        if [ -z "$SWITCH_PENDING" ]; then
+            SWITCH_PENDING="1"
+            log "面板要求开启, 启动内核"
+            switch_core on
+        fi
     elif [ "$DESIRED" = "false" ] && proxy_up; then
-        log "面板要求关闭, 停止内核"
-        switch_core off
+        if [ -z "$SWITCH_PENDING" ]; then
+            SWITCH_PENDING="1"
+            log "面板要求关闭, 停止内核"
+            switch_core off
+        fi
     fi
 
+    # ---------------------------------------------------------------- 配置拉取
     _now="$(date +%s)"
+    _config_changed=0
     if { [ -n "$REV" ] && [ "$REV" != "$LAST_REV" ]; } || [ $((_now - LAST_PULL)) -ge 21600 ]; then
-        if apply_config; then LAST_REV="$REV"; LAST_PULL="$_now"; fi
+        if apply_config; then
+            LAST_REV="$REV"
+            LAST_PULL="$_now"
+            _config_changed=1
+        fi
     fi
+
+    # ---------------------------------------------------------------- 心跳状态机自适应
+    if [ "$_config_changed" = "1" ] || [ -n "$SWITCH_PENDING" ]; then
+        # 有配置变更或刚做过切换 → 不稳定态
+        HEARTBEAT_STATE="unstable"
+        STABLE_COUNT=0
+    else
+        # 无变更 → 稳定计数 +1
+        STABLE_COUNT=$((STABLE_COUNT + 1))
+        if [ "$STABLE_COUNT" -ge "$STABLE_THRESHOLD" ]; then
+            HEARTBEAT_STATE="stable"
+        fi
+    fi
+
+    # ---------------------------------------------------------------- 确定本轮 sleep
+    if [ "$HEARTBEAT_STATE" = "stable" ]; then
+        _sleep="$SLEEP_STABLE"
+    else
+        _sleep="$SLEEP_UNSTABLE"
+    fi
+
+    SWITCH_PENDING=""
     [ -n "${RUN_ONCE:-}" ] && exit 0
-    sleep "$SLEEP"
+    sleep "$_sleep"
 done

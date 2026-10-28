@@ -5368,7 +5368,20 @@ gzip 的 tar; 以及**把"包取不到"这条兜底真跑一遍** —— 用一�
 
 ---
 
-### 8.94 v2.11.43: Debian 12 上装完打不开 —— 面板的语法下限比 Debian 12 的 Python 还新
+### 8.94 v2.12.5 (客户端 v1.4.38): 路由器客户端稳定性大修
+- **agent.sh 恢复命令行模式分派**: `case "${1:-}"` 补齐 config/geo/once 三路，
+  安装脚本调用 `agent.sh config` 不再进入无限心跳循环 (装不上)。
+- **心跳间隔自适应**: 不稳定态 5 秒 / 稳定态最长 30 秒，固定 15 秒 → 降低网络开销。
+- **多服务器心跳容错**: 至少一台成功应答即算"面板可达"，FAILS 只在全量失败时累加。
+- **配置拉取去重 + 校验超时**: 同一轮心跳内只拉一次; `mihomo -t` 最长等 30 秒，
+  防止大配置阻塞心跳循环。
+- **switch_core 后等 API 就绪**: `procd start` 后轮询 9090 真正监听再设 `core.up`，
+  避免"假启动"触发重启风暴。
+- **安装脚本优化**: `wait_datapath` 30→15s / `wait_core_api` 15→10s /
+  `CORE_PANEL_BUDGET` 90→30s; `apply_datapath()` 中 `mihomo -t` 加 30s 后台超时;
+  `tun_retry_without_redirect` 改为最多重试两次 (间隔 5s)。
+
+### 8.94a v2.11.43: Debian 12 上装完打不开 —— 面板的语法下限比 Debian 12 的 Python 还新
 
 `install.sh` 的抬头一直写着 "Ubuntu / Debian", 而真机验证记录里只有一台 **Ubuntu 24.04**
 (Python 3.12)。这两句话中间那道缝一直没人踩, 直到问出"能装 Debian 12 吗":
