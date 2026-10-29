@@ -357,8 +357,11 @@ def pick_port(state: dict, preferred: int | None = None) -> int:
 
 # ---------------------------------------------------------------- 真实握手探测
 
-def client_config(target: dict, socks_port: int) -> dict:
-    """把落地端参数渲染成一份最小 Xray 客户端 (本地 SOCKS 入站 + Reality 出站)。"""
+def client_config(target: dict, socks_port: int, state: dict | None = None) -> dict:
+    """把落地端参数渲染成一份最小 Xray 客户端 (本地 SOCKS 入站 + Reality 出站)。
+
+    F04: state 传入时, Reality 出站额外带上 chain exit 的证书信息。
+    """
     return {
         "log": {"loglevel": "error"},
         "inbounds": [
@@ -442,23 +445,25 @@ def read_exit_ip(socks_port: int, timeout: float = 10.0) -> tuple[str, str]:
     return "", last
 
 
-def probe_target(target: dict, timeout: float = 10.0) -> dict:
+def probe_target(target: dict, timeout: float = 10.0, state: dict | None = None) -> dict:
     """真的穿过落地端出一次网, 并读回落地出口 IP。
 
-    返回 {"ok", "probe_ok", "ms", "tcp_ms", "exit_ip", "detail"}。
+    返回 {"ok", "probe_ok", "ms", "tcp_ms", "exit_ip", "detail"}.
 
     `tcp_ms` 是**入口→落地这一跳的 TCP 握手耗时** (链路本身多出来的那个 RTT),
     面板要单独显示它; `ms` 是整段探测的总耗时 (含起临时客户端、经链出去问一次
     回显服务), 只能当"通不通"的参考 —— 拿它当延迟看会把人吓到。
 
-    `probe_ok=False` 表示"本机环境不允许探测" (没有 xray 二进制等), 与"配错了
+    `probe_ok=False` 表示"本机环境没法做这个测试"(没有 xray 二进制), 与"配错了
     连不通"区分开 —— 前者不该拦住用户, 后者才该拦住 (由调用方决定要不要 force)。
 
     QUIC 内层 (Hysteria 2) 走 `_probe_quic`: 那边是 UDP, 没有"TCP 握手 RTT"
     可以量, 所以 `tcp_ms` 留空 (面板对应位置显示的是传输方式而不是延迟)。
+
+    F04: 接受 `state` 以传递给 `client_config` / `_probe_quic` 做证书 SHA256 校验。
     """
     if (target.get("transport") or "reality") == "hysteria2":
-        return _probe_quic(target, timeout)
+        return _probe_quic(target, timeout, state=state)
     started = time.perf_counter()
     reachable, tcp_ms, tcp_detail = services.tcp_connect_ms(target["host"], target["port"], 5.0)
     if not reachable:
@@ -487,7 +492,7 @@ def probe_target(target: dict, timeout: float = 10.0) -> dict:
     workdir = tempfile.mkdtemp(prefix="zp-chain-probe-")
     cfg_path = os.path.join(workdir, "client.json")
     with open(cfg_path, "w", encoding="utf-8") as fh:
-        json.dump(client_config(target, socks_port), fh)
+        json.dump(client_config(target, socks_port, state=state), fh)
     proc = subprocess.Popen(
         [binary, "run", "-c", cfg_path],
         stdout=subprocess.DEVNULL,
@@ -532,8 +537,10 @@ def probe_target(target: dict, timeout: float = 10.0) -> dict:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def _probe_quic(target: dict, timeout: float = 10.0) -> dict:
+def _probe_quic(target: dict, timeout: float = 10.0, state: dict | None = None) -> dict:
     """QUIC 内层 (Hysteria 2) 的链路探测: 起一个临时客户端, 经它出一次网。
+
+    F04: 接受 state 以传递给 start_temp_client 做证书 SHA256 校验。
 
     与 Reality 那条路等价的语义: `ok` 表示真的读到落地出口 IP, `probe_ok=False`
     表示本机没条件测 (没有 hysteria 二进制)。区别是这里量不到"TCP 握手 RTT"
@@ -562,7 +569,7 @@ def _probe_quic(target: dict, timeout: float = 10.0) -> dict:
 
     socks_port = free_port()
     started = time.perf_counter()
-    proc, workdir, err = chain_quic.start_temp_client(target, socks_port)
+    proc, workdir, err = chain_quic.start_temp_client(target, socks_port, state=state)
     if proc is None:
         return {
             "ok": False,
@@ -605,9 +612,12 @@ def _probe_quic(target: dict, timeout: float = 10.0) -> dict:
         chain_quic.cleanup_temp(proc, workdir)
 
 
-def as_target(entry: dict) -> dict:
-    """从 state 里的条目取出探测 / 出站需要的参数。"""
-    return {
+def as_target(entry: dict, state: dict | None = None) -> dict:
+    """从 state 里的条目取出探测 / 出站需要的参数。
+
+    F04: state 传入时, 额外带上 chain_quic 配置供证书校验使用。
+    """
+    result = {
         "host": entry["host"],
         "port": int(entry["port"]),
         "uuid": entry["uuid"],
@@ -622,6 +632,13 @@ def as_target(entry: dict) -> dict:
         "hy_socks_port": int(entry.get("hy_socks_port") or 0),
         "hy_bw": int(entry.get("hy_bw") or 0),
     }
+    if state is not None:
+        # F04: 把 chain_quic 配置塞进去 (start_temp_client 用它拼 hysteria 客户端配置)
+        chain_entries = (state.get("chain") or {}).get("entries") or []
+        if chain_entries:
+            result["_chain_entries"] = chain_entries
+            result["_chain_state"] = state
+    return result
 
 
 # ---------------------------------------------------------------- 重启后预热
@@ -680,8 +697,11 @@ def warmup_targets(state: dict) -> list[dict]:
     return targets
 
 
-def _warm_one(binary: str, target: dict, timeout: float) -> tuple[bool, str, float]:
-    """起一个临时客户端穿一次这个入口; 返回 (是否读到出口 IP, 说明, 耗时秒)。"""
+def _warm_one(binary: str, target: dict, timeout: float, state: dict | None = None) -> tuple[bool, str, float]:
+    """起一个临时客户端穿一次这个入口; 返回 (是否读到出口 IP, 说明, 耗时秒)。
+
+    F04: 接受 state 以传递给 client_config。
+    """
     started = time.perf_counter()
     reachable, _ms, detail = services.tcp_connect_ms(target["host"], target["port"], 1.0)
     if not reachable:
@@ -691,7 +711,7 @@ def _warm_one(binary: str, target: dict, timeout: float) -> tuple[bool, str, flo
     workdir = tempfile.mkdtemp(prefix="zp-chain-warmup-")
     cfg_path = os.path.join(workdir, "client.json")
     with open(cfg_path, "w", encoding="utf-8") as fh:
-        json.dump(client_config(target, socks_port), fh)
+        json.dump(client_config(target, socks_port, state=state), fh)
     proc = subprocess.Popen(
         [binary, "run", "-c", cfg_path],
         stdout=subprocess.DEVNULL,
@@ -737,7 +757,7 @@ def warmup(state: dict, timeout: float = WARMUP_BUDGET) -> tuple[bool, str]:
         if left <= 1.5:
             rows.append(f"{target['port']} ↘ 预算用尽")
             break
-        ok, detail, cost = _warm_one(binary, target, min(left - 0.5, 12.0))
+        ok, detail, cost = _warm_one(binary, target, min(left - 0.5, 12.0), state=state)
         all_ok = all_ok and ok
         rows.append(f"{target['port']} {'✓' if ok else '↷'} {cost:.1f}s ({detail})")
     return all_ok, "; ".join(rows)
@@ -764,12 +784,14 @@ def warmup_in_background(state: dict) -> None:
             ok, detail = False, f"预热异常: {exc}"
         # 留痕失败也不该炸掉线程 (审计是"尽量留痕", 不是主流程)。
         with contextlib.suppress(Exception):
-            from .config import audit, load_state, save_state
+            from .config import LOCK, audit, load_state, save_state
 
             if _paths()["state"] != home_state_path:
                 return
-            fresh = load_state()
-            audit(fresh, "chain_warmup" if ok else "chain_warmup_failed", detail, actor="system")
-            save_state(fresh)
+            # F11: 拿锁再写, 防止与面板的并发写入冲突
+            with LOCK:
+                fresh = load_state()
+                audit(fresh, "chain_warmup" if ok else "chain_warmup_failed", detail, actor="system")
+                save_state(fresh)
 
     threading.Thread(target=run, name="zp-chain-warmup", daemon=True).start()

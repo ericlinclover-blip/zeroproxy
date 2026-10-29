@@ -219,6 +219,9 @@ def touch(state: dict, device: dict, info: dict) -> bool:
     是没必要的: 一台设备一天要写 5760 次, fsync + rename 在 SD 卡/闪存上是要付
     寿命代价的。所以 last_seen 只在超过 HEARTBEAT_WRITE_S 时才更新 (面板判断
     在线用 90 秒窗口, 精度足够), 其余字段变化一律算变化。
+
+    F10: 如果心跳 payload 里的 rev 与面板当前 config_rev 一致, 说明设备已真正
+    应用了这份配置, 标记 applied_rev (设备可能收到新 rev 但还没下载/应用)。
     """
     now = _now()
     changed = False
@@ -239,6 +242,16 @@ def touch(state: dict, device: dict, info: dict) -> bool:
     if info.get("rev") and device.get("rev") != str(info["rev"])[:32]:
         device["rev"] = str(info["rev"])[:32]
         changed = True
+    # F10: 心跳 payload 携带设备端实际 rev, 与面板当前 rev 一致则标记"已应用"
+    heartbeat_rev = str(info.get("heartbeat_rev") or "")
+    if heartbeat_rev:
+        panel_rev = config_rev(state)
+        if device.get("applied_rev") != panel_rev:
+            # heartbeat_rev 来自设备端 LAST_REV, 如果匹配面板当前 rev, 说明已应用
+            if heartbeat_rev == panel_rev:
+                if device.get("applied_rev") != panel_rev:
+                    device["applied_rev"] = panel_rev
+                    changed = True
     ui = clean_ui_url(info.get("ui"))
     if ui and device.get("ui") != ui:
         device["ui"] = ui
@@ -258,9 +271,16 @@ def touch(state: dict, device: dict, info: dict) -> bool:
 
 
 def remove(state: dict, device_id: str) -> bool:
-    """移除设备 (等价于吊销它手里的 secret)。"""
+    """移除设备 (等价于吊销它手里的 secret)。
+
+    标记设备为 deleted, 以便数据面 (Xray / Nginx) 重新生成时撤销其入站/出站条目。
+    """
     bucket = _bucket(state)
     before = len(bucket["items"])
+    for d in bucket["items"]:
+        if isinstance(d, dict) and d.get("id") == device_id:
+            d["deleted"] = True
+            break
     bucket["items"] = [d for d in bucket["items"] if not (isinstance(d, dict) and d.get("id") == device_id)]
     return len(bucket["items"]) != before
 

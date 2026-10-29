@@ -110,7 +110,13 @@ def _err(message: str, code: int = 400) -> JSONResponse:
 
 
 def _client_ip(request: Request) -> str:
-    """经 nginx 反代时取 X-Forwarded-For 首个地址 (面板只信任本机 nginx)。"""
+    """经 nginx 反代时取真实客户端地址。
+
+    nginx 设置 ``X-Real-IP``（自身追加在 XFF 末尾，不可伪造），优先使用；
+    回退到 XFF 第一个（兼容直连）。"""
+    real = request.headers.get("x-real-ip", "")
+    if real:
+        return real.strip()[:64]
     fwd = request.headers.get("x-forwarded-for", "")
     if fwd:
         return fwd.split(",")[0].strip()[:64]
@@ -491,8 +497,8 @@ def setup(payload: SetupIn, request: Request):
                 {
                     "configured": True,
                     "domain": domain,
-                    "trojan_password": password,
-                    "hysteria_password": password,
+                    "trojan_password": secrets.token_hex(16),
+                    "hysteria_password": secrets.token_hex(16),
                     "created_at": state["created_at"] or int(time.time()),
                 }
             )
@@ -1425,7 +1431,7 @@ def chain_entry_add(payload: ChainEntryIn, request: Request):
             return _err(f"本机找不到空闲的回环端口给 QUIC 客户端: {exc}")
 
     # 探测放在锁外面: 起临时客户端 + 真实出网要好几秒, 不该把整个面板卡住
-    probe = chain.probe_target(target)
+    probe = chain.probe_target(target, state=state)
     # probe_ok=False 表示"本机环境没法做这个测试"(没有 xray 二进制), 与"配错了连不通"不是一回事
     probe_ran = bool(probe.get("probe_ok", True))
     if not probe.get("ok") and probe.get("probe_ok", True) and not payload.force:
@@ -1627,9 +1633,9 @@ def chain_entry_probe(entry_id: str, request: Request):
         if entry is None:
             return _err("链式条目不存在", 404)
         label = entry.get("label") or entry.get("host")
-        target = chain.as_target(entry)
+        target = chain.as_target(entry, state=state)
 
-    probe = chain.probe_target(target)
+    probe = chain.probe_target(target, state=state)
     with config.locked():
         state = load_state()
         if not _require_auth(state, request):
@@ -2129,12 +2135,13 @@ async def restore(request: Request):
             actor=_client_ip(request),
         )
         save_state(restored)
-        steps = _reapply(restored, request)
-        body = _dashboard_body(restored, request)
-        body["steps"] = steps
-        response = JSONResponse(body)
-        _issue_session(restored, request, response)
-        save_state(restored)
+    # F09: _reapply 可能耗时十几秒 (生成配置 + systemctl 重启), 在外面跑不让锁阻塞其他请求
+    steps = _reapply(restored, request)
+    body = _dashboard_body(restored, request)
+    body["steps"] = steps
+    response = JSONResponse(body)
+    _issue_session(restored, request, response)
+    save_state(restored)
     return response
 
 
@@ -4027,7 +4034,9 @@ def client_subscription(
             base=share_links.panel_base_url(request, state),
         )
         # 拉配置也算一次"设备还活着": 装完立刻在面板上显示在线, 不用等下一轮心跳
-        if devices.touch(state, device, {"ip": _client_ip(request), "rev": devices.config_rev(state)}):
+        # F10: rev 写入心跳 rev 标记设备已下载此版本配置
+        panel_rev = devices.config_rev(state)
+        if devices.touch(state, device, {"ip": _client_ip(request), "rev": panel_rev, "heartbeat_rev": panel_rev}):
             save_state(state)
     return Response(
         body,
@@ -4070,12 +4079,16 @@ def client_report(payload: DeviceReportIn, request: Request):
             info["actual"] = payload.actual
         if payload.report:
             info["report"] = payload.report
+        # F10: 将设备端实际 rev 透传给 touch(), 用于标记 applied_rev
+        if payload.rev:
+            info["heartbeat_rev"] = payload.rev
         changed = devices.touch(state, device, info) or changed
         if changed:
             save_state(state)
         return {
             "desired": bool(device["desired"]),
             "rev": devices.config_rev(state),
+            "applied_rev": device.get("applied_rev", ""),
             "name": device["name"],
             "template": share_links.template_of(state),
             # 面板看到的这台设备的公网地址。设备端拿它做一件事: 判断"性能模式的出口探针

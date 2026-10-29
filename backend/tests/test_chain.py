@@ -42,7 +42,7 @@ def _fake_code(state: dict, host: str = "203.0.113.9", port: int = 8447,
 
 
 def _ok_probe(exit_ip: str = "203.0.113.9"):
-    return lambda target, timeout=10.0: {
+    return lambda target, timeout=10.0, state=None: {
         "ok": True,
         "probe_ok": True,
         "ms": 123.4,
@@ -52,7 +52,7 @@ def _ok_probe(exit_ip: str = "203.0.113.9"):
 
 
 def _bad_probe(detail: str = "连不上落地端 203.0.113.9:8447 — 超时"):
-    return lambda target, timeout=10.0: {
+    return lambda target, timeout=10.0, state=None: {
         "ok": False, "probe_ok": True, "ms": None, "exit_ip": "", "detail": detail,
     }
 
@@ -329,7 +329,7 @@ def test_entry_probe_gate_and_force(client, configured, monkeypatch):
     other = _fake_code(config.load_state(), host="198.51.100.7", label="备用")
     monkeypatch.setattr(
         chain, "probe_target",
-        lambda target, timeout=10.0: {"ok": False, "probe_ok": False, "ms": None,
+        lambda target, timeout=10.0, state=None: {"ok": False, "probe_ok": False, "ms": None,
                                       "exit_ip": "", "detail": "TCP 可达, 但本机没有 xray 二进制"},
     )
     untested = client.post("/api/chain/entries", json={"code": other})
@@ -393,7 +393,7 @@ def test_entry_revalidates_local_port_after_the_probe(client, configured, monkey
 
     monkeypatch.setattr(chain, "pick_port", fake_pick_port)
 
-    def stealing_probe(target, timeout=10.0):
+    def stealing_probe(target, timeout=10.0, state=None):
         # 模拟探测期间另一条链落地, 抢走 8446
         with config.locked():
             state = config.load_state()

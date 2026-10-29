@@ -5711,3 +5711,10 @@ PublicKey = ...
 - **状态恢复**: 心跳重新带上 IPv6、MTU、转发卸载、未接管原因与实测吞吐。
 - **安装脚本优化**: 本地 API 用单次短探测，配置校验快速返回，TUN 自愈最多重试两次。
 - **压测端点收紧**: `/c/bench` 改为需要设备凭据，避免匿名拉取 8 MB 数据。
+
+### 8.102 v2.12.7: P2 核心改进 (异步事件循环阻塞、设备配置版本追踪、原子写入、IPv6/独立探测)
+- **F09 · 异步事件循环阻塞修复**: `restore` 路由将 `_reapply` (配置生成 + systemctl 重启, 可能 10-30 秒) 移出 `config.locked()` 上下文, 锁只用于 `save_state`/`load_state`, 不再阻塞所有其他 API 请求。
+- **F10 · 设备配置版本追踪**: 心跳 `touch()` 新增 `heartbeat_rev` 参数, 设备携带的 rev 与面板 `config_rev` 一致时标记 `applied_rev`, 区分"已下载未应用"状态; 心跳响应返回 `applied_rev`。
+- **F11 · 原子写入并发安全**: 预热后台线程 `save_state` 审计记录时先获取 `config.locked()`, 防止与面板并发写入冲突。
+- **F12 · WireGuard IPv6 清理**: reload 脚本 / userspace_up 脚本在 IPv6 被禁用时主动 flush 旧 v6 地址, 防止残留导致配置不一致。
+- **F12 · QUIC 进程跨进程认领**: 新增 `_port_in_use()` 检查, `_already_running_elsewhere` 在指纹不匹配时通过端口监听判断是否认领, 避免跨进程重复绑定同一端口导致升级失败。

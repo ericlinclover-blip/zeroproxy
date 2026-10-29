@@ -317,10 +317,14 @@ def test_subscription_base64_contains_all_enabled_nodes(client, configured):
 
 def test_hysteria_link_carries_password_only_and_hop_ports(client, configured):
     """官方客户端把 `user:pass@` 整串当作 auth, 而服务端是整串比较口令。"""
+    from zeroproxy import config as _config
+
+    state = _config.load_state()
+    hy_password = state["hysteria_password"]
     path = configured["subscription_url"].split("testserver")[-1]
     text = base64.b64decode(client.get(path).text).decode()
     hy = [line for line in text.splitlines() if line.startswith("hysteria2://")][0]
-    assert f"hysteria2://{PASSWORD}@" in hy               # 只写口令, 没有 admin:
+    assert f"hysteria2://{hy_password}@" in hy               # 只写口令, 没有 admin:
     assert "admin:" not in hy
     assert f":{configured['ports']['hysteria']}" in hy
     assert "30001,31001,32001" in hy                       # 端口跳跃写进 host
@@ -3057,7 +3061,9 @@ def test_apply_skips_services_whose_config_did_not_change(client, configured, ho
     链式代理的操作只动 Xray 的入站, nginx / hysteria 的配置一个字符都没变, 却要
     陪着重载一次; 反过来, 服务真的挂了 (不在跑) 时又要照样自愈 —— 两条都要守住。
     """
-    from zeroproxy import apply, services
+    import os
+
+    from zeroproxy import apply, nginx_config, services
 
     calls: list[str] = []
     running = {"nginx": True}
@@ -3078,6 +3084,11 @@ def test_apply_skips_services_whose_config_did_not_change(client, configured, ho
     monkeypatch.setattr(apply, "_tcp_open", lambda port, timeout=0.3: True)
     monkeypatch.setattr(services, "udp_port_listening", lambda port: True)
     monkeypatch.setattr(apply, "_hop_redirect_note", lambda state: "")
+    # is_prod=True 时 gen_nginx 要写 /etc/nginx; 用 mock 避免权限问题
+    monkeypatch.setattr(
+        nginx_config, "write_nginx_conf",
+        lambda state: (True, str(home / "nginx" / "zeroproxy.conf")),
+    )
 
     state = config.load_state()
     wanted = {int(port) for port, _, _ in apply._wanted_ports(state)}  # noqa: SLF001

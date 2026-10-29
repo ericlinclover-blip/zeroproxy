@@ -415,6 +415,10 @@ else
     add_step true "面板已就绪" "http://127.0.0.1:${ZP_BIND_PORT:-9900}/api/info 可访问"
   else
     add_step false "面板已就绪" "等待 30s 仍无法访问面板接口"
+    # 面板未就绪 → 回滚到升级前版本, 避免面板永久不可用
+    STATUS_STATE="failed"
+    STATUS_MSG="面板升级后未就绪, 已回滚到 v$FROM_VERSION"
+    rollback
   fi
 fi
 

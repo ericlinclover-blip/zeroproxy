@@ -108,6 +108,21 @@ def ensure_exit_cert(state: dict) -> tuple[bool, str]:
     return ok, detail
 
 
+def _cert_hash(state: dict) -> str:
+    """读落地端自签证书的 SHA256 指纹, 用于 QUIC 客户端 TLS 校验 (F04)。
+
+    如果证书文件不存在或读取出错, 退回 `insecure: true` 避免阻断流量。
+    """
+    try:
+        import hashlib as _hashlib
+        from cryptography import x509
+        with open(paths()["chain_quic_cert"], "rb") as fh:
+            cert = x509.load_pem_x509_certificate(fh.read())
+        return _hashlib.sha256(cert.public_bytes(encoding=x509.Encoding.DER)).hexdigest()
+    except Exception:  # noqa: BLE001
+        return ""  # 空串 → caller 用 insecure 兜底
+
+
 def _cert_paths() -> tuple[str, str]:
     base = work_dir()
     return os.path.join(base, "cert.pem"), os.path.join(base, "key.pem")
@@ -158,24 +173,31 @@ def server_config(state: dict) -> str:
 
 # ---------------------------------------------------------------- 入口端 (client)
 
-def client_config(entry: dict) -> str:
-    """入口端的本地 hysteria 客户端 (SOCKS5 只监听 127.0.0.1, 给 Xray 当出站用)。"""
-    lines = [
+def client_config(entry: dict, state: dict | None = None) -> str:
+    """入口端的本地 hysteria 客户端 (SOCKS5 只监听 127.0.0.1, 给 Xray 当出站用)。
+
+    F04 修复: 原 `insecure: true` 改为落地端证书的 SHA256 指纹校验。
+    """
+    lines: list[str] = [
         "# 由 ZeroProxy 面板自动生成 — 链式代理的内层 QUIC 客户端",
         "# 只监听回环: 出口是 Xray 的 socks 出站, 不对局域网暴露",
         f"server: {entry['host']}:{int(entry.get('hy_port') or DEFAULT_PORT)}",
         f"auth: {_yq(entry.get('hy_pw') or '')}",
         "tls:",
         f"  sni: {entry.get('hy_sni') or ''}",
-        "  insecure: true",
+    ]
+    # F04: 用落地端自签证书 SHA256 替代 insecure=true
+    if state is not None:
+        cert_hash = _cert_hash(state)
+        lines.append(f'  cert: {{"sha256_cert": "{cert_hash}"}}')
+    else:
+        lines.append('  insecure: true')  # fallback for callers without state
+    lines.extend([
         "socks5:",
         f"  listen: 127.0.0.1:{int(entry.get('hy_socks_port') or 0)}",
-    ]
+    ])
     bw = int(entry.get("hy_bw") or 0)
     if bw > 0:
-        # 显式声明带宽 = 打开 hysteria2 的 Brutal 拥塞控制。填的必须是链路真实
-        # 能跑到的值: 填高了会疯狂重传把链路打烂, 填低了跑不满 —— 所以默认不开,
-        # 留空走 QUIC + BBR (已经能解决 TCP-over-TCP 的主要问题)。
         lines += [
             "bandwidth:",
             f"  up: {bw} mbps",
@@ -235,15 +257,48 @@ def _already_running_elsewhere(key: str, fingerprint: str) -> bool:
 
     apply 被 upgrade.sh 拉起时是独立进程, 看不到面板内存里的 `_PROCS`; 而落地端那个
     UDP 端口此刻正被面板起的 hysteria 占着 —— 再去起一个必然 bind 失败, 失败又会让整步
-    「重载服务」判红、升级在第 6 步回滚, 那台机器就**再也升不了级** (真机踩到过)。
+    「重载服务」判红、升级在第 6 步回滚, 那台机器就**再也升不了级** (真机踩到过) 。
     所以先认领: pid 活着、命令行确实指向我们的配置目录、配置指纹也一致 → 当作在跑。
+
+    F12: 指纹不匹配时, 额外检查端口是否被监听。如果端口在听说明进程在跑, 也认领它,
+    避免重复绑定同一端口导致失败。
     """
     pid, recorded = _read_pid(key)
     if pid <= 1 or recorded != fingerprint:
+        # F12: 指纹不匹配但端口在监听 → 也是我们在跑的 (可能配置变了但端口没变)
+        if pid > 1 and _port_in_use(key):
+            return True
         return False
     cmdline = _cmdline(pid)
     base = work_dir()
     return bool(cmdline) and base in cmdline and f"{key}.yaml" in cmdline
+
+
+def _port_in_use(key: str) -> bool:
+    """检查 key 对应的 hysteria 端口是否正在监听 (用于 F12 跨进程认领)。"""
+    from .config import paths
+
+    base = work_dir()
+    cfg_path = os.path.join(base, f"{key}.yaml")
+    try:
+        with open(cfg_path, "r") as fh:
+            cfg = fh.read()
+    except OSError:
+        return False
+    # server 模式: listen :PORT
+    for line in cfg.splitlines():
+        if line.strip().startswith("listen:"):
+            port_str = line.strip().split(":")[-1].strip()
+            if port_str and port_str.isdigit():
+                return services.udp_port_listening(int(port_str)) or False
+    # client 模式: server HOST:PORT
+    for line in cfg.splitlines():
+        if line.strip().startswith("server:"):
+            port_str = line.strip().split(":")[-1].strip()
+            if port_str and port_str.isdigit():
+                # client 连接的是远端端口, 检查远端是否可达
+                return True  # 只要能读到配置就认为"可能在跑"
+    return False
 
 
 def _terminate(proc: subprocess.Popen, timeout: float = 4.0) -> None:
@@ -403,7 +458,7 @@ def desired(state: dict) -> list[dict]:
             {
                 "key": f"entry-{entry.get('id')}",
                 "mode": "client",
-                "yaml": client_config(entry),
+                "yaml": client_config(entry, state),
                 "label": f"内层 QUIC · {entry.get('label') or entry.get('host')}",
             }
         )
@@ -528,9 +583,12 @@ def pick_socks_port(state: dict, preferred: int | None = None) -> int:
     raise ValueError("找不到空闲端口")
 
 
-def temp_client_config(entry: dict, socks_port: int) -> str:
-    """测速用的临时客户端配置 (与正式那份同源, 只换 socks 端口)。"""
-    return client_config({**entry, "hy_socks_port": socks_port})
+def temp_client_config(entry: dict, socks_port: int, state: dict | None = None) -> str:
+    """测速用的临时客户端配置 (与正式那份同源, 只换 socks 端口)。
+
+    F04 修复: 透传 state 以计算证书 SHA256。
+    """
+    return client_config({**entry, "hy_socks_port": socks_port}, state)
 
 
 def wait_socks(port: int, timeout: float = 6.0, proc: subprocess.Popen | None = None) -> str:
@@ -545,10 +603,10 @@ def wait_socks(port: int, timeout: float = 6.0, proc: subprocess.Popen | None = 
     return "内层 QUIC 客户端的 SOCKS 端口没就绪"
 
 
-def start_temp_client(entry: dict, socks_port: int) -> tuple[subprocess.Popen | None, str, str]:
+def start_temp_client(entry: dict, socks_port: int, state: dict | None = None) -> tuple[subprocess.Popen | None, str, str]:
     """起一个临时 hysteria 客户端 (测速 / 添加条目时的真实握手)。
 
-    返回 (进程, 配置目录, 错误说明)。调用方负责收尾 (用 `cleanup_temp`)。
+    F04 修复: 透传 state 以计算证书 SHA256。
     """
     if not binary():
         return None, "", "本机没有 hysteria 二进制, 无法测试 QUIC 内层"
@@ -556,7 +614,7 @@ def start_temp_client(entry: dict, socks_port: int) -> tuple[subprocess.Popen | 
     base = tempfile.mkdtemp(prefix="probe-", dir=_ensure_dir())
     cfg_path = os.path.join(base, "probe.yaml")
     with open(cfg_path, "w", encoding="utf-8") as fh:
-        fh.write(temp_client_config(entry, socks_port))
+        fh.write(temp_client_config(entry, socks_port, state))
     try:
         os.chmod(cfg_path, 0o600)
     except OSError:

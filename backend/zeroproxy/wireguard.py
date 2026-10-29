@@ -641,6 +641,14 @@ def reload_script(state: dict) -> str:
             f'  ip -6 addr add "$want6" dev {INTERFACE}',
             "fi",
         ]
+    else:
+        # F12: IPv6 被禁用时, 清理旧 v6 地址防止残留
+        lines += [
+            'cur6="$(ip -6 addr show dev {INTERFACE} | awk \'/inet6 /{{print $2; exit}}\')"',
+            'if [ -n "$cur6" ]; then',
+            f'  ip -6 addr flush dev {INTERFACE} scope global || true',
+            "fi",
+        ]
     lines += [
         f'ip link set dev {INTERFACE} mtu {int(wg.get("mtu") or DEFAULT_MTU)} up',
         f'"{paths()["wireguard_firewall"]}" up',
@@ -681,6 +689,14 @@ def userspace_up_script(state: dict) -> str:
             'if [ "$cur6" != "$want6" ]; then',
             f'  ip -6 addr flush dev {INTERFACE} scope global || true',
             f'  ip -6 addr add "$want6" dev {INTERFACE}',
+            "fi",
+        ]
+    else:
+        # F12: IPv6 被禁用时, 清理旧 v6 地址防止残留
+        lines += [
+            'cur6="$(ip -6 addr show dev {INTERFACE} | awk \'/inet6 /{{print $2; exit}}\')"',
+            'if [ -n "$cur6" ]; then',
+            f'  ip -6 addr flush dev {INTERFACE} scope global || true',
             "fi",
         ]
     lines += [

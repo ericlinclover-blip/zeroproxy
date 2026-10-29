@@ -583,6 +583,8 @@ def reapply(state: dict, timeout: int = 0, progress=None) -> list[dict]:
         (STEP_NAMES[5], restart_step, 180),
         (STEP_NAMES[6], verify_listeners, 12),
     )
+    # 配置生成/校验步骤 (索引 1-4): 任一步失败立即 abort, 不再进入 restart
+    validation_steps = {1, 2, 3, 4}
     for index, (name, fn, t) in enumerate(plan):
         if progress is not None:
             progress(index, len(plan), name)
@@ -591,6 +593,10 @@ def reapply(state: dict, timeout: int = 0, progress=None) -> list[dict]:
             # 证书是兜底补回来的话, 让这一步的说明里能看见 —— 否则用户只会注意到
             # "证书怎么变成自签了", 找不到原因
             steps[-1]["detail"] = f"{steps[-1]['detail']}; {cert_detail}"
+        if index in validation_steps and not steps[-1]["ok"]:
+            # F07: 配置校验失败 → 立即 abort, 不进入 restart_services / verify
+            steps[-1]["abort"] = True
+            break
     state["steps"] = steps
     save_state(state)
     return steps

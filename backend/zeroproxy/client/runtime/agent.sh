@@ -227,7 +227,7 @@ http_post() {
         _tries=$((_tries + 1))
         _rc=1
         if command -v curl >/dev/null 2>&1; then
-            if curl -fsSk -m 20 -H 'Content-Type: application/json' --data "$_body" "$_url" 2>/dev/null; then
+            if curl -fsS -m 20 -H 'Content-Type: application/json' --data "$_body" "$_url" 2>/dev/null; then
                 _rc=0
             else _rc=$?; fi
         elif uclient-fetch -q --no-check-certificate -O - --post-data "$_body" "$_url" 2>/dev/null; then
@@ -257,7 +257,7 @@ http_get() {
         _rc=1
         _out=""
         if command -v curl >/dev/null 2>&1; then
-            if _out="$(curl -fsSk -m 10 "$1" 2>/dev/null)"; then _rc=0; else _rc=$?; fi
+            if _out="$(curl -fsS -m 10 "$1" 2>/dev/null)"; then _rc=0; else _rc=$?; fi
         elif command -v uclient-fetch >/dev/null 2>&1; then
             if _out="$(uclient-fetch -q --no-check-certificate -O - "$1" 2>/dev/null)"; then _rc=0; fi
         else
@@ -291,7 +291,7 @@ http_get() {
 # 不是"装不上"。
 http_get_file() {
     _tmo="${2:-600}"
-    if command -v curl >/dev/null 2>&1; then curl -fsSk -m "$_tmo" "$1" 2>/dev/null
+    if command -v curl >/dev/null 2>&1; then curl -fsS -m "$_tmo" "$1" 2>/dev/null
     else uclient-fetch -q --no-check-certificate -T "$_tmo" -O - "$1" 2>/dev/null \
         || wget -q --no-check-certificate -T "$_tmo" -O - "$1" 2>/dev/null
     fi
@@ -335,7 +335,7 @@ flush_dns() { killall -HUP dnsmasq 2>/dev/null || /etc/init.d/dnsmasq reload 2>/
 # 自带 5 次重试；套进外层轮询会把 15 秒放大成几分钟。
 local_api_ready() {
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSk --connect-timeout 1 --max-time 1 \
+        curl -fsS --connect-timeout 1 --max-time 1 \
             "http://127.0.0.1:9090/version" >/dev/null 2>&1
     elif command -v uclient-fetch >/dev/null 2>&1; then
         uclient-fetch -q -T 1 -O /dev/null "http://127.0.0.1:9090/version" >/dev/null 2>&1
@@ -390,10 +390,15 @@ apply_config() {
     # 单服务器模式带内联 proxies, 多服务器模式带 proxy-providers —— 唯一共同的锚点是
     # 策略组, 所以用它判断"这看起来像一份配置"。
     grep -q '^proxy-groups:' "$CONF.new" || { rm -f "$CONF.new"; return 1; }
-    # 配置校验超时: 用 timeout 命令或背景执行 + 超时检测
+    # 配置校验超时: 用 timeout 命令 or 背景执行 + 超时 detection.
+    # `_config_ok` starts as failure (1) and is only cleared to 0 when the validator
+    # **exits 0** -- never on a non-zero/timeout result. (Previously the `timeout`
+    # branch only assigned `$?` on failure, so a successful validation left
+    # `_config_ok=1` and a good config was rejected -- F01.)
     _config_ok=1
     if command -v timeout >/dev/null 2>&1; then
-        timeout 30 /etc/zeroproxy/mihomo -t -d "$ZP_DIR" -f "$CONF.new" >/dev/null 2>&1 || _config_ok=$?
+        timeout 30 /etc/zeroproxy/mihomo -t -d "$ZP_DIR" -f "$CONF.new" >/dev/null 2>&1
+        _config_ok=$?
     else
         # 没有 timeout: 背景执行, 15 秒后检查
         /etc/zeroproxy/mihomo -t -d "$ZP_DIR" -f "$CONF.new" >/dev/null 2>&1 &
