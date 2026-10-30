@@ -95,3 +95,33 @@
 | `backend/zeroproxy/cli.py` | EOF 哨兵; `_guarded` 统一处理 `StateError` |
 | `backend/tests/test_second_pass.py` | 10 条回归用例(WG 脚本占位符/`sh -n`、UDP 双表、随机 UUID、哈希版本化、peer 注入、非 ASCII token、dae 降级) |
 | `backend/tests/test_devices.py` | 修正"降级分支可以引用 geoip"的错误断言 |
+
+---
+
+## 六、收口(v2.12.19): 上面"待排期"清单已全部处理
+
+第二轮结束时留下的 5 条 P2 + P1(`/c/btf`) 与若干 P3, 已在同一轮内修完:
+
+| 原结论 | 处理 |
+|---|---|
+| **P1** `/c/btf` 同步跑 ~110s、无并发合并 | 改成 `btf_prepare` + 后台线程 + `503/Retry-After`; 端点响应时间不再随上游抖动 |
+| (改完后新发现) 匿名 key 可放大成"一请求一线程 + 一次 GitHub API 调用" | `kver`/`arch` 白名单 + 状态表上限 32 + 抓取并发上限 2 + 上游清单 10 分钟 TTL 缓存 |
+| P2 `btf_fetch` 无串行化, 并发共写 `.part` | `_BTF_FETCH_LOCK` 串行化; 另外 core/geo/perf 的临时文件改成唯一名 |
+| P2 `btf_sums_lookup` 取前就写时间戳 → fail-open | 加锁 + 只在尝试结束后记时间 + 等锁后重读缓存; 清单未命中且过期会强制刷新一次 |
+| P2 BTF 90s 上限不覆盖清单/摘要查询 | 两个预算都按 `deadline` 收窄 |
+| P2 `repair`/`diagnose` 在全局锁内做秒级工作 | 都移到锁外 (落盘仍走 `config.locked()`) |
+| P2 换域名在锁内 reapply + 绕开 `_APPLY_RUN_LOCK` + 双击起两条管道 | reapply 移到锁外并共用 `_APPLY_RUN_LOCK`; 新增 `_DOMAIN_GATE` 非阻塞门控 |
+| P3 `downloading` 无看门狗 / 线程起不来 | `max(120, DEADLINE*3)` 判定"卡死"后可重起; 线程启动失败回滚状态 |
+| P3 `core_sha256` 秒级 mtime memo | 改用 `st_mtime_ns + st_ctime_ns`; 并保留最近 8 条(以前只留 1 条) |
+| P3 `btf_cached` 版本压过架构精确度 | 先比 rank 再比版本 |
+| P3 21 处 `int(os.environ.get(...))` | 统一 `_env_int()` —— 坏环境变量不再让面板起不来 |
+| P3 dae 空节点池 / IPv4 判定 | 空池直接报错(路由回 409, 设备留在 mihomo); IPv4/IPv6 改用 `ipaddress` |
+| P3 备份未剔 `wireguard.one_time_links` | 已剔除(与交接票据/配对码同类短期凭据) |
+| P3 `cli` wrapper 路径拼双引号 | 转义 `\ " $ \``; 写盘改原子 + 拒绝符号链接 |
+| P3 设备名/前缀注入 YAML 注释 | `_comment_safe()` 净化控制字符 |
+| (二轮新增覆盖) nginx 域名 80 端口块未脱敏 / 空域名非法配置 / `/panel/panel` | 三条都已修, 并加断言 |
+| 已知取舍 | dae 旧版本兜底仍保留(文件里写明的运维兜底), 只修了架构错配 |
+
+**仍建议真机确认的两处**(本机没有 xray/dae/hysteria 二进制):
+1. `dae validate` 接受新的 `geo=0` 降级分支;
+2. `/c/btf` 在路由器上拿到的 503 文案能正确打印(客户端读正文第一行当原因)。

@@ -240,6 +240,18 @@ exec "__ZP_HOME__/venv/bin/python" -m zeroproxy.cli "$@"
 """
 
 
+def _shell_dq(value: str) -> str:
+    """把一段文本转义成能安全放进**双引号**里的形式。
+
+    `z` 包装脚本里 `export ZP_HOME="__ZP_HOME__"` 是直接替换的: 路径里只要有 `$`、
+    反引号或双引号, 生成出来的脚本要么展开成别的东西, 要么直接语法错 —— 装到
+    /usr/local/bin 之后就是"z 敲不动", 而用户完全看不出跟路径有关。
+    """
+    for ch in ("\\", '"', "`", "$"):
+        value = value.replace(ch, "\\" + ch)
+    return value
+
+
 def _is_ours(path: str) -> bool:
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
@@ -292,7 +304,7 @@ def install_shortcut(bin_dir: str | None = None) -> int:
     """
     home = paths()["home"]
     bin_dir = _pick_bin_dir(bin_dir or os.environ.get("ZP_BIN_DIR"))
-    body = WRAPPER.replace("__ZP_HOME__", home)
+    body = WRAPPER.replace("__ZP_HOME__", _shell_dq(home))
     # 面板目录里那一份一定会被装上: 它是"PATH 里没有 /usr/local/bin"时的兜底
     targets = [os.path.join(home, "z"), os.path.join(bin_dir, "zeroproxy")]
     short = os.path.join(bin_dir, "z")
@@ -304,9 +316,11 @@ def install_shortcut(bin_dir: str | None = None) -> int:
     try:
         os.makedirs(bin_dir, exist_ok=True)
         for path in targets:
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(body)
-            os.chmod(path, 0o755)
+            if os.path.islink(path):
+                # root 下 open("w") 会顺着符号链接改到链接目标 —— 不跟随, 直接拒绝
+                _out(f"! {path} 是符号链接, 跳过 (避免写到链接目标上)")
+                continue
+            config.atomic_write_text(path, body, mode=0o755)
             _out(f"✓ 终端快捷命令: {path}")
     except OSError as exc:
         _out(f"× 安装快捷命令失败: {exc}")

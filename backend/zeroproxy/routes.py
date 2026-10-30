@@ -2236,7 +2236,9 @@ def diagnose(request: Request):
         state = load_state()
         if not _require_auth(state, request):
             return _err("未登录", 401)
-        checks = _diagnose(state)
+    # 诊断要跑 TCP 探测 / tls 握手 / 每条链的探活 / `xray -test` / wg 状态, 秒级 ——
+    # 放在 config.locked() 里会把登录、心跳、订阅全部堵住 (本文件 469-471 行自己定的规矩)。
+    checks = _diagnose(state)
     return {
         "ok": all(c["ok"] for c in checks),
         "checks": checks,
@@ -2252,8 +2254,14 @@ def repair(request: Request):
         if not _require_auth(state, request):
             return _err("未登录", 401)
         config.audit(state, "repair", actor=_client_ip(request))
-        steps = _reapply(state, request)
-        checks = _diagnose(state)
+        save_state(state)
+    # 落地 + 复检都是秒级 (<2-4 秒重启 + 诊断探测): 锁内跑等于把全站按住。
+    steps = _reapply(state, request)
+    checks = _diagnose(state)
+    with config.locked():
+        fresh = load_state()
+        fresh["steps"] = steps
+        save_state(fresh)
     return {"ok": all(c["ok"] for c in checks), "steps": steps, "checks": checks}
 
 
@@ -2373,6 +2381,11 @@ def _backup_payload(state: dict) -> dict:
     devices_bucket = clean.get("devices")
     if isinstance(devices_bucket, dict):
         devices_bucket["pair_codes"] = []
+    # WireGuard 的一次性链接 (10 分钟有效) 能直接换到一份**含私钥**的客户端配置 ——
+    # 与交接票据/配对码同一类短期凭据, 备份里既没用, 又是个额外的泄露面。
+    wireguard_bucket = clean.get("wireguard")
+    if isinstance(wireguard_bucket, dict):
+        wireguard_bucket["one_time_links"] = []
     return {
         "format": BACKUP_FORMAT,
         "backup_version": BACKUP_VERSION,
@@ -2883,18 +2896,21 @@ def _domain_pipeline(new_domain: str, progress=None) -> tuple[list[dict], str]:
         state["domain"] = new_domain
         state["cert"] = cert_state
         save_state(state)
+    # 落地闭环在锁外跑, 并与其它闭环共用同一把串行锁 —— 否则并发的 /api/apply
+    # 会同时重启服务 / 各写一份配置 (这条以前既不持 _APPLY_RUN_LOCK 又在锁内跑)。
+    with _APPLY_RUN_LOCK:
         landed = apply.reapply(
             state,
             progress=lambda index, _t, name: (
                 progress(1 + index + 1, total, name) if progress is not None else None
             ),
         )
-        steps.extend(landed)
-        failed = apply.failures(landed)
-        if failed:
-            reason = f"{failed[0]['name']}: {failed[0]['detail']}"
-            steps.extend(_rollback_domain(old_domain, old_cert))
-            return steps, f"配置落地失败 ({reason}) —— 已回滚, 面板仍在 {old_domain}"
+    steps.extend(landed)
+    failed = apply.failures(landed)
+    if failed:
+        reason = f"{failed[0]['name']}: {failed[0]['detail']}"
+        steps.extend(_rollback_domain(old_domain, old_cert))
+        return steps, f"配置落地失败 ({reason}) —— 已回滚, 面板仍在 {old_domain}"
 
     # ---- 3) 验证: 新域名上真的能打开面板吗 (证书受信任 + DNS + 端口) ----
     if services.is_prod():
@@ -2920,7 +2936,8 @@ def _rollback_domain(old_domain: str, old_cert: dict) -> list[dict]:
     state["domain"] = old_domain
     state["cert"] = old_cert
     save_state(state)
-    reverted = apply.reapply(state)
+    with _APPLY_RUN_LOCK:
+        reverted = apply.reapply(state)
     ok = not apply.failures(reverted)
     return [
         {
@@ -2972,8 +2989,23 @@ def _domain_change_sync(new_domain: str, request: Request, handoff: str) -> dict
     return body
 
 
+#: 换域名同一时刻只允许一条管道。它要**真的去签一张证书** (Let's Encrypt 有每周签发
+#: 上限), 双击/重试各起一条 = 签两次 + 两条 reapply 互相回滚。
+_DOMAIN_GATE = threading.Lock()
+
+
 @router.post("/api/domain")
 def change_domain(payload: DomainIn, request: Request):
+    """换域名 (门控版入口, 见 _change_domain_impl)。"""
+    if not _DOMAIN_GATE.acquire(blocking=False):
+        return _err("已有换域名任务在进行中, 请等它结束 (证书签发不能并发)", 409)
+    try:
+        return _change_domain_impl(payload, request)
+    finally:
+        _DOMAIN_GATE.release()
+
+
+def _change_domain_impl(payload: DomainIn, request: Request):
     """换面板域名: 预检 DNS → 签发证书 → 重写配置 → 热重载 → 验证 → 自动跳转。
 
     两件 setup 那次域名流程不需要、这里必须做的事:
@@ -4163,13 +4195,18 @@ def client_perf_config(request: Request, id: str = "", k: str = "", lan: str = "
         # `?tpl=` 会原样进配置头部那行注释; 以前直接拼用户输入, 换行就能注入配置行
         # (P3-16)。这里走 share_links 的白名单 (template_of), 未知值回退面板默认。
         template = share_links.template_of(state, (tpl or "").strip().lower())
-        body, skipped = dae_config.render(
-            state,
-            share_links.panel_base_url(request, state),
-            lan_interface=ifaces or "br-lan",
-            template=template,
-            geo=bool(geo),
-        )
+        try:
+            body, skipped = dae_config.render(
+                state,
+                share_links.panel_base_url(request, state),
+                lan_interface=ifaces or "br-lan",
+                template=template,
+                geo=bool(geo),
+            )
+        except ValueError as exc:
+            # 没有 dae 能用的节点: 给设备一句人话并让它**留在 mihomo 上**,
+            # 而不是下发一份一跑就 "no dialer in this group" 的配置。
+            return _err(str(exc), 409)
         if devices.touch(
             state,
             device,
@@ -4267,21 +4304,26 @@ def client_btf_package(request: Request, kver: str = "", arch: str = "", fmt: st
     state = load_state()
     if not state["configured"]:
         return _err("面板尚未初始化", 409)
-    ok, detail, path = router_client.btf_fetch(kver, arch, fmt)
-    if not ok:
-        permanent = detail.startswith(("这台内核是", "上游没有", "不认识的包格式", "没给出"))
-        text = router_client.btf_pending_text(kver, arch, fmt, detail)
-        return Response(
-            text + "\n",
-            status_code=404 if permanent else 502,
-            media_type="text/plain; charset=utf-8",
-            headers={"cache-control": "no-store"},
+    # **绝不在请求线程里同步取**: 这一跳最长 ~110 秒 (下载 90 秒 + 摘要清单查询),
+    # 而这是**匿名可达**的端点 —— 40 个并发就能把 40 线程的同步端点池占满, 面板的
+    # /c/report、/sub、/api/* 全部排队排死。改成与 /c/bin、/c/geo、/c/perf 同一个协议:
+    # 立刻回一句人话 + 后台去取。
+    permanent, detail, path = router_client.btf_prepare(kver, arch, fmt)
+    if path:
+        return FileResponse(
+            path,
+            media_type="application/octet-stream",
+            headers={"cache-control": "no-store", **_file_sha_header(path)},
+            filename=os.path.basename(path),
         )
-    return FileResponse(
-        path,
-        media_type="application/octet-stream",
-        headers={"cache-control": "no-store", **_file_sha_header(path)},
-        filename=os.path.basename(path),
+    headers = {"cache-control": "no-store"}
+    if not permanent:
+        headers["retry-after"] = "5"
+    return Response(
+        detail + "\n",
+        status_code=404 if permanent else 503,
+        media_type="text/plain; charset=utf-8",
+        headers=headers,
     )
 
 

@@ -511,27 +511,43 @@ def test_btf_package_endpoint_serves_a_cached_package(client, configured, monkey
     assert res.content == b"btf" * 64
     # 别的内核系列别想拿这份去糊弄 (6.6 的设备要 6.6 的包)
     res66 = client.get("/c/btf?kver=6.6.141&arch=aarch64_cortex-a53&fmt=apk")
-    assert res66.status_code in (404, 502), res66.text
+    assert res66.status_code in (404, 502, 503), res66.text
 
 
 def test_btf_endpoint_never_hangs_and_says_exactly_what_to_do(client, configured, monkeypatch):
-    """取不到时: 立刻回一句能读懂的话 + 手工兜底路径 + "它不影响什么"。
+    """没缓存时: **立刻**回 503 + Retry-After + 一句人话, 后台去取。
 
-    与内核那条是同一个规矩 (8.41): 不许把请求挂在同步取件上。BTF 包小, 所以面板给的
-    是**有硬上限**的一次尝试, 失败就说清楚 —— 而不是"一直转"。
+    这是二轮修掉的 P1: `/c/btf` 是匿名可达的, 以前它在请求线程里同步跑最长 ~110 秒
+    (下载 90 秒 + 摘要清单查询), 40 个并发就能把 40 线程的同步端点池占满 —— 那时
+    /c/report、/sub、/api/* 全部排队排死。与 /c/bin、/c/geo、/c/perf 对齐成
+    "503 + 后台取"之后, 这里断言的是**响应不挂住**这件事本身。
     """
+    import time as _time
+
     from zeroproxy import router_client
 
-    monkeypatch.setattr(router_client, "btf_upstream_assets",
-                        lambda: (False, "上游资产清单取不到 (超时)", []))
+    kicked = []
+    monkeypatch.setattr(
+        router_client, "ensure_btf_async",
+        lambda *a, **k: (kicked.append(a), {"state": "downloading"})[1],
+    )
+    started = _time.perf_counter()
     res = client.get("/c/btf?kver=6.12.94&arch=aarch64_cortex-a53&fmt=apk")
-    assert res.status_code == 502, res.text
-    assert router_client.btf_dir() in res.text, "要告诉运营方包该放进哪个目录"
+    elapsed = _time.perf_counter() - started
+    assert res.status_code == 503, res.text
+    assert res.headers.get("retry-after") == "5"
+    assert elapsed < 2.0, f"端点必须立刻回执, 实际花了 {elapsed:.1f}s"
+    assert kicked, "应当把取件交给后台任务"
+    assert "正在准备" in res.text
     assert "不影响当前的 TUN / tproxy 数据面" in res.text, "别让用户以为装坏了"
-    # 清单拿到了、但这一档没有 (armv7 不在上游矩阵里) → 永久性的 404, 不是"再试试"
-    monkeypatch.setattr(router_client, "btf_upstream_assets", lambda: (True, "ok", _btf_assets()))
-    res = client.get("/c/btf?kver=6.12.94&arch=armv7&fmt=apk")
+    # 匿名端点不下发面板的绝对路径 (部署用户名/目录结构)
+    assert router_client.btf_dir() not in res.text
+
+    # 永久性不可用 (参数就不对) → 404, 且不该去起后台任务
+    kicked.clear()
+    res = client.get("/c/btf?kver=6.12.94&arch=aarch64_cortex-a53&fmt=xz")
     assert res.status_code == 404, res.text
+    assert not kicked
 
 
 # ---------------------------------------------------------------- 性能模式 (dae / eBPF)
@@ -938,13 +954,13 @@ def test_btf_fetch_downloads_through_the_mirrors_then_caches(client, configured,
     try:
         monkeypatch.setattr(router_client, "BTF_MIN_BYTES", 1024)
         monkeypatch.setattr(router_client, "MIRRORS", (srv.url,))
-        monkeypatch.setattr(router_client, "btf_upstream_assets", lambda: (True, "ok", _btf_assets()))
+        monkeypatch.setattr(router_client, "btf_upstream_assets", lambda *a, **k: (True, "ok", _btf_assets()))
         ok, detail, path = router_client.btf_fetch("6.12.94", "aarch64_cortex-a53", "apk")
         assert ok and path.endswith("aarch64_cortex-a53.apk"), detail
         assert open(path, "rb").read() == body
         asked = []
         monkeypatch.setattr(router_client, "btf_upstream_assets",
-                            lambda: (asked.append(1), (True, "ok", []))[1])
+                            lambda *a, **k: (asked.append(1), (True, "ok", []))[1])
         ok2, detail2, _ = router_client.btf_fetch("6.12.94", "aarch64_cortex-a53", "apk")
         assert ok2 and detail2 == "已缓存" and not asked, "缓存命中不该再去问上游"
     finally:

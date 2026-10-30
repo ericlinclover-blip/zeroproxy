@@ -50,15 +50,28 @@ upstream zeroproxy_panel {
 server {
     listen 80;
     listen [::]:80;
-    server_name @DOMAIN@;
+    # 没有域名时 (初始化前的临时状态) 不能拼出 `server_name ;` —— 那是语法错误,
+    # nginx -t 会直接 "invalid number of arguments"。
+    server_name @PORT80_SERVER_NAME@;
+
+    # 这个块以前是**唯一**没套脱敏日志的 server 块, 而它恰恰是明文入口:
+    # `?k=<设备 secret>` / `?token=<引导令牌>` 会按发行版默认 combined 格式原样写进
+    # access.log。文件头那段自述与 test_nginx_logging 都要求"任何块都脱敏"。
+    access_log /var/log/nginx/zeroproxy.access.log zeroproxy_safe if=$zeroproxy_loggable;
 
     # Let's Encrypt ACME 验证
     location ^~ /.well-known/acme-challenge/ {
         root @WWW@;
     }
 
-    location / {
+    # 只有裸根路径才补 /panel: 以前一律补, 于是 `http://域名/panel/` 被跳到
+    # `/panel/panel/`, 被 `location ^~ /panel/` 再剥一层后成 404。
+    location = / {
         return 308 https://$host/panel$request_uri;
+    }
+
+    location / {
+        return 308 https://$host$request_uri;
     }
 }
 
@@ -76,11 +89,31 @@ server {
         root @WWW@;
     }
 
+    location = / {
+        return 308 https://@REDIRECT_HOST@/panel$request_uri;
+    }
+
     location / {
-        return 308 https://@DOMAIN@/panel$request_uri;
+        return 308 https://@REDIRECT_HOST@$request_uri;
     }
 }
 
+@TLS_DOMAIN_BLOCK@@PANEL_DOMAIN_BLOCK@
+"""
+
+# 面板反代公共片段
+_PANEL_PROXY = """\
+        proxy_pass http://zeroproxy_panel;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;"""
+
+# 域名命中时的 443 入口块: 没有域名时**整块不生成** —— 否则会拼出 `server_name ;`
+# (nginx -t 直接语法错) 和一份指向不存在证书的 ssl 配置。
+_TLS_DOMAIN_BLOCK = """\
 server {
     listen 443 ssl;
     listen [::]:443 ssl;
@@ -169,18 +202,7 @@ server {
 @PANEL_PROXY@
     }
 }
-@PANEL_DOMAIN_BLOCK@
 """
-
-# 面板反代公共片段
-_PANEL_PROXY = """\
-        proxy_pass http://zeroproxy_panel;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 3600s;"""
 
 # 域名命中时的面板 server 块: 用真实证书 (已配置域名才有意义)
 _PANEL_DOMAIN_BLOCK = """\
@@ -282,10 +304,16 @@ def build_nginx_conf(state: dict) -> str:
     p = paths()
     cert = state["cert"]
     domain = (state.get("domain") or "").strip()
-    # 未配置域名时去掉域名面板块 (只有默认自签块, 供引导阶段用)
+    # 未配置域名时去掉域名面板块 (只有默认自签块, 供引导阶段用);
+    # 443 域名入口块同理 —— 没有域名就没有证书可用。
+    tls_block = _TLS_DOMAIN_BLOCK if domain else ""
     conf = _TEMPLATE.replace("@PANEL_DOMAIN_BLOCK@", _PANEL_DOMAIN_BLOCK if domain else "")
+    conf = conf.replace("@TLS_DOMAIN_BLOCK@", tls_block)
     subs = {
         "DOMAIN": domain,
+        # 空域名时: server_name 用 `_` (兜底), 跳转目标退回 $host (绝不能拼出 https:///)
+        "PORT80_SERVER_NAME": domain or "_",
+        "REDIRECT_HOST": domain or "$host",
         "WS_PORT": state["ports"]["ws_internal"],
         "WSPATH": WS_PATH,
         "WWW": p["www"],

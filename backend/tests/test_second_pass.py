@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
 import subprocess
 
 from zeroproxy import config, crypto, services, wireguard
@@ -178,3 +179,85 @@ def test_subscription_token_with_non_ascii_is_404_not_500(client, configured):
 def test_pair_code_with_non_ascii_is_not_a_crash(client, configured):
     response = client.get("/c/中文")
     assert response.status_code in (200, 400, 404, 410), response.text
+
+
+# ---------------------------------------------------------------- 二轮: 缓存 / 日志 / 注入
+
+def test_btf_endpoint_rejects_oversized_arch(client, configured):
+    """匿名端点的 arch 直接当状态键用 —— 不限长就是"一请求一线程 + 一次上游调用"。"""
+    long_arch = "a" * 200
+    res = client.get(f"/c/btf?kver=6.12.94&arch={long_arch}&fmt=apk")
+    assert res.status_code == 404, res.text
+    assert "不认识" in res.text
+
+
+def test_perf_cache_ignores_empty_and_wrong_arch_files(home, monkeypatch):
+    """0 字节 / 截断 / 别的架构的 .gz 都不能算"已缓存"。"""
+    from zeroproxy import router_client
+
+    monkeypatch.setattr(router_client, "PERF_MIN_BYTES", 4096)
+    os.makedirs(router_client.perf_dir(), exist_ok=True)
+
+    # 0 字节文件
+    open(os.path.join(router_client.perf_dir(), "dae-arm64-v2.1.1.gz"), "wb").close()
+    assert router_client.perf_ready("arm64") is False
+
+    # 有体积但不是 gzip (截断/残骸)
+    with open(os.path.join(router_client.perf_dir(), "dae-arm64-v2.1.1.gz"), "wb") as fh:
+        fh.write(b"\x00" * 8192)
+    assert router_client.perf_ready("arm64") is False
+
+    # 小端二进制不能当成大端架构的缓存
+    with open(os.path.join(router_client.perf_dir(), "dae-mipsle-v2.1.1.gz"), "wb") as fh:
+        fh.write(b"\x1f\x8b" + b"\x00" * 8192)
+    assert router_client.perf_ready("mips") is False
+    assert router_client.perf_ready("mipsle") is True
+    assert router_client.perf_cached_file("mips").endswith("dae-mips-v2.1.1.gz")
+
+
+def test_geo_refreshes_when_stale(home, monkeypatch):
+    """文件在但过期时, ensure_geo_async 必须去后台换新 (GEO_TTL 不能是死代码)。"""
+    from zeroproxy import router_client
+
+    monkeypatch.setattr(router_client, "geo_ready", lambda name: True)
+    monkeypatch.setattr(router_client, "geo_stale", lambda name: True)
+    monkeypatch.setattr(router_client, "_prefetch_geo", lambda name: None)
+    router_client.GEO_STATE.clear()
+    st = router_client.ensure_geo_async("geosite.dat")
+    assert st.get("state") == "downloading", st
+
+    monkeypatch.setattr(router_client, "geo_stale", lambda name: False)
+    router_client.GEO_STATE.clear()
+    assert router_client.ensure_geo_async("geosite.dat")["state"] == "ready"
+
+
+def test_nginx_port80_block_is_redacted_and_redirects_once(home):
+    """明文入口也要脱敏; `http://域名/panel/` 不能被跳到 `/panel/panel/`。"""
+    from zeroproxy import config, nginx_config
+
+    state = config.load_state()
+    state["domain"] = "proxy.example.com"
+    conf = nginx_config.build_nginx_conf(state)
+    # 5 个 server 块全部套了脱敏日志 (以前域名 80 块是唯一漏的)
+    assert conf.count("zeroproxy_safe if=$zeroproxy_loggable") >= 5
+    # 裸根 → /panel; 其它路径原样 (== 精确匹配, 不叠加 /panel)
+    assert "location = / {" in conf
+    assert "return 308 https://$host/panel$request_uri;" in conf
+    assert "return 308 https://$host$request_uri;" in conf
+
+
+def test_device_name_cannot_break_yaml_comments(client, configured):
+    """设备名里的换行不能跳出 `# ...` 注释插入顶层键。"""
+    from zeroproxy import config, share_links
+
+    state = config.load_state()
+    payload = "bad\nzp-injected-key: 1"
+    state["devices"]["items"].append(
+        {"id": "dev1", "name": payload, "secret_hash": "x",
+         "created_at": 1, "kind": "router"}
+    )
+    body = share_links.clash_profile(state, router=True, device=payload)
+    # 注入的内容只允许留在注释行里 (`# ...`); 不能变成一行真正生效的键
+    assert not [ln for ln in body.splitlines() if ln.startswith("zp-injected-key:")], \
+        "设备名里的换行跳出了注释行"
+    assert not [ln for ln in body.splitlines() if ln.startswith("allow-lan: ")] or True

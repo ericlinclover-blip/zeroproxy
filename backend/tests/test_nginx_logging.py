@@ -15,7 +15,31 @@ def _conf(home):
     from zeroproxy import config, nginx_config
 
     state = config.load_state()
+    # 已配置域名才生成 443 域名入口与 HSTS 块 —— 没有域名时那整块**必须**不生成
+    # (否则会拼出 `server_name ;` 这种语法非法的配置, 见 nginx_config._redirect_plan)。
+    state["domain"] = "proxy.example.com"
+    state["cert"] = {
+        "type": "selfsigned",
+        "issuer": "test",
+        "cert_file": str(home / "certs" / "cert.pem"),
+        "key_file": str(home / "certs" / "key.pem"),
+        "not_after": 0,
+    }
     return nginx_config.build_nginx_conf(state)
+
+
+def test_conf_without_domain_stays_syntactically_valid(home):
+    """没有域名的引导阶段: 不能有 `server_name ;` / `https:///`, 也不能有 443 块。"""
+    from zeroproxy import config, nginx_config
+
+    state = config.load_state()
+    state["domain"] = ""
+    conf = nginx_config.build_nginx_conf(state)
+    # 只看**指令行**: 注释里本来就会提到这些坑 (注释不是配置)
+    directives = [ln.strip() for ln in conf.splitlines() if not ln.strip().startswith("#")]
+    assert "server_name ;" not in directives
+    assert not [ln for ln in directives if "https:///" in ln]
+    assert "listen 443 ssl" not in directives
 
 
 def test_finished_conf_redacts_query_strings_and_sensitive_paths(home):

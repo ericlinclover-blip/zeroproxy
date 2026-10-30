@@ -25,6 +25,7 @@ TCP / WS / TLS / gRPC / Meek / HTTPUpgrade)。所以 `vless-xhttp` 会被排除,
 """
 from __future__ import annotations
 
+import ipaddress
 import re
 from urllib.parse import urlsplit
 
@@ -82,8 +83,17 @@ def panel_direct_rules(base: str) -> list[str]:
         return []
     if not host:
         return []
-    if host.replace(".", "").isdigit():
-        return [f"dip({host}/32) -> direct"]
+    # 用 ipaddress 判, 而不是 "去掉点以后全是数字": 后者会把 IPv6 当成域名
+    # (静默失效 → 面板自己被塞进代理, 就是注释里要避免的那个死锁), 也会把
+    # `1.2.3.4.5` 拼成 `dip(1.2.3.4.5/32)` 让整份配置校验失败。
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        addr = None
+    if addr is not None:
+        prefix = 128 if addr.version == 6 else 32
+        text = f"[{addr}]" if addr.version == 6 else str(addr)
+        return [f"dip({text}/{prefix}) -> direct"]
     return [f"domain(suffix: {host}) -> direct"]
 
 
@@ -117,6 +127,15 @@ def render(
     """
     tpl = template or share_links.template_of(state)
     nodes, skipped = usable_nodes(state)
+    if not nodes:
+        # 空节点池的配置**能过 `dae validate`** (sink 只校验出站名字存在), 但一跑就是
+        # "no dialer in this group" —— 用户只看到"性能模式切换失败", 看不到真实原因。
+        # 这种情况下直接报错, 让设备留在 mihomo 上, 别切到一份注定不通的配置。
+        raise ValueError(
+            "没有 dae 能用的节点"
+            + (f" (跳过了: {', '.join(skipped)})" if skipped else "")
+            + " —— 至少启用一个 Reality / Trojan / Hysteria 2 / WS 节点再试"
+        )
     lines: list[str] = []
     add = lines.append
 

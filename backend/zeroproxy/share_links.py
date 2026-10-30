@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from urllib.parse import quote, urlsplit
 
 import yaml
@@ -444,6 +445,15 @@ SUB_FORMATS = ("base64", "clash", "singbox")
 
 
 # ---------------------------------------------------------------- 通用小工具
+
+#: 控制字符 (含换行/回车)。它们出现在 YAML 注释里就是"跳出行首" = 插入一个顶层键。
+_CTRL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _comment_safe(value: str, limit: int = 120) -> str:
+    """把外部来的字符串压成一行, 供 `# ...` 注释使用。"""
+    return _CTRL_RE.sub("", str(value or ""))[:limit]
+
 
 def _q(text: str) -> str:
     """URL 组件编码 (分享链接里的名字/路径)。"""
@@ -1028,7 +1038,9 @@ def clash_profile(
             "# dnsmasq / 防火墙都不需要改动, 停掉内核即完全恢复原状",
         ]
         if device:
-            head.append(f"# 设备: {device}")
+            # 设备名来自 /c/pair 的 model/hostname (外部输入): 换行会跳出行注释,
+            # 在顶层插入任意键 —— 与已修的 ?tpl= 注入同类。
+            head.append(f"# 设备: {_comment_safe(device)}")
         if tpl != "direct":
             head.append(
                 "# 分流数据库 (GeoIP / GeoSite) 随安装由面板下发, 已放在本目录; "
@@ -1344,7 +1356,7 @@ def provider_profile(state: dict, prefix: str = "") -> str:
     head = [
         "# ZeroProxy 节点源 (mihomo proxy-provider) — 路由器端多服务器聚合用",
         "# 本文件只含节点; 规则 / DNS / tun 由路由器侧的骨架提供",
-        f"# 节点名前缀: {label or '(无)'}",
+        f"# 节点名前缀: {_comment_safe(label) or '(无)'}",
     ]
     body = yaml.safe_dump({"proxies": proxies}, allow_unicode=True, sort_keys=False)
     return "\n".join(head) + "\n" + body

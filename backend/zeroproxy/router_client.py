@@ -237,32 +237,51 @@ UA = "zeroproxy-panel"
 #: 低于这个大小一律视为下载失败 (一个正常的 mihomo 压缩包 ≈ 20 MB)。
 #: 可用 ZP_CORE_MIN_BYTES 调低 —— 自动化演练里用一个几 KB 的假内核就能把
 #: "下载 → 解压 → 可执行校验"这条路整条跑通, 不必真的下 20 MB。
-MIN_BYTES = int(os.environ.get("ZP_CORE_MIN_BYTES", str(4 << 20)))
+def _env_int(name: str, default) -> int:
+    """读一个整数环境变量; 写错就退默认值, 绝不让 import 期抛异常。
+
+    这些常量全部在**模块导入时**求值: 运维把 `ZP_CORE_MIN_BYTES=4M` 写进 unit 的
+    `Environment=`, 后果不是"这个值被忽略", 而是 `ValueError` 让 `import zeroproxy.main`
+    直接失败 —— 面板起不来, systemd 一直 Restart 循环, 人只看到 502。
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        raw = default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        try:
+            return int(default)
+        except (TypeError, ValueError):
+            return 0
+
+
+MIN_BYTES = _env_int("ZP_CORE_MIN_BYTES", str(4 << 20))
 
 #: 单个镜像的连接/读取超时。注意 urllib 的 timeout 是"每次 socket 操作"的上限,
 #: 不是整段传输的上限 —— 一个每秒滴一点数据的镜像可以让它永远不超时 (真机现场:
 #: 安装命令停在"下载代理内核"上不动, 就是这种慢速黑洞)。
-CORE_SOURCE_TIMEOUT = int(os.environ.get("ZP_CORE_SOURCE_TIMEOUT", "60"))
+CORE_SOURCE_TIMEOUT = _env_int("ZP_CORE_SOURCE_TIMEOUT", "60")
 
 #: 一次取内核的**总**时间上限。超过就如实报错, 让路由器端拿到一句能读懂的话
 #: (以前这里没有上限: 5 个镜像 × 180 秒, 用户看到的就是"卡住", 不是"失败")。
 #: 240 秒是量出来的: 一条 170 KB/s 的镜像线路取 20 MB 要 115 秒, 150 秒会把它
 #: 卡在门口; 而路由器端等的是 CORE_WAIT=360 秒, 比这里长, 所以它总能等到一个
 #: 明确的结果 (ready 或 error), 不会两边一起超时。
-CORE_DEADLINE = int(os.environ.get("ZP_CORE_DEADLINE", "240"))
+CORE_DEADLINE = _env_int("ZP_CORE_DEADLINE", "240")
 
 #: 官方直连那一档的最长等待 (秒)。黑洞掉的直连不值得花掉整个预算。
-CORE_DIRECT_BUDGET = int(os.environ.get("ZP_CORE_DIRECT_BUDGET", "25"))
+CORE_DIRECT_BUDGET = _env_int("ZP_CORE_DIRECT_BUDGET", "25")
 
 #: 速率闸门: 观察期过后, 若某个镜像的实测速率低于这个值, 就认定它**按当前速率
 #: 跑不完这 20 MB**, 立刻换下一个镜像。
 #: 为什么需要它: 一个"能连上、但在国内线路上只有 30 KB/s"的镜像会把整个 CORE_DEADLINE
 #: 吃掉却什么也拿不到 (20 MB / 30 KB/s = 11 分钟), 而排在后面的镜像可能一秒就通了。
 #: 有 Content-Length 时用"剩余字节 / 剩余时间"精确判断, 没有时才用这个兜底值。
-CORE_MIN_RATE_KB = int(os.environ.get("ZP_CORE_MIN_RATE_KB", "32"))
+CORE_MIN_RATE_KB = _env_int("ZP_CORE_MIN_RATE_KB", "32")
 
 #: 速率闸门的观察期 (秒): 前几秒的抖动不做数。
-CORE_RATE_GRACE = int(os.environ.get("ZP_CORE_RATE_GRACE", "8"))
+CORE_RATE_GRACE = _env_int("ZP_CORE_RATE_GRACE", "8")
 
 #: 路由器端的取内核顺序: panel (默认, 面板直传) / mirror (先直连镜像) / auto (同 panel)。
 #: 面板自建镜像的人可以用它做 A/B: 哪条快就固定哪条。
@@ -332,11 +351,39 @@ def cached_arches() -> list[dict]:
 CORE_LOCK = threading.Lock()
 CORE_STATE: dict[str, dict] = {}
 #: 一次失败之后的冷静时间: 路由器每几秒问一次, 不能让面板一直捶上游。
-CORE_RETRY_AFTER = int(os.environ.get("ZP_CORE_RETRY_AFTER", "20"))
+CORE_RETRY_AFTER = _env_int("ZP_CORE_RETRY_AFTER", "20")
 
 
 #: "官方直连"那一档的写法 —— 只有它需要短预算 (被墙时 connect 会一直挂着)。
 DIRECT_TEMPLATE = "{url}"
+
+
+def _part_path(dst: str) -> str:
+    """给这次下载一个**唯一**的临时文件名 (`<dst>.part-<pid>-<tid>`)。
+
+    以前所有线程共用 `<dst>.part`: 看门狗判定"卡死"后重起一轮、或两个入口同时要同一份
+    资产时, 先结束的那个在 finally 里 `os.remove(tmp)` 会把另一个正在写的文件删掉,
+    后者 `os.replace` 直接 FileNotFoundError。
+    """
+    return f"{dst}.part-{os.getpid()}-{threading.get_ident()}"
+
+
+def _prune_parts(directory: str, max_age: float = 6 * 3600.0) -> None:
+    """清掉崩溃/断电留下的 `.part-*` 残骸。"""
+    now = time.time()
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    for name in names:
+        if ".part-" not in name:
+            continue
+        path = os.path.join(directory, name)
+        try:
+            if now - os.path.getmtime(path) > max_age:
+                os.remove(path)
+        except OSError:
+            continue
 
 
 def _budget_for(template: str, remaining: float, timeout: int) -> int:
@@ -391,7 +438,9 @@ def core_sha256(path: str) -> str:
         st = os.stat(path)
     except OSError:
         return ""
-    key = (path, int(st.st_mtime), st.st_size)
+    # 键用**纳秒**时间戳 + ctime: 秒级 mtime 下,"同一秒内被写成另一份同尺寸内容"
+    # 会命中缓存, 返回已不在盘上那份的摘要 —— 而它正是 verify_asset / X-ZP-Sha256 的依据。
+    key = (path, st.st_mtime_ns, st.st_ctime_ns, st.st_size)
     hit = _SHA_CACHE.get(key)
     if hit:
         return hit
@@ -403,7 +452,11 @@ def core_sha256(path: str) -> str:
     except OSError:
         return ""
     value = digest.hexdigest()
-    _SHA_CACHE.clear()
+    # 保留最近几条而不是"只留一条": 四个匿名端点 (/c/bin、/c/geo、/c/perf/geo、
+    # /c/agent/bin) 共用这份缓存, 交替请求会让单条缓存永远不命中 —— 于是每个请求都在
+    # 请求线程里把 2-20 MB 重读一遍重算一次 sha256。
+    if len(_SHA_CACHE) >= 8:
+        _SHA_CACHE.pop(next(iter(_SHA_CACHE)), None)
     _SHA_CACHE[key] = value
     return value
 
@@ -492,8 +545,28 @@ def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+#: 固定摘要表是**按版本**抄的。用 `ZP_PERF_VERSION` / `ZP_CORE_VERSION` 换了版本之后,
+#: 表里那些值对新字节不成立: 以前拿旧摘要比新字节, 每个镜像都被判"摘要不一致 (可能被
+#: 替换了)" —— 新版本永远取不到, 而且和真投毒长得一模一样。现在按"这一档没有可信锚点"
+#: 处理 (如实记日志), 完整性交给体积 + Content-Length 闸门。
+PINNED_PERF_VERSION = "v2.1.1"
+PINNED_CORE_VERSION = "v1.19.32"
+
+
 def expected_sha256(asset: str) -> str:
     """固定摘要表里的期望值; 没登记返回空串 (= 这一档还没有可信锚点)。"""
+    if asset.startswith("dae-linux-") and PERF_VERSION != PINNED_PERF_VERSION:
+        supply_log(
+            f"{asset}: PERF_VERSION={PERF_VERSION} 与固定摘要表 ({PINNED_PERF_VERSION}) 不一致"
+            " —— 这一档没有可信锚点, 只过体积 / 完整性闸门"
+        )
+        return ""
+    if asset.startswith("mihomo-linux-") and CORE_VERSION != PINNED_CORE_VERSION:
+        supply_log(
+            f"{asset}: CORE_VERSION={CORE_VERSION} 与固定摘要表 ({PINNED_CORE_VERSION}) 不一致"
+            " —— 这一档没有可信锚点, 只过体积 / 完整性闸门"
+        )
+        return ""
     return PINNED_SHA256.get(asset, "")
 
 
@@ -593,7 +666,11 @@ def ensure_core_async(arch: str) -> dict:
         return core_state(arch)
     with CORE_LOCK:
         entry = CORE_STATE.setdefault(arch, {})
-        if entry.get("state") == "downloading":
+        wedged = (
+            entry.get("state") == "downloading"
+            and time.time() - float(entry.get("started") or 0) > max(120, CORE_DEADLINE * 3)
+        )
+        if entry.get("state") == "downloading" and not wedged:
             return core_state(arch)
         failed_at = int(entry.get("done") or 0)
         if entry.get("state") == "error" and time.time() - failed_at < CORE_RETRY_AFTER:
@@ -606,7 +683,15 @@ def ensure_core_async(arch: str) -> dict:
             "started": int(time.time()),
             "done": 0,
         })
-    threading.Thread(target=_prefetch, args=(arch,), daemon=True, name=f"zp-core-{arch}").start()
+    try:
+        threading.Thread(
+            target=_prefetch, args=(arch,), daemon=True, name=f"zp-core-{arch}"
+        ).start()
+    except Exception as exc:  # noqa: BLE001 — 线程起不来不能让状态永远停在"下载中"
+        with CORE_LOCK:
+            CORE_STATE.setdefault(arch, {}).update(
+                {"state": "error", "error": f"无法启动后台任务: {exc}", "done": int(time.time())}
+            )
     return core_state(arch)
 
 
@@ -649,7 +734,8 @@ def fetch_core(
     if deadline is None:
         deadline = time.time() + CORE_DEADLINE
     os.makedirs(core_dir(), exist_ok=True)
-    tmp = dst + ".part"
+    _prune_parts(core_dir())
+    tmp = _part_path(dst)
     url = release_url(arch)
     errors: list[str] = []
     for template in MIRRORS:
@@ -671,6 +757,8 @@ def fetch_core(
                     total = int(resp.headers.get("content-length") or 0)
                 except (TypeError, ValueError):
                     total = 0
+                # total 以前只喂速率闸门; 这里再当完整性闸门用: 中途断流留下的半截
+                # .gz 仍可能过 MIN_BYTES, 而它会被路由器**以 root 执行**。
                 next_note = 1 << 20          # 每 1 MB 回一次进度
                 with open(tmp, "wb") as fh:
                     while True:
@@ -704,6 +792,9 @@ def fetch_core(
                                     )
             if size < MIN_BYTES:
                 errors.append(f"{source} 体积异常 ({size} 字节)")
+                continue
+            if total and size != total:
+                errors.append(f"{source} 传输不完整 ({size}/{total} 字节)")
                 continue
             # 供应链闸门: 官方发布页上的摘要必须对得上 —— 反代/CDN 只能骗传输。
             good, why = verify_asset(tmp, asset_name(arch), kind="mihomo 内核")
@@ -758,7 +849,7 @@ GEO_FILES: dict[str, tuple[str, int]] = {
 
 #: 数据过期时间: 超过就从上游重取 (分流数据不是"越新越好", 但也不能永远不更新 —— 一周
 #: 一次足够, 而且只在路由器安装/重装时才下载)。
-GEO_TTL = int(os.environ.get("ZP_GEO_TTL", str(7 * 86400)))
+GEO_TTL = _env_int("ZP_GEO_TTL", str(7 * 86400))
 
 #: 单个镜像的超时 (4 MB 的文件, 90 秒足够; 与 mihomo 自己的下载超时同量级)。
 GEO_SOURCE_TIMEOUT = 90
@@ -794,11 +885,11 @@ GEO_MIRRORS = _geo_mirror_list()
 
 #: 一次下载的总时间上限。5 个镜像各 90 秒最坏是 7 分钟, 而路由器正在**同步等**这份
 #: 数据 —— 它不可能给一台面板几分钟去翻墙。到点就如实报错, 让路由器先降级装上。
-GEO_DEADLINE = int(os.environ.get("ZP_GEO_DEADLINE", "200"))
+GEO_DEADLINE = _env_int("ZP_GEO_DEADLINE", "200")
 
 #: 体积下限 (挡 404 页面 / 限流提示)。演练里用 ZP_GEO_MIN_BYTES 调低: 一个几百字节的
 #: 假文件就能把"路由器从面板取数据"这条路整条跑通。
-GEO_MIN_OVERRIDE = int(os.environ.get("ZP_GEO_MIN_BYTES", "0") or 0)
+GEO_MIN_OVERRIDE = _env_int("ZP_GEO_MIN_BYTES", "0")
 
 #: 同一时间只允许一个下载任务: 两台路由器同时装机时不该把 4 MB 的文件拉两遍。
 GEO_LOCK = threading.Lock()
@@ -853,7 +944,7 @@ GEO_LOCK_ASYNC = threading.Lock()
 GEO_STATE: dict[str, dict] = {}
 
 #: 上一轮取失败了就等一会儿再试 —— 免得路由器每 5 秒重试一次、把上游刷成攻击。
-GEO_RETRY_AFTER = int(os.environ.get("ZP_GEO_RETRY_AFTER", "60"))
+GEO_RETRY_AFTER = _env_int("ZP_GEO_RETRY_AFTER", "60")
 
 
 def geo_pending_text(name: str) -> str:
@@ -874,11 +965,17 @@ def ensure_geo_async(name: str) -> dict:
     """确保有一份分流数据库正在后台下载, **不阻塞**调用方。返回当前状态。"""
     if name not in GEO_FILES:
         return {"state": "unknown", "error": f"未知的数据文件: {name}"}
-    if geo_ready(name):
+    # 有文件但**过期**时不能直接返回 ready: 那样 GEO_TTL 永远不生效, 数据会一直停在
+    # 装机那天的快照 (routes 里那句"后台换新的"也就成了空操作)。
+    if geo_ready(name) and not geo_stale(name):
         return {"state": "ready"}
     with GEO_LOCK_ASYNC:
         entry = GEO_STATE.setdefault(name, {})
-        if entry.get("state") == "downloading":
+        wedged = (
+            entry.get("state") == "downloading"
+            and time.time() - float(entry.get("started") or 0) > max(120, GEO_DEADLINE * 3)
+        )
+        if entry.get("state") == "downloading" and not wedged:
             return dict(entry)
         failed_at = int(entry.get("done") or 0)
         if entry.get("state") == "error" and time.time() - failed_at < GEO_RETRY_AFTER:
@@ -886,7 +983,15 @@ def ensure_geo_async(name: str) -> dict:
         entry.update(
             {"state": "downloading", "error": "", "started": int(time.time()), "done": 0}
         )
-    threading.Thread(target=_prefetch_geo, args=(name,), daemon=True, name=f"zp-geo-{name}").start()
+    try:
+        threading.Thread(
+            target=_prefetch_geo, args=(name,), daemon=True, name=f"zp-geo-{name}"
+        ).start()
+    except Exception as exc:  # noqa: BLE001
+        with GEO_LOCK_ASYNC:
+            GEO_STATE.setdefault(name, {}).update(
+                {"state": "error", "error": f"无法启动后台任务: {exc}", "done": int(time.time())}
+            )
     with GEO_LOCK_ASYNC:
         return dict(GEO_STATE.get(name) or {})
 
@@ -944,7 +1049,7 @@ def fetch_geo(
         if not force and geo_ready(name) and not geo_stale(name):
             return True, "已缓存", dst
         os.makedirs(geo_dir(), exist_ok=True)
-        tmp = dst + ".part"
+        tmp = _part_path(dst)
         deadline = time.time() + GEO_DEADLINE
         for template in GEO_MIRRORS:
             source = template.format(url=url)
@@ -1033,10 +1138,10 @@ BTF_API = os.environ.get("ZP_BTF_API", "https://api.github.com").rstrip("/")
 BTF_SERIES = ("6.6", "6.12")
 #: 取 BTF 包的总时限 (秒)。文件只有几 MB, 但装机时路由器正挂在请求上等 —— 所以它有
 #: **硬上限**, 到点就回一句人话 (与内核那条路同一个原则: 不许"一直转").
-BTF_DEADLINE = int(os.environ.get("ZP_BTF_DEADLINE", "90"))
-BTF_SOURCE_TIMEOUT = int(os.environ.get("ZP_BTF_SOURCE_TIMEOUT", "45"))
+BTF_DEADLINE = _env_int("ZP_BTF_DEADLINE", "90")
+BTF_SOURCE_TIMEOUT = _env_int("ZP_BTF_SOURCE_TIMEOUT", "45")
 #: 低于这个大小一律当下载失败 (正常的 BTF blob 几 MB; 反代回的 HTML 页面只有几十 KB)。
-BTF_MIN_BYTES = int(os.environ.get("ZP_BTF_MIN_BYTES", str(256 << 10)))
+BTF_MIN_BYTES = _env_int("ZP_BTF_MIN_BYTES", str(256 << 10))
 #: 手上已经放好包 (data/client/btf/) 的人可以把它钉死, 跳过上游资产清单那一步。
 BTF_VERSION = os.environ.get("ZP_BTF_VERSION", "").strip()
 
@@ -1109,7 +1214,9 @@ def btf_cached(minor: str, arch: str, ext: str) -> str:
             if minor and btf_minor(m.group(1)) != minor:
                 continue
             key = btf_version_key(m.group(1))
-            if (key, -rank) > (best_key, -best_rank):
+            # 先比架构精确度 (rank 小的优先), 同档再比版本。反过来会让"通用档的新版本"
+            # 压过"精确架构的旧版本", 与 btf_pick 的分组顺序相反。
+            if rank < best_rank or (rank == best_rank and key > best_key):
                 best_key, best_rank, best_path = key, rank, os.path.join(btf_dir(), name)
     if not best_path:
         return ""
@@ -1135,7 +1242,7 @@ BTF_SUMS_MAX_BYTES = 512 << 10
 _BTF_SUMS_CACHE: dict[str, str] = {}
 _BTF_SUMS_AT = 0.0
 #: 清单缓存多久 (秒)。取不到时也按同一个间隔退避, 免得每台设备装机都去撞一次上游。
-BTF_SUMS_TTL = int(os.environ.get("ZP_BTF_SUMS_TTL", "600"))
+BTF_SUMS_TTL = _env_int("ZP_BTF_SUMS_TTL", "600")
 
 
 def _parse_sha256sums(text: str) -> dict[str, str]:
@@ -1155,26 +1262,45 @@ def _parse_sha256sums(text: str) -> dict[str, str]:
     return out
 
 
-def btf_sums_lookup(asset: str, *, timeout: int = 25) -> str:
+#: 摘要清单的取用串行化。以前"开始取"和"取失败"共用一个时间戳: 一个线程正在取时,
+#: 另一个线程立刻拿到空串 → btf_verify 按"上游没给摘要"**放行** (供应链闸门 fail-open)。
+_BTF_SUMS_LOCK = threading.Lock()
+
+
+def btf_sums_lookup(asset: str, *, timeout: int = 25, deadline: float | None = None) -> str:
     """从上游 release 的 SHA256SUMS 里取一个资产的摘要 (取不到返回空串)。
 
     只走默认镜像表 (与资产本身同一条路): 它挡不住"整条链路一起被换", 但能挡住
     "某个反代回了一份别的字节 / 半截文件"。真正的固定锚点还是要靠上游发布版本号 ——
     BTF 的 tag 是 latest, 这一档只能做到这里 (残余风险已在报告里写明)。
+
+    并发语义: 同一时刻只有一个线程去取, 其它线程**等它取完**再读缓存 —— 而不是
+    直接拿到空串当成"上游没有摘要"。
     """
     global _BTF_SUMS_AT
     if asset == BTF_SUMS_NAME:
         return ""
-    if not _BTF_SUMS_CACHE and (time.time() - _BTF_SUMS_AT) < BTF_SUMS_TTL:
-        return ""  # 刚试过、没取到: TTL 内不重复撞上游
-    if not _BTF_SUMS_CACHE:
-        _BTF_SUMS_AT = time.time()
+    if _BTF_SUMS_CACHE:
+        return _BTF_SUMS_CACHE.get(asset, "")
+    with _BTF_SUMS_LOCK:
+        if asset in _BTF_SUMS_CACHE:             # 等锁期间别人可能已经取到了
+            return _BTF_SUMS_CACHE[asset]
+        if (time.time() - _BTF_SUMS_AT) < BTF_SUMS_TTL:
+            # 两种"缓存里没有它": 清单一整份都没取到 (上一轮失败), 或者清单是旧快照
+            # (上游刚发了新内核包)。TTL 内先按"没有锚点"放行, 到点后强制刷新一次。
+            return ""
+        budget = int(timeout)
+        if deadline is not None:
+            budget = max(5, min(budget, int(deadline - time.time())))
+        fetched: dict[str, str] = {}
         url = btf_asset_url(BTF_SUMS_NAME)
         for template in MIRRORS:
+            if deadline is not None and time.time() > deadline:
+                break
             source = template.format(url=url)
             try:
                 request = urllib.request.Request(source, headers={"User-Agent": UA})
-                with urllib.request.urlopen(request, timeout=timeout) as resp:
+                with urllib.request.urlopen(request, timeout=budget) as resp:
                     status = getattr(resp, "status", 200)
                     if status is not None and status != 200:
                         continue
@@ -1183,12 +1309,16 @@ def btf_sums_lookup(asset: str, *, timeout: int = 25) -> str:
                 continue
             parsed = _parse_sha256sums(raw.decode("utf-8", "replace"))
             if parsed:
-                _BTF_SUMS_CACHE.update(parsed)
+                fetched = parsed
                 break
+        _BTF_SUMS_AT = time.time()               # 成败都记, 但只在**尝试结束之后**
+        _BTF_SUMS_CACHE.update(fetched)
     return _BTF_SUMS_CACHE.get(asset, "")
 
 
-def btf_verify(path: str, asset: str, digest: str = "") -> tuple[bool, str]:
+def btf_verify(
+    path: str, asset: str, digest: str = "", deadline: float | None = None
+) -> tuple[bool, str]:
     """BTF 包的摘要校验: 资产 digest > SHA256SUMS > (都没有) 如实记录后放行。"""
     if not SUPPLY_VERIFY:
         supply_log(f"BTF {asset}: 本次关闭了摘要比对 (ZP_SUPPLY_VERIFY=0)")
@@ -1197,7 +1327,7 @@ def btf_verify(path: str, asset: str, digest: str = "") -> tuple[bool, str]:
     if want.startswith("sha256:"):
         want = want[len("sha256:"):].strip()
     if not want:
-        want = btf_sums_lookup(asset)
+        want = btf_sums_lookup(asset, deadline=deadline)
     if not want:
         supply_log(f"BTF {asset}: 上游没有给 digest / SHA256SUMS 也取不到, 只过了体积闸门")
         return True, "未校验 (上游没有摘要)"
@@ -1208,7 +1338,17 @@ def btf_verify(path: str, asset: str, digest: str = "") -> tuple[bool, str]:
     return True, ""
 
 
-def btf_upstream_assets() -> tuple[bool, str, list[dict]]:
+def _safe_int(value, default: int = 0) -> int:
+    """上游给的数字字段: 解析不了就退默认值 (别让它变成一次 500)。"""
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def btf_upstream_assets(
+    timeout: int = 20, *, use_cache: bool = True
+) -> tuple[bool, str, list[dict]]:
     """问一次上游 release 的资产清单。返回 (ok, 说明, [{name, url, size}])。
 
     只在缓存里没有时才问, 而且**只问一次** (装机时路由器挂在请求上等, 这里不能反复
@@ -1216,29 +1356,41 @@ def btf_upstream_assets() -> tuple[bool, str, list[dict]]:
     """
     if BTF_VERSION:
         return True, "已钉版本", [{"version": BTF_VERSION}]
+    if use_cache and _BTF_ASSETS_CACHE["assets"] and (
+        time.time() - float(_BTF_ASSETS_CACHE["at"] or 0) < BTF_ASSETS_TTL
+    ):
+        return True, _BTF_ASSETS_CACHE["detail"], list(_BTF_ASSETS_CACHE["assets"])
     url = f"{BTF_API}/repos/{BTF_REPO}/releases/tags/latest"
     headers = {"User-Agent": UA, "Accept": "application/vnd.github+json"}
     try:
         request = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(request, timeout=20) as resp:
+        with urllib.request.urlopen(request, timeout=max(5, int(timeout))) as resp:
             payload = json.loads(resp.read().decode("utf-8", "replace"))
     except (urllib.error.URLError, OSError, ValueError) as exc:
         return False, f"上游资产清单取不到 ({exc})", []
+    if not isinstance(payload, dict):
+        # 上游被反代换成数组/字符串时, 以前是 `payload.get` 抛 AttributeError 变成 500
+        return False, "上游资产清单格式不对 (不是对象)", []
     assets = []
     for item in payload.get("assets", []) or []:
+        if not isinstance(item, dict):
+            continue
         name = str(item.get("name") or "")
         if not name:
             continue
         assets.append({
             "name": name,
             "url": str(item.get("browser_download_url") or btf_asset_url(name)),
-            "size": int(item.get("size") or 0),
+            "size": _safe_int(item.get("size")),
             # GitHub 给每个 release 资产算了 digest (`sha256:…`)。有它就不必再取
             # SHA256SUMS —— 它是发布侧给出的期望值, 与下载链路无关。
             "digest": str(item.get("digest") or ""),
         })
     if not assets:
         return False, "上游 release 里一个资产都没有", []
+    _BTF_ASSETS_CACHE.update(
+        {"at": time.time(), "ok": True, "detail": "ok", "assets": list(assets)}
+    )
     return True, "ok", assets
 
 
@@ -1270,12 +1422,179 @@ def btf_pick(assets: list[dict], minor: str, arch: str, ext: str) -> list[dict]:
     return picked
 
 
+# ---------------------------------------------------------------- BTF 异步取用
+# `/c/btf` 是**匿名可达**的: 以前它在请求线程里同步跑最长 ~110 秒 (90 秒下载 + 摘要清单
+# 最多 6×25 秒), 而 FastAPI 的同步端点跑在 40 线程的池子里 —— 40 个并发请求就能把
+# /c/report、/sub、/api/* 全部排队排死。这里与 /c/bin、/c/geo、/c/perf 对齐成
+# "立刻回一句人话 + 后台去取"。
+BTF_LOCK = threading.Lock()
+BTF_STATE: dict[str, dict] = {}
+BTF_RETRY_AFTER = _env_int("ZP_BTF_RETRY_AFTER", "60")
+#: 同一时刻只允许一个 BTF 抓取: 两个线程共享同一个 `<name>.part` 时, 一个线程的 finally
+#: 清理会删掉另一个正在写的文件, 对方随后 os.replace 就是 FileNotFoundError。
+_BTF_FETCH_LOCK = threading.Lock()
+#: 一次抓取最多允许"在跑"多久 (超过就当那一轮线程已经死了)
+_BTF_WEDGE = max(120, BTF_DEADLINE * 3)
+
+
+def btf_key(kver: str, arch: str, ext: str) -> str:
+    return f"{btf_minor(kver)}|{(arch or '').strip()}|{(ext or 'apk').strip().lower()}"
+
+
+def btf_state(kver: str, arch: str, ext: str) -> dict:
+    key = btf_key(kver, arch, ext)
+    minor = btf_minor(kver)
+    if minor and btf_cached(minor, (arch or "").strip(), (ext or "apk").strip().lower()):
+        return {"key": key, "state": "ready", "detail": "面板已缓存", "error": "", "started": 0, "done": 0}
+    with BTF_LOCK:
+        entry = dict(BTF_STATE.get(key) or {})
+    entry["key"] = key
+    entry.setdefault("state", "missing")
+    return entry
+
+
+def btf_wait_text(kver: str, arch: str, ext: str) -> str:
+    """等取时给路由器端看的一句话 (客户端会把正文第一行当原因打印出来)。"""
+    st = btf_state(kver, arch, ext)
+    if st.get("state") == "error":
+        return btf_pending_text(kver, arch, ext, str(st.get("error") or "上游不可达"))
+    if st.get("state") == "downloading":
+        return (
+            f"面板正在准备内核 BTF 包 (内核 {kver or '?'} · {arch or '?'} · {ext})… "
+            "这不是错误 —— 稍后会自动重试。这一档只影响 eBPF 性能模式, "
+            "不影响当前的 TUN / tproxy 数据面。"
+        )
+    return btf_pending_text(kver, arch, ext, "面板正在准备")
+
+
+def ensure_btf_async(kver: str, arch: str, ext: str) -> dict:
+    """确保有一份 BTF 包正在后台准备, **不阻塞**调用方。返回当前状态。"""
+    key = btf_key(kver, arch, ext)
+    spawn = False
+    with BTF_LOCK:
+        entry = BTF_STATE.setdefault(key, {})
+        wedged = (
+            entry.get("state") == "downloading"
+            and time.time() - float(entry.get("started") or 0) > _BTF_WEDGE
+        )
+        if entry.get("state") == "downloading" and not wedged:
+            out = dict(entry)
+            out["key"] = key
+            return out
+        if (
+            entry.get("state") == "error"
+            and time.time() - float(entry.get("done") or 0) < BTF_RETRY_AFTER
+            and not wedged
+        ):
+            out = dict(entry)
+            out["key"] = key
+            return out
+        entry.update(
+            {"state": "downloading", "detail": "正在从上游取", "error": "",
+             "started": int(time.time()), "done": 0}
+        )
+        spawn = True
+    if spawn:
+        if not _BTF_CONCURRENCY.acquire(blocking=False):
+            # 后台已经在取别的档了: 先把状态退回"未知", 让调用方稍后重试,
+            # 而不是再起一个线程去打上游。
+            with BTF_LOCK:
+                BTF_STATE.setdefault(key, {}).update({"state": "", "detail": "", "error": ""})
+            return btf_state(kver, arch, ext)
+        try:
+            threading.Thread(
+                target=_prefetch_btf, args=(kver, arch, ext), daemon=True,
+                name=f"zp-btf-{key}",
+            ).start()
+        except Exception as exc:  # noqa: BLE001 — 线程起不来不能让状态停在"下载中"
+            _BTF_CONCURRENCY.release()
+            with BTF_LOCK:
+                BTF_STATE.setdefault(key, {}).update(
+                    {"state": "error", "error": f"无法启动后台任务: {exc}",
+                     "done": int(time.time())}
+                )
+        with BTF_LOCK:
+            _btf_trim_locked()
+    return btf_state(kver, arch, ext)
+
+
+def _prefetch_btf(kver: str, arch: str, ext: str) -> None:
+    key = btf_key(kver, arch, ext)
+    try:
+        ok, detail, _path = btf_fetch(kver, arch, ext)
+    except Exception as exc:  # noqa: BLE001 — 后台线程不能死得无声无息
+        ok, detail = False, f"取 BTF 包时出错了: {exc}"
+    with BTF_LOCK:
+        BTF_STATE.setdefault(key, {}).update(
+            {"state": "ready" if ok else "error", "detail": detail,
+             "error": "" if ok else detail, "done": int(time.time())}
+        )
+    _BTF_CONCURRENCY.release()
+
+
+#: `arch` / `kver` 来自**匿名**请求, 直接当状态键用: 不限长就是一个"一请求一线程 +
+#: 一次未认证 GitHub API 调用"的放大面 (60 次/小时配额打满 → 真实装机全 503)。
+_ARCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,47}$")
+_KVER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,63}$")
+#: 状态表上限: 只保留仍需要回答的那几档 (超出时丢最旧的已结束项)
+BTF_STATE_MAX = 32
+#: 同一时刻最多允许几个后台抓取 (再多就回 503 让它稍后重试)
+_BTF_CONCURRENCY = threading.Semaphore(2)
+#: 上游资产清单的 TTL 缓存 —— 原来每个不同 key 都会直连一次 api.github.com
+_BTF_ASSETS_CACHE: dict = {"at": 0.0, "ok": False, "detail": "", "assets": []}
+BTF_ASSETS_TTL = _env_int("ZP_BTF_ASSETS_TTL", "600")
+
+
+def _btf_trim_locked() -> None:
+    """状态表超限时丢掉最旧的"已结束"项 (调用方必须已持 BTF_LOCK)。"""
+    if len(BTF_STATE) <= BTF_STATE_MAX:
+        return
+    done = [
+        (float(v.get("done") or v.get("started") or 0), k)
+        for k, v in BTF_STATE.items()
+        if v.get("state") != "downloading"
+    ]
+    for _, key in sorted(done)[: max(0, len(BTF_STATE) - BTF_STATE_MAX)]:
+        BTF_STATE.pop(key, None)
+
+
+def btf_prepare(kver: str, arch: str, ext: str) -> tuple[bool, str, str]:
+    """端点用的入口。返回 (是否**永久**不可用, 给用户的一句话, 本地路径)。
+
+    永久不可用 (400/404 语义): 参数不认识、内核系列社区没有现成件 —— 重试也没用。
+    其余情况一律"后台去取", 端点回 503 + Retry-After。
+    """
+    kver = (kver or "").strip()
+    arch = (arch or "").strip()
+    ext = (ext or "apk").strip().lower()
+    if ext not in ("apk", "ipk"):
+        return True, f"不认识的包格式: {ext}", ""
+    minor = btf_minor(kver)
+    if not kver or not minor:
+        return True, f"没给出可识别的内核版本 (收到 {kver!r})", ""
+    if not arch:
+        return True, "没给出设备架构", ""
+    if not _KVER_RE.match(kver) or not _ARCH_RE.match(arch):
+        return True, f"内核版本或架构写法不认识 (kver={kver[:24]!r} arch={arch[:24]!r})", ""
+    path = btf_cached(minor, arch, ext)
+    if path:
+        return False, "已缓存", path
+    if minor not in BTF_SERIES:
+        return True, (
+            f"这台内核是 {minor} 系列 —— 社区的 BTF 包只覆盖 {' / '.join(BTF_SERIES)} "
+            "(补 BTF 要有对应系列的影子内核, 别的系列没有现成件)"
+        ), ""
+    ensure_btf_async(kver, arch, ext)
+    return False, btf_wait_text(kver, arch, ext), ""
+
+
 def btf_pending_text(kver: str, arch: str, ext: str, why: str) -> str:
     """取不到时给路由器端的一句人话 —— 要说清"怎么办", 以及"它到底影响什么"。"""
     return (
         f"面板没能给这台设备准备内核 BTF 包 (内核 {kver or '?'} · {arch or '?'} · {ext}): {why}\n"
         f"1) 面板自己取不到上游时, 手动把匹配的包 (vmlinux-btf*{btf_minor(kver)}*{arch}*.{ext}) "
-        f"放进 {btf_dir()}/ 再重跑安装命令 —— 面板会直接把它发给路由器;\n"
+        "放进面板数据目录下的 client/btf/ (面板日志里有绝对路径) 再重跑安装命令 —— "
+        "面板会直接把它发给路由器;\n"
         f"2) 上游: https://github.com/{BTF_REPO}/releases (tag: latest)。\n"
         "这一档只关系到 eBPF 性能档 (dae 那一类), **不影响当前的 TUN / tproxy 数据面**。"
     )
@@ -1300,13 +1619,19 @@ def btf_fetch(kver: str, arch: str, ext: str, *, deadline: float | None = None) 
     cached = btf_cached(minor, arch, ext)
     if cached:
         return True, "已缓存", cached
+    if deadline is None:
+        deadline = time.time() + BTF_DEADLINE
     if minor not in BTF_SERIES:
         return False, (
             f"这台内核是 {minor} 系列 —— 社区的 BTF 包只覆盖 {' / '.join(BTF_SERIES)} "
             "(补 BTF 要有对应系列的影子内核, 别的系列没有现成件)"
         ), ""
 
-    ok, detail, assets = btf_upstream_assets()
+    # 清单查询与摘要查询**都**要算进这一轮的时限: 它们各自最多几十秒, 加起来能顶掉
+    # 一整个 90 秒预算, 却原来完全不受 deadline 约束。
+    ok, detail, assets = btf_upstream_assets(
+        timeout=max(5, min(BTF_SOURCE_TIMEOUT, int(deadline - time.time())))
+    )
     if not ok:
         return False, detail, ""
     picks = btf_pick(assets, minor, arch, ext)
@@ -1317,15 +1642,21 @@ def btf_fetch(kver: str, arch: str, ext: str, *, deadline: float | None = None) 
             f"该格式上游有的架构: {', '.join(available) or '无'}"
         ), ""
 
-    if deadline is None:
-        deadline = time.time() + BTF_DEADLINE
     os.makedirs(btf_dir(), exist_ok=True)
+    # 同一时刻只允许一个 BTF 抓取: 两个线程共享同一个 `<name>.part` 时, 一个线程的
+    # finally 清理会删掉另一个正在写的文件, 对方随后 os.replace 直接 FileNotFoundError。
+    with _BTF_FETCH_LOCK:
+        return _btf_download(picks, deadline)
+
+
+def _btf_download(picks: list[dict], deadline: float) -> tuple[bool, str, str]:
+    """(持锁的) 实际下载循环, 从 btf_fetch 里拆出来。"""
     errors: list[str] = []
     for pick in picks:
         name = str(pick["name"])
         dst = os.path.join(btf_dir(), name)
         url = str(pick.get("url") or btf_asset_url(name))
-        tmp = dst + ".part"
+        tmp = _part_path(dst)
         for template in MIRRORS:
             left = deadline - time.time()
             if left <= 2:
@@ -1340,6 +1671,10 @@ def btf_fetch(kver: str, arch: str, ext: str, *, deadline: float | None = None) 
                         errors.append(f"{source} HTTP {status}")
                         continue
                     size = 0
+                    try:
+                        total = int(resp.headers.get("content-length") or 0)
+                    except (TypeError, ValueError):
+                        total = 0
                     with open(tmp, "wb") as fh:
                         while True:
                             # 与内核那条一样: 只有墙钟管得住"一直有数据但极慢"的连接
@@ -1353,8 +1688,13 @@ def btf_fetch(kver: str, arch: str, ext: str, *, deadline: float | None = None) 
                 if size < BTF_MIN_BYTES:
                     errors.append(f"{source} 体积异常 ({size} 字节)")
                     continue
+                if total and size != total:
+                    errors.append(f"{source} 传输不完整 ({size}/{total} 字节)")
+                    continue
                 # 摘要闸门: 上游 release 的资产 digest / SHA256SUMS 对得上才发出去。
-                good, why = btf_verify(tmp, name, str(pick.get("digest") or ""))
+                good, why = btf_verify(
+                    tmp, name, str(pick.get("digest") or ""), deadline=deadline
+                )
                 if not good:
                     errors.append(f"{source} {why}")
                     continue
@@ -1395,15 +1735,15 @@ PERF_ASSET: dict[str, str] = {
 }
 
 #: 解出来的 dae 二进制至少这么大 (真实的约 25-30 MB)。挡"上游给了一层错误页"这类事故。
-PERF_MIN_BYTES = int(os.environ.get("ZP_PERF_MIN_BYTES", str(6 << 20)))
+PERF_MIN_BYTES = _env_int("ZP_PERF_MIN_BYTES", str(6 << 20))
 #: 一次取 dae 的总时限。它比内核小 (10 MB 的 tar.xz), 但同样是"有上限的等待"。
-PERF_DEADLINE = int(os.environ.get("ZP_PERF_DEADLINE", "300"))
-PERF_SOURCE_TIMEOUT = int(os.environ.get("ZP_PERF_SOURCE_TIMEOUT", "60"))
-PERF_DIRECT_BUDGET = int(os.environ.get("ZP_PERF_DIRECT_BUDGET", "25"))
+PERF_DEADLINE = _env_int("ZP_PERF_DEADLINE", "300")
+PERF_SOURCE_TIMEOUT = _env_int("ZP_PERF_SOURCE_TIMEOUT", "60")
+PERF_DIRECT_BUDGET = _env_int("ZP_PERF_DIRECT_BUDGET", "25")
 
 PERF_LOCK = threading.Lock()
 PERF_STATE: dict[str, dict] = {}
-PERF_RETRY_AFTER = int(os.environ.get("ZP_PERF_RETRY_AFTER", "20"))
+PERF_RETRY_AFTER = _env_int("ZP_PERF_RETRY_AFTER", "20")
 
 
 def perf_dir() -> str:
@@ -1431,36 +1771,47 @@ def perf_ready(arch: str) -> bool:
     手工放进去的也算 (运维在面板取不到上游时的兜底): 只要文件名里带 `dae` 与这个架构,
     体积过关就用它 —— 与内核那个"手动放压缩包"的兜底同款。
     """
-    path = perf_file(arch)
-    try:
-        if os.path.getsize(path) >= (PERF_MIN_BYTES // 4):
-            return True
-    except OSError:
-        pass
+    if _perf_file_ok(perf_file(arch)):
+        return True
     try:
         names = os.listdir(perf_dir())
     except OSError:
         return False
-    for name in _perf_candidates(names, arch):
-        try:
-            if os.path.getsize(os.path.join(perf_dir(), name)) >= (PERF_MIN_BYTES // 4):
-                return True
-        except OSError:
-            continue
-    return False
+    return any(_perf_file_ok(os.path.join(perf_dir(), name)) for name in _perf_candidates(names, arch))
+
+
+def _perf_min_size() -> int:
+    return max(1, PERF_MIN_BYTES // 4)
+
+
+def _perf_file_ok(path: str) -> bool:
+    """这一份 .gz 能不能发出去: 体积过门槛 + gzip 魔数对。
+
+    只看 `os.path.exists` 会把 0 字节 / 半截 / 旧版本的文件发出去 —— 路由器
+    `gunzip` 失败, 而 `perf_ready` 那边又会认为"已缓存", 于是一直不重下。
+    """
+    try:
+        if os.path.getsize(path) < _perf_min_size():
+            return False
+        with open(path, "rb") as fh:
+            return fh.read(2) == b"\x1f\x8b"
+    except OSError:
+        return False
 
 
 def perf_cached_file(arch: str) -> str:
     """返回实际要发出去的那一份 (优先精确版本号那个文件名)。"""
     path = perf_file(arch)
-    if os.path.exists(path):
+    if _perf_file_ok(path):
         return path
     try:
-        names = sorted(os.listdir(perf_dir()))
+        names = os.listdir(perf_dir())
     except OSError:
         return path
     for name in _perf_candidates(names, arch):
-        return os.path.join(perf_dir(), name)
+        candidate = os.path.join(perf_dir(), name)
+        if _perf_file_ok(candidate):
+            return candidate
     return path
 
 
@@ -1488,6 +1839,10 @@ def _extract_dae(archive_path: str, dest_bin: str) -> tuple[bool, str]:
     """
     import tarfile
 
+    #: 单个成员解出来最多这么大: 压缩炸弹 (高压缩比 tar.xz, 或 tar 头虚报 size) 能把
+    #: data 盘写满, 而那目录里有面板的全部状态。
+    limit = 256 << 20
+    written = 0
     member = None
     try:
         with tarfile.open(archive_path, "r:xz") as tf:
@@ -1501,6 +1856,11 @@ def _extract_dae(archive_path: str, dest_bin: str) -> tuple[bool, str]:
                     member = item
             if member is None:
                 return False, "压缩包里没有文件"
+            if member.size and member.size > limit:
+                return False, (
+                    f"压缩包里的 {member.name} 解出来有 {member.size // 1048576} MB, "
+                    "超过上限 (不像一个 dae 二进制)"
+                )
             handle = tf.extractfile(member)
             if handle is None:
                 return False, f"读不到压缩包里的 {member.name}"
@@ -1509,6 +1869,9 @@ def _extract_dae(archive_path: str, dest_bin: str) -> tuple[bool, str]:
                     chunk = handle.read(1 << 20)
                     if not chunk:
                         break
+                    written += len(chunk)
+                    if written > limit:
+                        return False, "解出来的内容超过上限 (疑似压缩炸弹)"
                     fh.write(chunk)
     except (tarfile.TarError, OSError, EOFError) as exc:
         return False, f"解包失败: {exc}"
@@ -1656,13 +2019,25 @@ def ensure_perf_async(arch: str) -> dict:
         return perf_state(arch)
     with PERF_LOCK:
         entry = PERF_STATE.setdefault(arch, {})
-        if entry.get("state") == "downloading":
+        wedged = (
+            entry.get("state") == "downloading"
+            and time.time() - float(entry.get("started") or 0) > max(120, PERF_DEADLINE * 3)
+        )
+        if entry.get("state") == "downloading" and not wedged:
             return perf_state(arch)
         if entry.get("state") == "error" and time.time() - float(entry.get("done") or 0) < PERF_RETRY_AFTER:
             return perf_state(arch)
         entry.update({"state": "downloading", "detail": "正在从上游下载", "bytes": 0,
                       "error": "", "started": int(time.time()), "done": 0})
-    threading.Thread(target=_prefetch_perf, args=(arch,), daemon=True, name=f"zp-perf-{arch}").start()
+    try:
+        threading.Thread(
+            target=_prefetch_perf, args=(arch,), daemon=True, name=f"zp-perf-{arch}"
+        ).start()
+    except Exception as exc:  # noqa: BLE001
+        with PERF_LOCK:
+            PERF_STATE.setdefault(arch, {}).update(
+                {"state": "error", "error": f"无法启动后台任务: {exc}", "done": int(time.time())}
+            )
     return perf_state(arch)
 
 
@@ -1711,8 +2086,11 @@ def ui_file(name: str) -> tuple[str, str, str] | None:
         return None
     rel, media = entry
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "client", "luci", rel)
-    with open(path, "r", encoding="utf-8") as fh:
-        return fh.read(), media, os.path.basename(rel)
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read(), media, os.path.basename(rel)
+    except OSError:
+        return None      # 白名单里有、但包里没这个文件 → 404, 不是 500
 
 
 # ---------------------------------------------------------------- 运行时装机件 (client/runtime/)
@@ -1873,7 +2251,7 @@ AGENT_VERSION = os.environ.get("ZP_AGENT_VERSION", "1.3.2")
 
 #: 小于这个大小的一律不当二进制 (一份正常的 zpcore.gz 约 2.5 MB)。演练里可以用
 #: ZP_AGENT_MIN_BYTES 调低。
-AGENT_MIN_BYTES = int(os.environ.get("ZP_AGENT_MIN_BYTES", str(256 << 10)))
+AGENT_MIN_BYTES = _env_int("ZP_AGENT_MIN_BYTES", str(256 << 10))
 
 
 def agent_dir() -> str:
