@@ -3842,6 +3842,35 @@ def test_upgrade_script_shipped_and_valid():
     assert _bash_syntax_ok(path)
 
 
+def test_hysteria_core_upgrade_and_install_asset_structure():
+    """Hysteria 2 二进制升级与安装: 必须是单可执行文件 (非 tar.gz) 且带官方 CDN 兜底。
+
+    起因: Hysteria 2 官方 release 资产是 hysteria-linux-amd64 单二进制,
+    如果脚本错写为 .tar.gz 会下载 404, 解压也会因不是 tar 包报错失败。
+    同时升级界面不得在代码未回滚时硬编码显示「代码已自动回滚」。
+    """
+    upg_path = os.path.join(REPO_ROOT, "upgrade.sh")
+    inst_path = os.path.join(REPO_ROOT, "install.sh")
+    view_path = os.path.join(REPO_ROOT, "backend", "static", "app", "views", "update.js")
+    upg = open(upg_path, encoding="utf-8").read()
+    inst = open(inst_path, encoding="utf-8").read()
+    view = open(view_path, encoding="utf-8").read()
+
+    # 1. upgrade.sh 中的 Hysteria 2 资产不能是 .tar.gz
+    assert 'HY_ASSET="hysteria-linux-$HY_ARCH"' in upg or 'HY_ASSET="hysteria-linux-${HY_ARCH}"' in upg
+    assert "download.hysteria.network" in upg, "upgrade.sh 必须带 Hysteria 官方 CDN 兜底"
+    assert "rolled_back" in upg, "upgrade.sh 必须向 update.json 报告是否真正发生了回滚"
+
+    # 2. install.sh 中 Hysteria 2 资产同样要有官方 CDN 兜底与单二进制支持
+    assert "download.hysteria.network" in inst, "install.sh 必须带 Hysteria 官方 CDN 兜底"
+    assert "/tmp/hysteria-dl version" in inst
+
+    # 3. 前端 update.js 必须由 rolled_back 决定是否显示「代码已自动回滚」
+    assert "last.rolled_back" in view, "update.js 不能无条件提示代码已回滚"
+    assert _bash_syntax_ok(upg_path)
+    assert _bash_syntax_ok(inst_path)
+
+
 def test_deployment_scripts_use_the_self_hosted_github_mirror():
     """面板**部署**与**升级**这两条路必须走自建反代, 而且它排第一。
 

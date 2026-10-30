@@ -473,35 +473,49 @@ ok "Xray $(/usr/local/bin/xray version 2>/dev/null | head -1 || echo installed)"
 
 # ---------------- 5. Hysteria 2 (QUIC/UDP) ----------------
 info "下载 Hysteria 2 ..."
+case "$ARCH" in
+  x86_64|amd64) HY_ARCH="amd64" ;;
+  aarch64|arm64) HY_ARCH="arm64" ;;
+  armv7*|armhf)  HY_ARCH="armv7" ;;
+  i386|i686)     HY_ARCH="386" ;;
+  *)             HY_ARCH="$ARCH" ;;
+esac
 HY_JSON="$(curl -fsSL --max-time 20 "$GH_API/repos/apernet/hysteria/releases/latest" || true)"
 HY_TAG="$(printf '%s' "$HY_JSON" | grep -oP '"tag_name":\\s*"\\Kv?[^"]+' | head -1 || true)"
-HY_URL="$(printf '%s' "$HY_JSON" | grep -oE '"browser_download_url": *"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/' | grep -E "hysteria-linux-${ARCH}(-v[0-9]+(\\.[0-9]+)*)?(\\.tar\\.gz)?$" | head -1 || true)"
-[ -n "$HY_URL" ] || HY_URL="$GH/apernet/hysteria/releases/download/${HY_TAG:-v1.1.5}/hysteria-linux-${ARCH}.tar.gz"
-HY_TAG="${HY_TAG#v}"; HY_TAG="${HY_TAG:-1.1.5}"
+HY_URL="$(printf '%s' "$HY_JSON" | grep -oE '"browser_download_url": *"[^"]+"' | sed -E 's/.*"([^"]+)"$/\1/' | grep -E "hysteria-linux-${HY_ARCH}(-v[0-9]+(\\.[0-9]+)*)?(\\.tar\\.gz)?$" | head -1 || true)"
+[ -n "$HY_URL" ] || HY_URL="$GH/apernet/hysteria/releases/latest/download/hysteria-linux-${HY_ARCH}"
+HY_TAG="${HY_TAG#v}"; HY_TAG="${HY_TAG:-latest}"
+HY_DL_OK=0
 if fetch_github_file "$HY_URL" /tmp/hysteria-dl; then
-  case "$ARCH" in
+  HY_DL_OK=1
+elif curl -fsSL --connect-timeout 10 --max-time 180 -o /tmp/hysteria-dl "https://download.hysteria.network/app/latest/hysteria-linux-${HY_ARCH}" 2>/dev/null && [ -s /tmp/hysteria-dl ]; then
+  HY_DL_OK=1
+fi
+if [ "$HY_DL_OK" = "1" ]; then
+  case "$HY_ARCH" in
     arm64) HY_SHA_ENV="ZP_HYSTERIA_SHA256_ARM64" ;;
     *)     HY_SHA_ENV="ZP_HYSTERIA_SHA256_AMD64" ;;
   esac
   HY_SHA_EXPECT="${!HY_SHA_ENV:-}"
   HY_DL_SHA="$(sha256_file /tmp/hysteria-dl 2>/dev/null || true)"
   if [ -n "$HY_SHA_EXPECT" ] && [ "$(printf '%s' "$HY_SHA_EXPECT" | tr 'A-F' 'a-f')" != "$HY_DL_SHA" ]; then
-    fail "Hysteria 压缩包 SHA256 与 $HY_SHA_ENV 不一致 (期望 $HY_SHA_EXPECT, 实际 ${HY_DL_SHA:-无法计算})
+    fail "Hysteria 产物 SHA256 与 $HY_SHA_ENV 不一致 (期望 $HY_SHA_EXPECT, 实际 ${HY_DL_SHA:-无法计算})
        确认后清除该变量再试 (或指定版本), 不要带着被替换的二进制继续部署。"
   fi
-  case "$HY_URL" in
-    *.tar.gz)
-      tar -tzf /tmp/hysteria-dl >/dev/null 2>&1 \
-        || fail "Hysteria 压缩包结构校验失败 (反代可能回了一页 HTML): $HY_URL"
-      tar -xzf /tmp/hysteria-dl -C /tmp
-      install -m 755 /tmp/hysteria "$HYSTERIA_BIN" ;;
-    *)
-      install -m 755 /tmp/hysteria-dl "$HYSTERIA_BIN" ;;
-  esac
+  chmod +x /tmp/hysteria-dl 2>/dev/null || true
+  if /tmp/hysteria-dl version >/dev/null 2>&1; then
+    install -m 755 /tmp/hysteria-dl "$HYSTERIA_BIN"
+  elif tar -tzf /tmp/hysteria-dl >/dev/null 2>&1 \
+       && tar -xzf /tmp/hysteria-dl -C /tmp hysteria \
+       && install -m 755 /tmp/hysteria "$HYSTERIA_BIN"; then
+    :
+  else
+    fail "Hysteria 二进制校验失败 (反代可能回了一页 HTML): $HY_URL"
+  fi
   if [ -n "$HY_SHA_EXPECT" ]; then
     ok "Hysteria $HY_TAG (SHA256 与 $HY_SHA_ENV 一致)"
   else
-    warn "未固定 Hysteria 压缩包 SHA256 (设 $HY_SHA_ENV=<hex> 可钉死; 实际 ${HY_DL_SHA:-未知})"
+    warn "未固定 Hysteria 产物 SHA256 (设 $HY_SHA_ENV=<hex> 可钉死; 实际 ${HY_DL_SHA:-未知})"
   fi
 else
   warn "Hysteria 下载失败 (Hysteria 2 节点不可用, 其余协议正常)"

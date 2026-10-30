@@ -5981,3 +5981,24 @@ PublicKey = ...
   - 生产环境配置落地阶段自动尝试启用 `timedatectl set-ntp true`，杜绝宿主机时间漂移超过 120 秒触发 Reality 强制回落至伪装网站（Fallback）。
 - **发布清单**:
   - 重新生成 `SHA256SUMS` 清单并完成测试回归。
+
+
+### 8.119 v2.12.24: 修复升级 Hysteria 2 内核文件名错误与界面假回滚告警
+- **Hysteria 2 资产匹配与下载修复**:
+  - 故障现象：在面板勾选「同时升级 Xray / Hysteria 2 内核」时，第 9 步提示「升级失败: 升级 Hysteria 2，下载失败, 已保留现有版本 · 代码已自动回滚到升级前版本」。
+  - 根因分析：
+    1. 官方 `apernet/hysteria` 发行版为单可执行 ELF 二进制文件（例如 `hysteria-linux-amd64` / `hysteria-linux-arm64`），而旧版 `upgrade.sh` 误写为 `hysteria-linux-$ARCH.tar.gz`，导致向 GitHub 发送请求时返回 404；且随后的提取逻辑调用 `tar -xzf` 也会因格式不匹配而崩溃。
+    2. 缺失官方 CDN 兜底逻辑，若 GitHub 镜像遇到网络抖动或限流便直接中断。
+  - 修复方案：
+    1. 修正 `upgrade.sh` 与 `install.sh` 中的 Hysteria 资产名称为单二进制 `hysteria-linux-$HY_ARCH`，规范化 CPU 架构映射。
+    2. 增加 Hysteria 官方 CDN `https://download.hysteria.network/app/latest/$HY_ASSET` 作为备选快速源。
+    3. 升级前先对二进制执行 `hysteria version` 进行可执行与格式校验，验证通过后安全原子替换，兼顾兼容 legacy tar 包提取。
+- **状态报告与回滚信息准确性改进**:
+  - 根因：旧版 `update.js` 在升级失败横幅中硬编码了「代码已自动回滚到升级前版本」，但若仅是可选内核二进制下载未果、现有核心与新版面板代码均完好运行（`PANEL_READY=1`），该提示与实际状态矛盾。
+  - 修复方案：
+    1. `upgrade.sh` 与 `update.py` 引入显式 `rolled_back` 状态布尔字段，严格在实际执行 `rollback()` 时才标记为 true。
+    2. 完善收尾判据：当核心面板已正常就绪且无回滚发生时，若仅可选内核步骤下载告警，整体状态标记为 `success (部分可选步骤有告警)`，面板给出带警示标记的正常升级完成状态并触发自动重载，避免阻断升级。
+    3. 前端 `update.js` 仅在 `rolled_back: true` 时渲染回滚提示。
+- **发布清单与回归测试**:
+  - 重新生成 `SHA256SUMS` 清单。
+  - 新增 `test_hysteria_core_upgrade_and_install_asset_structure` 测试用例。

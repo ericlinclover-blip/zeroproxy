@@ -180,8 +180,9 @@ function updateResultHtml(u, last) {
       <div class="mt-2">${steps || "<span class='muted'>—</span>"}</div></details>`;
   }
   const first = (last.steps || []).find((s) => !s.ok) || {};
+  const rollbackNote = last.rolled_back ? " · 代码已自动回滚到升级前版本" : "";
   return `<div class="banner bad"><span class="ico">✗</span><span><b>升级失败: ${esc(first.name || last.message || "未知步骤")}</b>
-    <br><span class="muted">${esc(first.detail || last.message || "")} · 代码已自动回滚到升级前版本 · ${esc(trigger)}</span></span></div>
+    <br><span class="muted">${esc(first.detail || last.message || "")}${rollbackNote} · ${esc(trigger)}</span></span></div>
     ${steps ? `<div class="mt-3">${steps}</div>` : ""}
     ${u.log_tail ? `<details class="mt-3" open><summary class="muted fs-sm pointer">升级日志</summary>
       <div class="log-box">${esc(u.log_tail)}</div></details>` : ""}`;

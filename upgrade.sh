@@ -197,7 +197,7 @@ HOOK
 
 # 升级失败不留半成品: /tmp 里的下载物与解压目录统一清掉
 cleanup_tmp() {
-  rm -f /tmp/zp-upgrade.tar.gz /tmp/zp.SHA256SUMS /tmp/xray.zip /tmp/hysteria.tar.gz /tmp/hysteria /tmp/zp-shortcut.log 2>/dev/null || true
+  rm -f /tmp/zp-upgrade.tar.gz /tmp/zp.SHA256SUMS /tmp/xray.zip /tmp/hysteria.tar.gz /tmp/hysteria /tmp/hysteria-dl /tmp/zp-shortcut.log 2>/dev/null || true
   rm -rf /tmp/zp-upgrade-src 2>/dev/null || true
   return 0
 }
@@ -213,6 +213,7 @@ TO_VERSION="unknown"
 STARTED_AT="$(date +%s)"
 FINISHED_AT=0
 CODE_BACKUP=""
+ROLLED_BACK=0
 
 json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000'; }
 
@@ -263,6 +264,7 @@ write_status() {
     printf '  "trigger": "%s",\n' "$(json_escape "$ZP_TRIGGER")"
     printf '  "started_at": %s,\n' "$STARTED_AT"
     printf '  "finished_at": %s,\n' "$FINISHED_AT"
+    printf '  "rolled_back": %s,\n' "$([ "$ROLLED_BACK" = "1" ] && echo true || echo false)"
     printf '  "current": "%s",\n' "$(json_escape "$CURRENT")"
     printf '  "message": "%s",\n' "$(json_escape "$STATUS_MSG")"
     printf '  "plan": %s,\n' "$(json_array "${PLAN[@]-}")"
@@ -328,6 +330,7 @@ on_exit() {
 #: 之前只回滚代码与 state, 于是"旧代码 + 新依赖 + 新单元"照样起不来, 而且失败得静悄悄。
 #: pip 已装依赖只前进不后退 (没有可靠的通用回退办法), 会在报告里明确写出来。
 rollback() {
+  ROLLED_BACK=1
   if [ -z "$CODE_BACKUP" ] || [ ! -d "$CODE_BACKUP" ]; then
     return 0
   fi
@@ -606,14 +609,21 @@ fi
 # ---------- 5. 可选: 升级内核二进制 ----------
 if [ "$ZP_UPDATE_CORE" = "1" ]; then
   ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m)"
-  XRAY_ASSET="Xray-linux-$( [ "$ARCH" = "arm64" ] && echo arm64-v8a || echo 64 ).zip"
-  HY_ASSET="hysteria-linux-$ARCH.tar.gz"
+  case "$ARCH" in
+    x86_64|amd64) HY_ARCH="amd64" ;;
+    aarch64|arm64) HY_ARCH="arm64" ;;
+    armv7*|armhf)  HY_ARCH="armv7" ;;
+    i386|i686)     HY_ARCH="386" ;;
+    *)             HY_ARCH="$ARCH" ;;
+  esac
+  XRAY_ASSET="Xray-linux-$( [ "$HY_ARCH" = "arm64" ] && echo arm64-v8a || echo 64 ).zip"
+  HY_ASSET="hysteria-linux-$HY_ARCH"
   step_log "升级 Xray / Hysteria 2 二进制 (ZP_UPDATE_CORE=1) ..."
   # 内核下载复用 GH_MIRRORS (F-08): 受限网络下"升级面板能过、升级内核卡死"就是这里
   # 只走 GitHub 直连造成的。镜像只作传输, 摘要仍用可选的固定常量校验。
   begin_step "升级 Xray Core"
   if fetch_gh_asset "XTLS/Xray-core/releases/latest/download/$XRAY_ASSET" /tmp/xray.zip; then
-    case "$ARCH" in
+    case "$HY_ARCH" in
       arm64) _xray_sha_env="ZP_XRAY_SHA256_ARM64" ;;
       *)     _xray_sha_env="ZP_XRAY_SHA256_AMD64" ;;
     esac
@@ -634,30 +644,49 @@ if [ "$ZP_UPDATE_CORE" = "1" ]; then
     add_step false "升级 Xray Core" "下载失败, 已保留现有版本"
   fi
   rm -f /tmp/xray.zip
+
   begin_step "升级 Hysteria 2"
-  if fetch_gh_asset "apernet/hysteria/releases/latest/download/$HY_ASSET" /tmp/hysteria.tar.gz; then
-    case "$ARCH" in
+  _hy_downloaded=0
+  if fetch_gh_asset "apernet/hysteria/releases/latest/download/$HY_ASSET" /tmp/hysteria-dl; then
+    _hy_downloaded=1
+  elif curl -fsSL --connect-timeout 10 --max-time 180 -o /tmp/hysteria-dl "https://download.hysteria.network/app/latest/$HY_ASSET" 2>/dev/null && [ -s /tmp/hysteria-dl ]; then
+    _hy_downloaded=1
+  fi
+
+  if [ "$_hy_downloaded" = "1" ]; then
+    case "$HY_ARCH" in
       arm64) _hy_sha_env="ZP_HYSTERIA_SHA256_ARM64" ;;
       *)     _hy_sha_env="ZP_HYSTERIA_SHA256_AMD64" ;;
     esac
     _hy_expect="${!_hy_sha_env:-}"
-    _hy_sha="$(sha256_file /tmp/hysteria.tar.gz 2>/dev/null || true)"
+    _hy_sha="$(sha256_file /tmp/hysteria-dl 2>/dev/null || true)"
     if [ -n "$_hy_expect" ] && [ "$(printf '%s' "$_hy_expect" | tr 'A-F' 'a-f')" != "$_hy_sha" ]; then
-      warn "Hysteria 压缩包 SHA256 与 $_hy_sha_env 不一致, 保留现有版本"
+      warn "Hysteria 产物 SHA256 与 $_hy_sha_env 不一致, 保留现有版本"
       add_step false "升级 Hysteria 2" "SHA256 校验失败, 已保留现有版本"
-    elif tar -tzf /tmp/hysteria.tar.gz >/dev/null 2>&1 \
-         && tar -xzf /tmp/hysteria.tar.gz -C /tmp hysteria \
-         && install -m 755 /tmp/hysteria /usr/local/bin/hysteria; then
-      add_step true "升级 Hysteria 2" "$(/usr/local/bin/hysteria version 2>/dev/null | head -1)"
     else
-      add_step false "升级 Hysteria 2" "压缩包解不开, 已保留现有版本"
+      chmod +x /tmp/hysteria-dl 2>/dev/null || true
+      if /tmp/hysteria-dl version >/dev/null 2>&1; then
+        install -m 755 /tmp/hysteria-dl /usr/local/bin/hysteria
+        _hy_ver="$(/usr/local/bin/hysteria version 2>/dev/null | grep -iE 'version|v[0-9]' | head -1 | sed 's/^[ \t]*//')"
+        [ -n "$_hy_ver" ] || _hy_ver="Hysteria 2"
+        add_step true "升级 Hysteria 2" "$_hy_ver"
+      elif tar -tzf /tmp/hysteria-dl >/dev/null 2>&1 \
+           && tar -xzf /tmp/hysteria-dl -C /tmp hysteria \
+           && install -m 755 /tmp/hysteria /usr/local/bin/hysteria; then
+        _hy_ver="$(/usr/local/bin/hysteria version 2>/dev/null | grep -iE 'version|v[0-9]' | head -1 | sed 's/^[ \t]*//')"
+        [ -n "$_hy_ver" ] || _hy_ver="Hysteria 2"
+        add_step true "升级 Hysteria 2" "$_hy_ver"
+      else
+        warn "Hysteria 产物校验失败 (非有效可执行文件), 保留现有版本"
+        add_step false "升级 Hysteria 2" "产物校验失败, 已保留现有版本"
+      fi
     fi
     [ -n "$_hy_expect" ] || warn "未固定 Hysteria SHA256 (设 $_hy_sha_env=<hex> 可钉死; 实际 ${_hy_sha:-未知})"
   else
-    warn "Hysteria 2 下载失败 (镜像与直连都不通), 保留现有版本"
+    warn "Hysteria 2 下载失败 (镜像、直连与官方源都不通), 保留现有版本"
     add_step false "升级 Hysteria 2" "下载失败, 已保留现有版本"
   fi
-  rm -f /tmp/hysteria.tar.gz /tmp/hysteria
+  rm -f /tmp/hysteria-dl /tmp/hysteria /tmp/hysteria.tar.gz
 fi
 
 # ---------- 6. 按现有配置重新落地 ----------
@@ -697,9 +726,19 @@ fi
 # ---------- 8. 收尾 ----------
 FINISHED_AT="$(date +%s)"
 CURRENT=""
-if printf '%s' "$(steps_json)" | grep -q '"ok":false'; then
+if [ "${ROLLED_BACK:-0}" = "1" ] || [ "${PANEL_READY:-0}" != "1" ]; then
   STATUS_STATE="failed"
-  STATUS_MSG="升级完成但有步骤失败, 详见面板「程序更新」卡片"
+  STATUS_MSG="升级失败, 代码已自动回滚到升级前版本"
+elif printf '%s' "$(steps_json)" | grep -q '"ok":false'; then
+  # 关键步骤失败判为 failed; 若仅可选步骤失败 (如内核下载未果但已保留现有可用内核),
+  # 核心面板已就绪且可用, 判为 success (面板显示 "X 步有告警", 避免因可选内核网络波动阻断更新)
+  if printf '%s' "$(steps_json)" | grep -qE '"name":"(下载新版本代码|安装新代码|同步 Python 依赖|重载 systemd 单元|按 state\.json 重新生成配置并热重载|面板已就绪)","ok":false'; then
+    STATUS_STATE="failed"
+    STATUS_MSG="升级过程中关键步骤失败, 详见面板「程序更新」卡片"
+  else
+    STATUS_STATE="success"
+    STATUS_MSG="升级完成 (部分可选步骤有告警): v$FROM_VERSION → v$TO_VERSION"
+  fi
 else
   STATUS_STATE="success"
   STATUS_MSG="升级完成: v$FROM_VERSION → v$TO_VERSION"

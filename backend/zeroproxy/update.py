@@ -349,6 +349,7 @@ def start(trigger: str = "panel", timeout: int = 30, core: bool = False) -> tupl
             "trigger": trigger,
             "started_at": int(time.time()),
             "finished_at": 0,
+            "rolled_back": False,
             "core": bool(core),
             "message": f"升级任务已排队{core_note}",
             "steps": [],
