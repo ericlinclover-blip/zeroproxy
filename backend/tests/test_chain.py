@@ -287,7 +287,7 @@ def test_entry_add_lands_in_config_and_subscription(client, configured, monkeypa
     # 客户端那侧: 就是订阅里多了一个普通 Reality 节点, 地址是**本机**
     link = share_links.share_links(state)[nid]
     assert link.startswith(f"vless://{state['uuid']}@{DOMAIN}:{entry['local_port']}")
-    assert "security=reality" in link and "flow=xtls-rprx-vision" in link
+    assert "security=reality" in link and "type=tcp" in link
 
     b64 = unquote(base64.b64decode(_sub(client, configured).text).decode())
     assert f"@{DOMAIN}:{entry['local_port']}" in b64 and "ZeroProxy 链式 · 美国落地" in b64

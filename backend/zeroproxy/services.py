@@ -1011,7 +1011,7 @@ def client_config(state: dict, node_id: str, socks_port: int) -> dict | None:
                     {
                         "address": "127.0.0.1",
                         "port": int(chain.get("local_port") or 0),
-                        "users": [{"id": uuid, "encryption": "none", "flow": "xtls-rprx-vision"}],
+                        "users": [{"id": uuid, "encryption": "none", "flow": ""}],
                     }
                 ]
             },

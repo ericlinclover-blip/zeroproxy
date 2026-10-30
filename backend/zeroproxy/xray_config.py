@@ -259,14 +259,21 @@ def _chain_exit_inbound(state: dict) -> dict:
 
 
 def _chain_entry_inbound(state: dict, entry: dict) -> dict:
-    """中转端入站: 客户端连这里 (地址就是本机), 流量随后交给落地端出网。"""
+    """中转端入站: 客户端连这里 (地址就是本机), 流量随后交给落地端出网。
+
+    注意: 链式中转入站必须使用 flow: "" (无 Vision):
+    XTLS Vision 是面向直连出站 (freedom) 的零拷贝 splice 机制。当出站为二级代理
+    (连落地端的 vless 或 hysteria socks 出站) 时, 入站若开启 Vision 会尝试向代理套接字
+    执行 TLS 记录 splice, 导致 TLS 帧冲突并在客户端表现为超时卡死。
+    中转端入站保持纯净的 VLESS + Reality 传输 (免证书、全加密), 落地出网畅通无阻。
+    """
     return {
         "tag": chain_node_id(entry),
         "listen": "0.0.0.0",
         "port": int(entry["local_port"]),
         "protocol": "vless",
         "settings": {
-            "clients": [{"id": state["uuid"], "flow": "xtls-rprx-vision"}],
+            "clients": [{"id": state["uuid"], "flow": ""}],
             "decryption": "none",
         },
         "streamSettings": _reality_stream(state),
@@ -366,6 +373,17 @@ def build_xray_config(state: dict) -> dict:
                 "statsOutboundDownlink": True,
             },
         },
+        "dns": {
+            # 显式配置 IPv4 优先的上游 DNS:
+            # 当 freedom 出站开启 UseIPv4 时, Xray 切换至内置 DNS 模块解析目标域名。
+            # 若缺失顶层 dns 配置, 在 systemd-resolved 或受限 DNS 环境下会导致域名解析失败或测速超时。
+            "servers": [
+                "1.1.1.1",
+                "8.8.8.8",
+                "localhost",
+            ],
+            "queryStrategy": "UseIPv4",
+        },
         "inbounds": [],
         # 强制出站使用 IPv4 解析与建联:
         # 大多数云厂商 VPS 默认分配了数据中心机房的 IPv6 (ASN 与 IPv4 往往不同甚至不可路由),
@@ -377,6 +395,9 @@ def build_xray_config(state: dict) -> dict:
                 "protocol": "freedom",
                 "tag": "direct",
                 "settings": {"domainStrategy": "UseIPv4"},
+                "streamSettings": {
+                    "sockopt": {"domainStrategy": "UseIPv4"},
+                },
             }
         ],
         "routing": {

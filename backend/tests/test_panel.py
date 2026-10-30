@@ -3917,3 +3917,81 @@ def test_readme_documents_one_line_upgrade():
     assert "upgrade.sh | bash" in text
     assert "一键更新" in text
     assert "/api/update" in text
+
+
+def test_xray_config_dns_and_freedom_use_ipv4(configured):
+    """Xray 配置验证: 顶层 DNS 与 freedom 出站 UseIPv4 联动。
+
+    当 freedom 出站配置 domainStrategy: UseIPv4 时, Xray 切换至内置 DNS 模块解析。
+    顶层必须具备完整的 dns 配置 (servers + queryStrategy: UseIPv4),
+    否则在 systemd-resolved 或受限 DNS 环境下会导致目标域名 (如 generate_204) 解析超时。
+    """
+    state = config.load_state()
+    cfg = xray_config.build_xray_config(state)
+    assert "dns" in cfg, "Xray 配置必须包含顶层 dns 段"
+    assert "1.1.1.1" in cfg["dns"]["servers"]
+    assert cfg["dns"]["queryStrategy"] == "UseIPv4"
+
+    direct_out = next(o for o in cfg["outbounds"] if o["tag"] == "direct")
+    assert direct_out["settings"]["domainStrategy"] == "UseIPv4"
+    assert direct_out["streamSettings"]["sockopt"]["domainStrategy"] == "UseIPv4"
+
+
+def test_clash_reality_and_chain_flow_and_opts(configured):
+    """Clash / Mihomo 客户端订阅字段全面审计:
+
+    1. VLESS Reality: 包含 xtls-rprx-vision, packet-encoding: xudp, support-x25519mlkem768, fingerprint
+    2. 链式中转节点: 入站与客户端必须使用 flow: "" (无 Vision), 避免向二级代理出站二次 splice 导致握手冲突超时
+    3. 全协议指纹与编码对齐: vless-xhttp, vless-ws, trojan, hysteria2
+    """
+    state = config.load_state()
+    vr = share_links._clash_proxy(state, "vless-reality")
+    assert vr["flow"] == "xtls-rprx-vision"
+    assert vr["packet-encoding"] == "xudp"
+    assert vr["client-fingerprint"] == "chrome"
+    assert vr["fingerprint"] == "chrome"
+    assert vr["reality-opts"]["support-x25519mlkem768"] is True
+
+    # 链式条目测试
+    entry = {
+        "id": "tst1",
+        "host": "198.51.100.1",
+        "port": 8447,
+        "uuid": state["uuid"],
+        "local_port": 8446,
+        "sni": "us.example.com",
+        "pbk": state["reality"]["public_key"],
+        "sid": state["reality"]["short_id"],
+        "enabled": True,
+        "label": "测试落地",
+    }
+    state.setdefault("chain", {}).setdefault("entries", []).append(entry)
+    config.save_state(state)
+    cp = share_links._clash_proxy(state, f"chain-{entry['id']}")
+    assert cp["flow"] == "", "链式中转入站必须使用 flow: '' (无 Vision)"
+    assert cp["packet-encoding"] == "xudp"
+    assert cp["client-fingerprint"] == "chrome"
+    assert cp["fingerprint"] == "chrome"
+    assert cp["reality-opts"]["support-x25519mlkem768"] is True
+
+    # 服务端链式中转入站流控必须为空
+    cfg = xray_config.build_xray_config(state)
+    chain_in = next(i for i in cfg["inbounds"] if i["tag"] == f"chain-{entry['id']}")
+    assert chain_in["settings"]["clients"][0]["flow"] == ""
+
+    # 其他协议审计
+    vx = share_links._clash_proxy(state, "vless-xhttp")
+    assert vx["packet-encoding"] == "xudp"
+    assert vx["fingerprint"] == "chrome"
+    assert vx["reality-opts"]["support-x25519mlkem768"] is True
+
+    ws = share_links._clash_proxy(state, "vless-ws")
+    assert ws["packet-encoding"] == "xudp"
+    assert ws["fingerprint"] == "chrome"
+
+    tr = share_links._clash_proxy(state, "trojan")
+    assert tr["fingerprint"] == "chrome"
+
+    hy = share_links._clash_proxy(state, "hysteria2")
+    assert hy["fingerprint"] == "chrome"
+

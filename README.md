@@ -5726,3 +5726,16 @@ PublicKey = ...
 - **路由器管理面板 UI 体验优化**: 移除按钮增加操作中禁用与 `正在移除…` 状态提示；移除成功时为卡片增加淡出、缩放与平滑折叠动画 (`all .32s var(--ease)`)；Toast 提示正确反转义并展示真实结果。
 - **zpcore 二进制同步更新**: 重新编译 6 架构二进制并完成打包，确保全平台与面板端完全同步。
 
+### 8.104 v2.12.9 (客户端 v1.4.41): 严防 DNS/IPv6/WebRTC 泄漏与高纯净度出网优化
+- **GEOIP,CN 增加 no-resolve**: 解决 fake-ip 模式下未匹配境外国外域名触发本地国内 DNS 查询导致的 DNS 泄漏与污染问题。
+- **落地节点规则集大幅扩展**: 纳入 Cloudflare Turnstile、Arkose、Scamalytics、IPinfo、Stripe 等高纯净度与欺诈检测域名。
+- **清除 WebRTC / STUN fake-ip 过滤**: 防止浏览器向国内 DNS 直查 STUN 导致暴露国内公网 IP。
+- **多服务器骨架落地组容错**: 无链式节点时平滑回退至通用节点选择组，避免策略组不可用。
+
+### 8.105 v2.12.10 (客户端 v1.4.42): 修复 VLESS Reality 与链式代理超时及全协议审计
+- **修复 VLESS Reality 客户端超时**: Clash / Mihomo 配置补齐 `packet-encoding: xudp`、`fingerprint: chrome` 以及 `support-x25519mlkem768: true`，彻底消除现代 Xray 核心 (Go 1.23+ 引入后量子 MLKEM768 密钥协商) 在客户端 Reality 握手超时的问题。
+- **根除链式代理二次 Vision splice 冲突**: 链式中转端入站采用 `flow: ""` (标准 VLESS + Reality 隧道传输)，消除向二级代理出站 (vless 落地或 hysteria socks) 执行内核态 TLS 记录 splice 导致的帧冲突与连接超时。
+- **Xray 顶层 DNS 与 Freedom UseIPv4 协同**: 在 `xray/config.json` 补齐顶层 `dns.servers` (`1.1.1.1`, `8.8.8.8`, `localhost`) 与 `queryStrategy: "UseIPv4"`，解决 Freedom 出站强制使用 IPv4 时因内置 DNS 模块缺上游而导致的域名解析超时。
+- **全协议节点完整性审计与调优**: 对齐 `vless-xhttp`、`vless-ws`、`trojan`、`hysteria2` 的客户端指纹 (`chrome`) 与 UDP 数据包封装，确保所有节点在各类客户端下均实现低延迟秒通。
+
+

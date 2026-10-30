@@ -566,7 +566,7 @@ def share_links(state: dict) -> dict[str, str]:
             continue
         links[f"chain-{entry['id']}"] = (
             f"vless://{uuid}@{host}:{int(entry['local_port'])}"
-            f"?encryption=none&flow=xtls-rprx-vision&security=reality&type=tcp"
+            f"?encryption=none&security=reality&type=tcp"
             f"&pbk={_pbk(r['public_key'])}&sid={r['short_id']}"
             f"&sni={_q(r['server_name'])}&fp=chrome"
             f"#{_q(chain_node_name(entry))}"
@@ -606,7 +606,8 @@ def _clash_proxy(state: dict, node_id: str) -> dict | None:
 
     entry = chain_entry_of(state, node_id)
     if entry is not None:
-        # 链式中转节点: 客户端连本机 (Reality + Vision), 出网走落地端
+        # 链式中转节点: 客户端连本机 (Reality), 出网走落地端
+        # 链式中转入站必须使用 flow: "" (无 Vision): 避免向代理出站二次 splice 导致握手冲突超时
         return {
             "name": chain_node_name(entry),
             "type": "vless",
@@ -615,11 +616,17 @@ def _clash_proxy(state: dict, node_id: str) -> dict | None:
             "uuid": state["uuid"],
             "udp": True,
             "tls": True,
-            "flow": "xtls-rprx-vision",
+            "flow": "",
             "servername": r["server_name"],
             "client-fingerprint": "chrome",
+            "fingerprint": "chrome",
             "network": "tcp",
-            "reality-opts": {"public-key": _pbk(r["public_key"]), "short-id": r["short_id"]},
+            "packet-encoding": "xudp",
+            "reality-opts": {
+                "public-key": _pbk(r["public_key"]),
+                "short-id": r["short_id"],
+                "support-x25519mlkem768": True,
+            },
         }
     if node_id == "vless-reality":
         return {
@@ -633,8 +640,14 @@ def _clash_proxy(state: dict, node_id: str) -> dict | None:
             "flow": "xtls-rprx-vision",
             "servername": r["server_name"],
             "client-fingerprint": "chrome",
+            "fingerprint": "chrome",
             "network": "tcp",
-            "reality-opts": {"public-key": _pbk(r["public_key"]), "short-id": r["short_id"]},
+            "packet-encoding": "xudp",
+            "reality-opts": {
+                "public-key": _pbk(r["public_key"]),
+                "short-id": r["short_id"],
+                "support-x25519mlkem768": True,
+            },
         }
     if node_id == "vless-xhttp":
         if not CLASH_XHTTP:
@@ -649,13 +662,19 @@ def _clash_proxy(state: dict, node_id: str) -> dict | None:
             "tls": True,
             "servername": r["server_name"],
             "client-fingerprint": "chrome",
+            "fingerprint": "chrome",
             "network": "xhttp",
+            "packet-encoding": "xudp",
             "xhttp-opts": {
                 "path": x.get("path") or XHTTP_PATH,
                 "host": (x.get("host") or "").strip() or r["server_name"],
                 "mode": x.get("mode") or "auto",
             },
-            "reality-opts": {"public-key": _pbk(r["public_key"]), "short-id": r["short_id"]},
+            "reality-opts": {
+                "public-key": _pbk(r["public_key"]),
+                "short-id": r["short_id"],
+                "support-x25519mlkem768": True,
+            },
         }
     if node_id == "vless-ws":
         return {
@@ -669,7 +688,9 @@ def _clash_proxy(state: dict, node_id: str) -> dict | None:
             "servername": host,
             "skip-cert-verify": _insecure(state),
             "client-fingerprint": "chrome",
+            "fingerprint": "chrome",
             "network": "ws",
+            "packet-encoding": "xudp",
             "ws-opts": {"path": WS_PATH, "headers": {"Host": host}},
         }
     if node_id == "trojan":
@@ -683,6 +704,7 @@ def _clash_proxy(state: dict, node_id: str) -> dict | None:
             "sni": host,
             "skip-cert-verify": _insecure(state),
             "client-fingerprint": "chrome",
+            "fingerprint": "chrome",
         }
     if node_id == "hysteria2":
         proxy = {
@@ -692,6 +714,8 @@ def _clash_proxy(state: dict, node_id: str) -> dict | None:
             "password": state["hysteria_password"],
             "sni": host,
             "skip-cert-verify": True,
+            "client-fingerprint": "chrome",
+            "fingerprint": "chrome",
         }
         hop = _hysteria_hop_span(state)
         if "," in hop or "-" in hop:
@@ -1040,13 +1064,14 @@ def _singbox_outbound(state: dict, node_id: str) -> dict | None:
     entry = chain_entry_of(state, node_id)
     if entry is not None:
         # 链式中转节点: 客户端连本机, 落地在对方那一侧
+        # 链式中转入站必须使用 flow: "" (无 Vision): 避免向代理出站二次 splice 导致握手冲突超时
         return {
             "type": "vless",
             "tag": chain_node_name(entry),
             "server": host,
             "server_port": int(entry["local_port"]),
             "uuid": state["uuid"],
-            "flow": "xtls-rprx-vision",
+            "flow": "",
             "packet_encoding": "xudp",
             "tls": {
                 "enabled": True,

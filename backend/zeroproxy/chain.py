@@ -690,10 +690,17 @@ def warmup_targets(state: dict) -> list[dict]:
 
     targets: list[dict] = []
     seen: set[int] = set()
+    reality_port = 0
+    try:
+        reality_port = int((state.get("ports") or {}).get("reality") or 0)
+    except (TypeError, ValueError):
+        pass
+
     for port in ports:
         if 1 <= port <= 65535 and port not in seen:
             seen.add(port)
-            targets.append({**base, "port": port})
+            flow = "xtls-rprx-vision" if port == reality_port else ""
+            targets.append({**base, "port": port, "flow": flow})
     return targets
 
 
