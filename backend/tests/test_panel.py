@@ -4204,7 +4204,7 @@ def test_clash_reality_and_chain_flow_and_opts(configured):
     assert vr["flow"] == "xtls-rprx-vision"
     assert vr["packet-encoding"] == "xudp"
     assert vr["client-fingerprint"] == "chrome"
-    assert vr["fingerprint"] == "chrome"
+    assert "fingerprint" not in vr, "Mihomo 中 fingerprint 是证书 Pinning 散列，浏览器指纹必须用 client-fingerprint"
     assert "public-key" in vr["reality-opts"]
     assert "short-id" in vr["reality-opts"]
 
@@ -4227,7 +4227,7 @@ def test_clash_reality_and_chain_flow_and_opts(configured):
     assert cp["flow"] == "", "链式中转入站必须使用 flow: '' (无 Vision)"
     assert cp["packet-encoding"] == "xudp"
     assert cp["client-fingerprint"] == "chrome"
-    assert cp["fingerprint"] == "chrome"
+    assert "fingerprint" not in cp
     assert "public-key" in cp["reality-opts"]
 
     # 服务端链式中转入站流控必须为空, 且必须配置 sniffing
@@ -4250,18 +4250,22 @@ def test_clash_reality_and_chain_flow_and_opts(configured):
     # 其他协议审计
     vx = share_links._clash_proxy(state, "vless-xhttp")
     assert vx["packet-encoding"] == "xudp"
-    assert vx["fingerprint"] == "chrome"
+    assert vx["client-fingerprint"] == "chrome"
+    assert "fingerprint" not in vx
     assert "public-key" in vx["reality-opts"]
 
     ws = share_links._clash_proxy(state, "vless-ws")
     assert ws["packet-encoding"] == "xudp"
-    assert ws["fingerprint"] == "chrome"
+    assert ws["client-fingerprint"] == "chrome"
+    assert "fingerprint" not in ws
 
     tr = share_links._clash_proxy(state, "trojan")
-    assert tr["fingerprint"] == "chrome"
+    assert tr["client-fingerprint"] == "chrome"
+    assert "fingerprint" not in tr
 
     hy = share_links._clash_proxy(state, "hysteria2")
-    assert hy["fingerprint"] == "chrome"
+    assert hy["client-fingerprint"] == "chrome"
+    assert "fingerprint" not in hy
 
 
 

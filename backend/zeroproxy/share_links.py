@@ -631,7 +631,6 @@ def _clash_proxy(state: dict, node_id: str) -> dict | None:
             "flow": "",
             "servername": r["server_name"],
             "client-fingerprint": "chrome",
-            "fingerprint": "chrome",
             "network": "tcp",
             "packet-encoding": "xudp",
             "reality-opts": {
@@ -651,7 +650,6 @@ def _clash_proxy(state: dict, node_id: str) -> dict | None:
             "flow": "xtls-rprx-vision",
             "servername": r["server_name"],
             "client-fingerprint": "chrome",
-            "fingerprint": "chrome",
             "network": "tcp",
             "packet-encoding": "xudp",
             "reality-opts": {
@@ -672,7 +670,6 @@ def _clash_proxy(state: dict, node_id: str) -> dict | None:
             "tls": True,
             "servername": r["server_name"],
             "client-fingerprint": "chrome",
-            "fingerprint": "chrome",
             "network": "xhttp",
             "packet-encoding": "xudp",
             "xhttp-opts": {
@@ -697,7 +694,6 @@ def _clash_proxy(state: dict, node_id: str) -> dict | None:
             "servername": host,
             "skip-cert-verify": _insecure(state),
             "client-fingerprint": "chrome",
-            "fingerprint": "chrome",
             "network": "ws",
             "packet-encoding": "xudp",
             "ws-opts": {"path": WS_PATH, "headers": {"Host": host}},
@@ -713,7 +709,6 @@ def _clash_proxy(state: dict, node_id: str) -> dict | None:
             "sni": host,
             "skip-cert-verify": _insecure(state),
             "client-fingerprint": "chrome",
-            "fingerprint": "chrome",
         }
     if node_id == "hysteria2":
         proxy = {
@@ -724,7 +719,6 @@ def _clash_proxy(state: dict, node_id: str) -> dict | None:
             "sni": host,
             "skip-cert-verify": True,
             "client-fingerprint": "chrome",
-            "fingerprint": "chrome",
         }
         hop = _hysteria_hop_span(state)
         if "," in hop or "-" in hop:

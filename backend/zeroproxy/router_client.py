@@ -165,7 +165,8 @@ from .config import paths
 #:         ④ 更新的 install.sh、内核/性能内核/运行时件按面板下发的 sha256 校验后再落盘;
 #:         ⑤ zpcore 1.3.2: LuCI 会话校验 username=root (或 ACL)、安全响应头、PATH_INFO 动作。
 #: 1.4.46: 修复路由器端更新客户端时无法识别 servers/ 目录凭据导致接入账号失败的问题 (兼容 servers/*.json 与 device.json.migrated)。
-SCRIPT_VERSION = "1.4.46"
+#: 1.4.47: 修复 Mihomo (Clash) 订阅节点中误传 fingerprint: chrome 导致配置校验失败 (proxy: fingerprint is used for TLS certificate pinning) 故障。
+SCRIPT_VERSION = "1.4.47"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"

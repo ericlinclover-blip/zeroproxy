@@ -6030,3 +6030,12 @@ PublicKey = ...
 - **版本对齐与发布清单**:
   - 路由器客户端版本由 `v1.4.45` 升级至 `v1.4.46`，面板版本升至 `v2.12.27`。
   - 重新生成 `SHA256SUMS` 发布清单。
+
+
+### 8.123 v2.12.28 (客户端 v1.4.47): 修复 Mihomo (Clash) 订阅节点中误传 fingerprint: chrome 导致配置校验失败
+- **修复路由器端拉取配置报错 `fingerprint is used for TLS certificate pinning`**:
+  - **根本成因**: 在 Mihomo (Clash.Meta) 核心中，`client-fingerprint` 专用于指定浏览器 uTLS 伪装指纹 (如 `chrome`), 而 `fingerprint` 仅用于指定证书公钥 SHA-256 Pinning 散列。此前在生成 Clash 节点配置时同时注入了 `fingerprint: "chrome"`，导致路由器端内置的 Mihomo 核心 (v1.19+) 在 `拉取配置` 执行 `mihomo -t` 语法检测时报错并拒绝加载 (`proxy 4: fingerprint is used for TLS certificate pinning`)，安装与更新流程因此在拉配置环节中断。
+  - **解决方案**: 在 `share_links._clash_proxy()` 中移除各代理节点的 `fingerprint: "chrome"`，保留规范标准的 `client-fingerprint: "chrome"`。
+- **版本对齐与发布清单**:
+  - 路由器客户端版本由 `v1.4.46` 升级至 `v1.4.47`，面板版本升至 `v2.12.28`。
+  - 重新生成 `SHA256SUMS` 发布清单并对齐单元测试。
