@@ -502,16 +502,18 @@ if [ "$HY_DL_OK" = "1" ]; then
     fail "Hysteria 产物 SHA256 与 $HY_SHA_ENV 不一致 (期望 $HY_SHA_EXPECT, 实际 ${HY_DL_SHA:-无法计算})
        确认后清除该变量再试 (或指定版本), 不要带着被替换的二进制继续部署。"
   fi
-  chmod +x /tmp/hysteria-dl 2>/dev/null || true
-  if /tmp/hysteria-dl version >/dev/null 2>&1; then
-    install -m 755 /tmp/hysteria-dl "$HYSTERIA_BIN"
+  cp -f /tmp/hysteria-dl "$HYSTERIA_BIN.tmp" 2>/dev/null && chmod +x "$HYSTERIA_BIN.tmp" 2>/dev/null || true
+  if [ -x "$HYSTERIA_BIN.tmp" ] && "$HYSTERIA_BIN.tmp" version >/dev/null 2>&1; then
+    mv -f "$HYSTERIA_BIN.tmp" "$HYSTERIA_BIN"
   elif tar -tzf /tmp/hysteria-dl >/dev/null 2>&1 \
        && tar -xzf /tmp/hysteria-dl -C /tmp hysteria \
        && install -m 755 /tmp/hysteria "$HYSTERIA_BIN"; then
     :
   else
+    rm -f "$HYSTERIA_BIN.tmp" 2>/dev/null || true
     fail "Hysteria 二进制校验失败 (反代可能回了一页 HTML): $HY_URL"
   fi
+  rm -f "$HYSTERIA_BIN.tmp" 2>/dev/null || true
   if [ -n "$HY_SHA_EXPECT" ]; then
     ok "Hysteria $HY_TAG (SHA256 与 $HY_SHA_ENV 一致)"
   else

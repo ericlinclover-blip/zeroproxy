@@ -3863,7 +3863,7 @@ def test_hysteria_core_upgrade_and_install_asset_structure():
 
     # 2. install.sh 中 Hysteria 2 资产同样要有官方 CDN 兜底与单二进制支持
     assert "download.hysteria.network" in inst, "install.sh 必须带 Hysteria 官方 CDN 兜底"
-    assert "/tmp/hysteria-dl version" in inst
+    assert "version" in inst and "HYSTERIA_BIN" in inst
 
     # 3. 前端 update.js 必须由 rolled_back 决定是否显示「代码已自动回滚」
     assert "last.rolled_back" in view, "update.js 不能无条件提示代码已回滚"

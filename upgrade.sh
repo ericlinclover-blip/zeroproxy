@@ -664,9 +664,9 @@ if [ "$ZP_UPDATE_CORE" = "1" ]; then
       warn "Hysteria 产物 SHA256 与 $_hy_sha_env 不一致, 保留现有版本"
       add_step false "升级 Hysteria 2" "SHA256 校验失败, 已保留现有版本"
     else
-      chmod +x /tmp/hysteria-dl 2>/dev/null || true
-      if /tmp/hysteria-dl version >/dev/null 2>&1; then
-        install -m 755 /tmp/hysteria-dl /usr/local/bin/hysteria
+      cp -f /tmp/hysteria-dl /usr/local/bin/hysteria.tmp 2>/dev/null && chmod +x /usr/local/bin/hysteria.tmp 2>/dev/null || true
+      if [ -x /usr/local/bin/hysteria.tmp ] && /usr/local/bin/hysteria.tmp version >/dev/null 2>&1; then
+        mv -f /usr/local/bin/hysteria.tmp /usr/local/bin/hysteria
         _hy_ver="$(/usr/local/bin/hysteria version 2>/dev/null | grep -iE 'version|v[0-9]' | head -1 | sed 's/^[ \t]*//')"
         [ -n "$_hy_ver" ] || _hy_ver="Hysteria 2"
         add_step true "升级 Hysteria 2" "$_hy_ver"
@@ -680,6 +680,7 @@ if [ "$ZP_UPDATE_CORE" = "1" ]; then
         warn "Hysteria 产物校验失败 (非有效可执行文件), 保留现有版本"
         add_step false "升级 Hysteria 2" "产物校验失败, 已保留现有版本"
       fi
+      rm -f /usr/local/bin/hysteria.tmp 2>/dev/null || true
     fi
     [ -n "$_hy_expect" ] || warn "未固定 Hysteria SHA256 (设 $_hy_sha_env=<hex> 可钉死; 实际 ${_hy_sha:-未知})"
   else
