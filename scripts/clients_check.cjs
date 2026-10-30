@@ -30,6 +30,32 @@ for (const extra of (process.env.ZP_NODE_PATH || "").split(path.delimiter)) {
   if (extra && !module.paths.includes(extra)) module.paths.push(extra);
 }
 
+// playwright 必须在 spawn 面板**之前** require: 本机没有这个模块时, 旧写法是在面板
+// 子进程已经起来之后才抛 MODULE_NOT_FOUND, catch 直接 exit(1), 子进程没人收尸 ——
+// 端口一直 LISTEN (实测残留过)。先 require 再 spawn: 缺依赖就干净退出 1。
+let chromium;
+try {
+  ({ chromium } = require("playwright"));
+} catch (e) {
+  console.error(
+    "缺少 playwright: 本脚本需要 node + playwright + Chromium。\n" +
+      "本机没有时请明确跳过 (不能当作\"通过\"), 不要安装到项目里来跑。\n" +
+      "原始错误: " + (e && e.message ? e.message : e)
+  );
+  process.exit(1);
+}
+
+// 面板子进程 (缺依赖 / 中途抛错时统一在 catch 里收尸)
+let server = null;
+/** 收掉面板子进程: 已退出就立即返回, 否则等它真的退出 (不留 LISTEN 的孤儿)。 */
+function stopServer() {
+  if (!server || server.exitCode !== null || server.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    server.once("exit", resolve);
+    server.kill("SIGTERM");
+  });
+}
+
 const results = [];
 function check(name, ok, detail = "") {
   results.push({ name, ok, detail });
@@ -66,7 +92,7 @@ async function main() {
   });
   await new Promise((r) => stall.listen(0, "127.0.0.1", r));
 
-  const server = spawn(PYTHON, ["-m", "zeroproxy.main"], {
+  server = spawn(PYTHON, ["-m", "zeroproxy.main"], {
     cwd: path.join(ROOT, "backend"),
     env: {
       ...process.env,
@@ -88,7 +114,6 @@ async function main() {
   server.stdout.on("data", (d) => (serverLog += d));
   server.stderr.on("data", (d) => (serverLog += d));
 
-  const { chromium } = require("playwright");
   const base = `http://127.0.0.1:${PORT}`;
   let browser;
   try {
@@ -233,13 +258,40 @@ async function main() {
       (await page.locator(".dev-card .pill").innerText()).trim());
     check("关闭后卡片不再是绿色", await page.locator(".dev-card.on").count() === 0);
 
+    console.log("\n[3b] 配置版本语义 (已下载 ≠ 已应用)");
+    // 面板把新配置推给设备只证明"已下载"; 只有设备自己回报"已应用"才推进 applied_rev。
+    // 这里直接给 dash 喂两个 rev (最小耦合), 验证卡片不会拿下载冒充生效。
+    const revUi = await page.evaluate(() => {
+      const item = dash.devices.items[0];
+      const before = { downloaded: item.downloaded_rev, applied: item.applied_rev };
+      item.downloaded_rev = "aaaaaaaaaaaaaaaa";
+      item.applied_rev = "bbbbbbbbbbbbbbbb";     // 设备上一次应用的是旧版本
+      renderDash(true);
+      const pending = document.querySelector("#client-body").innerText.replace(/\s+/g, " ");
+      item.applied_rev = "aaaaaaaaaaaaaaaa";     // 设备回报: 这一版已应用
+      renderDash(true);
+      const applied = document.querySelector("#client-body").innerText.replace(/\s+/g, " ");
+      item.downloaded_rev = before.downloaded;
+      item.applied_rev = before.applied;
+      renderDash(true);
+      return { pending, applied };
+    });
+    check("已下载未应用: 卡片明说下载了但还没生效 (不冒充已应用)",
+      /已下载未应用/.test(revUi.pending) && !/配置已应用/.test(revUi.pending),
+      (revUi.pending.match(/已下载未应用[^,。]*/) || [""])[0].slice(0, 48));
+    check("设备回报应用成功后才显示「配置已应用」",
+      /配置已应用/.test(revUi.applied) && !/已下载未应用/.test(revUi.applied), "");
+
     console.log("\n[4] 手机 / 电脑 tab");
     await page.click('[data-client-tab="phone"]');
-    await page.waitForSelector(".mini-card");
-    check("手机 tab 给出扫码与复制订阅", (await page.locator(".mini-card").count()) >= 2);
+    await page.waitForSelector("#client-body .mini-card");
+    check("手机 tab 给出扫码与复制订阅",
+      (await page.locator("#client-body .mini-card").count()) >= 2,
+      `${await page.locator("#client-body .mini-card").count()} 条`);
     await page.click('[data-client-tab="desktop"]');
     await page.waitForTimeout(200);
-    check("电脑 tab 给出三个平台", (await page.locator(".mini-card").count()) === 3);
+    const desktopCards = await page.locator("#client-body .mini-card").count();
+    check("电脑 tab 给出三个平台", desktopCards === 3, `${desktopCards} 条 (其它板块的 .mini-card 不算)`);
     await page.click('[data-client-tab="router"]');
 
     console.log("\n[5] 深色模式");
@@ -256,8 +308,7 @@ async function main() {
     for (const sock of stallSockets) sock.destroy();
     stall.close();
     stall.unref();
-    server.kill("SIGTERM");
-    await new Promise((r) => server.once("exit", r));
+    await stopServer();   // 缺依赖 / 中途抛错也走这里: 不能把面板进程留在端口上
   }
 
   const failed = results.filter((r) => !r.ok);
@@ -269,7 +320,8 @@ async function main() {
   return failed.length ? 1 : 0;
 }
 
-main().then((code) => process.exit(code)).catch((err) => {
+main().then((code) => process.exit(code)).catch(async (err) => {
   console.error("验证失败:", err);
+  await stopServer();     // 兜底: 任何未预期的异常都不留面板子进程
   process.exit(1);
 });

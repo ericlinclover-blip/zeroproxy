@@ -10,5 +10,14 @@ Restart=always
 RestartSec=3
 LimitNOFILE=1048576
 
+# ---- 沙箱 (P2-13): 不降 User (既有部署的文件属主不变), 只收窄能力与文件系统 ----
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/zeroproxy
+PrivateTmp=yes
+ProtectHome=read-only
+# 监听 30001+ 高端口; 保留 NET_BIND_SERVICE 给自定义低端口兜底, NET_RAW 给 QUIC/探测兜底。
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
+
 [Install]
 WantedBy=multi-user.target

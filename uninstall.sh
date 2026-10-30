@@ -11,6 +11,8 @@ set -Eeuo pipefail
 
 ZP_HOME="${ZP_HOME:-/opt/zeroproxy}"
 PANEL_PORT="${ZP_PORT:-8899}"
+SYSTEMD_DIR="${ZP_SYSTEMD_DIR:-/etc/systemd/system}"
+LETSENCRYPT_DIR="${ZP_LETSENCRYPT_DIR:-/etc/letsencrypt}"
 
 info() { printf '\033[1;34m[ZeroProxy]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ZeroProxy]\033[0m %s\n' "$*"; }
@@ -21,7 +23,7 @@ warn() { printf '\033[1;33m[ZeroProxy]\033[0m %s\n' "$*"; }
 info "停止并禁用服务 ..."
 for unit in zeroproxy zeroproxy-wg zeroproxy-wg-userspace xray hysteria2; do
   systemctl disable --now "$unit" 2>/dev/null || true
-  rm -f "/etc/systemd/system/${unit}.service"
+  rm -f "$SYSTEMD_DIR/${unit}.service"
 done
 systemctl daemon-reload 2>/dev/null || true
 
@@ -29,6 +31,13 @@ info "移除 nginx 面板配置 ..."
 rm -f /etc/nginx/conf.d/zeroproxy.conf
 if command -v nginx >/dev/null && nginx -t >/dev/null 2>&1; then
   systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
+fi
+
+info "移除证书续期钩子 ..."
+# 与 install.sh / upgrade.sh 落的是同一个文件 (只删带 ZeroProxy 标记的那份)
+_HOOK="$LETSENCRYPT_DIR/renewal-hooks/deploy/zeroproxy-reload.sh"
+if [ -f "$_HOOK" ] && grep -q "ZeroProxy" "$_HOOK" 2>/dev/null; then
+  rm -f "$_HOOK" && ok "已移除 $_HOOK"
 fi
 
 info "移除终端快捷命令 (z / zeroproxy) ..."
@@ -65,6 +74,12 @@ if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active
   ufw delete allow 8445/tcp >/dev/null 2>&1 || true
   ufw delete allow 30001:32001/udp >/dev/null 2>&1 || true
   ufw delete allow 51820/udp >/dev/null 2>&1 || true
+elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+  warn "检测到 firewalld (本脚本只自动回收 ufw)。如需回收规则请执行:"
+  printf '    firewall-cmd --permanent --remove-port=80/tcp --remove-port=443/tcp --remove-port=%s/tcp\n' "$PANEL_PORT"
+  printf '    firewall-cmd --permanent --remove-port=8443/tcp --remove-port=8444/tcp --remove-port=8445/tcp\n'
+  printf '    firewall-cmd --permanent --remove-port=30001-32001/udp --remove-port=51820/udp\n'
+  printf '    firewall-cmd --reload\n'
 fi
 
 echo

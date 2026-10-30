@@ -29,6 +29,16 @@ except ImportError:  # pragma: no cover
 #: v6: 新增 wireguard (原生 WireGuard 入站 / 每设备 peer, 见 wireguard.py)
 STATE_VERSION = 6
 
+
+class StateError(RuntimeError):
+    """state.json 存在但读不出来 / 不是合法状态对象。
+
+    这是**必须停机**的故障, 不能回落 DEFAULTS: 回落之后 `configured` 变成 False,
+    而引导令牌在初始化成功那一刻就被删掉了 (见 clear_bootstrap_token), 于是 setup
+    的门禁整段被跳过 —— 谁先打开面板谁就能设置新管理员 (P2-4)。上层 (main.py)
+    把它统一翻成 503「状态文件损坏」, 面板进入只读维护态而不是"像没初始化过一样"。
+    """
+
 DEFAULT_HOME = "/opt/zeroproxy"
 #: 面板对外端口 (nginx 监听, 默认 8899) — 用于生成订阅/面板链接
 PANEL_PORT = int(os.environ.get("ZP_PORT", "8899"))
@@ -365,6 +375,34 @@ def clear_bootstrap_token() -> None:
         pass
 
 
+def initialization_traces() -> list[str]:
+    """已经存在的初始化痕迹 (文件路径列表)。
+
+    用途: setup 在没有引导令牌时据此拒绝 —— 一台**已经动过**的机器不该因为
+    state.json 被删/坏而重新变成"谁先打开谁初始化"。判据刻意选那些只有初始化
+    才会产生的文件 (state.json / 证书 / nginx 配置 / xray 配置), 空目录不算。
+    """
+    p = paths()
+    seen: list[str] = []
+    for path in (
+        p["state"],
+        p["cert_file"],
+        p["cert_key"],
+        p["panel_cert"],
+        p["nginx_etc"],
+        p["nginx_home"],
+        p["xray_config"],
+    ):
+        if not path:
+            continue
+        try:
+            if os.path.exists(path):
+                seen.append(path)
+        except OSError:  # pragma: no cover - 权限异常时当作"看不见"
+            continue
+    return seen
+
+
 # ---------------------------------------------------------------- 状态读写
 
 @contextlib.contextmanager
@@ -392,6 +430,12 @@ def locked():
 
 
 def load_state() -> dict:
+    """读 state.json 并补齐默认结构。
+
+    **文件存在但读不出来时抛 StateError, 不回落 DEFAULTS** —— 静默回落会把
+    一台已初始化的面板伪装成"还没初始化", setup 的引导令牌门禁随之失效 (P2-4)。
+    文件不存在 (真正的第一次启动) 才返回 DEFAULTS。
+    """
     with LOCK:
         _ensure_dirs()
         state = copy.deepcopy(DEFAULTS)
@@ -399,9 +443,19 @@ def load_state() -> dict:
         if os.path.exists(path):
             try:
                 with open(path, "r", encoding="utf-8") as fh:
-                    _merge(state, json.load(fh))
-            except (json.JSONDecodeError, OSError):
-                pass
+                    data = json.load(fh)
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+                raise StateError(
+                    f"状态文件 {path} 无法读取 ({type(exc).__name__}: {exc})。"
+                    "面板已进入维护态: 请先备份/修复该文件再重启面板, 不要删掉它重新初始化 "
+                    "(那会丢掉全部节点凭据与设备注册)。"
+                ) from exc
+            if not isinstance(data, dict):
+                raise StateError(
+                    f"状态文件 {path} 的内容不是对象 ({type(data).__name__}), 已被外部改坏。"
+                    "请恢复上一份可用备份后重启面板。"
+                )
+            _merge(state, data)
         # 结构升级: 缺失键由 _merge 自动补齐, 这里统一标注版本号
         state["version"] = STATE_VERSION
         ensure_audit_ids(state)      # 老记录的 id 补齐后才能按游标分页
@@ -493,6 +547,7 @@ AUDIT_ACTIONS: dict[str, tuple[str, str]] = {
     "geodata_auto": ("自动更新 GeoIP", "data"),
     "backup": ("导出备份", "data"),
     "restore": ("从备份恢复", "data"),
+    "handoff_ip_mismatch": ("交接票据来源 IP 不符", "auth"),
     "update": ("升级面板", "system"),
     "renew_cert": ("证书续期", "system"),
     "audit_clear": ("清空操作记录", "data"),
@@ -536,10 +591,18 @@ def _archive_audit(entries: list[dict]) -> None:
     """
     path = audit_log_path()
     try:
+        # data 目录在正常启动时已存在; 这里补一次是为了"审计先于任何写盘"的路径
+        # (例如迁移脚本 / 首次登录失败) 也能落下一条记录。
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         if os.path.exists(path) and os.path.getsize(path) > AUDIT_LOG_MAX:
             os.replace(path, path + ".1")
-        with open(path, "a", encoding="utf-8") as fh:
+        # 审计记录里有 actor (IP / 用户名) 与失败登录的用户名: 默认 umask 下会是 0644,
+        # 同机其它用户就能读到。用 os.open 明确 0600 创建 (已有文件也顺手收紧)。
+        fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
             fh.writelines(json.dumps(e, ensure_ascii=False) + "\n" for e in entries)
+        with contextlib.suppress(OSError):
+            os.chmod(path, 0o600)
     except (OSError, TypeError, ValueError):
         pass
 

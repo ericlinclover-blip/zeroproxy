@@ -87,16 +87,68 @@ for arch in $TARGETS; do
     if env GOOS=linux CGO_ENABLED=0 $envs "$GO" build -trimpath \
         -ldflags "-s -w -X main.agentVersion=$VERSION" -o "$out" . ; then
         gzip -9 -c "$out" > "$out.gz" && rm -f "$out"
-        printf '  ✓ %-9s %s KB (压缩后)\n' "$arch" "$(( $(wc -c < "$out.gz") / 1024 ))"
+        # 产物自检: 这份 .gz 是要被发到路由器上解压执行的, "构建命令返回 0"不等于
+        # "文件是对的"。注入的版本号必须真的在二进制里 (撤掉 -X 时构建照样成功,
+        # 面板会一直发一个自报 dev 的件), 而且必须是 ELF、gzip 完整。
+        _bad=""
+        gzip -t "$out.gz" 2>/dev/null || _bad="gzip 校验不过"
+        [ -n "$_bad" ] || {
+            case "$(gunzip -c "$out.gz" 2>/dev/null | head -c 4 | od -An -tx1 | tr -d ' \n')" in
+                7f454c46) ;;
+                *) _bad="解压后不是 ELF" ;;
+            esac
+        }
+        [ -n "$_bad" ] || {
+            gunzip -c "$out.gz" 2>/dev/null | grep -q "$VERSION" || _bad="二进制里没有注入版本号 $VERSION"
+        }
+        if [ -n "$_bad" ]; then
+            printf '  ✗ %-9s 产物自检失败: %s\n' "$arch" "$_bad"
+            rm -f "$out.gz"
+            FAILED=1
+            continue
+        fi
+        printf '  ✓ %-9s %s KB (压缩后, 自检通过)\n' "$arch" "$(( $(wc -c < "$out.gz") / 1024 ))"
     else
         printf '  ✗ %-9s 构建失败\n' "$arch"
         FAILED=1
     fi
 done
 
+# 旧版本制品必须**删掉**, 不能留: 面板按 AGENT_VERSION 挑文件, 旧件留在仓库里只会
+# 占体积并让人以为"这一档已经准备好了" (升级后仍能在 dist 里看到上一版)。
+for old in "$DIST"/zpcore-*-*.gz; do
+    [ -f "$old" ] || continue
+    case "$(basename "$old")" in
+        *-"$VERSION".gz) ;;
+        *)  rm -f "$old" && printf '  - 删掉旧版本制品 %s\n' "$(basename "$old")" ;;
+    esac
+done
+
+# 摘要清单: 面板侧 router_client.agent_sha256() 读它, 路由器端拿到面板下发的
+# X-ZP-Sha256 后比对 —— 供应链的信任锚点从"面板这一跳"前移到"仓库里的这份清单"。
+# 只登记当前版本的文件 (旧版本上面已经删了), 名字用相对名 (与 sha256sum 默认一致)。
+if [ "$FAILED" = "0" ]; then
+    _sums="$DIST/SHA256SUMS"
+    : > "$_sums"
+    for f in "$DIST"/zpcore-*-"$VERSION".gz; do
+        [ -f "$f" ] || continue
+        _n="$(basename "$f")"
+        if command -v sha256sum >/dev/null 2>&1; then
+            _h="$(sha256sum "$f" | cut -d' ' -f1)"
+        else
+            _h="$(shasum -a 256 "$f" | cut -d' ' -f1)"
+        fi
+        [ -n "$_h" ] || { echo "算不出 $_n 的 sha256 —— 停在这里" >&2; exit 1; }
+        printf '%s  %s\n' "$_h" "$_n" >> "$_sums"
+    done
+    printf '  ✓ 摘要清单 %s (%s 条)\n' "$_sums" "$(wc -l < "$_sums" | tr -d ' ')"
+fi
+
 if [ "$FAILED" = "1" ]; then
     echo "有架构没构建成功 —— 上面标 ✗ 的那几个上, 路由器会退回原来的界面路径。"
     exit 1
 fi
-echo "完成。记得把 $DIST 一起提交, 面板才发得出去。"
-echo "只需要部分架构的话, 直接删掉对应的 zpcore-<架构>-<版本>.gz —— 装了那一档的路由器会自动退回原来的界面路径。"
+echo "完成。记得把 $DIST 一起提交 (含 .gz 与 SHA256SUMS), 面板才发得出去。"
+echo "只需要部分架构的话: 删掉对应的 zpcore-<架构>-<版本>.gz, 然后刷新摘要清单 ——"
+echo "  (cd $DIST && shasum -a 256 zpcore-*.gz > SHA256SUMS)"
+echo "装了被删掉那一档的路由器会自动退回原来的界面路径 (装机不会失败)。"

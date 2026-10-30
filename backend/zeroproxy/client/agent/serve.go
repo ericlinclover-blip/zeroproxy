@@ -101,43 +101,66 @@ func serve(cfg serveConfig) error {
 }
 
 func route(w http.ResponseWriter, r *http.Request, cfg serveConfig) {
-	switch r.URL.Path {
-	case "/favicon.ico":
+	// 安全响应头 (与 cgi 的 sec_headers 是同一组): 页面会被 LuCI 的 status.js 用 iframe
+	// 嵌进去 (同源), 所以只允许同源嵌入; 不许 MIME 嗅探; 也不把带令牌的地址当 Referer
+	// 发出去。两个入口以前都没有这些头 (P2-8)。
+	h := w.Header()
+	h.Set("X-Frame-Options", "SAMEORIGIN")
+	h.Set("Content-Security-Policy", "frame-ancestors 'self'")
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Referrer-Policy", "no-referrer")
+	switch {
+	case r.URL.Path == "/favicon.ico":
 		w.WriteHeader(http.StatusNoContent)
-	case "/", "/index.html":
+	case r.URL.Path == "/", r.URL.Path == "/index.html":
 		serveStatic(w, cfg, "index.html")
-	case "/app.js":
+	case r.URL.Path == "/app.js":
 		serveStatic(w, cfg, "app.js")
-	case "/perf.js":
+	case r.URL.Path == "/perf.js":
 		serveStatic(w, cfg, "perf.js")
-	case "/cgi-bin/zeroproxy":
-		// 页面与脚本本身**不需要授权** (代码里不含任何机密, 授权只在数据接口上),
-		// 这与原来的 cgi 完全一致 —— 否则用户第一眼看到的是浏览器弹的登录框。
-		query := r.URL.Query()
-		// 脚本名走白名单 (与原 cgi 一致): 这个分支不需要授权, 拼路径等于开任意文件读取。
-		if want := query.Get("file"); want == "app.js" || want == "perf.js" {
-			serveStatic(w, cfg, want)
-			return
-		}
-		action := query.Get("a")
-		if action == "" {
-			if r.Method == http.MethodGet || r.Method == http.MethodHead {
-				serveStatic(w, cfg, "index.html")
-				return
-			}
-			writeJSON(w, http.StatusMethodNotAllowed, simpleResp{Error: "缺少 a= 参数"})
-			return
-		}
-		if !authorized(w, r, cfg) {
-			writeJSON(w, http.StatusForbidden, simpleResp{
-				Error: "未授权 — 在路由器上执行 zeroproxy ui 拿到带令牌的地址",
-			})
-			return
-		}
-		handleAction(w, r, cfg, action)
+	case r.URL.Path == "/cgi-bin/zeroproxy", strings.HasPrefix(r.URL.Path, "/cgi-bin/zeroproxy/"):
+		handleCGI(w, r, cfg)
 	default:
 		http.Error(w, "not found", http.StatusNotFound)
 	}
+}
+
+// handleCGI 是页面 + 数据接口那一条路 (/cgi-bin/zeroproxy)。抽成函数是因为动作有两个
+// 来源: `?a=` (页面用的) 与 PATH_INFO (`/cgi-bin/zeroproxy/add`, 外部脚本/手工路径用的)。
+// 以前 zpcore 只认 ?a= —— "契约与 cgi 完全一致"对后者不成立 (P2-8, 契约漂移)。
+func handleCGI(w http.ResponseWriter, r *http.Request, cfg serveConfig) {
+	// 页面与脚本本身**不需要授权** (代码里不含任何机密, 授权只在数据接口上),
+	// 这与原来的 cgi 完全一致 —— 否则用户第一眼看到的是浏览器弹的登录框。
+	query := r.URL.Query()
+	// 脚本名走白名单 (与原 cgi 一致): 这个分支不需要授权, 拼路径等于开任意文件读取。
+	if want := query.Get("file"); want == "app.js" || want == "perf.js" {
+		serveStatic(w, cfg, want)
+		return
+	}
+	action := query.Get("a")
+	if action == "" {
+		// PATH_INFO: /cgi-bin/zeroproxy/add → add (与 cgi 的 PATH_INFO 判据同一个形状)
+		if rest := strings.TrimPrefix(r.URL.Path, "/cgi-bin/zeroproxy/"); rest != r.URL.Path {
+			if rest != "" {
+				action = strings.SplitN(rest, "/", 2)[0]
+			}
+		}
+	}
+	if action == "" {
+		if r.Method == http.MethodGet || r.Method == http.MethodHead {
+			serveStatic(w, cfg, "index.html")
+			return
+		}
+		writeJSON(w, http.StatusMethodNotAllowed, simpleResp{Error: "缺少 a= 参数"})
+		return
+	}
+	if !authorized(w, r, cfg) {
+		writeJSON(w, http.StatusForbidden, simpleResp{
+			Error: "未授权 — 在路由器上执行 zeroproxy ui 拿到带令牌的地址",
+		})
+		return
+	}
+	handleAction(w, r, cfg, action)
 }
 
 // authorized 认三样东西: 地址里的 ?k= (顺手种成一年期的 cookie)、已种下的 cookie、
@@ -171,6 +194,13 @@ func authorized(w http.ResponseWriter, r *http.Request, cfg serveConfig) bool {
 
 // luciSession 拿 `sysauth*` cookie 去问 ubus: 有效会话返回 JSON, 无效会话打印
 // "Command failed … (Not found)"。**两种情况退出码都是 0**, 所以只能看文本。
+//
+// 会话有效只是第一层: **身份**也要对 (P2-8)。zpcore 会以 root 执行 CLI (add / update /
+// drop / perf-on 都是 root 级动作), 而 `sysauth` 是**任意已登录 LuCI 账号**的会话 ——
+// 在配了多账号 + ACL 的固件上, 一个被 ACL 限制的账号以前能借这里越权。判据:
+//   - `values.username == "root"` → 放行 (默认单 root 固件就是这一条);
+//   - 否则该会话的 ACL 必须明确放行本应用 (`luci-app-zeroproxy`, 见 acl.json) → 放行;
+//   - 都不满足 → 拒绝 (fail closed)。
 func luciSession(r *http.Request) bool {
 	for _, cookie := range r.Cookies() {
 		if !strings.HasPrefix(cookie.Name, "sysauth") {
@@ -194,7 +224,45 @@ func luciSession(r *http.Request) bool {
 		if _, hasErr := resp["error"]; hasErr {
 			continue
 		}
-		return true
+		values, _ := resp["values"].(map[string]any)
+		username := ""
+		if values != nil {
+			username, _ = values["username"].(string)
+		}
+		if strings.TrimSpace(username) == "root" {
+			return true
+		}
+		// 非 root: 只认"该会话的 ACL 明确放行本应用"。找 access (顶层或 values 里都认,
+		// 不同 OpenWrt 版本的 session get 输出形状略有差别)。
+		if sessionAllowsApp(resp) || (values != nil && sessionAllowsApp(values)) {
+			return true
+		}
+	}
+	return false
+}
+
+// sessionAllowsApp 判断会话数据里的 `access` 有没有本应用 (rpc 的 ACL 组名)。
+// access 可能是 {组名: 方法表} (map)、也可能是组名列表 (array)、或一段文本 —— 三种都认,
+// 但只认**明确出现** zeroproxy 的那一项 (宁可拒绝, 不要放过)。
+func sessionAllowsApp(container map[string]any) bool {
+	if container == nil {
+		return false
+	}
+	switch access := container["access"].(type) {
+	case map[string]any:
+		for group := range access {
+			if strings.Contains(group, "zeroproxy") {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range access {
+			if name, isString := item.(string); isString && strings.Contains(name, "zeroproxy") {
+				return true
+			}
+		}
+	case string:
+		return strings.Contains(access, "zeroproxy")
 	}
 	return false
 }
@@ -292,6 +360,11 @@ func cliArgs(action string, payload map[string]any) ([]string, error) {
 		}
 		if !strings.Contains(url, "/c/") {
 			return nil, fmt.Errorf("这看起来不是一个面板链接 (要 /c/<配对码> 那一段)")
+		}
+		// `replace` 是"接入另一台/更换面板"的显式确认 (P1-4)。真正的收口在 CLI 里
+		// (已配对却换了 base 的 add 必须带 --replace) —— 这里只把确认原样转过去。
+		if asBool(payload["replace"]) || asBool(payload["confirm"]) {
+			return []string{"add", "--replace", url}, nil
 		}
 		return []string{"add", url}, nil
 	case "drop":
@@ -415,11 +488,16 @@ func asString(v any) string {
 }
 
 func asBool(v any) bool {
+	// 与 cgi 的 toggle 解析**同一套语义** (P2-8 的"布尔解析不一致"): 以前 cgi 只认
+	// true/1, zpcore 还认 yes/on/非零数字 —— 于是 `on:"yes"` 在两个入口一个是开一个是关。
 	switch t := v.(type) {
 	case bool:
 		return t
 	case string:
-		return t == "true" || t == "1" || t == "yes" || t == "on"
+		switch strings.ToLower(strings.TrimSpace(t)) {
+		case "true", "1", "yes", "on":
+			return true
+		}
 	case float64:
 		return t != 0
 	}

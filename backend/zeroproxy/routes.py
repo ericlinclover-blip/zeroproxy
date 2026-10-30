@@ -30,7 +30,11 @@ import qrcode
 import qrcode.constants
 import qrcode.image.pil  # noqa: F401  (PIL 后端需显式导入)
 import qrcode.image.svg
-from fastapi import APIRouter, Request
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel
 
@@ -72,6 +76,19 @@ BACKUP_FORMAT = "zeroproxy-backup"
 BACKUP_VERSION = 1
 #: 恢复请求体上限 (state.json 只有几 KB, 4 MB 足够且能挡住内存滥用)
 RESTORE_MAX_BYTES = 4 * 1024 * 1024
+#: 加密备份的容器魔数 (AES-GCM, 口令派生见 _backup_encrypt)。明文 JSON 备份不带它。
+BACKUP_ENC_MAGIC = b"ZPBAKENC1"
+#: PBKDF2-SHA256 迭代次数 (OWASP 2023 对 PBKDF2-SHA256 的建议下限)
+BACKUP_KDF_ITERATIONS = 600_000
+#: 加密备份口令最短长度 —— 备份里有 Reality / WireGuard 私钥与管理员口令哈希,
+#: 等价于服务器 root, 口令太短等于没加密。
+BACKUP_PASSPHRASE_MIN = 8
+#: 恢复时逐个复查的端口键 (与 DEFAULTS["ports"] 一致)
+_PORT_KEYS = ("reality", "xhttp", "ws_internal", "trojan", "hysteria", "api")
+#: hysteria / trojan 口令允许的字符集 (会原样进 YAML / Xray 配置)
+_PASSWORD_RE = re.compile(r"^[A-Za-z0-9_.@%+=:,/-]{6,128}$")
+#: 恢复时允许的证书路径根 (备份可能来自另一台机器: 只做"不得指向任意文件"的约束)
+_CERT_ROOT_OK = ("/etc/letsencrypt/",)
 
 #: 登录限流: 连续失败 3 次后开始封禁, 时长 2^n 秒, 上限 300s
 LOGIN_FREE_TRIES = 3
@@ -85,6 +102,10 @@ _DOMAIN_RE = re.compile(
 )
 _SNI_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?)+$")
 _URL_RE = re.compile(r"^https?://[^\s\"'<>]+$")
+
+#: 初始化只能跑一份。这个锁只覆盖请求编排, 长耗时的 certbot / systemctl / nginx
+#: 绝不能持有 config.locked() —— 否则后台诊断、状态读取和重试都会被一起按住。
+_SETUP_GATE = threading.Lock()
 
 
 # ---------------------------------------------------------------- 基础工具
@@ -129,6 +150,69 @@ def _is_ip(host: str) -> bool:
         return True
     except ValueError:
         return False
+
+
+#: 本机回环地址 (含 IPv4 全段与 v6 回环)。面板进程只监听回环。
+_LOOPBACK_PREFIX = "127."
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def _peer_is_loopback(request: Request) -> bool:
+    peer = (request.client.host if request.client else "").strip()
+    return peer in _LOOPBACK_HOSTS or peer.startswith(_LOOPBACK_PREFIX)
+
+
+def _login_rate_limit_key(request: Request) -> str:
+    """登录限流分桶用的 key。
+
+    面板只监听回环, 直连 ``127.0.0.1:9900`` 的人可以随手伪造 ``X-Real-IP`` 来
+    让每次尝试都落进新桶 —— 限流就形同虚设 (P3-12)。所以从回环来的连接一律
+    忽略 ``X-Real-IP``/``X-Forwarded-For``, 整个回环共用同一个桶: 代价是经 nginx
+    失败的登录共享一条退避曲线, 收益是"本机伪造头换桶"这条路彻底没了。
+    """
+    if _peer_is_loopback(request):
+        return "loopback"
+    return _client_ip(request)
+
+
+def _bearer_secret(request: Request) -> str:
+    """``Authorization: Bearer <设备 secret>``。
+
+    新客户端 (路由器 1.4.45+) 把设备凭据放在头里: URL 不进 nginx access log、
+    不进 shell 历史。``?k=`` 作为旧面板/旧路由器兼容路径继续保留 (P2-6)。
+    """
+    raw = (request.headers.get("authorization") or "").strip()
+    if not raw:
+        return ""
+    scheme, _, value = raw.partition(" ")
+    if scheme.lower() != "bearer":
+        return ""
+    return value.strip()
+
+
+def _device_secret(request: Request, k: str = "") -> str:
+    """设备凭据统一读取: 优先 Bearer 头, 回退 ?k= 查询参数。"""
+    return _bearer_secret(request) or (k or "").strip()
+
+
+def _sha_response_header(data: bytes) -> dict:
+    """下发字节的摘要响应头 (路由器端据此比对完整性, 旧端缺了就只警告)。"""
+    helper = getattr(router_client, "sha256_hex", None)
+    digest = helper(data) if callable(helper) else hashlib.sha256(data).hexdigest()
+    return {"x-zp-sha256": digest}
+
+
+def _file_sha_header(path: str) -> dict:
+    """已落盘文件的摘要响应头 (FileResponse 用: 读一次算 sha256, 内核 20MB 可接受)。"""
+    try:
+        helper = getattr(router_client, "core_sha256", None)
+        digest = helper(path) if callable(helper) else ""
+        if not digest:
+            with open(path, "rb") as fh:
+                digest = hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return {}
+    return {"x-zp-sha256": digest}
 
 
 def _hopping_ports(base: int) -> list[int]:
@@ -236,7 +320,7 @@ class SetupIn(BaseModel):
 
 
 def _install_cert(state: dict, timeout: int = 0) -> tuple[bool, str]:
-    ok, detail, cert_state = services.install_cert(state["domain"])
+    ok, detail, cert_state = services.install_cert(state["domain"], timeout=timeout or 300)
     state["cert"] = cert_state
     return ok, detail
 
@@ -351,7 +435,14 @@ def _finish_job(job_id: str, steps: list[dict], error: str = "") -> None:
                 finished_at=time.time(),
                 index=job.get("index") or job.get("total") or 1,
             )
-        stale = sorted(_APPLY_JOBS, key=lambda k: _APPLY_JOBS[k]["started_at"])[:-_APPLY_JOB_KEEP]
+        # 只裁已结束的任务 (P3-21): 按 started_at 混着 running 一起排序时, 并发任务
+        # 超过上限会把**还在跑**的那条删掉, 前端轮询随即 404 / 丢进度。
+        finished = [
+            key
+            for key, item in _APPLY_JOBS.items()
+            if item.get("state") in ("done", "failed")
+        ]
+        stale = sorted(finished, key=lambda k: _APPLY_JOBS[k]["started_at"])[:-_APPLY_JOB_KEEP]
         for key in stale:
             _APPLY_JOBS.pop(key, None)
 
@@ -372,13 +463,25 @@ def _running_job(request: Request | None, kind: str | None = None) -> dict | Non
     return None
 
 
+#: 串行化"改配置 → 重启服务"这条闭环。它以前是靠 config.locked() 全程持有的,
+#: 但那样会让 2-4 秒的 systemctl 重启把登录 / 心跳 / 订阅全部堵在锁外 (P2-2)。
+#: 单独一把进程内锁既保证同一时刻只有一次闭环, 又不阻塞其它 state 读写。
+_APPLY_RUN_LOCK = threading.Lock()
+
+
 def _run_apply_job(job_id: str, after=None) -> None:
-    """后台线程: 跑完整闭环 (含"放行端口"这类收尾步骤), 结果写回任务表。"""
+    """后台线程: 跑完整闭环 (含"放行端口"这类收尾步骤), 结果写回任务表。
+
+    锁的范围缩短成"读一份 state 副本": 生成配置 + 重启服务 (2-4 秒, 证书兜底时更久)
+    在锁外跑, apply.reapply 内部自己在最后落盘。并发的两次闭环由 _APPLY_RUN_LOCK
+    串行化, 不会互相踩 (P2-2)。
+    """
     steps: list[dict] = []
     error = ""
     try:
-        with config.locked():
-            state = load_state()
+        with _APPLY_RUN_LOCK:
+            with config.locked():
+                state = load_state()
             steps = apply.reapply(
                 state,
                 progress=lambda index, total, name: _job_update(
@@ -463,60 +566,132 @@ def setup(payload: SetupIn, request: Request):
     except ValueError as exc:
         return _err(str(exc))
 
-    expected = config.bootstrap_token()
-    provided = (payload.token or request.headers.get("x-zp-token", "")).strip()
-    if expected and not hmac.compare_digest(provided, expected):
-        return _err("引导令牌无效: 请使用安装完成时终端打印的带 ?token= 的链接打开面板", 403)
+    if not _SETUP_GATE.acquire(blocking=False):
+        return _err("初始化正在进行, 请等待当前任务完成", 409)
 
-    with config.locked():
-        state = load_state()
-        if state["configured"]:
-            return _err("已完成配置, 请使用「重新应用」更新", 409)
+    try:
+        expected = config.bootstrap_token()
+        provided = (payload.token or request.headers.get("x-zp-token", "")).strip()
+        if expected and not hmac.compare_digest(provided, expected):
+            return _err("引导令牌无效: 请使用安装完成时终端打印的带 ?token= 的链接打开面板", 403)
+
+        # 只在读取初始状态时短暂持锁; 证书申请和服务重启都在锁外。
+        with config.locked():
+            state = load_state()
+            # 已初始化 → 409 (第二次 setup 的正常拒绝路径, 先于下面的痕迹门禁)
+            if state["configured"]:
+                return _err("已完成配置, 请使用「重新应用」更新", 409)
+            state_before = copy.deepcopy(state)
+
+        # P2-4: 没有引导令牌时不能再无条件放行。引导令牌在初始化成功那一刻就被删除,
+        # 所以"令牌为空 + 机器上已有初始化痕迹"只可能是 state.json 被删/坏之后的重放:
+        # 这时放行等于让第一个打开面板的人设置新管理员。
+        if not expected:
+            traces = config.initialization_traces()
+            if traces:
+                return _err(
+                    "这台面板已有初始化痕迹 ("
+                    + ", ".join(traces[:3])
+                    + ")，但没有可用的引导令牌，拒绝重新初始化。"
+                    "请修复/恢复 data/state.json 后重启面板; 确需重新初始化请先手动清空 "
+                    "ZP_HOME 下的状态与配置并重启。",
+                    403,
+                )
 
         steps = _steps_recorder()
 
-        def step_keys(state, t=0):
-            # 1. 密钥材料: VLESS UUID 派生 / Reality X25519 密钥对 / 订阅令牌
-            r = state["reality"]
-            if not crypto.reality_key_valid(r["private_key"], r["public_key"]):
-                r["private_key"], r["public_key"], r["short_id"] = crypto.new_reality_keys()
-            state["uuid"] = crypto.derive_uuid(username, password)
-            state["subscription_token"] = state["subscription_token"] or crypto.new_token()
-            state["admin"] = {"username": username, "password_hash": crypto.hash_password(password)}
-            return True, "UUID / Reality 密钥对 / 订阅令牌 就绪"
-
-        _add_step(steps, "生成密钥材料", step_keys, state)
-        if not steps[0]["ok"]:
+        def abort(message: str) -> JSONResponse:
             return JSONResponse(
-                {"error": f"密钥生成失败: {steps[0]['detail']}", "steps": steps},
+                {"error": message, "steps": steps, "retryable": True},
                 status_code=500,
             )
 
-        def step_state(state, t=0):
-            state.update(
+        def step_keys(current, t=0):
+            # 1. 密钥材料: VLESS UUID 派生 / Reality X25519 密钥对 / 订阅令牌
+            reality = current["reality"]
+            if not crypto.reality_key_valid(reality["private_key"], reality["public_key"]):
+                reality["private_key"], reality["public_key"], reality["short_id"] = crypto.new_reality_keys()
+            current["uuid"] = crypto.derive_uuid(username, password)
+            current["subscription_token"] = current["subscription_token"] or crypto.new_token()
+            current["admin"] = {"username": username, "password_hash": crypto.hash_password(password)}
+            return True, "UUID / Reality 密钥对 / 订阅令牌 就绪"
+
+        def prepare_state(current, t=0):
+            current.update(
                 {
-                    "configured": True,
                     "domain": domain,
                     "trojan_password": secrets.token_hex(16),
                     "hysteria_password": secrets.token_hex(16),
-                    "created_at": state["created_at"] or int(time.time()),
+                    "created_at": current["created_at"] or int(time.time()),
                 }
             )
-            save_state(state)
+            return True, "已在内存中准备, 证书成功后再提交"
+
+        def commit_state(current, t=0):
+            with config.locked():
+                fresh = load_state()
+                if fresh["configured"]:
+                    raise RuntimeError("初始化状态已被另一进程提交")
+                current["configured"] = True
+                save_state(current)
             return True, "已持久化"
 
-        _add_step(steps, "写入面板状态", step_state, state)
-        # 顺序很关键: 先把 nginx 的 80 端口 ACME 校验路径挂起来, certbot 才可能
-        # 通过 webroot 验证拿到 Let's Encrypt 证书; 拿到后再生成引用真实证书的
-        # nginx / xray (Trojan) 配置。反过来做只会永远退回自签证书。
-        _add_step(steps, "生成 Hysteria 2 证书", lambda s, t: services.generate_hysteria_cert(s["domain"]), state)
+        request_host = request.url.hostname or ""
+
+        if not _add_step(steps, "生成密钥材料", step_keys, state):
+            return abort(f"密钥生成失败: {steps[-1]['detail']}")
+        _add_step(steps, "准备面板状态", prepare_state, state)
+        _add_step(
+            steps,
+            "生成 Hysteria 2 证书",
+            lambda current, t=0: services.generate_hysteria_cert(current["domain"]),
+            state,
+        )
         _add_step(steps, "预置自签证书 (引导 nginx)", _ensure_cert, state)
-        _add_step(steps, "生成 Nginx 配置 (80 ACME + 面板)", apply.gen_nginx, state)
-        _add_step(steps, "重载 Nginx", _reload_nginx, state)
+
+        # 证书申请前只切到“初始化入口”: 80 端口继续反代面板, 同时为待签发域名
+        # 提供 ACME webroot。不能提前生成需要正式证书的 443 配置。
+        _add_step(
+            steps,
+            "生成 Nginx 初始化入口 (80 ACME + 面板)",
+            lambda current, t=0: apply.gen_setup_nginx(current, [request_host], timeout=t),
+            state,
+            timeout=60,
+        )
+        _add_step(steps, "重载 Nginx", _reload_nginx, state, timeout=60)
+        bootstrap_ready = all(step["ok"] for step in steps[2:6])
+        if not bootstrap_ready:
+            failed = apply.failures(steps)[0]
+            return abort(f"初始化入口未就绪: {failed['name']} — {failed['detail']}")
+
         _add_step(steps, "申请 SSL 证书", _install_cert, state, timeout=360)
+        if not steps[-1]["ok"]:
+            return abort(f"申请 SSL 证书失败: {steps[-1]['detail']}")
+
         _add_step(steps, "生成 Xray 配置", apply.gen_xray, state)
-        _add_step(steps, "生成 Nginx 配置 (真实证书)", apply.gen_nginx, state)
+        if not steps[-1]["ok"]:
+            return abort(f"生成 Xray 配置失败: {steps[-1]['detail']}")
         _add_step(steps, "生成 Hysteria 2 配置", apply.gen_hysteria, state)
+        if not steps[-1]["ok"]:
+            return abort(f"生成 Hysteria 2 配置失败: {steps[-1]['detail']}")
+
+        _add_step(steps, "提交面板状态", commit_state, state)
+        if not steps[-1]["ok"]:
+            return abort(f"提交面板状态失败: {steps[-1]['detail']}")
+
+        _add_step(steps, "生成 Nginx 配置 (真实证书)", apply.gen_nginx, state)
+        if not steps[-1]["ok"]:
+            # 正式配置写坏了时把状态与初始化入口恢复, 保证同一令牌还能重试。
+            with config.locked():
+                save_state(state_before)
+            recovered, recovery_detail = apply.gen_setup_nginx(state, [request_host], timeout=30)
+            if recovered:
+                _reload_nginx(state)
+            return abort(
+                f"生成正式 Nginx 配置失败: {steps[-1]['detail']}; "
+                f"初始化入口恢复: {'成功' if recovered else recovery_detail}"
+            )
+
         _add_step(steps, "启动/重载服务", apply.restart_services, state, timeout=180)
         _add_step(steps, "验证端口监听", apply.verify_listeners, state, timeout=12)
 
@@ -545,7 +720,9 @@ def setup(payload: SetupIn, request: Request):
         save_state(state)
         # 初始化完成后不再接受第二次 setup: 作废引导令牌
         config.clear_bootstrap_token()
-    return response
+        return response
+    finally:
+        _SETUP_GATE.release()
 
 
 # ---------------------------------------------------------------- 认证
@@ -558,21 +735,32 @@ class LoginIn(BaseModel):
 @router.post("/api/login")
 def login(payload: LoginIn, request: Request):
     ip = _client_ip(request)
+    # 限流分桶用独立的 key: 回环连接忽略 X-Real-IP, 伪造头换桶这条路就没了 (P3-12)
+    bucket = _login_rate_limit_key(request)
     with config.locked():
         state = load_state()
         if not state["configured"]:
             return _err("系统尚未初始化", 409)
 
-        wait = _login_blocked_for(state, ip)
+        wait = _login_blocked_for(state, bucket)
         if wait:
             response = _err(f"登录尝试过多, 请 {wait} 秒后重试", 429)
             response.headers["Retry-After"] = str(wait)
             return response
 
-        if payload.username != state["admin"]["username"] or not crypto.verify_password(
+        # 用户名错也要跑一次 PBKDF2 (P3-12): 先短路用户名会让"正确用户名"的响应
+        # 明显更慢, 成了可枚举信号。两个判断都做, 再合并结论。
+        # compare_digest 对 str 只接受 ASCII; 用户名/输入可能是任意 UTF-8 (例如中文),
+        # 先编码成 bytes 再比, 避免一个非 ASCII 用户名把登录打成 500。
+        user_ok = hmac.compare_digest(
+            payload.username.encode("utf-8", "surrogatepass"),
+            str(state["admin"]["username"] or "").encode("utf-8", "surrogatepass"),
+        )
+        pass_ok = crypto.verify_password(
             payload.password, state["admin"]["password_hash"]
-        ):
-            block = _login_failed(state, ip)
+        )
+        if not (user_ok and pass_ok):
+            block = _login_failed(state, bucket)
             config.audit(state, "login_failed", f"user={payload.username[:32]}", actor=ip)
             save_state(state)
             response = _err("用户名或密码错误", 401)
@@ -580,7 +768,7 @@ def login(payload: LoginIn, request: Request):
                 response.headers["Retry-After"] = str(block)
             return response
 
-        _login_succeeded(state, ip)
+        _login_succeeded(state, bucket)
         _clean_sessions(state)
         response = JSONResponse({"ok": True})
         _issue_session(state, request, response)
@@ -703,7 +891,7 @@ def _post_setup_redirect(state: dict, request: Request) -> dict:
     """初始化完成后, 要不要把用户直接送到"真证书 + 域名"的面板。
 
     必须两个条件都成立才敢跳: 证书是 Let's Encrypt 签的, 并且从本机按浏览器的方式
-    访问 `https://<域名>:<面板端口>/api/info` 真的能通 (DNS 已解析 + nginx 已挂真证书)。
+    访问 `https://<域名>/panel/api/info` 真的能通 (DNS 已解析 + nginx 已挂真证书)。
     否则跳过去只会把用户扔到一个打不开或证书报错的页面 —— 那还不如留在 IP 页面并说清
     原因。用户是在 IP 页面上初始化的, 所以这一步是"从自签兜底切到正式入口"的唯一机会。
     """
@@ -720,9 +908,10 @@ def _post_setup_redirect(state: dict, request: Request) -> dict:
     scheme = fwd_proto or request.url.scheme
     raw_host = request.headers.get("host") or request.url.netloc or ""
     host, _, host_port = raw_host.partition(":")
+    standard_host = domain if services.is_domain(domain) else host
     secure_url = (
-        f"https://{host}:{config.PANEL_PORT}/"
-        if (host and scheme == "http" and host_port in ("", "80") and services.is_prod())
+        f"https://{standard_host}/panel/"
+        if (standard_host and scheme == "http" and host_port in ("", "80") and services.is_prod())
         else ""
     )
     if not services.is_domain(domain):
@@ -731,20 +920,51 @@ def _post_setup_redirect(state: dict, request: Request) -> dict:
     if state.get("cert", {}).get("type") != "letsencrypt":
         return {"ready": False, "url": url, "secure_url": secure_url,
                 "reason": "证书不是 Let's Encrypt (域名可能还没解析到本机, 或 80 端口被挡)"}
-    ok, detail = services.probe_public_panel(domain, config.PANEL_PORT)
+    ok, detail = services.probe_public_panel(domain, 443)
     return {"ready": ok, "url": url, "secure_url": secure_url, "reason": detail}
 
 
+def _chain_exit_pin(state: dict) -> str:
+    """本机作为落地端时 QUIC 证书的当前指纹 (chain-quic 提供; 没有就返回空串)。"""
+    fn = getattr(chain, "current_exit_pin", None)
+    if not callable(fn):
+        return ""
+    try:
+        return str(fn(state) or "").strip().lower()
+    except Exception:  # noqa: BLE001 — 自检项坏掉不能把整个仪表盘打成 500
+        return ""
+
+
 def _chain_view(state: dict) -> dict:
-    """链式代理卡片的数据: 本机作为落地端的配对码 + 已连接的中转条目。"""
+    """链式代理卡片的数据: 本机作为落地端的配对码 + 已连接的中转条目。
+
+    QUIC 证书固定 (P1-1 / P2-7) 的三个视图字段, 字段名是前端契约:
+      * `entries[].pin_ok`      —— 这条链路有没有可用的对端证书指纹;
+      * `entries[].needs_repair` —— 需要重新配对 (旧 v2 码 / 指纹与落地端当前证书不符);
+      * 顶层 `exit_pin`         —— 本机落地端证书当前指纹 (没开落地端 QUIC 时为空);
+      * 顶层 `pin_mismatch`     —— 存在"已固定但与落地端当前证书不一致"的入口条目。
+    """
+    exit_pin = _chain_exit_pin(state)
     chain_cfg = state.get("chain") or {}
     exit_cfg = chain_cfg.get("exit") or {}
     code = chain.exit_code(state)
     procs = chain_quic.status(state)
     entries = []
+    pin_mismatch = False
     for entry in chain_cfg.get("entries") or []:
         probe = entry.get("last_probe") or {}
         transport = entry.get("transport") or "reality"
+        pin = str(entry.get("hy_cert_sha256") or "").strip().lower()
+        if transport == "hysteria2":
+            # 固定过对端证书才算 pin_ok; 指纹与落地端当前证书不一致时也算不可用
+            # (hysteria 会直接拒绝握手: no certificate matches the pinned hash)。
+            pinned = bool(pin)
+            pin_ok = pinned and (not exit_pin or pin == exit_pin)
+            if pinned and exit_pin and pin != exit_pin:
+                pin_mismatch = True
+        else:
+            # Reality 内层没有证书固定这回事, 不产生误报
+            pin_ok = True
         entries.append(
             {
                 "id": entry.get("id", ""),
@@ -766,6 +986,10 @@ def _chain_view(state: dict) -> dict:
                 "hy_port": int(entry.get("hy_port") or 0),
                 "hy_socks_port": int(entry.get("hy_socks_port") or 0),
                 "has_quic": bool(entry.get("hy_port") and entry.get("hy_pw")),
+                # 证书固定的三项 (前端按这些字段渲染, 名字不可改)
+                "hy_cert_pin": pin,
+                "pin_ok": bool(pin_ok),
+                "needs_repair": not bool(pin_ok),
                 "enabled": bool(entry.get("enabled", True)),
                 "default_out": bool(entry.get("default_out")),
                 "created_at": int(entry.get("created_at") or 0),
@@ -788,6 +1012,9 @@ def _chain_view(state: dict) -> dict:
         },
         "entries": entries,
         "default_out": next((e["id"] for e in entries if e["default_out"]), ""),
+        # 落地端证书当前指纹 + 是否存在过期指纹 (P2-7)
+        "exit_pin": exit_pin,
+        "pin_mismatch": bool(pin_mismatch),
     }
 
 
@@ -828,10 +1055,22 @@ def _dash_fingerprint(state: dict) -> str:
     exit_cfg = chain_cfg.get("exit") or {}
     exit_state = f"exit:{exit_cfg.get('uuid', '')}:{bool(exit_cfg.get('enabled', True))}"
 
+    # GeoIP 数据 (P3-18): state 里真实的键是 files / updated_at / enabled, 以前读的
+    # `geodata.downloaded` 根本不存在 → 恒 False, geo 数据更新后指纹不变, 前端就停在
+    # "安静期"不刷新。这里用"每份数据的 sha256 前 12 位 + 更新时间 + 开关"做签名。
+    geo = state.get("geodata") or {}
+    geo_files = geo.get("files") if isinstance(geo.get("files"), dict) else {}
+    geo_sig = ",".join(
+        f"{name}:{str((geo_files.get(name) or {}).get('sha256') or '')[:12]}"
+        for name in sorted(geo_files)
+        if isinstance(geo_files.get(name), dict)
+    )
+    geo_state = f"{bool(geo.get('enabled'))}:{int(geo.get('updated_at') or 0)}:{geo_sig}"
+
     parts = [
         state.get("domain", ""),
         state.get("hysteria_hopping", False),
-        state.get("geodata", {}).get("downloaded", False),
+        geo_state,
         (state.get("cert") or {}).get("type", ""),
         *node_states,
         *chain_states,
@@ -1566,6 +1805,18 @@ def chain_entry_update(entry_id: str, payload: ChainEntryPatch, request: Request
         changed: list[str] = []
         label = entry.get("label") or entry.get("host")
         if payload.enabled is not None and bool(payload.enabled) != bool(entry.get("enabled", True)):
+            # 重新启用一条"旧 v2 QUIC 配对码"的条目要在 API 层就说清楚 (P1-1):
+            # 它没有 hy_cert_sha256, 以 insecure 方式连落地端 —— apply 会判红、
+            # 看门线程也不托管它, 与其让用户点完看到红灯, 不如当场拒绝并给动作。
+            if (
+                payload.enabled
+                and (entry.get("transport") or "reality") == "hysteria2"
+                and not str(entry.get("hy_cert_sha256") or "").strip()
+            ):
+                return _err(
+                    "这条链来自旧版 QUIC 配对码, 没有落地端证书指纹 (无法校验对端身份); "
+                    "请让落地端升级后重新生成配对码, 删掉这条再按新码接一次"
+                )
             entry["enabled"] = bool(payload.enabled)
             if not entry["enabled"]:
                 entry["default_out"] = False
@@ -1742,6 +1993,49 @@ def _check_tcp(hostport: str, label: str) -> tuple[bool, str]:
         return False, f"{label} 连接失败: {exc}"
 
 
+def _chain_diagnose_items(state: dict) -> list[dict]:
+    """链式 QUIC 证书固定的自检项 (chain.diagnose_items, chain-quic 提供)。
+
+    统一成 /api/diagnose 现有项的样子: `name` / `ok` / `detail` / `fixable`,
+    另带 `id` / `title` / `hint` (链式那两项的原始 schema)。取不到函数 (旧代码 /
+    降级部署) 就返回空 —— 不能因为一个自检项不存在把整个诊断打成 500。
+    """
+    fn = getattr(chain, "diagnose_items", None)
+    if not callable(fn):
+        return []
+    try:
+        raw = fn(state)
+    except Exception as exc:  # noqa: BLE001
+        return [
+            {
+                "id": "chain_quic_diagnose",
+                "name": "链式 QUIC 证书固定",
+                "title": "链式 QUIC 证书固定",
+                "ok": False,
+                "detail": f"自检失败: {type(exc).__name__}: {exc}",
+                "hint": "检查 state.json 的 chain 段; 这属于诊断器自身故障, 不影响代理运行",
+                "fixable": False,
+            }
+        ]
+    out: list[dict] = []
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or item.get("name") or "链式 QUIC")
+        out.append(
+            {
+                "id": str(item.get("id") or ""),
+                "name": title,
+                "title": title,
+                "ok": bool(item.get("ok")),
+                "detail": str(item.get("detail") or ""),
+                "hint": str(item.get("hint") or ""),
+                "fixable": bool(item.get("fixable")),
+            }
+        )
+    return out
+
+
 def _diagnose(state: dict) -> list[dict]:
     """逐项自检 (只读), 修复动作交给 /api/repair。"""
     checks: list[dict] = []
@@ -1906,6 +2200,10 @@ def _diagnose(state: dict) -> list[dict]:
         wg_ok, wg_detail = wireguard.diagnose(state)
         add("WireGuard 入站", wg_ok, wg_detail, fixable=True)
 
+    # 10. 链式 QUIC 的证书固定 (chain-quic 提供): 旧 v2 配对码的"无对端身份校验"
+    #     条目、以及落地端重签后过期的指纹, 都只能靠这里报出来 (P1-1 / P2-7)。
+    checks.extend(_chain_diagnose_items(state))
+
     return checks
 
 
@@ -2046,44 +2344,194 @@ def _backup_payload(state: dict) -> dict:
     # 会话与登录限流是纯运行时数据, 备份里没有意义, 且不该被复制到别的机器
     clean.pop("sessions", None)
     clean.pop("login_failures", None)
+    # P2-5: 交接票据 (10 分钟有效, 能直接换一个管理员会话) 与未使用的配对码
+    # (能领设备 secret) 都是短期凭据 —— 备份里既没用, 又是个额外的泄露面。
+    clean.pop("handoffs", None)
+    devices_bucket = clean.get("devices")
+    if isinstance(devices_bucket, dict):
+        devices_bucket["pair_codes"] = []
     return {
         "format": BACKUP_FORMAT,
         "backup_version": BACKUP_VERSION,
         "panel_version": __import__("zeroproxy").__version__,
         "state_version": config.STATE_VERSION,
         "exported_at": int(time.time()),
+        # 只保证"文件完整、没有被截断/改坏"的完整性校验 (算法公开、无密钥);
+        # 它**不是签名**, 防不了有意的篡改 —— 要防篡改/防泄露请用 encrypt=1 加密导出。
         "checksum": hashlib.sha256(_canonical(clean).encode("utf-8")).hexdigest(),
         "state": clean,
     }
 
 
-@router.get("/api/backup")
-def backup(request: Request):
-    """导出完整状态 (含 Reality 私钥 / 口令哈希 / 订阅令牌) — 需登录。"""
+class BackupIn(BaseModel):
+    """POST /api/backup 的请求体 (可选)。加密标记也可以走 ?encrypt=1。"""
+
+    encrypt: int = 0
+
+
+def _backup_passphrase(request: Request) -> str:
+    """加密备份的口令 (只从请求头来, 不进 URL / 日志)。"""
+    return (request.headers.get("x-zp-passphrase") or "").strip()
+
+
+def _backup_encrypt(plain: bytes, passphrase: str) -> bytes:
+    """AES-256-GCM 封装: magic | salt(16) | nonce(12) | ciphertext+tag。
+
+    密钥 = PBKDF2-SHA256(口令, salt, 600k 次)。AAD 用容器魔数, 防止把一份密文
+    当成另一种容器解 (改 format 标识会直接 InvalidTag)。
+    """
+    salt = os.urandom(16)
+    nonce = os.urandom(12)
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(), length=32, salt=salt, iterations=BACKUP_KDF_ITERATIONS
+    )
+    sealed = AESGCM(kdf.derive(passphrase.encode("utf-8"))).encrypt(
+        nonce, plain, BACKUP_ENC_MAGIC
+    )
+    return BACKUP_ENC_MAGIC + salt + nonce + sealed
+
+
+def _backup_decrypt(blob: bytes, passphrase: str) -> bytes:
+    """解密 _backup_encrypt 产出的容器; 口令错/被改坏统一抛 ValueError。"""
+    body = blob[len(BACKUP_ENC_MAGIC):]
+    if len(body) < 16 + 12 + 16:
+        raise ValueError("加密容器内容不完整")
+    salt, nonce, sealed = body[:16], body[16:28], body[28:]
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(), length=32, salt=salt, iterations=BACKUP_KDF_ITERATIONS
+    )
+    try:
+        return AESGCM(kdf.derive(passphrase.encode("utf-8"))).decrypt(
+            nonce, sealed, BACKUP_ENC_MAGIC
+        )
+    except InvalidTag:
+        raise ValueError("口令错误, 或文件已被改动/损坏") from None
+
+
+@router.post("/api/backup")
+def backup(request: Request, payload: BackupIn | None = None, encrypt: int = 0):
+    """导出完整状态 (含 Reality 私钥 / 口令哈希 / 订阅令牌) — 需登录。
+
+    敏感度: 备份等价于"这台服务器的 root 凭据", 拿到它就能还原全部私钥与管理员
+    口令哈希。所以:
+      * 只接受 POST (GET 是"有副作用的 GET", 缓存/预取/爬虫都可能把它带走);
+      * `encrypt=1` + `X-ZP-Passphrase` 头 → 返回 AES-GCM 加密的 .enc (口令不落
+        URL / 日志); 不加密时返回明文 .json, 由调用方自行保管。
+    """
+    want_encrypt = bool(int(payload.encrypt if payload is not None else 0) or int(encrypt or 0))
+    passphrase = _backup_passphrase(request)
+    if want_encrypt and len(passphrase) < BACKUP_PASSPHRASE_MIN:
+        return _err(
+            f"加密备份的口令至少 {BACKUP_PASSPHRASE_MIN} 个字符 (放在 X-ZP-Passphrase 头里)",
+            400,
+        )
     with config.locked():
         state = load_state()
         if not _require_auth(state, request):
             return _err("未登录", 401)
-        config.audit(state, "backup", f"domain={state['domain']}", actor=_client_ip(request))
+        config.audit(
+            state,
+            "backup",
+            f"domain={state['domain']} · {'加密' if want_encrypt else '明文'}",
+            actor=_client_ip(request),
+        )
         save_state(state)
-        payload = _backup_payload(state)
+        payload_body = _backup_payload(state)
     stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
-    return JSONResponse(
-        payload,
+    if not want_encrypt:
+        return JSONResponse(
+            payload_body,
+            headers={
+                "content-disposition": f'attachment; filename="zeroproxy-backup-{stamp}.json"',
+                "cache-control": "no-store",
+            },
+        )
+    plain = json.dumps(payload_body, ensure_ascii=False).encode("utf-8")
+    blob = _backup_encrypt(plain, passphrase)
+    return Response(
+        blob,
+        media_type="application/octet-stream",
         headers={
-            "content-disposition": f'attachment; filename="zeroproxy-backup-{stamp}.json"',
+            "content-disposition": f'attachment; filename="zeroproxy-backup-{stamp}.json.enc"',
             "cache-control": "no-store",
         },
     )
 
 
+@router.get("/api/backup")
+def backup_get_rejected(request: Request):
+    """旧入口 (GET) 明确拒绝: 导出必须走 POST。"""
+    return _err(
+        "导出备份请用 POST /api/backup (需要加密时加 encrypt=1 并在 X-ZP-Passphrase 头里给口令)",
+        405,
+    )
+
+
+async def _raw_request_body(request: Request) -> bytes:
+    """读原始请求体 (restore 用)。
+
+    恢复的端点是**同步 def** (FastAPI 会放进线程池, 不占事件循环 —— P2-3);
+    但同步函数里不能 await, 所以请求体由一个 async 依赖先读出来。
+    """
+    return await request.body()
+
+
+def _restore_validate(state: dict) -> str:
+    """恢复前把会直接进生成器的字段重新校验一遍 (P2-3)。
+
+    备份是外部输入: "校验和过了"只能说明文件完整 (校验和算法是公开的, 不是签名)。
+    这些字段会被原样拼进 nginx / Xray / Hysteria 配置, 所以恢复路径上必须和
+    手工改设置走同一套门槛。
+    """
+    domain = str(state.get("domain") or "").strip().lower()
+    if not domain or not (_DOMAIN_RE.match(domain) or _is_ip(domain)):
+        return f"备份里的 domain 不合法: {domain[:60]!r}"
+
+    ports = state.get("ports")
+    if not isinstance(ports, dict):
+        return "备份里的 ports 不合法 (应为对象)"
+    for key in _PORT_KEYS:
+        try:
+            port = int(ports.get(key))
+        except (TypeError, ValueError):
+            return f"备份里的端口 {key} 不是整数"
+        if not 1 <= port <= 65535:
+            return f"备份里的端口 {key}={port} 超出范围 (1-65535)"
+
+    for key in ("hysteria_password", "trojan_password"):
+        value = str(state.get(key) or "")
+        if value and not _PASSWORD_RE.match(value):
+            return f"备份里的 {key} 含非法字符, 或长度不在 6-128 之间"
+
+    cert = state.get("cert") or {}
+    home_prefix = os.path.abspath(config.home())
+    allowed_roots = (home_prefix + os.sep, *_CERT_ROOT_OK)
+    for key in ("cert_file", "key_file"):
+        value = str(cert.get(key) or "")
+        if not value:
+            continue
+        if "\n" in value or "\r" in value or not os.path.isabs(value):
+            return f"备份里的证书路径 {key} 不合法: {value[:80]!r}"
+        if ".." in value.split(os.sep):
+            return f"备份里的证书路径 {key} 不能包含 .. : {value[:80]!r}"
+        resolved = os.path.abspath(value)
+        if not resolved.startswith(allowed_roots):
+            return f"备份里的证书路径 {key} 不在允许目录内: {resolved[:80]!r}"
+    return ""
+
+
 @router.post("/api/restore")
-async def restore(request: Request):
+def restore(request: Request, raw: bytes = Depends(_raw_request_body)):
     """从备份恢复状态, 然后重新生成全部配置并热重载。
 
-    校验链: 结构 → 校验和 → 必填字段 → 状态版本。任一不过都保持现网不变。
+    校验链: (可选解密) → 结构 → 完整性校验和 → 必填字段 → 状态版本 → 字段重校验。
+    任一不过都保持现网不变。
+
+    这段是**同步 def**: FastAPI 把它放进线程池, 恢复后的 _reapply (nginx -t /
+    systemctl restart 级耗时) 不再卡住事件循环 (P2-3)。落盘也拆成"锁内先存 →
+    锁外用副本 apply": 以前是 apply 完再把一份旧快照无条件写回去, 期间任何并发
+    修改 (设备心跳 / 登录会话) 都会被覆盖。
     """
-    raw = await request.body()
     if len(raw) > RESTORE_MAX_BYTES:
         return _err("备份文件过大", 413)
 
@@ -2091,6 +2539,17 @@ async def restore(request: Request):
         current = load_state()
         if not _require_auth(current, request):
             return _err("未登录", 401)
+
+    passphrase = _backup_passphrase(request)
+    if raw.startswith(BACKUP_ENC_MAGIC):
+        if not passphrase:
+            return _err(
+                "这是加密备份: 请在 X-ZP-Passphrase 头里提供导出时用的口令", 400
+            )
+        try:
+            raw = _backup_decrypt(raw, passphrase)
+        except ValueError as exc:
+            return _err(f"加密备份解密失败: {exc}", 400)
 
     try:
         payload = json.loads(raw.decode("utf-8"))
@@ -2115,7 +2574,10 @@ async def restore(request: Request):
     candidate.pop("login_failures", None)
     actual = hashlib.sha256(_canonical(candidate).encode("utf-8")).hexdigest()
     if not hmac.compare_digest(str(expected), actual):
-        return _err("备份文件校验和不匹配 (文件被修改或损坏)")
+        return _err(
+            "备份文件校验和不匹配 (文件被截断/改坏)。注意: 校验和只用于完整性检查, "
+            "不是签名 —— 需要防篡改/防泄露请用加密备份 (X-ZP-Passphrase)"
+        )
 
     if int(payload.get("state_version", 0) or 0) > config.STATE_VERSION:
         return _err(
@@ -2134,9 +2596,13 @@ async def restore(request: Request):
         return _err("备份缺少 Reality 密钥对")
     if not restored["admin"].get("username") or not restored["admin"].get("password_hash"):
         return _err("备份缺少管理员凭据")
+    problem = _restore_validate(restored)
+    if problem:
+        return _err(problem)
 
     with config.locked():
         # 恢复是"覆盖"操作: 先记审计再落盘 (审计属于新状态的一部分)
+        original = load_state()
         restored["sessions"] = {}
         restored["login_failures"] = {}
         config.audit(
@@ -2146,13 +2612,29 @@ async def restore(request: Request):
             actor=_client_ip(request),
         )
         save_state(restored)
-    # F09: _reapply 可能耗时十几秒 (生成配置 + systemctl 重启), 在外面跑不让锁阻塞其他请求
-    steps = _reapply(restored, request)
-    body = _dashboard_body(restored, request)
+
+    # 长耗时闭环在锁外跑; 用的是副本 —— 失败时把恢复前的状态原样写回。
+    applied = copy.deepcopy(restored)
+    try:
+        steps = _reapply(applied, request)
+    except Exception as exc:  # noqa: BLE001 — 恢复失败必须留一条回滚路径
+        with config.locked():
+            save_state(original)
+        return _err(
+            f"恢复后重新应用配置失败 ({type(exc).__name__}: {exc}), 已回滚到恢复前状态", 500
+        )
+
+    with config.locked():
+        fresh = load_state()
+        fresh["steps"] = steps
+        save_state(fresh)
+    body = _dashboard_body(fresh, request)
     body["steps"] = steps
     response = JSONResponse(body)
-    _issue_session(restored, request, response)
-    save_state(restored)
+    with config.locked():
+        fresh = load_state()
+        _issue_session(fresh, request, response)
+        save_state(fresh)
     return response
 
 
@@ -2212,6 +2694,21 @@ def session_handoff(payload: HandoffIn, request: Request):
         if not entry or int(entry.get("expires") or 0) < time.time():
             save_state(state)
             return _err("交接票据已失效, 请在新域名上用账号密码登录", 401)
+        # 票据绑定签发时的来源 IP (P3-13): 票据会出现在 URL / 日志里, 被截获后
+        # 10 分钟内任意 IP 都能换一个管理员会话 —— 这里让它只对原 IP 有效。
+        # 换域名时客户端 IP 不变, 所以正常路径不受影响; 没记录 IP 的老票据放行。
+        bound = str(entry.get("ip") or "").strip()
+        if bound and bound != _client_ip(request):
+            config.audit(
+                state,
+                "handoff_ip_mismatch",
+                f"expected={bound} actual={_client_ip(request)}",
+                actor=state["admin"]["username"],
+            )
+            save_state(state)
+            return _err(
+                "交接票据与当前来源 IP 不一致 (已作废), 请在新域名上用账号密码登录", 401
+            )
         _clean_sessions(state)
         response = JSONResponse({"ok": True})
         _issue_session(state, request, response)
@@ -2351,7 +2848,7 @@ def _domain_pipeline(new_domain: str, progress=None) -> tuple[list[dict], str]:
 
     # ---- 3) 验证: 新域名上真的能打开面板吗 (证书受信任 + DNS + 端口) ----
     if services.is_prod():
-        reachable, why = services.probe_public_panel(new_domain, config.PANEL_PORT, timeout=15)
+        reachable, why = services.probe_public_panel(new_domain, 443, timeout=15)
         if not reachable:
             with config.locked():
                 steps.extend(_rollback_domain(old_domain, old_cert))
@@ -2856,6 +3353,56 @@ def _wg_reply(state: dict, request: Request, steps: list[dict]) -> dict:
     return body
 
 
+def _wg_sync_and_persist(
+    state: dict,
+    request: Request,
+    before: dict,
+    step_name: str,
+    step_detail: str,
+    action: str,
+    audit_detail: str,
+) -> tuple[dict, list[dict], bool]:
+    """把 wireguard.sync() 移出 config 锁执行, 失败回滚 + 写审计 (P2-2)。
+
+    锁内只做 state 的读改写与落盘 (期望状态); `sync()` 内部会 apt install /
+    systemctl 启停 / 循环等 wg0 就绪 (最长 90-180 秒), 持着全局锁跑会让登录、
+    订阅、心跳、仪表盘全部排队。这里先在锁内把期望状态存好, 释放锁后同步,
+    再用一次短锁把结果 (内核补齐的 server keys / active_mode) 或回滚写回去。
+    """
+    snapshot = copy.deepcopy(state)
+    started = time.time()
+    try:
+        ok, sync_detail = wireguard.sync(snapshot, timeout=180)
+    except Exception as exc:  # noqa: BLE001 — 异常同样走回滚路径
+        ok, sync_detail = False, f"异常: {type(exc).__name__}: {exc}"
+    steps = [
+        {
+            "name": step_name,
+            "ok": bool(ok),
+            "detail": f"{step_detail} · {sync_detail}" if step_detail else sync_detail,
+            "ms": int((time.time() - started) * 1000),
+        }
+    ]
+    with config.locked():
+        fresh = load_state()
+        if ok:
+            # sync() 可能补齐 server 私钥 / active_mode, 以它算出来的那份为准
+            fresh["wireguard"] = copy.deepcopy(snapshot.get("wireguard") or {})
+        else:
+            # 回滚期望状态: 不能让面板显示"改好了"而设备面没变
+            fresh["wireguard"] = copy.deepcopy(before)
+            steps[0]["rolled_back"] = True
+        config.audit(
+            fresh,
+            action,
+            audit_detail[:200] + ("" if ok else " · 失败已回滚"),
+            actor=_client_ip(request),
+        )
+        fresh["steps"] = steps
+        save_state(fresh)
+    return fresh, steps, ok
+
+
 @router.get("/api/wireguard")
 def wireguard_status(request: Request):
     state = load_state()
@@ -2870,6 +3417,8 @@ def wireguard_settings(payload: WireGuardSettingsIn, request: Request):
         state = load_state()
         if not _require_auth(state, request):
             return _err("未登录", 401)
+        # 变更前快照: sync() 在锁外失败时按这份回滚 (P2-2)
+        before_wg = copy.deepcopy(state.get("wireguard") or {})
         wg = wireguard.bucket(state)
         updates: dict = {}
 
@@ -2948,27 +3497,29 @@ def wireguard_settings(payload: WireGuardSettingsIn, request: Request):
                 elif not updates["ipv6"] and peer.get("allowed_ips") == "0.0.0.0/0, ::/0":
                     peer["allowed_ips"] = "0.0.0.0/0"
 
-        started = time.time()
-        ok, detail = wireguard.sync(state, timeout=180)
-        steps = [
+        # 锁内只落"期望状态"; sync() (apt/systemctl/等 wg0) 放到锁外执行 (P2-2)
+        save_state(state)
+    fresh, steps, ok = _wg_sync_and_persist(
+        state,
+        request,
+        before_wg,
+        "WireGuard 配置",
+        "",
+        "wireguard_settings",
+        ", ".join(changed),
+    )
+    if ok and (fresh.get("wireguard") or {}).get("enabled"):
+        steps.append(
             {
-                "name": "WireGuard 配置",
-                "ok": bool(ok),
-                "detail": detail,
-                "ms": int((time.time() - started) * 1000),
+                "name": "放行 WireGuard 端口",
+                "ok": True,
+                "detail": services.open_firewall_port(
+                    int((fresh.get("wireguard") or {}).get("port") or 0), "udp"
+                ),
+                "ms": 0,
             }
-        ]
-        if ok and wg.get("enabled"):
-            steps.append(
-                {
-                    "name": "放行 WireGuard 端口",
-                    "ok": True,
-                    "detail": services.open_firewall_port(int(wg["port"]), "udp"),
-                    "ms": 0,
-                }
-            )
-        config.audit(state, "wireguard_settings", ", ".join(changed), actor=_client_ip(request))
-        return _wg_reply(state, request, steps)
+        )
+    return _wg_reply(fresh, request, steps)
 
 
 @router.post("/api/wireguard/peers")
@@ -2977,6 +3528,7 @@ def wireguard_peer_add(payload: WireGuardPeerIn, request: Request):
         state = load_state()
         if not _require_auth(state, request):
             return _err("未登录", 401)
+        before_wg = copy.deepcopy(state.get("wireguard") or {})
         wg = wireguard.bucket(state)
         if not wg.get("enabled"):
             return _err("请先启用 WireGuard", 409)
@@ -2989,24 +3541,20 @@ def wireguard_peer_add(payload: WireGuardPeerIn, request: Request):
             )
         except ValueError as exc:
             return _err(str(exc))
-        started = time.time()
-        ok, detail = wireguard.sync(state)
-        steps = [
-            {
-                "name": "添加 WireGuard 客户端",
-                "ok": bool(ok),
-                "detail": f"{peer['name']} · {peer['address']} · {detail}",
-                "ms": int((time.time() - started) * 1000),
-            }
-        ]
-        config.audit(
-            state, "wireguard_peer_add", f"{peer['name']} ({peer['address']})",
-            actor=_client_ip(request),
-        )
-        body = _wg_reply(state, request, steps)
-        body["peer_id"] = peer["id"]
-        body["config"] = wireguard.client_config(state, peer)
-        return body
+        save_state(state)
+    fresh, steps, _ok = _wg_sync_and_persist(
+        state,
+        request,
+        before_wg,
+        "添加 WireGuard 客户端",
+        f"{peer['name']} · {peer['address']}",
+        "wireguard_peer_add",
+        f"{peer['name']} ({peer['address']})",
+    )
+    body = _wg_reply(fresh, request, steps)
+    body["peer_id"] = peer["id"]
+    body["config"] = wireguard.client_config(fresh, peer)
+    return body
 
 
 @router.post("/api/wireguard/peers/{peer_id}")
@@ -3015,6 +3563,7 @@ def wireguard_peer_update(peer_id: str, payload: WireGuardPeerPatch, request: Re
         state = load_state()
         if not _require_auth(state, request):
             return _err("未登录", 401)
+        before_wg = copy.deepcopy(state.get("wireguard") or {})
         wg = wireguard.bucket(state)
         peer = wireguard.find_peer(state, peer_id)
         if peer is None:
@@ -3055,24 +3604,20 @@ def wireguard_peer_update(peer_id: str, payload: WireGuardPeerPatch, request: Re
             changed.append(f"compat={bool(payload.compat)}")
         if not changed:
             return _err("没有需要修改的内容")
-        started = time.time()
-        ok, detail = wireguard.sync(state)
-        steps = [
-            {
-                "name": "更新 WireGuard 客户端",
-                "ok": bool(ok),
-                "detail": f"{peer.get('name')} · {detail}",
-                "ms": int((time.time() - started) * 1000),
-            }
-        ]
-        config.audit(
-            state, "wireguard_peer_update",
-            f"{peer.get('name')}: {', '.join(changed)}", actor=_client_ip(request),
-        )
-        body = _wg_reply(state, request, steps)
-        body["peer_id"] = peer["id"]
-        body["config"] = wireguard.client_config(state, peer)
-        return body
+        save_state(state)
+    fresh, steps, _ok = _wg_sync_and_persist(
+        state,
+        request,
+        before_wg,
+        "更新 WireGuard 客户端",
+        f"{peer.get('name')}",
+        "wireguard_peer_update",
+        f"{peer.get('name')}: {', '.join(changed)}",
+    )
+    body = _wg_reply(fresh, request, steps)
+    body["peer_id"] = peer["id"]
+    body["config"] = wireguard.client_config(fresh, peer)
+    return body
 
 
 @router.delete("/api/wireguard/peers/{peer_id}")
@@ -3081,24 +3626,21 @@ def wireguard_peer_delete(peer_id: str, request: Request):
         state = load_state()
         if not _require_auth(state, request):
             return _err("未登录", 401)
+        before_wg = copy.deepcopy(state.get("wireguard") or {})
         peer = wireguard.remove_peer(state, peer_id)
         if peer is None:
             return _err("客户端不存在", 404)
-        started = time.time()
-        ok, detail = wireguard.sync(state)
-        steps = [
-            {
-                "name": "移除 WireGuard 客户端",
-                "ok": bool(ok),
-                "detail": f"{peer.get('name')} · {detail}",
-                "ms": int((time.time() - started) * 1000),
-            }
-        ]
-        config.audit(
-            state, "wireguard_peer_remove",
-            f"{peer.get('name')} ({peer.get('address')})", actor=_client_ip(request),
-        )
-        return _wg_reply(state, request, steps)
+        save_state(state)
+    fresh, steps, _ok = _wg_sync_and_persist(
+        state,
+        request,
+        before_wg,
+        "移除 WireGuard 客户端",
+        f"{peer.get('name')}",
+        "wireguard_peer_remove",
+        f"{peer.get('name')} ({peer.get('address')})",
+    )
+    return _wg_reply(fresh, request, steps)
 
 
 @router.post("/api/wireguard/peers/{peer_id}/rotate")
@@ -3107,26 +3649,24 @@ def wireguard_peer_rotate(peer_id: str, request: Request):
         state = load_state()
         if not _require_auth(state, request):
             return _err("未登录", 401)
+        before_wg = copy.deepcopy(state.get("wireguard") or {})
         peer = wireguard.rotate_peer(state, peer_id)
         if peer is None:
             return _err("客户端不存在", 404)
-        started = time.time()
-        ok, detail = wireguard.sync(state)
-        steps = [
-            {
-                "name": "轮换 WireGuard 密钥",
-                "ok": bool(ok),
-                "detail": f"{peer.get('name')} · 旧配置已失效 · {detail}",
-                "ms": int((time.time() - started) * 1000),
-            }
-        ]
-        config.audit(
-            state, "wireguard_peer_rotate", str(peer.get("name")), actor=_client_ip(request)
-        )
-        body = _wg_reply(state, request, steps)
-        body["peer_id"] = peer["id"]
-        body["config"] = wireguard.client_config(state, peer)
-        return body
+        save_state(state)
+    fresh, steps, _ok = _wg_sync_and_persist(
+        state,
+        request,
+        before_wg,
+        "轮换 WireGuard 密钥",
+        f"{peer.get('name')} · 旧配置已失效",
+        "wireguard_peer_rotate",
+        str(peer.get("name")),
+    )
+    body = _wg_reply(fresh, request, steps)
+    body["peer_id"] = peer["id"]
+    body["config"] = wireguard.client_config(fresh, peer)
+    return body
 
 
 @router.get("/api/wireguard/peers/{peer_id}/config")
@@ -3234,6 +3774,10 @@ class DeviceReportIn(BaseModel):
     k: str = ""
     actual: bool | None = None
     rev: str = ""
+    #: 设备显式上报"这份配置我已应用(校验 + 重载)成功"的版本 (P2-9)
+    applied_rev: str = ""
+    #: 设备明确回报数据面健康时, 它当前生效的 `rev` 才视为已应用
+    healthy: bool | None = None
     version: str = ""
     arch: str = ""
     os: str = ""
@@ -3313,11 +3857,18 @@ def _install_command(base: str, code: str, insecure: bool = False) -> str:
 
 
 def _client_script(body: str) -> Response:
-    """把一份正文当成"给 shell 看的脚本"下发 (安装脚本与说明都是这个形态)。"""
+    """把一份正文当成"给 shell 看的脚本"下发 (安装脚本与说明都是这个形态)。
+
+    带 `X-ZP-Install-Sha256`: 路由器端 (1.4.45+) 落盘前比对, 不符就拒绝执行 ——
+    第一跳是整条安装链上唯一没有摘要锚点的一环 (缺失时旧客户端只警告并继续)。
+    """
+    data = body.encode("utf-8")
+    helper = getattr(router_client, "sha256_hex", None)
+    digest = helper(data) if callable(helper) else hashlib.sha256(data).hexdigest()
     return Response(
         body,
         media_type="text/x-shellscript; charset=utf-8",
-        headers={"cache-control": "no-store"},
+        headers={"cache-control": "no-store", "x-zp-install-sha256": digest},
     )
 
 
@@ -3535,21 +4086,28 @@ def client_perf_config(request: Request, id: str = "", k: str = "", lan: str = "
         if not state["configured"]:
             return _err("面板尚未初始化", 409)
         device = devices.find(state, id)
-        if not devices.check_secret(device, k):
+        if not devices.check_secret(device, _device_secret(request, k)):
             return _err("设备凭据无效", 403)
         # 接口名只允许 [A-Za-z0-9._-]: 它会原样进配置文件, 不接受任何别的字符。
         ifaces = ",".join(
             part for part in (chunk.strip() for chunk in (lan or "").split(","))
             if part and all(ch.isalnum() or ch in "._-" for ch in part)
         )[:120]
+        # `?tpl=` 会原样进配置头部那行注释; 以前直接拼用户输入, 换行就能注入配置行
+        # (P3-16)。这里走 share_links 的白名单 (template_of), 未知值回退面板默认。
+        template = share_links.template_of(state, (tpl or "").strip().lower())
         body, skipped = dae_config.render(
             state,
             share_links.panel_base_url(request, state),
             lan_interface=ifaces or "br-lan",
-            template=(tpl or "").strip().lower() or None,
+            template=template,
             geo=bool(geo),
         )
-        if devices.touch(state, device, {"ip": _client_ip(request)}):
+        if devices.touch(
+            state,
+            device,
+            {"ip": _client_ip(request), "downloaded_rev": devices.config_rev(state)},
+        ):
             save_state(state)
     if skipped:
         # 如实写进配置头部 (dae 忽略注释, 但人看得见) —— 少一个节点这件事不该只活在代码里
@@ -3579,10 +4137,11 @@ def client_perf_geo(name: str, request: Request):
             "「更新分流数据」后重试 —— 在此之前这台设备会拿到一份不含 geo 规则的降级配置。",
             503,
         )
+    path = geodata.file_path(name)
     return FileResponse(
-        geodata.file_path(name),
+        path,
         media_type="application/octet-stream",
-        headers={"cache-control": "no-store"},
+        headers={"cache-control": "no-store", **_file_sha_header(path)},
         filename=name,
     )
 
@@ -3607,7 +4166,7 @@ def client_perf_binary(arch: str, request: Request):
         return FileResponse(
             path,
             media_type="application/gzip",
-            headers={"cache-control": "no-store"},
+            headers={"cache-control": "no-store", **_file_sha_header(path)},
             filename=os.path.basename(path),
         )
     router_client.ensure_perf_async(arch)
@@ -3654,7 +4213,7 @@ def client_btf_package(request: Request, kver: str = "", arch: str = "", fmt: st
     return FileResponse(
         path,
         media_type="application/octet-stream",
-        headers={"cache-control": "no-store"},
+        headers={"cache-control": "no-store", **_file_sha_header(path)},
         filename=os.path.basename(path),
     )
 
@@ -3706,7 +4265,7 @@ def client_core_binary(arch: str, request: Request):
         return FileResponse(
             path,
             media_type="application/gzip",
-            headers={"cache-control": "no-store"},
+            headers={"cache-control": "no-store", **_file_sha_header(path)},
             filename=os.path.basename(path),
         )
     router_client.ensure_core_async(arch)
@@ -3743,7 +4302,7 @@ def client_agent_binary(arch: str, request: Request):
     return FileResponse(
         path,
         media_type="application/gzip",
-        headers={"cache-control": "no-store"},
+        headers={"cache-control": "no-store", **_file_sha_header(path)},
         filename=os.path.basename(path),
     )
 
@@ -3771,7 +4330,7 @@ def client_bench(mb: int, request: Request, id: str = "", k: str = ""):
         if not state["configured"]:
             return _err("面板尚未初始化", 409)
         device = devices.find(state, id)
-        if not devices.check_secret(device, k):
+        if not devices.check_secret(device, _device_secret(request, k)):
             return _err("设备凭据无效", 403)
     # 注意不是 `mb or 4`: 那个写法会把 0 当成"没给"(Python 里 0 是假值), 于是
     # /c/bench/0 返回 4 MB —— 一个看起来"很小"的请求反而拿到最多的数据。钳到 [1, 上限]。
@@ -3860,10 +4419,11 @@ def client_geo_file(name: str, request: Request):
     if router_client.geo_ready(name):
         if router_client.geo_stale(name):
             router_client.ensure_geo_async(name)   # 后台换新的, 这一次先把手上这份给出去
+        path = router_client.geo_file(name)
         return FileResponse(
-            router_client.geo_file(name),
+            path,
             media_type="application/octet-stream",
-            headers={"cache-control": "no-store"},
+            headers={"cache-control": "no-store", **_file_sha_header(path)},
             filename=name,
         )
     router_client.ensure_geo_async(name)
@@ -3889,7 +4449,12 @@ def client_ui_file(name: str, request: Request):
     if got is None:
         return _err("没有这个界面文件", 404)
     body, media, _filename = got
-    return Response(body, media_type=media, headers={"cache-control": "no-store"})
+    raw = body.encode("utf-8") if isinstance(body, str) else body
+    return Response(
+        body,
+        media_type=media,
+        headers={"cache-control": "no-store", **_sha_response_header(raw)},
+    )
 
 
 @router.get("/c/rt/bundle")
@@ -3911,7 +4476,7 @@ def client_runtime_bundle(request: Request):
     return Response(
         blob,
         media_type="application/gzip",
-        headers={"cache-control": "no-store"},
+        headers={"cache-control": "no-store", **_sha_response_header(blob)},
     )
 
 
@@ -3931,10 +4496,11 @@ def client_runtime_file(name: str, request: Request):
     if got is None:
         return _err("没有这个装机件", 404)
     body, _filename = got
+    raw = body.encode("utf-8") if isinstance(body, str) else body
     return Response(
         body,
         media_type="text/plain; charset=utf-8",
-        headers={"cache-control": "no-store"},
+        headers={"cache-control": "no-store", **_sha_response_header(raw)},
     )
 
 
@@ -4023,7 +4589,7 @@ def client_subscription(
         if not state["configured"]:
             return _err("面板尚未初始化", 409)
         device = devices.find(state, device_id)
-        if not devices.check_secret(device, k):
+        if not devices.check_secret(device, _device_secret(request, k)):
             return _err("设备凭据无效", 403)
         # 设备自己的模板覆盖优先于全局设置
         tpl = (device or {}).get("template") or ""
@@ -4048,10 +4614,13 @@ def client_subscription(
             # 分流数据库的下载地址指向面板自己 (路由器只需要能访问面板)
             base=share_links.panel_base_url(request, state),
         )
-        # 拉配置也算一次"设备还活着": 装完立刻在面板上显示在线, 不用等下一轮心跳
-        # F10: rev 写入心跳 rev 标记设备已下载此版本配置
+        # 拉配置也算一次"设备还活着": 装完立刻在面板上显示在线, 不用等下一轮心跳。
+        # 只记 `downloaded_rev` (面板发出去的是哪一版), **不**记 applied_rev ——
+        # 下载成功不等于设备已经校验/重载/数据面健康 (P2-9)。
         panel_rev = devices.config_rev(state)
-        if devices.touch(state, device, {"ip": _client_ip(request), "rev": panel_rev, "heartbeat_rev": panel_rev}):
+        if devices.touch(
+            state, device, {"ip": _client_ip(request), "downloaded_rev": panel_rev}
+        ):
             save_state(state)
     return Response(
         body,
@@ -4068,7 +4637,7 @@ def client_report(payload: DeviceReportIn, request: Request):
         if not state["configured"]:
             return _err("面板尚未初始化", 409)
         device = devices.find(state, payload.device)
-        if not devices.check_secret(device, payload.k):
+        if not devices.check_secret(device, _device_secret(request, payload.k)):
             return _err("设备凭据无效", 403)
         assert device is not None  # check_secret 已保证
         changed = False
@@ -4094,15 +4663,22 @@ def client_report(payload: DeviceReportIn, request: Request):
             info["actual"] = payload.actual
         if payload.report:
             info["report"] = payload.report
-        # F10: 将设备端实际 rev 透传给 touch(), 用于标记 applied_rev
+        # 设备显式上报的"已应用版本" / "数据面健康" —— 只有它们才推进 applied_rev
+        # (P2-9: 面板从"下载了"推断"应用了"是错的)。旧客户端没有这两个字段时
+        # applied_rev 保持原样, 不会被心跳悄悄刷新。
         if payload.rev:
-            info["heartbeat_rev"] = payload.rev
+            info["rev"] = payload.rev
+        if payload.applied_rev:
+            info["applied_rev"] = payload.applied_rev
+        if payload.healthy is not None:
+            info["healthy"] = payload.healthy
         changed = devices.touch(state, device, info) or changed
         if changed:
             save_state(state)
         return {
             "desired": bool(device["desired"]),
             "rev": devices.config_rev(state),
+            "downloaded_rev": device.get("downloaded_rev", ""),
             "applied_rev": device.get("applied_rev", ""),
             "name": device["name"],
             "template": share_links.template_of(state),

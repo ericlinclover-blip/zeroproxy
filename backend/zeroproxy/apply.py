@@ -59,6 +59,33 @@ _VERIFY_POLL = 0.15
 _VERIFY_PROBE_TIMEOUT = 0.3
 
 
+def _snapshot_nginx_files() -> dict[str, bytes | None]:
+    p = paths()
+    out: dict[str, bytes | None] = {}
+    for path in (p["nginx_home"], p["nginx_etc"]):
+        try:
+            with open(path, "rb") as fh:
+                out[path] = fh.read()
+        except OSError:
+            out[path] = None
+    return out
+
+
+def _restore_nginx_files(snapshot: dict[str, bytes | None]) -> None:
+    """恢复上一份 nginx 配置, 避免校验失败时把唯一可用入口留在坏文件上。"""
+    for path, content in snapshot.items():
+        try:
+            if content is None:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(path)
+            else:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as fh:
+                    fh.write(content)
+        except OSError:
+            pass
+
+
 def steps_recorder() -> list[dict]:
     return []
 
@@ -176,9 +203,11 @@ def gen_nginx(state: dict, timeout: int = 0) -> tuple[bool, str]:
     生产环境下写不进 `/etc/nginx` 属硬失败 —— 否则面板会显示成功, 而 nginx
     实际仍在跑旧配置 (443 不监听 / WS 节点不通)。
     """
+    previous = _snapshot_nginx_files()
     ok_etc, actual = nginx_config.write_nginx_conf(state)
     prod = services.is_prod()
     if not ok_etc and prod:
+        _restore_nginx_files(previous)
         return False, (
             f"无法写入 {paths()['nginx_etc']} (面板进程需要 root 权限) → "
             f"仅暂存 {actual}, nginx 未生效"
@@ -188,18 +217,58 @@ def gen_nginx(state: dict, timeout: int = 0) -> tuple[bool, str]:
     if ok_etc and binary:
         ok, out = services.run([binary, "-t"], timeout=30)
         if not ok:
+            _restore_nginx_files(previous)
+            return False, f"nginx -t 未通过: {' '.join(out.split())[:150]}"
+        detail += " (nginx -t 通过)"
+    return True, detail
+
+
+def gen_setup_nginx(
+    state: dict, hosts: list[str] | tuple[str, ...], timeout: int = 0
+) -> tuple[bool, str]:
+    """写入可重试的初始化入口, 不提前生成需要正式证书的 443 配置。"""
+    previous = _snapshot_nginx_files()
+    ok_etc, actual = nginx_config.write_setup_nginx_conf(state, hosts)
+    if services.is_prod() and not ok_etc:
+        _restore_nginx_files(previous)
+        return False, (
+            f"无法写入 {paths()['nginx_etc']} (面板进程需要 root 权限) → "
+            f"仅暂存 {actual}, 初始化入口未生效"
+        )
+    detail = f"已写入 {actual}" if ok_etc else f"无 /etc/nginx 权限 → 已存 {actual} (本地开发)"
+    binary = services.bin_path("nginx")
+    if ok_etc and binary:
+        ok, out = services.run([binary, "-t"], timeout=min(max(timeout or 30, 5), 60))
+        if not ok:
+            _restore_nginx_files(previous)
             return False, f"nginx -t 未通过: {' '.join(out.split())[:150]}"
         detail += " (nginx -t 通过)"
     return True, detail
 
 
 def gen_hysteria(state: dict, timeout: int = 0) -> tuple[bool, str]:
+    """写 Hysteria 2 配置, 重启前先做配置校验 (P2-12)。
+
+    以前这一步只查证书文件在不在: 坏 YAML / 缺段会顺利写盘, 重启后 hysteria2
+    永远起不来 (Restart 循环), 面板却显示"已生成"。现在把**已写出的那一份**
+    读回来用 `hysteria_config.validate()` 解析校验, 有问题就让该步失败 ——
+    对照 Xray 的 `xray -test` / nginx 的 `nginx -t`。
+    """
     hysteria_config.write_hysteria_config(state)
+    p = paths()
+    try:
+        with open(p["hysteria_config"], "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as exc:
+        return False, f"已生成但读不回配置, 无法校验: {exc}"
+    problems = hysteria_config.validate(text)
+    if problems:
+        return False, "已生成但配置校验未通过: " + "; ".join(problems)
     if state["nodes"].get("hysteria2"):
-        cert, key = paths()["hysteria_cert"], paths()["hysteria_key"]
+        cert, key = p["hysteria_cert"], p["hysteria_key"]
         if not (os.path.exists(cert) and os.path.exists(key)):
-            return False, "已生成但证书缺失 (客户端将无法连接)"
-    return True, "已生成"
+            return False, "已生成且配置合法, 但证书缺失 (客户端将无法连接)"
+    return True, "已生成 (配置校验通过)"
 
 
 def gen_wireguard(state: dict, timeout: int = 0) -> tuple[bool, str]:
@@ -264,15 +333,46 @@ def restart_services(
     # 链式内层的 QUIC 进程 (Hysteria 2) 由面板自己托管, 必须**在 Xray 之前**对齐:
     # 那条链的出站指向它的本地 SOCKS 端口, 端口还没开就重启 Xray, 起来后的头几批
     # 连接会直接失败。这一步在有 QUIC 内层时才说话, 不用它的机器看不到任何变化。
+    #
+    # P1-1: 旧 v2 配对码落地的条目没有证书指纹 —— 这样的 hysteria 客户端完全不校验
+    # 对端身份。**不调用 chain_quic.sync**: 宁可这条链暂时不通 (fail-closed), 也不能
+    # 静默生成一份 insecure 客户端。但这一步**不判红**: `python -m zeroproxy.apply`
+    # 退出码 1 会让 upgrade.sh 回滚整次升级, 老部署就永远升不上来 —— 诊断里
+    # `chain_quic_pin` 仍是红项、面板链式卡片也有 needs_repair 红条, 用户会被明确
+    # 告知重新配对。已停用的条目只提示 (重新启用后由下一次 apply 兜住)。
     quic_note = ""
-    try:
-        quic_ok, quic_note = chain_quic.sync(state)
-        if quic_note and not quic_ok:
-            quic_note = "✗ " + quic_note
-        elif quic_note:
-            quic_note = "✓ " + quic_note
-    except Exception as exc:  # noqa: BLE001 - 内层 QUIC 不能拖垮整次落地
-        quic_note = f"✗ 内层 QUIC 同步异常: {exc}"
+    entries = (state.get("chain") or {}).get("entries") or []
+    enabled_ids = {
+        str(e.get("id") or "")
+        for e in entries
+        if isinstance(e, dict) and e.get("enabled", True)
+    }
+    unpinned = chain.unpinned_quic_entries(state)
+    blocked = [e for e in unpinned if e["id"] in enabled_ids]
+    if blocked:
+        rows = ", ".join(f"{e['label']} ({e['host']}:{e['port']})" for e in blocked)
+        quic_note = f"⚠ 旧配对码缺少证书指纹，已跳过该链路的 QUIC 客户端，请重新配对: {rows}"
+        config.audit(state, "chain_quic_pin_blocked", quic_note, actor="system")
+    else:
+        try:
+            quic_ok, quic_note = chain_quic.sync(state)
+            if quic_note and not quic_ok:
+                quic_note = "✗ " + quic_note
+            elif quic_note:
+                quic_note = "✓ " + quic_note
+        except Exception as exc:  # noqa: BLE001 - 内层 QUIC 不能拖垮整次落地
+            quic_note = f"✗ 内层 QUIC 同步异常: {exc}"
+    if unpinned and not blocked:
+        quic_note = (quic_note + "; " if quic_note else "") + (
+            "⚠ 已停用的旧 QUIC 条目缺少证书指纹, 重新启用前需要重新配对: "
+            + ", ".join(e["label"] for e in unpinned)
+        )
+    # P2-7: 落地端证书重签后, 入口条目里的指纹过期 —— 只警告 + 留痕, **不阻断**
+    # 升级 apply (回滚一次升级的代价远大于一条链路暂时连不上)。
+    for item in chain.diagnose_items(state):
+        if item["id"] == "chain_quic_pin_mismatch" and not item["ok"]:
+            quic_note = (quic_note + "; " if quic_note else "") + "⚠ " + item["detail"]
+            config.audit(state, "chain_quic_pin_warning", item["detail"], actor="system")
 
     # 原生 WireGuard 不进上面的 systemctl 并发列表: 它要的是 syncconf 而不是
     # restart (restart 会把整条隧道拆掉重来)。只在"确实在用它"时才动它 ——
@@ -293,7 +393,8 @@ def restart_services(
 
     if not jobs:
         # 同样只看核心服务: 配置都没变、服务都在跑, 这一步就是成功的 ——
-        # 内层 QUIC 起不来只是把它写进说明, 不改变结论 (理由见下面 core_failed 那段)
+        # 内层 QUIC 起不来 (含"旧条目缺少证书指纹、已跳过") 只是把它写进说明,
+        # 不改变结论 (理由见下面 core_failed 那段; 诊断/UI 另有红条)。
         detail = "配置都没有变化, 无需重启 (服务都在正常运行)"
         if quic_note:
             detail += f"; {quic_note}"
@@ -341,11 +442,12 @@ def restart_services(
                 services.open_firewall_ports(udp_p, "udp")
 
     ordered = [results.get(name, f"{name} ✗ 没有结果") for name, _, _ in jobs]
-    # 这一步的成败只看核心服务 (nginx / xray / hysteria2) —— 内层 QUIC 是可选链路,
-    # 它起不来不该把整步判红。判红的代价很重: `python -m zeroproxy.apply` 以退出码 1
-    # 结束, upgrade.sh 会判定第 6 步失败并**回滚整次升级** —— 那台机器就再也升不了级
-    # (真机踩到过: 落地端 8448/udp 被面板自己起的进程占着)。QUIC 的实际状态另有出处:
-    # 面板链式卡片会显示"内层 QUIC 没在跑", 「一键诊断」也有独立一项。
+    # 这一步的成败只看核心服务 (nginx / xray / hysteria2) 与 WireGuard —— 内层 QUIC
+    # 进程起不来 (含"旧 v2 条目缺证书指纹、已跳过") 不该把整步判红。判红的代价很重:
+    # `python -m zeroproxy.apply` 以退出码 1 结束, upgrade.sh 会判定第 6 步失败并
+    # **回滚整次升级** —— 那台机器就再也升不了级 (真机踩到过: 落地端 8448/udp 被
+    # 面板自己起的进程占着)。QUIC 的实际状态另有出处: 面板链式卡片有
+    # needs_repair 红条, 「一键诊断」里 chain_quic_pin 是红项。
     core_failed = any("✗" in row for row in ordered) or wg_failed
     if quic_note:
         # 挂在 Xray 那一行 (QUIC 进程就是给它当出站用的); 这一轮没重启 Xray 时

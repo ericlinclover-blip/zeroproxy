@@ -33,8 +33,8 @@ sudo bash install.sh
 打开就是初始化页, **没有证书警告**, 也不需要额外放行端口; 面板同时挂在
 `https://<服务器IP>:8899` 上, 那是自签证书, 80 被占/被拦时用它, 浏览器会提示一次
 "不安全") → 填 **域名 / 用户名 / 密码** 三个信息 → 点「一键生成」→ 得到 5 个节点、
-三种格式的订阅链接与二维码。之后改用 `https://<你的域名>:8899`, 即为
-**Let's Encrypt 真实可信证书** (见 8.80)。
+三种格式的订阅链接与二维码。之后改用 `https://<你的域名>/panel/`, 走标准 443 与
+**Let's Encrypt 真实可信证书**, 不需要额外放行 8899 (见 8.108)。
 
 ### 升级 (已经部署过)
 
@@ -79,10 +79,10 @@ curl -fsSL https://github.i3.pub/https://raw.githubusercontent.com/ericlinclover
 | **备份 / 恢复** | 一键导出含全部密钥与令牌的备份, 换机或重装后一键还原 (校验和校验, 篡改即拒绝) |
 | **流量统计** | 内置 Xray Stats API (仅 127.0.0.1), 仪表盘按节点展示上下行, 并写入订阅的 `subscription-userinfo` 头 |
 | **订阅恒定, 内容动态** | 订阅 URL 永不变; 节点启停 / 端口变更 / 伪装设置都会自动同步到客户端 |
-| **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
+| **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP/HSTS/no-store 等安全响应头、Origin 校验、无 CORS 通配；nginx 访问日志不记 query、订阅/设备/一次性链接路径不记录；备份可选口令加密 (AES-256-GCM) |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` **378 项通过 + 6 skip** (带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (105 项, 含**两台机器真跑一条链** 与**四档数据面 × IPv6 的路由器配置过真 mihomo**) + `scripts/router_install_check.py` (**201 项**, 真的用 shell 跑一遍路由器安装脚本, 内含四类机器 / 本机覆盖 / revert 比对 / zpcore 真跑 / **四档数据面下四个现场入口的一致性矩阵**) + `scripts/browser_check.cjs` (157 项) + `scripts/clients_check.cjs` (26 项, 真实浏览器点开关) + `scripts/router_ui_check.cjs` (18 项) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` **466 通过 + 6 skip** (带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过); `scripts/verify.py` (缺内核二进制时默认非 0 退出, `--allow-skip` 放行; 含**两台机器真跑一条链**与四档数据面路由配置过真 mihomo); `scripts/router_install_check.py` (真的用 shell 跑一遍路由器安装脚本, 含四类机器 / 本机覆盖 / revert 比对 / zpcore 真跑 / 四档数据面四个现场入口一致性矩阵); `scripts/upgrade_sim.sh` (**43 项全绿**, 含坏清单回滚与证书 hook 断言); 另有真 Chromium 的 `browser_check.cjs` / `clients_check.cjs` / `router_ui_check.cjs` 与 `geo_slow_check.cjs` (150 s 慢速桩)。**用例数以脚本自身输出为准** |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 | **看得懂的界面 (v2.6.0)** | 控制台布局: 左侧锚点导航 (带计数角标 + 滚动高亮) + 顶部指标条 (健康节点 / 落地出口 IP / 平均延迟 + 迷你折线 / 运行时长) + 节点密集表格 (名称 / 地址状态 / **握手延迟条** / **上下行双轨** / 开关与复制) + **流量卡 (双弧圆环 + 实时速率曲线 + 逐节点双色流量条)** + 链式链路拓扑 (你的设备 → 本机入口 → 落地端) + 程序更新闭环; 动效全部走 `transform`/自绘 rAF 并受 `prefers-reduced-motion` 约束 |
 
@@ -142,7 +142,7 @@ zeroproxy/
 │       │   └── dist/              #   面板分发的制品 (zpcore-<架构>-<版本>.gz, 跟着仓库走)
 │       ├── client/luci/           # 路由器管理界面 (页面 + cgi; zpcore 复用同一套页面)
 │       ├── geodata.py             # GeoIP/GeoSite 下载与校验 + 分流规则 (硬前置: 数据缺失不下发) + 启动前自愈 CLI
-│       ├── nginx_config.py        # Nginx 生成 (ACME + 443 WS 反代 + 伪装主页 + 8899 面板 TLS)
+│       ├── nginx_config.py        # Nginx 生成 (ACME + 443 面板/WS + 伪装主页 + 8899 兼容 TLS)
 │       ├── hysteria_config.py     # Hysteria 2 配置生成 (端口跳跃 + masquerade 伪装)
 │       ├── wireguard.py           # 原生 WireGuard: 密钥 / 地址池 / wg0 配置 / NAT / 测速
 │       ├── apply.py               # 配置落地闭环 (生成 → xray -test / nginx -t → 重载 → 复查端口监听), 面板与 upgrade.sh 共用
@@ -157,7 +157,7 @@ zeroproxy/
 │   ├── browser_check.cjs          # 真实浏览器 (Playwright) UI 验证与截图
 │   └── upgrade_sim.sh             # 一键升级演练: 真跑 upgrade.sh (桩掉 root/systemd), 覆盖成功与回滚两条路径
 └── systemd/
-    ├── zeroproxy.service          # 面板 (仅监听 127.0.0.1:9900, nginx 在 8899 终结 TLS)
+    ├── zeroproxy.service          # 面板 (仅监听 127.0.0.1:9900, nginx 在 443/8899 终结 TLS)
     ├── xray.service
     ├── hysteria2.service
     ├── zeroproxy-wg.service       # 原生 WireGuard 内核模式 (wg0; reload 走 syncconf)
@@ -214,12 +214,12 @@ zeroproxy/
 - **XHTTP**: Vision flow 只能用于 TCP, 因此 XHTTP 入站 `flow` 为空; 与 Reality 叠加后同样免证书。
 - **端口跳跃默认开启**: 主端口 `30001/udp` 真的 listen, 另两个端口由 Hysteria 2 自己装进
   nftables / iptables 的 REDIRECT 规则转到主端口 (Linux 独有, 见 8.4), 封锁单端口不影响服务;
-  订阅链接把端口写在 host 位置 (`host:30001,31001,32001`), 官方客户端据此启用 udphop。
+  订阅链接 authority 只写主端口, 跳跃列表放在 `mport`, 兼顾 Shadowrocket 与官方客户端。
 - **Hysteria masquerade**: 非代理流量反代到一个真实网站 (`type=proxy` + `rewriteHost`),
   复用 QUIC 端口, 不额外占用 TCP 端口。
 - **443 伪装主页**: nginx 对非代理路径返回中性网页。
-- **面板走真实可信证书**: 面板进程只监听 `127.0.0.1:9900`, 对外由 nginx 在 **8899** 终结 TLS —
-  SNI 命中域名用 Let's Encrypt 证书, 其余 (IP / 未知 SNI) 回退自签。
+- **面板走标准 443 / 真实可信证书**: 面板进程只监听 `127.0.0.1:9900`; 正式入口是
+  `https://<域名>/panel/`, 由 nginx 用 Let's Encrypt 证书反代。8899 保留为兼容 / 自签备用入口。
 - **流量统计**: Xray 配置内置 `stats`/`policy`/`api`, API 入站只监听 `127.0.0.1:10085`,
   路由规则把 API 入站交给 `tag=api` 处理器 (写成 `direct` 时 `xray api statsquery` 连不上)。
 - **GeoIP 分流是"硬前置"的**: Xray 在配置构建阶段就要求 `geoip.dat` / `geosite.dat` 存在,
@@ -291,8 +291,8 @@ POST /c/report                     → 心跳: 上报实际状态, 取回期望�
   `?format=singbox-next` 走新的 `http_clients` 写法 (1.13 及更早**不支持**, 会报 unknown field)。
 - **凭据格式经过源码级核对**: Hysteria 2 官方客户端把 `hysteria2://user:pass@host` 整串 `user:pass`
   当作 auth 发送, 而服务端 `extras/auth/password.go` 是整串比较口令 —— 因此本面板只写
-  `hysteria2://<password>@host`; 端口跳跃同样按官方实现写在 host 的端口位置 (并附带 `mport`
-  供支持该参数的三方客户端使用)。
+  `hysteria2://<password>@host`; authority 只能写单个主端口, 跳跃列表放 `mport`。把逗号端口
+  写进 authority 会让标准 URI 解析器直接报错, 小火箭会因此拒绝整份订阅。
 - XHTTP 支持情况已用真实客户端验证: mihomo v1.19.31 (`network: xhttp` + `xhttp-opts`) 与
   sing-box 1.14.2 (`transport.type: http`) 都能通过配置校验。
 
@@ -434,14 +434,14 @@ state.json (唯一事实来源, schema v6, 旧版本自动升级)
 
 ### 8.1 初始化 → 域名面板 的交接
 
-初始化是在 **IP 页面**上做的 (`https://<IP>:8899/?token=...`, 自签证书, 浏览器会提示不安全),
-而正式入口是 `https://<域名>:8899`。这一步过去只把域名当文字显示在副标题里, 用户初始化完就
+初始化是在 **IP 页面**上做的 (`http://<IP>/?token=...`, 80 明文引导页),
+而正式入口是 `https://<域名>/panel/`。这一步过去只把域名当文字显示在副标题里, 用户初始化完就
 一直留在那个"不安全"的 IP 页面上 —— 所以现在把它做成交接:
 
 - 后端在 `/api/setup` 的响应里带上 `redirect`: 只有**证书是 Let's Encrypt 签发的**,
   并且**从服务器本机按浏览器的方式访问 `https://<域名>:8899/api/info` 真的能通**
   (证书链按系统 CA 校验) 时, `ready` 才是 `true`。真实服务器上这一步实测通过。
-- `ready` 为真 → 前端显示「部署完成 · 正在跳转到 `https://<域名>:8899/?user=<用户名>` · 3 秒」,
+- `ready` 为真 → 前端显示「部署完成 · 正在跳转到 `https://<域名>/panel/?user=<用户名>` · 3 秒」,
   3 秒后自动跳转, 也可以点「立即前往」; 域名面板的登录页会**预填用户名、聚焦密码框**并提示
   「已切换到域名面板」。会话 Cookie 是按 host 存的, 所以跨到域名必须重新登录一次 ——
   密码不会进 URL, 用户名用完即从地址栏去掉 (`history.replaceState`)。
@@ -1660,14 +1660,15 @@ curl -fsSL https://raw.githubusercontent.com/ericlinclover-blip/zeroproxy/main/u
 - **支持哪些系统?** 面板 (服务器端) 支持 **Debian 12+ / Ubuntu 22.04+** —— 判据是系统自带的
   Python: 面板要求 **Python ≥ 3.10** (Debian 12 = 3.11, Debian 13 = 3.13, Ubuntu 22.04 = 3.10,
   Ubuntu 24.04 = 3.12)。Debian 11 与 Ubuntu 20.04 自带 3.9, 装不了 —— `install.sh` 会当场停下
-  并说明原因 (不是装到一半才崩)。另外还需要: 公网 IP 或已解析的域名, 放行 80 / 443 / 8899。
+  并说明原因 (不是装到一半才崩)。另外还需要: 公网 IP 或已解析的域名, 放行 80 / 443;
+  8899 只是兼容备用入口。
   路由器那一端是**另一个客户端**: 面板生成的安装命令面向 OpenWrt 系固件 (非 OpenWrt 上会明确
   停下说明), 拿一台 x86 Debian 软路由当客户端用**目前还没有做** (见
   `docs/ROUTER-CLIENT-REDESIGN.md` 的兼容性矩阵)。
 - **打不开面板 / 提示不安全?** 初始化页的**主链接**是 `http://<IP>/?token=…` (80 端口明文),
   打开就是初始化页, 没有证书警告 —— 先用它。终端上另给的 `https://<IP>:8899` 是自签证书的
   备用入口, 浏览器会提示一次, 点「继续访问」即可; 80 端口被占 / 被运营商拦时用它。
-  完成 setup 且 certbot 签发成功后, 面板会自动跳到 `https://<域名>:8899` (登录页已预填用户名);
+  完成 setup 且 certbot 签发成功后, 面板会自动跳到 `https://<域名>/panel/` (登录页已预填用户名);
   也可以手动用它访问, 那时就是可信证书。用 IP 访问时仪表盘顶部也会给一条「切到域名面板」的提示。
 - **提示「引导令牌无效」?** 必须用安装完成时终端打印的、带 `?token=` 的链接打开面板。令牌文件在
   `/opt/zeroproxy/data/bootstrap_token`, 初始化成功后自动删除。
@@ -5753,5 +5754,66 @@ PublicKey = ...
 - **状态临时文件从创建起即为 0600**: 改用独占临时文件，消除 rename 后 chmod 前其他本地用户可读的窗口。
 - **新增真实回归**: Go 测试覆盖 ubus 响应与方法边界，Python 测试覆盖 v3 配对码、证书指纹与 CGI 拒绝 GET，真实 Hysteria 2 进程测试覆盖服务端/客户端证书固定。
 
+### 8.108 v2.12.13: 初始化页稳定性与标准 443 面板入口
+- **证书申请不再持全局状态锁**: certbot / nginx / systemctl 的长步骤全部移出 `config.locked()`；证书等待期间状态、诊断和其他请求仍可响应，初始化入口也不会被全局锁拖住。
+- **初始化只在成功后提交**: 证书未完成时 `configured=false`，引导令牌保留；证书失败、nginx 校验失败或服务步骤异常时可直接用同一链接重试，不再留下“已配置但进不去”的半成品状态。
+- **证书阶段保留可重试入口**: 先用临时 nginx 配置同时承接当前 IP、目标域名和 ACME webroot，证书完成后才切到正式 443 配置。配置写入失败会恢复上一份可用文件。
+- **标准 443 `/panel/` 入口**: 正式面板、API、静态资源与订阅统一走 `https://<域名>/panel/`，只依赖 80/443，不再要求云安全组额外放行 8899；8899 保留为兼容备用入口。
+- **命令超时真正终止进程树**: certbot 等命令派生孙子进程并占住管道时，超时会对整个进程组发 SIGKILL，避免请求永久挂起。
+- **去掉误导性启动告警**: 面板不再把“8899 被 nginx 正常占用”记为端口冲突。
+- **验证**: Python 回归 **382 通过 / 6 skip**；服务器升级后 7 步 apply 全成功，浏览器经标准 443 入口进入登录页，首屏脚本、API 与静态资源均正常。
+
+### 8.109 v2.12.14: 修复 Shadowrocket 无法导入订阅
+- **根因**: Hysteria 2 节点把端口跳跃列表写进了 URI authority (`host:30001,31001,32001`)。标准解析器要求 authority 端口是单个整数，Shadowrocket/3445 拉取订阅后因此拒绝整份配置。
+- **修复**: authority 只写主端口，跳跃列表改为 `mport=30001,31001,32001`。不支持跳跃的客户端仍可稳定连接主端口。
+- **回归**: 默认 Base64 订阅中的每条 URI 都用标准 `urlsplit` 校验为单整数端口，并保留 Hysteria 2 密码与 `mport` 断言。
 
 
+
+
+
+### 8.110 v2.12.15 (客户端 v1.4.45 · zpcore 1.3.2): 安全加固、供应链完整性与并发收敛
+- **链式 QUIC 证书固定闭环**: 旧 v2 配对码（无 `hy_cert_sha256`）的启用条目不
+  再启动「不校验证书」的 hysteria 客户端（fail-closed）；`/api/diagnose` 新增
+  `chain_quic_pin` / `chain_quic_pin_mismatch` 两项，落地端证书重签后入口端会看到
+  「pin 对不上」的告警；链式页给出红条与「重新配对」指引；重新启用旧条目被 API
+  拒绝；apply 只跳过该链路并写审计，**不阻断升级**（旧条目需用落地端最新 v3 配对码
+  重新配对后才会恢复）。
+- **供应链完整性**: 新增仓库根 `SHA256SUMS`（逐文件）与生成器 `scripts/gen_sha256sums.sh`；
+  `install.sh` / `upgrade.sh` 解压后用**同一 ref 的原始 raw 地址**独立取清单逐文件校验，
+  镜像只负责传输，不一致/缺清单直接中止（`ZP_ALLOW_UNVERIFIED=1` 才跳过）；会话自保
+  取回的脚本先校验 hash；zpcore 新增 `dist/SHA256SUMS`，面板下发 `/c/**` 时带
+  `X-ZP-Sha256` / `X-ZP-Install-Sha256`，路由器端落盘前比对；Xray/Hysteria 支持
+  `ZP_*_SHA256_<arch>` 钉扎（未提供时告警并记录）。
+- **路由器 TLS 与 add/update**: CLI 不再无条件 `-k`：先正常校验证书，**仅证书错误**
+  才降级一次并打印告警；装机探测不再因丢包/超时永久降级；`add` 仅在未配对或显式
+  `--replace` 时允许更换面板，`update` 固定使用已配对 base，并校验面板下发的
+  install.sh 摘要后才执行。
+- **LuCI / zpcore 鉴权**: 有效 LuCI 会话还要求 `username=root` 或对应 ACL；cgi 与
+  zpcore 补齐 `X-Frame-Options` / `frame-ancestors` / `nosniff`；cgi 补 `packets`
+  判据；动作来源与布尔解析对齐；cgi JSON 转义控制字符。zpcore 升到 1.3.2 并重建
+  6 个架构制品。
+- **面板凭据与数据**: `/api/backup` 改 POST，支持 AES-256-GCM（`X-ZP-Passphrase`，
+  PBKDF2-SHA256 600k）加密导出，备份不再包含 handoff 票据与未用配对码；`/api/restore`
+  改为线程池执行并重新校验 domain/端口/证书路径/口令；`state.json` 损坏不再静默回落
+  默认值（503 维护态），setup 在没有引导令牌但已有初始化痕迹时拒绝；设备凭据支持
+  `Authorization: Bearer`（旧 `?k=` 兼容），下载只记「已下载」，设备上报后才推进
+  「已应用」。
+- **证书续期**: certbot 增加 `--deploy-hook`，`install.sh` / `upgrade.sh` / 面板三处
+  写入同一份 `zeroproxy-reload.sh`（reload nginx + restart xray）；手动续期同样
+  reload/restart；Hysteria 配置在重启前做结构校验（坏 YAML 不再进重启循环）。
+- **并发与资源**: WireGuard 同步移出全局状态锁（锁内快照、锁外执行、失败回滚 + 审计）；
+  后台 apply 不再整段持锁（`_APPLY_RUN_LOCK` 串行化）；dashboard 版本采样加 5s TTL；
+  外部命令超时改为终止整个进程组。
+- **HTTP 与日志**: 新增 HSTS（仅 HTTPS）与 `/api/*` `no-store`；写接口校验 Origin；
+  登录限流对回环地址忽略 `X-Real-IP`；交接票据绑定签发 IP；nginx 日志格式不再记录
+  query string，且 `/c/`、`/sub/`、`/wg/one/`（含 `/panel/` 前缀）整条不记录。
+- **安装 / 升级 / systemd**: install.log 从创建起 0600、token 打码（完整链接走 0600
+  `bootstrap_urls` 只打印到终端）；升级回滚覆盖 requirements / 五个 systemd 单元 /
+  upgrade.sh 自身，回滚后 daemon-reload + apply + `/api/info` readiness 复验；五个
+  unit 加沙箱与资源上限（不降 User）；`ZP_HOME` 在 install 与 unit 之间保持一致。
+- **仓库卫生与验证**: 删除 6 个 `.bak` 文件并加入 `.gitignore`；`upgrade_sim.sh` 修掉
+  WireGuard 惰性生成的旧断言并新增清单校验/回滚/hook/systemd 断言；`verify.py` 缺内核
+  时默认非 0 退出（`--allow-skip` 放行）；浏览器脚本先 `require` 再起服务、异常时
+  收掉子进程，修正 `.banner` / `.mini-card` 选择器；全量 pytest、Go test/vet、
+  upgrade_sim 全部跑通。

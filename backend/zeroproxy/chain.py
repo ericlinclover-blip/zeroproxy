@@ -220,7 +220,12 @@ def parse_code(text: str) -> dict:
         raise CodeError("配对码内容损坏 (不是合法 JSON), 请重新复制") from exc
     if not isinstance(payload, dict):
         raise CodeError("配对码内容损坏 (不是一份参数), 请重新复制")
-    version = int(payload.get("v") or 0)
+    # 恶意/损坏的配对码可以把 `v` 做成 dict/list —— `int()` 会抛 TypeError 直接
+    # 冒到路由层变成 500。这里统一收成 CodeError, 面板才有"配对码不合法"的中文提示。
+    try:
+        version = int(payload.get("v") or 0)
+    except (TypeError, ValueError):
+        raise CodeError("配对码版本字段不合法 (可能来自更新版本的面板), 请升级本机程序后重试") from None
     if version not in (1, 2, 3):
         raise CodeError("配对码版本不认识 (可能来自更新版本的面板), 请升级本机程序后重试")
 
@@ -334,6 +339,176 @@ def exit_code(state: dict) -> str:
         hy_sni=str(exit_cfg.get("hy_sni") or "") if hy_on else "",
         hy_cert_sha256=hy_pin,
     )
+
+
+# ---------------------------------------------------------------- 证书固定闭环
+
+def _quic_entries(state: dict) -> list[dict]:
+    """state 里所有走 QUIC 内层 (Hysteria 2) 的链式条目。"""
+    entries = (state.get("chain") or {}).get("entries") or []
+    return [
+        entry
+        for entry in entries
+        if isinstance(entry, dict) and (entry.get("transport") or "reality") == "hysteria2"
+    ]
+
+
+def unpinned_quic_entries(state: dict) -> list[dict]:
+    """走 QUIC 内层却没有落地端证书指纹的条目 (旧 v2 配对码的残留, P1-1)。
+
+    v2.12.12 之前的配对码没有 `y.c`; 用它们落地的条目只有 `insecure: true`,
+    hysteria 客户端**完全不校验对端身份** —— 入口↔落地之间能 MITM 的人可以冒充
+    落地端拿到 QUIC 密码。新配对码 (v3) 才带指纹, 旧条目只能重新配对修好;
+    这里把它们找出来交给「一键诊断」/ apply 明确告警, 而不是继续静默运行。
+
+    返回 `{"id", "label", "host", "port"}`。`port` 是 QUIC 内层的 UDP 端口
+    (没有就退回条目本身的端口), 面板上展示"这个地址上的 QUIC 没有身份校验"。
+    """
+    out: list[dict] = []
+    for entry in _quic_entries(state):
+        if str(entry.get("hy_cert_sha256") or "").strip():
+            continue
+        try:
+            port = int(entry.get("hy_port") or entry.get("port") or 0)
+        except (TypeError, ValueError):
+            port = 0
+        out.append(
+            {
+                "id": str(entry.get("id") or ""),
+                "label": node_label(entry),
+                "host": str(entry.get("host") or ""),
+                "port": port,
+            }
+        )
+    return out
+
+
+def _current_exit_pin(state: dict) -> tuple[str, str]:
+    """本机作为落地端时 QUIC 证书的当前指纹: (pin, 读取失败原因)。
+
+    没开落地端 / 没开内层 QUIC → 空串且无错误 (这台机器没有可比的 pin);
+    证书存在但读不出来 → 空串 + 原因 (chain_quic 同时写面板日志)。两者以前都被
+    压成空串, 面板分不清"没开 QUIC"和"证书坏了" (P3-2)。
+    """
+    exit_cfg = (state.get("chain") or {}).get("exit") or {}
+    if not (exit_cfg.get("enabled") and exit_cfg.get("hy_enabled")):
+        return "", ""
+    from . import chain_quic
+
+    return chain_quic.cert_pin()
+
+
+def current_exit_pin(state: dict) -> str:
+    """本机落地端 QUIC 证书的当前 DER SHA-256 指纹 (P2-7: 展示 / 快照对比用)。
+
+    没有/读不出来都返回空串; 需要区分原因时用 `_current_exit_pin` (diagnose_items
+    就是这么做的)。
+    """
+    return _current_exit_pin(state)[0]
+
+
+def diagnose_items(state: dict) -> list[dict]:
+    """链式 QUIC 证书固定的自检项 (routes 把它们拼进 /api/diagnose)。
+
+    字段与 `routes._diagnose` 的项保持一套: `id` / `ok` / `title` / `detail` /
+    `hint` / `fixable`; 额外带一个 `name` 别名 —— 现前端按 `name` 渲染, 两种接线
+    方式都不会显示空白标题。
+
+    两项:
+      * `chain_quic_pin` —— 旧 v2 配对码落地、没有证书指纹的条目 (P1-1);
+      * `chain_quic_pin_mismatch` —— 落地端证书重签后入口条目里的指纹过期 (P2-7)。
+    只在本机确实用到 QUIC 内层时才产出, 不用这个功能的机器看不到新噪声。
+    """
+    items: list[dict] = []
+
+    def add(
+        item_id: str,
+        ok: bool,
+        title: str,
+        detail: str,
+        hint: str = "",
+        fixable: bool = False,
+    ) -> None:
+        items.append(
+            {
+                "id": item_id,
+                "name": title,   # 兼容现前端 (c.name) 的渲染
+                "title": title,
+                "ok": bool(ok),
+                "detail": detail,
+                "hint": hint,
+                "fixable": fixable,
+            }
+        )
+
+    quic_entries = _quic_entries(state)
+    if quic_entries:
+        unpinned = unpinned_quic_entries(state)
+        if unpinned:
+            rows = ", ".join(f"{e['label']} ({e['host']}:{e['port']})" for e in unpinned)
+            add(
+                "chain_quic_pin",
+                False,
+                "链式 QUIC 证书固定",
+                f"{len(unpinned)} 条内层 QUIC 链路来自旧配对码, 没有落地端证书指纹: {rows}。"
+                "它们以 insecure 方式连接, 不校验对端身份",
+                "到落地端重新生成配对码, 删掉这些条目后按新码重新添加 (新码带证书指纹); "
+                "暂时不确定的话先停用这些条目, 避免继续无校验运行",
+            )
+        else:
+            add(
+                "chain_quic_pin",
+                True,
+                "链式 QUIC 证书固定",
+                f"{len(quic_entries)} 条内层 QUIC 链路都固定了落地端证书指纹",
+            )
+
+    # P2-7: 落地端重签证书后, 入口条目里那份指纹就成了"过期快照" —— 面板必须报出来,
+    # 否则用户只能去 hysteria 日志里找 `no certificate matches the pinned hash`。
+    exit_cfg = (state.get("chain") or {}).get("exit") or {}
+    if exit_cfg.get("enabled") and exit_cfg.get("hy_enabled"):
+        pin, pin_error = _current_exit_pin(state)
+        pinned = [e for e in quic_entries if str(e.get("hy_cert_sha256") or "").strip()]
+        if pin_error:
+            add(
+                "chain_quic_pin_mismatch",
+                False,
+                "落地端 QUIC 证书指纹",
+                f"读取落地端 QUIC 证书指纹失败: {pin_error}",
+                "检查 data/chain-quic/cert.pem 是否可读; 读不出来时配对码会退回 v1 (不带 QUIC), "
+                "重新应用配置会按当前 SNI 重签证书",
+            )
+        elif pinned and not pin:
+            add(
+                "chain_quic_pin_mismatch",
+                False,
+                "落地端 QUIC 证书指纹",
+                "落地端已启用 QUIC 但还没有可用的证书指纹 (证书尚未生成?)",
+                "重新应用配置会按当前 SNI 生成证书; 之后入口条目需要重新配对",
+            )
+        elif pinned:
+            stale = [
+                e for e in pinned
+                if str(e.get("hy_cert_sha256") or "").strip().lower() != pin
+            ]
+            if stale:
+                rows = ", ".join(node_label(e) for e in stale)
+                add(
+                    "chain_quic_pin_mismatch",
+                    False,
+                    "落地端 QUIC 证书指纹",
+                    f"落地端证书已重签 (当前指纹 {pin[:16]}…), {len(stale)} 条入口条目的指纹已过期: {rows}",
+                    "这些链路会报 no certificate matches the pinned hash; "
+                    "在入口端删掉这些条目, 用落地端新配对码重新添加",
+                )
+            else:
+                add(
+                    "chain_quic_pin_mismatch",
+                    True,
+                    "落地端 QUIC 证书指纹",
+                    f"{len(pinned)} 条入口条目的指纹与落地端当前证书一致",
+                )
+    return items
 
 
 # ---------------------------------------------------------------- 端口分配

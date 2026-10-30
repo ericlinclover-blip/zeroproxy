@@ -123,9 +123,25 @@ echo "    占位状态: xray 入站 $INBOUNDS_BEFORE 个, hysteria 口令 change
 NEW_SRC="$SIM/newsrc/zeroproxy-main"
 mkdir -p "$NEW_SRC"
 cp -r "$ROOT/backend" "$ROOT/systemd" "$NEW_SRC/"
-cp "$ROOT/upgrade.sh" "$NEW_SRC/"
+cp "$ROOT/upgrade.sh" "$ROOT/install.sh" "$NEW_SRC/"
+[ -f "$ROOT/dev.sh" ] && cp "$ROOT/dev.sh" "$NEW_SRC/"
 [ -f "$ROOT/uninstall.sh" ] && cp "$ROOT/uninstall.sh" "$NEW_SRC/"
 rm -rf "$NEW_SRC/backend/zeroproxy/__pycache__" "$NEW_SRC/backend/zeroproxy"/*/__pycache__
+# 发布清单: 由仓库脚本按同一份"待发代码树"生成, 并放进 tarball。
+# upgrade.sh 会再从原始 raw 地址取一份 (演练里由桩 curl 提供) 做交叉比对 + 逐文件校验。
+bash "$ROOT/scripts/gen_sha256sums.sh" "$NEW_SRC" "$SIM/new.SHA256SUMS" >/dev/null
+cp "$SIM/new.SHA256SUMS" "$NEW_SRC/SHA256SUMS"
+# 故意改坏一行 —— 用来演练"清单对不上 → 中止并回滚"
+"$PYTHON" - "$SIM/new.SHA256SUMS" "$SIM/bad.SHA256SUMS" <<'PY'
+import sys
+
+lines = open(sys.argv[1], encoding="utf-8").read().splitlines()
+first = lines[0]
+hash_, path = first.split("  ", 1)
+bad = ("1" if hash_[0] != "1" else "0") + hash_[1:]
+lines[0] = f"{bad}  {path}"
+open(sys.argv[2], "w", encoding="utf-8").write("\n".join(lines) + "\n")
+PY
 tar -czf "$SIM/new.tar.gz" -C "$SIM/newsrc" zeroproxy-main
 
 # ---------- 4. 桩二进制 ----------
@@ -153,6 +169,15 @@ while [ $# -gt 0 ]; do
   esac
 done
 if [ -n "$out" ]; then
+  case "$url" in
+    *SHA256SUMS*)
+      # 发布清单: 正常演练给真清单, ZP_SIM_BAD_SUMS=1 时给改坏的那份
+      if [ "${ZP_SIM_BAD_SUMS:-0}" = "1" ] && [ -n "${ZP_SIM_SUMS_BAD:-}" ]; then
+        cp "$ZP_SIM_SUMS_BAD" "$out"; exit 0
+      fi
+      if [ -n "${ZP_SIM_SUMS:-}" ]; then cp "$ZP_SIM_SUMS" "$out"; exit 0; fi
+      exit 22 ;;
+  esac
   if [ -n "${ZP_SIM_TARBALL:-}" ]; then cp "$ZP_SIM_TARBALL" "$out"; exit 0; fi
   exit 22                                  # 模拟 GitHub 不可达
 fi
@@ -181,6 +206,9 @@ run_upgrade() { # run_upgrade <trigger> [tarball] [panel|file]
   fi
   PATH="$BIN_DIR:$PATH" ZP_HOME="$HOME_DIR" ZP_TRIGGER="$trigger" \
     ZP_SIM_TARBALL="$tarball" ZP_SYSTEMD_DIR="$SIM/systemd-units" ZP_SELF_DIR="$self_dir" \
+    ZP_SIM_SUMS="$SIM/new.SHA256SUMS" ZP_SIM_SUMS_BAD="$SIM/bad.SHA256SUMS" \
+    ZP_SIM_BAD_SUMS="${SIM_SERVE_BAD_SUMS:-0}" \
+    ZP_LETSENCRYPT_DIR="$SIM/letsencrypt" \
     "${runner[@]}" 2>&1 | tee "$SIM/upgrade-$trigger-$mode.log"
   return "${PIPESTATUS[0]}"
 }
@@ -281,22 +309,103 @@ no_script_error "$SIM/upgrade-sim-panel.log" \
 [ ! -d "$STAGE" ] && ok "临时副本已随升级收尾清掉 ($STAGE)" \
   || bad "临时副本残留: $STAGE"
 
+# 供应链校验真的跑了 (不是只打印一句): 下载日志里要有逐文件校验通过那行
+if grep -q "SHA256SUMS 逐文件校验通过" "$SIM/upgrade-sim-panel.log"; then
+  ok "代码包按同 ref 的 SHA256SUMS 逐文件校验通过 (供应链锚点生效)"
+else
+  bad "升级日志里没有 SHA256SUMS 校验通过的记录"
+fi
+
+# 证书续期钩子 (P2-1): 续期成功后要 reload nginx + restart xray
+HOOK="$SIM/letsencrypt/renewal-hooks/deploy/zeroproxy-reload.sh"
+if [ -f "$HOOK" ]; then
+  if [ -x "$HOOK" ] && grep -q "reload nginx" "$HOOK" && grep -q "restart xray" "$HOOK"; then
+    ok "证书续期钩子随升级落盘且可执行 (reload nginx + restart xray)"
+  else
+    bad "证书续期钩子内容/权限不符合预期: $HOOK"
+  fi
+else
+  bad "证书续期钩子缺失: $HOOK"
+fi
+
+# systemd 加固 (P2-13): 升级后的单元必须带沙箱字段, 且不降 User (不破坏既有部署)
+UNIT_DIR="$SIM/systemd-units"
+_assert_unit_has() { # _assert_unit_has <文件> <模式> <说明>
+  if grep -qE "$2" "$UNIT_DIR/$1" 2>/dev/null; then
+    ok "$3"
+  else
+    bad "$3 (缺字段: $2 · $1)"
+  fi
+}
+_assert_unit_has zeroproxy.service 'NoNewPrivileges=yes' "面板单元带 NoNewPrivileges=yes"
+_assert_unit_has zeroproxy.service 'ProtectSystem=strict' "面板单元带 ProtectSystem=strict"
+_assert_unit_has zeroproxy.service 'ReadWritePaths=.*/etc/nginx.*/etc/letsencrypt.*/run' "面板单元写了 ReadWritePaths 白名单"
+_assert_unit_has zeroproxy.service 'MemoryMax=' "面板单元带 MemoryMax (资源上限)"
+_assert_unit_has zeroproxy.service 'PrivateTmp=yes' "面板单元带 PrivateTmp=yes"
+_assert_unit_has xray.service 'NoNewPrivileges=yes' "Xray 单元带 NoNewPrivileges=yes"
+_assert_unit_has xray.service 'ProtectSystem=strict' "Xray 单元带 ProtectSystem=strict"
+_assert_unit_has xray.service 'CapabilityBoundingSet=' "Xray 单元限制 CapabilityBoundingSet"
+_assert_unit_has hysteria2.service 'NoNewPrivileges=yes' "Hysteria 单元带 NoNewPrivileges=yes"
+_assert_unit_has zeroproxy-wg.service 'CapabilityBoundingSet=CAP_NET_ADMIN' "WireGuard 单元只保留 CAP_NET_ADMIN"
+if grep -q '^User=' "$UNIT_DIR/zeroproxy.service" 2>/dev/null; then
+  bad "面板单元不应降 User (会破坏既有部署的文件属主/权限)"
+else
+  ok "systemd 加固没有降 User (既有部署文件权限不受影响)"
+fi
+
 cp "$HOME_DIR/data/state.json" "$SIM/state-after.json"
 if "$PYTHON" - "$SIM/state-before.json" "$SIM/state-after.json" <<'PY'
+import base64
 import json
 import sys
 
 before = json.load(open(sys.argv[1], encoding="utf-8"))
 after = json.load(open(sys.argv[2], encoding="utf-8"))
-# steps (面板进度) 与 updated_at (写盘时间戳) 每次保存都会变; 其余字段必须一字不差
+# steps (面板进度) 与 updated_at (写盘时间戳) 每次保存都会变; 其余字段必须保持不变。
+# 例外 (不是回归, 是产品语义): apply 的「重新生成 WireGuard 配置」会在密钥为空时**惰性
+# 生成**一对合法密钥 (wireguard.py 只在无效/为空时生成, 不会覆盖已有密钥)。所以这里
+# 允许 wireguard.server_private_key / server_public_key 从 "" 变成一对合法的 32 字节
+# base64 密钥; 其它任何字段变化仍然算失败。
 strip = lambda d: {k: v for k, v in d.items() if k not in ("steps", "updated_at")}
 b, a = strip(before), strip(after)
-if a != b:
-    raise SystemExit("字段发生变化: " + ", ".join(sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))))
+LENIENT_WG = ("wireguard.server_private_key", "wireguard.server_public_key")
+
+
+def wg_key_generated(old, new):
+    """空 → 合法的 32 字节 base64 (curve25519) 才算"惰性生成"。"""
+    if old not in ("", None):
+        return False
+    if not isinstance(new, str) or not new:
+        return False
+    try:
+        return len(base64.b64decode(new, validate=True)) == 32
+    except Exception:
+        return False
+
+
+changed = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
+unexpected = []
+wg_ok = []
+for key in changed:
+    if key == "wireguard" and isinstance(a.get("wireguard"), dict) and isinstance(b.get("wireguard"), dict):
+        wa, wb = a["wireguard"], b["wireguard"]
+        inner = sorted(k for k in set(wa) | set(wb) if wa.get(k) != wb.get(k))
+        for ikey in inner:
+            field = f"wireguard.{ikey}"
+            if field in LENIENT_WG and wg_key_generated(wb.get(ikey), wa.get(ikey)):
+                wg_ok.append(field)
+                continue
+            unexpected.append(field)
+        continue
+    unexpected.append(key)
+if unexpected:
+    raise SystemExit("字段发生变化: " + ", ".join(unexpected))
 assert after.get("steps") and all(s["ok"] for s in after["steps"]), after.get("steps")
+if wg_ok:
+    print("    (允许的惰性生成: " + ", ".join(wg_ok) + " — 空 → 合法密钥)")
 PY
 then
-  ok "state.json 的密钥 / 令牌 / 节点配置原样保留 (只有 steps 进度被刷新)"
+  ok "state.json 的密钥 / 令牌 / 节点配置原样保留 (只有 steps 进度与 WireGuard 惰性生成的密钥变化)"
 else
   bad "state.json 的关键字段被改动"
 fi
@@ -342,6 +451,53 @@ if [ -n "$BACKUP" ] && [ -f "$BACKUP/state.json" ] && [ -d "$BACKUP/zeroproxy" ]
 else
   bad "备份目录不符合预期: ${BACKUP:-无}"
 fi
+
+# 回滚面完整性 (P2-10): 备份里必须同时有依赖清单 / systemd 单元 / 脚本自身, 否则
+# "回滚"只是把代码换回去, 旧代码可能配着新依赖/新单元, 面板照样起不来
+if [ -f "$BACKUP/requirements.txt" ] && [ -f "$BACKUP/upgrade.sh" ] \
+   && [ -f "$BACKUP/systemd/zeroproxy.service" ]; then
+  ok "回滚备份覆盖 requirements.txt / systemd 单元 / upgrade.sh 自身 (完整运行版本回滚)"
+else
+  bad "回滚备份面不全 (缺 requirements/单元/upgrade.sh)"
+fi
+
+# ---------- 5e. 供应链校验失败: 必须中止并回滚 ----------
+# 镜像把代码包换了, 而原始 raw 地址的 SHA256SUMS 对不上 —— 升级必须失败、代码保持原样。
+section "[2d] 代码包与 SHA256SUMS 不符时中止并回滚"
+VERSION_BEFORE_SUMS="$(sed -n 's/^__version__ *= *"\([^"]*\)".*/\1/p' "$HOME_DIR/zeroproxy/__init__.py")"
+SIM_SERVE_BAD_SUMS=1
+set +e; run_upgrade sim-badsums "$SIM/new.tar.gz" panel >/dev/null 2>&1; BADSUMS_RC=$?; set -e
+SIM_SERVE_BAD_SUMS=0
+echo "    退出码 $BADSUMS_RC"
+
+section "[断言]"
+[ "$BADSUMS_RC" != "0" ] && ok "SHA256SUMS 校验失败时升级返回非 0 ($BADSUMS_RC)" \
+  || bad "SHA256SUMS 校验失败却返回 0"
+if grep -qE "SHA256SUMS.*(校验失败|不一致)|清单不一致" "$SIM/upgrade-sim-badsums-panel.log"; then
+  ok "日志里说清了失败原因是代码包 / SHA256SUMS 校验失败"
+else
+  bad "日志没写清 SHA256SUMS 校验失败"
+fi
+VERSION_AFTER_SUMS="$(sed -n 's/^__version__ *= *"\([^"]*\)".*/\1/p' "$HOME_DIR/zeroproxy/__init__.py")"
+[ "$VERSION_BEFORE_SUMS" = "$VERSION_AFTER_SUMS" ] \
+  && ok "校验失败后代码回滚到升级前版本 (v$VERSION_AFTER_SUMS)" \
+  || bad "校验失败后代码没回滚: v$VERSION_BEFORE_SUMS → v$VERSION_AFTER_SUMS"
+if "$PYTHON" - "$HOME_DIR/data/update.json" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+assert data["state"] == "failed", data
+assert any(not s["ok"] for s in data["steps"]), data["steps"]
+PY
+then
+  ok "校验失败落成 update.json=failed (面板能显示失败原因)"
+else
+  bad "校验失败没有写进 update.json"
+fi
+NODES_AFTER_SUMS="$(grep -c '"tag"' "$HOME_DIR/xray/config.json" || true)"
+[ "${NODES_AFTER_SUMS:-0}" -ge 4 ] && ok "校验失败没有破坏现有部署 (入站仍有 $NODES_AFTER_SUMS 个)" \
+  || bad "校验失败把配置弄坏了 (入站 $NODES_AFTER_SUMS 个)"
 
 # ---------- 5d. apply 步骤内部失败: 失败原因必须写进 update.json ----------
 # apply 自己还会再分几步 (生成 / 校验 / 重载 / 端口复查)。它失败时, 面板横幅引用的是

@@ -323,3 +323,65 @@ def test_toggling_ipv6_realigns_full_tunnel_allowed_ips(client, configured):
     assert peer["allowed_ips"] == "0.0.0.0/0, ::/0"
     off = client.post("/api/wireguard/settings", json={"ipv6": False}).json()
     assert off["wireguard"]["peers"][0]["allowed_ips"] == "0.0.0.0/0"
+
+
+# ---------------------------------------------------------------- 并发: sync 在锁外
+
+def _lock_is_free() -> bool:
+    """当前线程能不能立刻拿到 config 锁 (RLock 同线程可重入, 必须开新线程试)。"""
+    import threading
+
+    result: list[bool] = []
+
+    def probe() -> None:
+        acquired = config.LOCK.acquire(blocking=False)
+        result.append(acquired)
+        if acquired:
+            config.LOCK.release()
+
+    thread = threading.Thread(target=probe)
+    thread.start()
+    thread.join(timeout=2)
+    return bool(result and result[0])
+
+
+def test_wireguard_sync_runs_outside_the_config_lock(client, configured, monkeypatch):
+    """sync() 内部的 apt/systemctl 等 90-180s, 不能持着全局锁跑 (P2-2)。"""
+    seen: dict = {}
+
+    def fake_sync(state, timeout=90):
+        seen["lock_free"] = _lock_is_free()
+        return True, "stub sync"
+
+    monkeypatch.setattr(wireguard, "sync", fake_sync)
+    res = client.post("/api/wireguard/settings", json={"enabled": True})
+    assert res.status_code == 200, res.text
+    assert res.json()["wireguard"]["enabled"] is True
+    assert seen.get("lock_free") is True, "wireguard.sync 仍在 config 锁内执行"
+
+
+def test_wireguard_sync_failure_rolls_state_back_and_audits(client, configured, monkeypatch):
+    """落盘失败 → 期望状态回滚 (面板不能显示"改好了"而设备面没变) + 写审计。"""
+    monkeypatch.setattr(wireguard, "sync", lambda state, timeout=90: (False, "wg0 起不来"))
+    res = client.post("/api/wireguard/settings", json={"enabled": True})
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["wireguard"]["enabled"] is False, "失败的改动必须回滚"
+    assert body["steps"][0]["ok"] is False
+    assert body["steps"][0].get("rolled_back") is True
+
+    state = config.load_state()
+    assert state["wireguard"]["enabled"] is False
+    failed = [e for e in state["audit"] if e["action"] == "wireguard_settings"]
+    assert failed and "失败已回滚" in failed[-1]["detail"]
+
+
+def test_peer_add_failure_rolls_back_the_peer_list(client, configured, monkeypatch):
+    monkeypatch.setattr(wireguard, "sync", lambda state, timeout=90: (True, "ok"))
+    client.post("/api/wireguard/settings", json={"enabled": True})
+    assert len(wireguard.peers(config.load_state())) == 0
+
+    monkeypatch.setattr(wireguard, "sync", lambda state, timeout=90: (False, "syncconf 失败"))
+    res = client.post("/api/wireguard/peers", json={"name": "iPhone"})
+    assert res.status_code == 200
+    assert res.json()["wireguard"]["peer_count"] == 0, "新增失败要把 peer 回滚掉"

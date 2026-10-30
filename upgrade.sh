@@ -22,6 +22,12 @@
 #    ZP_UPDATE_CORE=1        同时把 Xray / Hysteria 2 二进制升到最新版
 #    ZP_CHECK_ONLY=1         只检查版本, 不做任何改动
 #    ZP_NO_RESTART=1         不重启面板进程 (仅命令行调试用)
+#    ZP_ALLOW_UNVERIFIED=1   跳过代码包 SHA256SUMS 校验 (默认严格)
+#
+#  供应链校验: 下载代码包后用**同一 ref 的原始 raw 地址**另取一份仓库根 SHA256SUMS,
+#  逐文件比对后才会替换代码 (镜像只承担传输); 不一致立即中止并回滚。
+#  回滚是完整的运行版本回滚: 代码 + requirements.txt + systemd 单元 + 脚本自身 + state.json,
+#  回滚后 daemon-reload、重新落地配置并复验 /api/info; pip 已装依赖只前进不后退。
 # ============================================================
 set -Eeuo pipefail
 
@@ -54,10 +60,17 @@ STATE_FILE="$ZP_HOME/data/state.json"
 STATUS_FILE="$ZP_HOME/data/update.json"
 LOG_FILE="$ZP_HOME/data/update.log"
 BACKUP_DIR="$ZP_HOME/data/backups"
+# 演练 / 容器环境可覆盖; 默认就是系统目录
+SYSTEMD_DIR="${ZP_SYSTEMD_DIR:-/etc/systemd/system}"
+LETSENCRYPT_DIR="${ZP_LETSENCRYPT_DIR:-/etc/letsencrypt}"
 ZP_TRIGGER="${ZP_TRIGGER:-cli}"
 ZP_UPDATE_CORE="${ZP_UPDATE_CORE:-0}"
 ZP_CHECK_ONLY="${ZP_CHECK_ONLY:-0}"
 ZP_NO_RESTART="${ZP_NO_RESTART:-0}"
+#: 代码包校验总开关: 默认严格 (取不到/对不上 SHA256SUMS 就回滚); 只有明确知情才跳过。
+ZP_ALLOW_UNVERIFIED="${ZP_ALLOW_UNVERIFIED:-0}"
+# 日志与状态文件不含机密, 但统一收紧权限 (升级由 root 跑; 面板也是 root 读)
+umask 022
 # 带 PID: 同一秒内跑两次也不会撞名 (撞名会让 cp -r 把新代码套进旧备份, 回滚就退错版本)
 STAMP="$(date +%Y%m%d-%H%M%S)-$$"
 
@@ -65,6 +78,129 @@ info() { printf '\033[1;34m[ZeroProxy]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ZeroProxy]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[ZeroProxy]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[ZeroProxy]\033[0m %s\n' "$*"; exit 1; }
+
+# ---------- 供应链完整性 (P1-2) ----------
+# 期望摘要来自同一 ref 的**原始 raw 地址** (独立于 tarball; 镜像只承担传输), 逐文件比对。
+# 清单没有签名, 残余风险是"镜像同时伪造清单"; 但单个镜像投毒/坏缓存会被这里挡下。
+sha256_file() { # sha256_file <文件> → 打印小写 hex; 没有可用工具时返回 1
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$1" | sed 's/^.*= *//'
+  else
+    return 1
+  fi
+}
+
+# verify_sums_file <清单> <根目录> [只校验的相对路径]
+#   0 = 全部一致   2 = 有不一致/缺失   3 = 清单无效或没有可用条目
+verify_sums_file() {
+  local sums="$1" root="$2" only="${3:-}" line hash path actual n=0 bad=0 ok_n=0
+  [ -s "$sums" ] || return 3
+  while IFS= read -r line; do
+    case "$line" in ""|"#"*) continue ;; esac
+    hash="${line%% *}"
+    path="${line#"$hash"}"
+    path="${path# }"
+    path="${path# }"
+    path="${path#\*}"
+    case "$hash" in *[!0-9a-fA-F]*) continue ;; esac
+    [ "${#hash}" -eq 64 ] || continue
+    [ -n "$only" ] && [ "$path" != "$only" ] && continue
+    n=$((n + 1))
+    if [ ! -f "$root/$path" ]; then
+      printf '  缺少文件: %s\n' "$path" >&2
+      bad=$((bad + 1))
+      continue
+    fi
+    actual="$(sha256_file "$root/$path" 2>/dev/null || true)"
+    [ -n "$actual" ] || continue
+    ok_n=$((ok_n + 1))
+    if [ "$actual" != "$hash" ]; then
+      printf '  摘要不一致: %s\n' "$path" >&2
+      bad=$((bad + 1))
+    fi
+  done < "$sums"
+  [ "$n" -gt 0 ] || return 3
+  [ "$bad" -eq 0 ] || return 2
+  [ "$ok_n" -eq "$n" ] || return 3
+  return 0
+}
+
+# fetch_zp_sums <输出文件> <ref>: 同一 ref 的原始 raw 地址取 SHA256SUMS (镜像只作传输)
+fetch_zp_sums() {
+  local out="$1" ref="$2" url p
+  url="https://raw.githubusercontent.com/$ZP_REPO/$ref/SHA256SUMS"
+  for p in "https://github.i3.pub/" "" "https://gh-proxy.com/" "https://hk.gh-proxy.com/"; do
+    rm -f "$out"
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL --connect-timeout 10 --max-time 120 -o "$out" "$p$url" 2>/dev/null \
+        && [ -s "$out" ] && return 0
+    else
+      wget -q --timeout=60 --tries=1 -O "$out" "$p$url" 2>/dev/null \
+        && [ -s "$out" ] && return 0
+    fi
+  done
+  rm -f "$out"
+  return 1
+}
+
+# fetch_gh_asset <github.com 之后的路径> <输出>: 内核 / 复核产物走 GH_MIRRORS (自建反代优先)
+fetch_gh_asset() {
+  local path="$1" out="$2" prefix
+  for prefix in "${GH_MIRRORS[@]}"; do
+    rm -f "$out"
+    if curl -fsSL --connect-timeout 10 --max-time 180 -o "$out" "$prefix/$path" 2>/dev/null \
+       && [ -s "$out" ]; then
+      return 0
+    fi
+  done
+  rm -f "$out"
+  return 1
+}
+
+# install_units <源码目录>: 落 systemd 单元; ZP_HOME 非默认值时同步替换单元里的路径
+install_units() {
+  local src="$1" f base repl
+  repl="$(printf '%s' "$ZP_HOME" | sed -e 's/[\\&|]/\\&/g')"
+  for f in "$src"/systemd/*.service; do
+    [ -f "$f" ] || continue
+    base="$(basename "$f")"
+    if [ "$ZP_HOME" = "/opt/zeroproxy" ]; then
+      cp -f "$f" "$SYSTEMD_DIR/$base"
+    else
+      sed "s|/opt/zeroproxy|$repl|g" "$f" > "$SYSTEMD_DIR/$base"
+    fi
+    chmod 644 "$SYSTEMD_DIR/$base" 2>/dev/null || true
+  done
+}
+
+# 证书续期钩子 (P2-1): 与 install.sh / 面板 services.install_cert 落的是同一个文件, 内容一致
+install_le_hook() {
+  local dir="$LETSENCRYPT_DIR/renewal-hooks/deploy"
+  local f="$LETSENCRYPT_DIR/renewal-hooks/deploy/zeroproxy-reload.sh"
+  mkdir -p "$dir" || return 1
+  cat > "$f" <<'HOOK'
+#!/bin/sh
+# ZeroProxy: Let's Encrypt 续期成功后让 nginx / Xray 用上新证书。
+# 由 install.sh / upgrade.sh / 面板 services.install_cert 落盘, 内容保持一致。
+# (--webroot 签发不会自动 reload, 没有这个钩子就要等到下一次手动续期/apply)
+set -u
+systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
+systemctl restart xray 2>/dev/null || true
+HOOK
+  chmod 755 "$f" || return 1
+  [ -x "$f" ]
+}
+
+# 升级失败不留半成品: /tmp 里的下载物与解压目录统一清掉
+cleanup_tmp() {
+  rm -f /tmp/zp-upgrade.tar.gz /tmp/zp.SHA256SUMS /tmp/xray.zip /tmp/hysteria.tar.gz /tmp/hysteria /tmp/zp-shortcut.log 2>/dev/null || true
+  rm -rf /tmp/zp-upgrade-src 2>/dev/null || true
+  return 0
+}
 
 # ---------- 进度文件 (面板「程序更新」卡片读它) ----------
 STEPS=()
@@ -97,7 +233,7 @@ json_array() { # json_array <字符串...> → ["a","b"]
 #: 这次升级会依次做哪些事 —— 面板拿它渲染"待执行 / 进行中 / 已完成"的步骤清单。
 #: 名字必须和下面 add_step 用的一字不差, 否则面板对不上号。
 build_plan() {
-  PLAN=("备份代码与 state.json" "下载新版本代码" "安装新代码" "同步 Python 依赖" "重载 systemd 单元")
+  PLAN=("备份代码与 state.json" "下载新版本代码" "安装新代码" "同步 Python 依赖" "重载 systemd 单元" "安装证书续期钩子")
   # 终端快捷命令: 只有 root 装得了 (/usr/local/bin) —— 条件必须与下面执行处**完全一致**,
   # 否则计划清单与实际步骤对不上 (面板的"待执行/已完成"清单就会错位)
   if [ "$(id -u)" -eq 0 ] && [ -x "$VENV/bin/python" ]; then
@@ -173,6 +309,7 @@ SKIP_STATUS="${SKIP_STATUS:-0}"
 on_exit() {
   local code=$?
   cleanup_self_dir
+  cleanup_tmp
   if [ "$SKIP_STATUS" = "1" ] || [ "$STATUS_STATE" != "running" ]; then
     return 0
   fi
@@ -185,19 +322,66 @@ on_exit() {
   warn "升级失败, 详见 $LOG_FILE"
 }
 
+#: 回滚必须是**完整的运行版本回滚** (P2-10): 代码 + 依赖清单 + systemd 单元 + 脚本自身
+#: + state.json 一起退回去, 然后 daemon-reload、重新落地配置、再验一次面板 readiness。
+#: 之前只回滚代码与 state, 于是"旧代码 + 新依赖 + 新单元"照样起不来, 而且失败得静悄悄。
+#: pip 已装依赖只前进不后退 (没有可靠的通用回退办法), 会在报告里明确写出来。
 rollback() {
   if [ -z "$CODE_BACKUP" ] || [ ! -d "$CODE_BACKUP" ]; then
     return 0
   fi
-  warn "回滚到升级前的代码与状态 ..."
+  warn "回滚到升级前的代码与运行版本 ..."
   rm -rf "$ZP_HOME/zeroproxy" "$ZP_HOME/static"
-  cp -r "$CODE_BACKUP/zeroproxy" "$ZP_HOME/zeroproxy"
-  cp -r "$CODE_BACKUP/static" "$ZP_HOME/static"
+  if [ -d "$CODE_BACKUP/zeroproxy" ]; then cp -r "$CODE_BACKUP/zeroproxy" "$ZP_HOME/zeroproxy"; fi
+  if [ -d "$CODE_BACKUP/static" ]; then cp -r "$CODE_BACKUP/static" "$ZP_HOME/static"; fi
   if [ -f "$CODE_BACKUP/state.json" ]; then
     cp -f "$CODE_BACKUP/state.json" "$STATE_FILE"
   fi
+  # 依赖清单与脚本自身
+  if [ -f "$CODE_BACKUP/requirements.txt" ]; then
+    cp -f "$CODE_BACKUP/requirements.txt" "$ZP_HOME/requirements.txt"
+  fi
+  if [ -f "$CODE_BACKUP/upgrade.sh" ]; then
+    cp -f "$CODE_BACKUP/upgrade.sh" "$ZP_HOME/upgrade.sh"
+    chmod +x "$ZP_HOME/upgrade.sh" 2>/dev/null || true
+  fi
+  if [ -f "$CODE_BACKUP/uninstall.sh" ]; then
+    cp -f "$CODE_BACKUP/uninstall.sh" "$ZP_HOME/uninstall.sh" 2>/dev/null || true
+  fi
+  # systemd 单元 (升级覆盖过 /etc/systemd/system, 这里按备份逐份换回)
+  if [ -d "$CODE_BACKUP/systemd" ] && [ -d "$SYSTEMD_DIR" ]; then
+    for _u in "$CODE_BACKUP"/systemd/*.service; do
+      [ -f "$_u" ] || continue
+      cp -f "$_u" "$SYSTEMD_DIR/$(basename "$_u")" 2>/dev/null || true
+    done
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
   systemctl restart xray hysteria2 nginx zeroproxy >/dev/null 2>&1 || true
-  ok "已回滚 (备份保留在 $BACKUP_DIR)"
+  # 回滚后复验: 先按 state.json 重新落地 (旧代码 + 旧配置), 再等面板接口就绪
+  ROLLBACK_APPLY="ok"
+  if [ -f "$STATE_FILE" ] && [ -x "$VENV/bin/python" ]; then
+    if ! env ZP_HOME="$ZP_HOME" PYTHONPATH="$ZP_HOME" "$VENV/bin/python" -m zeroproxy.apply --quiet \
+         >>"$LOG_FILE" 2>&1; then
+      ROLLBACK_APPLY="apply 失败 (详见 $LOG_FILE)"
+    fi
+  fi
+  ROLLBACK_READY=0
+  for _ in $(seq 1 20); do
+    if curl -fsS --max-time 3 "http://127.0.0.1:${ZP_BIND_PORT:-9900}/api/info" >/dev/null 2>&1; then
+      ROLLBACK_READY=1
+      break
+    fi
+    sleep 1
+  done
+  if [ "$ROLLBACK_READY" = "1" ]; then
+    ok "已回滚 (备份保留在 $BACKUP_DIR); 面板接口已恢复"
+  else
+    warn "已回滚代码 / 单元 / 依赖清单, 但面板 20 秒内仍未就绪。可操作提示:"
+    warn "  1) journalctl -u zeroproxy -n 50   看进程为什么起不来"
+    warn "  2) $VENV/bin/pip install -r $ZP_HOME/requirements.txt   重装依赖 (pip 只前进不后退)"
+    warn "  3) 备份在 $BACKUP_DIR; state.json 未被升级覆盖 (密钥/令牌原样保留)"
+    warn "回滚后 apply: $ROLLBACK_APPLY"
+  fi
 }
 
 run_step() { # run_step <名称> <命令...>
@@ -266,12 +450,27 @@ cp -r "$ZP_HOME/static" "$CODE_BACKUP/static"
 if [ -f "$STATE_FILE" ]; then
   cp -f "$STATE_FILE" "$CODE_BACKUP/state.json"
 fi
+# P2-10: 升级会改的**运行版本组成**全部一起备份 —— 只备份代码与 state 的话,
+# 回滚出来可能变成"旧代码 + 新依赖 + 新 systemd 单元", 面板照样起不来。
+[ -f "$ZP_HOME/requirements.txt" ] && cp -f "$ZP_HOME/requirements.txt" "$CODE_BACKUP/requirements.txt"
+[ -f "$ZP_HOME/upgrade.sh" ] && cp -f "$ZP_HOME/upgrade.sh" "$CODE_BACKUP/upgrade.sh"
+[ -f "$ZP_HOME/uninstall.sh" ] && cp -f "$ZP_HOME/uninstall.sh" "$CODE_BACKUP/uninstall.sh"
+if [ -d "$SYSTEMD_DIR" ]; then
+  mkdir -p "$CODE_BACKUP/systemd"
+  for _u in "$SYSTEMD_DIR"/zeroproxy.service "$SYSTEMD_DIR"/xray.service \
+            "$SYSTEMD_DIR"/hysteria2.service "$SYSTEMD_DIR"/zeroproxy-wg.service \
+            "$SYSTEMD_DIR"/zeroproxy-wg-userspace.service; do
+    [ -f "$_u" ] && cp -f "$_u" "$CODE_BACKUP/systemd/" 2>/dev/null || true
+  done
+fi
+# pip 依赖只前进不后退: 记一份升级前的 freeze, 失败时至少能对照/手工装回
+"$VENV/bin/pip" freeze > "$CODE_BACKUP/pip-freeze.txt" 2>/dev/null || true
 # 只保留最近 5 次备份, 避免长期占盘
 if ls -1dt "$BACKUP_DIR"/code-* >/dev/null 2>&1; then
   ls -1dt "$BACKUP_DIR"/code-* 2>/dev/null | tail -n +6 | while read -r old; do rm -rf "$old"; done
 fi
-ok "已备份当前代码与 state.json → $CODE_BACKUP"
-add_step true "备份代码与 state.json" "$(basename "$CODE_BACKUP") (最近 5 份自动保留)"
+ok "已备份当前代码 / 依赖清单 / systemd 单元 / state.json → $CODE_BACKUP"
+add_step true "备份代码与 state.json" "$(basename "$CODE_BACKUP") (最近 5 份自动保留; 含单元与依赖清单)"
 
 trap on_exit EXIT
 
@@ -281,6 +480,7 @@ begin_step "下载新版本代码"
 fetch_tarball() { # fetch_tarball <输出文件>
   local out="$1" url err sha prefix
   err="$(mktemp)"
+  ZP_TARBALL_SHA=""
   # 先把分支 / tag 解析成提交 SHA, 再按 SHA 下载 —— `archive/refs/heads/<分支>.tar.gz`
   # 在推送后会被 CDN 缓存一小会儿, 刚发完版就升级会**装到上一个版本的代码**
   # (面板上显示成 "v2.6.28 → v2.6.28", 用户以为没升级)。SHA 是不可变快照, 没有这个问题;
@@ -301,7 +501,7 @@ fetch_tarball() { # fetch_tarball <输出文件>
   urls+=("$GH_API/repos/$ZP_REPO/tarball/$ZP_REF")
   for url in "${urls[@]}"; do
     curl -fsSL --connect-timeout 10 --max-time 180 -o "$out" "$url" 2>"$err" || { rm -f "$out"; continue; }
-    if tar -tzf "$out" >/dev/null 2>&1; then rm -f "$err"; return 0; fi
+    if tar -tzf "$out" >/dev/null 2>&1; then ZP_TARBALL_SHA="$sha"; rm -f "$err"; return 0; fi
     rm -f "$out"
   done
   DL_ERR="$(tail -1 "$err" 2>/dev/null || true)"
@@ -318,6 +518,32 @@ mkdir -p /tmp/zp-upgrade-src
 tar -xzf /tmp/zp-upgrade.tar.gz -C /tmp/zp-upgrade-src
 SRC_DIR="$(find /tmp/zp-upgrade-src -mindepth 1 -maxdepth 1 -type d | head -1)"
 [ -f "$SRC_DIR/backend/zeroproxy/main.py" ] || fail "下载的代码不完整: $SRC_DIR"
+
+# ---- 供应链校验 (P1-2): 逐文件比对同一 ref 的 SHA256SUMS ----
+# 清单从原始 raw 地址独立取 (镜像只作传输); 任一条不一致就中止 → trap 回滚。
+if [ "${ZP_ALLOW_UNVERIFIED:-0}" = "1" ]; then
+  warn "ZP_ALLOW_UNVERIFIED=1: 跳过代码包 SHA256SUMS 校验 (不推荐)"
+else
+  _sums_ref="${ZP_TARBALL_SHA:-$ZP_REF}"
+  rm -f /tmp/zp.SHA256SUMS
+  if ! fetch_zp_sums /tmp/zp.SHA256SUMS "$_sums_ref"; then
+    fail "取不到代码包校验清单 (SHA256SUMS): $ZP_REPO@$_sums_ref
+       升级通道必须能独立取到清单; 应急可显式跳过 (不推荐): ZP_ALLOW_UNVERIFIED=1 bash upgrade.sh"
+  fi
+  if [ -f "$SRC_DIR/SHA256SUMS" ]; then
+    _in_pkg="$(sha256_file "$SRC_DIR/SHA256SUMS" 2>/dev/null || true)"
+    _raw="$(sha256_file /tmp/zp.SHA256SUMS 2>/dev/null || true)"
+    if [ -n "$_in_pkg" ] && [ -n "$_raw" ] && [ "$_in_pkg" != "$_raw" ]; then
+      fail "代码包内的 SHA256SUMS 与同 ref 的原始清单不一致 —— 镜像可能被篡改, 已中止升级"
+    fi
+  fi
+  if ! verify_sums_file /tmp/zp.SHA256SUMS "$SRC_DIR"; then
+    fail "代码包 SHA256SUMS 校验失败 (文件被改动 / 不完整) —— 已中止升级并回滚
+       镜像可能被投毒; 换一个 ref 或镜像重试, 确认无风险时才用 ZP_ALLOW_UNVERIFIED=1。"
+  fi
+  ok "代码包已按 SHA256SUMS 逐文件校验通过 ($ZP_REPO@$_sums_ref)"
+fi
+
 TO_VERSION="$(read_version "$SRC_DIR/backend/zeroproxy/__init__.py")"
 TO_VERSION="${TO_VERSION:-unknown}"
 ok "代码已就绪 (v$FROM_VERSION → v$TO_VERSION)"
@@ -331,10 +557,10 @@ cp -r "$SRC_DIR/backend/zeroproxy" "$ZP_HOME/zeroproxy"
 cp -r "$SRC_DIR/backend/static" "$ZP_HOME/static"
 cp "$SRC_DIR/backend/requirements.txt" "$ZP_HOME/requirements.txt"
 rm -rf "$ZP_HOME/zeroproxy/__pycache__" "$ZP_HOME/zeroproxy"/*/__pycache__
-# systemd 单元目录可被 ZP_SYSTEMD_DIR 覆盖 (容器 / 演练环境用; 默认就是系统目录)
-SYSTEMD_DIR="${ZP_SYSTEMD_DIR:-/etc/systemd/system}"
+# systemd 单元目录可被 ZP_SYSTEMD_DIR 覆盖 (容器 / 演练环境用; 默认就是系统目录)。
+# ZP_HOME 不是 /opt/zeroproxy 时, install_units 会同步替换单元里的路径。
 if [ -d "$SYSTEMD_DIR" ]; then
-  cp "$SRC_DIR"/systemd/*.service "$SYSTEMD_DIR/"
+  install_units "$SRC_DIR"
 else
   warn "未发现 $SYSTEMD_DIR, 跳过 systemd 单元安装 (非 systemd 环境)"
 fi
@@ -343,12 +569,20 @@ if [ -f "$SRC_DIR/uninstall.sh" ]; then
   cp "$SRC_DIR/uninstall.sh" "$ZP_HOME/uninstall.sh"
 fi
 chmod +x "$ZP_HOME/upgrade.sh" "$ZP_HOME/uninstall.sh" 2>/dev/null || true
-rm -rf /tmp/zp-upgrade.tar.gz /tmp/zp-upgrade-src
+rm -rf /tmp/zp-upgrade.tar.gz /tmp/zp-upgrade-src /tmp/zp.SHA256SUMS
 add_step true "安装新代码" "v$FROM_VERSION → v$TO_VERSION ($ZP_HOME)"
 
 # ---------- 4. 依赖 ----------
 run_step "同步 Python 依赖" "$VENV/bin/pip" install -q -r "$ZP_HOME/requirements.txt"
 run_step "重载 systemd 单元" systemctl daemon-reload
+# 证书续期钩子 (P2-1): 老部署升级后也要有 —— 自动续期成功但 nginx / Xray 继续用旧证书
+# 是"证书突然过期"的根因。内容与 install.sh / services.install_cert 保持一致。
+begin_step "安装证书续期钩子"
+if install_le_hook; then
+  add_step true "安装证书续期钩子" "$LETSENCRYPT_DIR/renewal-hooks/deploy/zeroproxy-reload.sh"
+else
+  add_step false "安装证书续期钩子" "写入 $LETSENCRYPT_DIR 失败; 续期后需手动 reload nginx / restart xray"
+fi
 # 终端快捷管理 (z): 老部署升级完也要有 —— 它是"忘记面板密码"时的唯一兜底入口。
 # 幂等, 内容随本版本刷新。条件与 build_plan 里那条一模一样 (清单要对得上号)。
 if [ "$(id -u)" -eq 0 ] && [ -x "$VENV/bin/python" ]; then
@@ -365,24 +599,55 @@ fi
 # ---------- 5. 可选: 升级内核二进制 ----------
 if [ "$ZP_UPDATE_CORE" = "1" ]; then
   ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m)"
+  XRAY_ASSET="Xray-linux-$( [ "$ARCH" = "arm64" ] && echo arm64-v8a || echo 64 ).zip"
+  HY_ASSET="hysteria-linux-$ARCH.tar.gz"
   step_log "升级 Xray / Hysteria 2 二进制 (ZP_UPDATE_CORE=1) ..."
+  # 内核下载复用 GH_MIRRORS (F-08): 受限网络下"升级面板能过、升级内核卡死"就是这里
+  # 只走 GitHub 直连造成的。镜像只作传输, 摘要仍用可选的固定常量校验。
   begin_step "升级 Xray Core"
-  if curl -fsSL --max-time 120 -o /tmp/xray.zip \
-      "$GH/XTLS/Xray-core/releases/latest/download/Xray-linux-$( [ "$ARCH" = "arm64" ] && echo arm64-v8a || echo 64 ).zip"; then
-    unzip -oq /tmp/xray.zip -d /usr/local/bin && chmod +x /usr/local/bin/xray
-    add_step true "升级 Xray Core" "$(/usr/local/bin/xray version 2>/dev/null | head -1)"
+  if fetch_gh_asset "XTLS/Xray-core/releases/latest/download/$XRAY_ASSET" /tmp/xray.zip; then
+    case "$ARCH" in
+      arm64) _xray_sha_env="ZP_XRAY_SHA256_ARM64" ;;
+      *)     _xray_sha_env="ZP_XRAY_SHA256_AMD64" ;;
+    esac
+    _xray_expect="${!_xray_sha_env:-}"
+    _xray_sha="$(sha256_file /tmp/xray.zip 2>/dev/null || true)"
+    if [ -n "$_xray_expect" ] && [ "$(printf '%s' "$_xray_expect" | tr 'A-F' 'a-f')" != "$_xray_sha" ]; then
+      warn "Xray 压缩包 SHA256 与 $_xray_sha_env 不一致, 保留现有版本"
+      add_step false "升级 Xray Core" "SHA256 校验失败, 已保留现有版本"
+    elif unzip -t /tmp/xray.zip >/dev/null 2>&1 \
+         && unzip -oq /tmp/xray.zip -d /usr/local/bin && chmod +x /usr/local/bin/xray; then
+      add_step true "升级 Xray Core" "$(/usr/local/bin/xray version 2>/dev/null | head -1)"
+    else
+      add_step false "升级 Xray Core" "压缩包解不开, 已保留现有版本"
+    fi
+    [ -n "$_xray_expect" ] || warn "未固定 Xray SHA256 (设 $_xray_sha_env=<hex> 可钉死; 实际 ${_xray_sha:-未知})"
   else
-    warn "Xray 下载失败, 保留现有版本"
+    warn "Xray 下载失败 (镜像与直连都不通), 保留现有版本"
     add_step false "升级 Xray Core" "下载失败, 已保留现有版本"
   fi
   rm -f /tmp/xray.zip
   begin_step "升级 Hysteria 2"
-  if curl -fsSL --max-time 120 -o /tmp/hysteria.tar.gz \
-      "$GH/apernet/hysteria/releases/latest/download/hysteria-linux-$ARCH.tar.gz"; then
-    tar -xzf /tmp/hysteria.tar.gz -C /tmp hysteria && install -m 755 /tmp/hysteria /usr/local/bin/hysteria
-    add_step true "升级 Hysteria 2" "$(/usr/local/bin/hysteria version 2>/dev/null | head -1)"
+  if fetch_gh_asset "apernet/hysteria/releases/latest/download/$HY_ASSET" /tmp/hysteria.tar.gz; then
+    case "$ARCH" in
+      arm64) _hy_sha_env="ZP_HYSTERIA_SHA256_ARM64" ;;
+      *)     _hy_sha_env="ZP_HYSTERIA_SHA256_AMD64" ;;
+    esac
+    _hy_expect="${!_hy_sha_env:-}"
+    _hy_sha="$(sha256_file /tmp/hysteria.tar.gz 2>/dev/null || true)"
+    if [ -n "$_hy_expect" ] && [ "$(printf '%s' "$_hy_expect" | tr 'A-F' 'a-f')" != "$_hy_sha" ]; then
+      warn "Hysteria 压缩包 SHA256 与 $_hy_sha_env 不一致, 保留现有版本"
+      add_step false "升级 Hysteria 2" "SHA256 校验失败, 已保留现有版本"
+    elif tar -tzf /tmp/hysteria.tar.gz >/dev/null 2>&1 \
+         && tar -xzf /tmp/hysteria.tar.gz -C /tmp hysteria \
+         && install -m 755 /tmp/hysteria /usr/local/bin/hysteria; then
+      add_step true "升级 Hysteria 2" "$(/usr/local/bin/hysteria version 2>/dev/null | head -1)"
+    else
+      add_step false "升级 Hysteria 2" "压缩包解不开, 已保留现有版本"
+    fi
+    [ -n "$_hy_expect" ] || warn "未固定 Hysteria SHA256 (设 $_hy_sha_env=<hex> 可钉死; 实际 ${_hy_sha:-未知})"
   else
-    warn "Hysteria 2 下载失败, 保留现有版本"
+    warn "Hysteria 2 下载失败 (镜像与直连都不通), 保留现有版本"
     add_step false "升级 Hysteria 2" "下载失败, 已保留现有版本"
   fi
   rm -f /tmp/hysteria.tar.gz /tmp/hysteria

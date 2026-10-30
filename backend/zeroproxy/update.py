@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -23,6 +24,11 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+
+try:  # POSIX 下用 flock 串行化 update.json 的写入 (CLI `z update` 与面板可并发)
+    import fcntl
+except ImportError:  # pragma: no cover - 非 POSIX 平台退化为纯原子写
+    fcntl = None  # type: ignore[assignment]
 
 from . import __version__, services
 from .config import paths
@@ -122,12 +128,36 @@ def _read_status() -> dict:
 
 
 def _write_status(payload: dict) -> None:
+    """写升级进度文件 (P3-7): 临时文件 + fsync + 锁内原子替换 + 0600。
+
+    为什么要有锁: 面板里的升级与命令行 `z update` 是两条独立路径, 并发时后写的
+    会静默覆盖前一份进度, 面板上就出现"升级在跑但进度文件是上一次的结果"。
+    flock 只覆盖 replace 那一下, 不阻塞任何读路径 (读到的要么是旧文件、要么是新文件)。
+    """
     path = paths()["update_status"]
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    # 每个写入者一个独立临时文件 (mkstemp 从创建瞬间就是 0600): 并发写时不能共用
+    # 一个固定名字, 否则先完成的那个 replace 走之后, 另一条路径的 replace 会 ENOENT。
+    fd, tmp = tempfile.mkstemp(prefix=".update.", suffix=".tmp", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, 0o600)
+        lock_path = path + ".lock"
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            os.replace(tmp, path)
+            with contextlib.suppress(OSError):
+                os.chmod(path, 0o600)
+        finally:
+            os.close(fd)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(tmp)
 
 
 def _log_tail(lines: int = 40) -> str:

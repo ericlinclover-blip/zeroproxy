@@ -37,6 +37,33 @@ for (const extra of (process.env.ZP_NODE_PATH || "").split(path.delimiter)) {
   if (extra && !module.paths.includes(extra)) module.paths.push(extra);
 }
 
+// playwright 必须在 spawn 面板**之前** require: 本机没有这个模块时, 旧写法是在面板
+// 子进程已经起来之后才抛 MODULE_NOT_FOUND, catch 直接 exit(1), 子进程没人收尸 ——
+// 端口一直 LISTEN (实测残留过)。先 require 再 spawn: 缺依赖就干干净净地退出 1,
+// 一个子进程都不会留下。
+let chromium;
+try {
+  ({ chromium } = require("playwright"));
+} catch (e) {
+  console.error(
+    "缺少 playwright: 本脚本需要 node + playwright + Chromium。\n" +
+      "本机没有时请明确跳过 (不能当作\"通过\"), 不要安装到项目里来跑。\n" +
+      "原始错误: " + (e && e.message ? e.message : e)
+  );
+  process.exit(1);
+}
+
+// 面板子进程 (缺依赖 / 中途抛错时统一在 catch 里收尸)
+let server = null;
+/** 收掉面板子进程: 已退出就立即返回, 否则等它真的退出 (不留 LISTEN 的孤儿)。 */
+function stopServer() {
+  if (!server || server.exitCode !== null || server.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    server.once("exit", resolve);
+    server.kill("SIGTERM");
+  });
+}
+
 const results = [];
 function check(name, ok, detail = "") {
   results.push({ name, ok, detail });
@@ -133,7 +160,7 @@ async function main() {
   fs.writeFileSync(path.join(home, "data", "bootstrap_token"), TOKEN + "\n", { mode: 0o600 });
   fs.mkdirSync(SHOT_DIR, { recursive: true });
 
-  const server = spawn(PYTHON, ["-m", "zeroproxy.main"], {
+  server = spawn(PYTHON, ["-m", "zeroproxy.main"], {
     cwd: path.join(ROOT, "backend"),
     env: {
       ...process.env,
@@ -149,7 +176,6 @@ async function main() {
   server.stdout.on("data", (d) => (serverLog += d));
   server.stderr.on("data", (d) => (serverLog += d));
 
-  const { chromium } = require("playwright");
   const base = `http://127.0.0.1:${PORT}`;
   let browser;
   try {
@@ -498,12 +524,40 @@ async function main() {
     check("重新打开后区间跟着主端口走",
       hopAfter.length === 3 && hopAfter[0] === 30001 && hopAfter[2] === 32001, hopAfter.join(" / "));
 
-    const backup = await page.request.get(`${base}/api/backup`);
+    // 备份改 POST (旧版是 GET: 有副作用, 也没法把口令/加密选择放进请求头)。
+    // 明文导出仍返回 JSON; 加密导出 (encrypt=1 + X-ZP-Passphrase) 返回二进制 .enc。
+    const backup = await page.request.post(`${base}/api/backup`, { data: { encrypt: 0 } });
     const backupBody = await backup.json();
-    check("备份可下载", backup.ok() && !!backupBody.checksum,
+    check("备份可导出 (POST, 明文 JSON)", backup.ok() && !!backupBody.checksum,
       `${backupBody.format} v${backupBody.backup_version} · ${backupBody.checksum.slice(0, 12)}`);
-    check("恢复入口存在", (await page.locator("#btn-restore").count()) === 1
-      && (await page.locator("#restore-file").count()) === 1);
+    const encBackup = await page.request.post(`${base}/api/backup?encrypt=1`, {
+      headers: { "X-ZP-Passphrase": "browser-check-pass" },
+      data: { encrypt: 1 },
+    });
+    const encBytes = await encBackup.body();
+    const encHead = encBytes.slice(0, 60).toString("utf8");
+    check("加密备份导出 (encrypt=1 + X-ZP-Passphrase, 不是明文 JSON)",
+      encBackup.ok() && !encHead.trimStart().startsWith("{")
+      && /\.enc/i.test(encBackup.headers()["content-disposition"] || ""),
+      `${encBytes.length} 字节 · ${encHead.slice(0, 10).replace(/[^\x20-\x7e]/g, "?")}…`);
+    check("恢复入口存在 (接受明文 / 加密原文件)",
+      (await page.locator("#btn-restore").count()) === 1
+      && (await page.locator("#restore-file").count()) === 1
+      && /\.enc/.test(await page.locator("#restore-file").getAttribute("accept") || ""));
+    // 导出前必须先弹确认框: 写清"备份等价 root", 并给一个可选的加密口令输入
+    // (口令不落 URL —— 加密请求走 X-ZP-Passphrase 头)。
+    await page.click("#btn-backup");
+    await page.waitForSelector("#confirm-mask:not(.hidden)", { timeout: 10000 });
+    const backupConfirm = await page.evaluate(() => ({
+      title: document.querySelector("#confirm-title").innerText,
+      body: document.querySelector("#confirm-body").innerText.replace(/\s+/g, " "),
+      hasPass: !!document.querySelector("#backup-pass"),
+    }));
+    check("导出备份先弹确认 (说明等价 root, 可选口令加密)",
+      /导出备份/.test(backupConfirm.title) && backupConfirm.hasPass && /root/.test(backupConfirm.body),
+      backupConfirm.title);
+    await page.click("#confirm-cancel");
+    check("取消导出后弹窗关闭", (await page.locator("#confirm-mask.hidden").count()) === 1, "");
     // 恢复是覆盖操作: 选完文件要先弹自定义确认框 (原来是浏览器原生 confirm, 长得像系统
     // 警告、讲不清"哪些东西会被替换")。这里不真的恢复, 只验证这一步与取消路径。
     const notABackup = path.join(os.tmpdir(), "zp-not-a-backup.json");
@@ -516,6 +570,8 @@ async function main() {
     check("确认框写清会被替换的东西与订阅会变",
       /密钥/.test(await page.locator("#confirm-body").innerText())
       && /重新导入订阅/.test(await page.locator("#confirm-body").innerText()), "");
+    check("加密备份恢复时能填口令 (X-ZP-Passphrase, 不落 URL)",
+      (await page.locator("#restore-pass").count()) === 1);
     await page.click("#confirm-cancel");
     check("取消后弹窗关闭", (await page.locator("#confirm-mask.hidden").count()) === 1, "");
 
@@ -654,7 +710,7 @@ async function main() {
           steps: plan.map((n) => ({ name: n, ok: true, detail: "完成" })), message: "" },
       };
       renderUpdate();
-      const banner = document.querySelector("#update-body .banner");
+      const banner = document.querySelector("#update-result .banner");
       return {
         cls: banner.className,
         text: banner.innerText.replace(/\s+/g, " ").trim(),
@@ -684,7 +740,7 @@ async function main() {
             { name: plan[2], ok: false, detail: "命令执行失败, 详见日志" }] },
       };
       renderUpdate();
-      const banner = document.querySelector("#update-body .banner");
+      const banner = document.querySelector("#update-result .banner");
       return {
         cls: banner.className,
         text: banner.innerText.replace(/\s+/g, " ").trim(),
@@ -704,7 +760,7 @@ async function main() {
 
     await page.evaluate(() => loadUpdate(false));   // 恢复成真实状态, 不影响后面的检查
     check("恢复真实状态后卡片回到版本对比",
-      await page.evaluate(() => !document.querySelector("#update-body .banner")), "");
+      await page.evaluate(() => !document.querySelector("#update-result .banner")), "");
 
     console.log("\n[3e] 初始化 → 域名面板 交接到位");
     // 真机上部署成功后后端会返回 redirect.ready, 前端弹这张"3 秒后跳转"的卡。
@@ -992,6 +1048,44 @@ async function main() {
       splitProbe.pills.some((t) => /^出口 IP 198\.51\.100\.7$/.test(t))
       && splitProbe.pills.some((t) => /链路 187ms/.test(t))
       && /探测用时 3\.1s/.test(splitProbe.text), splitProbe.pills.join(" / "));
+
+    // 证书 pin 对不上时不能静默 (P2-7): 后端给 entry.pin_ok / needs_repair、顶层
+    // exit_pin / pin_mismatch, 前端必须把它们变成醒目的红条 + 「重新配对」入口。
+    // 这里直接往 dash 里喂字段 (与真实链路的耦合最小), 验证的是渲染契约。
+    const pinUi = await page.evaluate(() => {
+      const entry = dash.chain.entries[0];
+      entry.pin_ok = false;
+      entry.needs_repair = true;
+      dash.chain.exit_pin = "a".repeat(64);
+      dash.chain.pin_mismatch = true;
+      renderChain(dash);
+      const summary = document.querySelector("#chain-pin-banner");
+      const repair = document.querySelector("[data-chain-repair]");
+      return {
+        summary: !!summary,
+        summaryText: ((summary || {}).innerText || "").replace(/\s+/g, " ").trim(),
+        perEntry: !!document.querySelector("#chain-entries .chain-entry .banner.bad"),
+        repairBtn: !!repair,
+        repairText: ((repair || {}).innerText || "").trim(),
+        exitWarn: !!document.querySelector("#chain-exit-pin-warn"),
+        exitText: (document.querySelector("#chain-exit-card").innerText || "").replace(/\s+/g, " "),
+      };
+    });
+    check("unpinned / pin 不一致: 链式卡片给出明确红条与「重新配对」入口 (不再静默)",
+      pinUi.summary && /证书指纹/.test(pinUi.summaryText) && pinUi.perEntry
+      && pinUi.repairBtn && /重新配对/.test(pinUi.repairText),
+      pinUi.summaryText.slice(0, 64));
+    check("落地端证书重签时当面说清入口端 pin 对不上",
+      pinUi.exitWarn && /pin/.test(pinUi.exitText), pinUi.exitText.slice(0, 48));
+    // 还原成测试里真实的那条链 (后面还要断开它), 别把注入的告警状态带出去
+    await page.evaluate(() => {
+      const entry = dash.chain.entries[0];
+      delete entry.pin_ok;
+      delete entry.needs_repair;
+      delete dash.chain.exit_pin;
+      dash.chain.pin_mismatch = false;
+      renderChain(dash);
+    });
 
     // 断开 → 卡片与订阅里的节点一起消失
     await page.click(`[data-chain-del='${entryCard.id}']`);
@@ -1441,8 +1535,7 @@ async function main() {
     await page.waitForSelector("#view-dash:not(.hidden)", { timeout: 20000 });
   } finally {
     if (browser) await browser.close();
-    server.kill("SIGTERM");
-    await new Promise((r) => server.once("exit", r));
+    await stopServer();   // 缺依赖 / 中途抛错也走这里: 不能把面板进程留在端口上
   }
 
   const failed = results.filter((r) => !r.ok);
@@ -1454,7 +1547,8 @@ async function main() {
   return failed.length ? 1 : 0;
 }
 
-main().then((code) => process.exit(code)).catch((err) => {
+main().then((code) => process.exit(code)).catch(async (err) => {
   console.error("验证失败:", err);
+  await stopServer();     // 兜底: 任何未预期的异常都不留面板子进程
   process.exit(1);
 });

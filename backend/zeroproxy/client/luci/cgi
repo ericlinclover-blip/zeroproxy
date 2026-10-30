@@ -32,9 +32,20 @@ ui_page_dir() {
 }
 PAGE_DIR="$(ui_page_dir)"
 
+#: 安全响应头。本页面会被 LuCI 的 status.js 用 iframe 嵌进去 (同源), 所以只允许同源嵌入;
+#: 不许 MIME 嗅探; 也不把地址里的 ?k= 带给外站。与 zpcore 的 serve.go 发的是**同一组**
+#: (两个入口一套语义 —— 以前两边都没有这些头, 见 P2-8)。
+sec_headers() {
+    printf 'X-Frame-Options: SAMEORIGIN\r\n'
+    printf "Content-Security-Policy: frame-ancestors 'self'\r\n"
+    printf 'X-Content-Type-Options: nosniff\r\n'
+    printf 'Referrer-Policy: no-referrer\r\n'
+}
+
 header() {
     printf 'Content-Type: application/json; charset=utf-8\r\n'
     printf 'Cache-Control: no-store\r\n'
+    sec_headers
     printf '\r\n'
 }
 fail() { header; printf '{"ok":false,"error":"%s"}\n' "$1"; exit 0; }
@@ -70,7 +81,19 @@ if [ -z "$ok" ]; then
         _sess="$(ubus call session get "{\"ubus_rpc_session\":\"$sid\"}" 2>&1)"
         case "$_sess" in
             ""|*"Command failed"*) ;;
-            *) ok=1 ;;
+            *)
+                # "会话有效"只是第一层: **身份**也要对。这个 cgi 由 uhttpd 以 root 身份
+                # 执行 /usr/bin/zeroproxy, 而 update / perf-on / drop 都是 root 级动作。
+                # 以前只要会话存在就放行 —— 在配了多账号 + ACL 的固件上, 一个被 ACL 限制
+                # 的 LuCI 账号可以借 root 的 cgi 越权 (P2-8)。判据: username 必须是 root;
+                # 不是 root 时, 该会话的 ACL 必须明确放行本应用 (acl.json 里的
+                # luci-app-zeroproxy)。默认单 root 固件行为不变。
+                if printf '%s' "$_sess" | grep -Eq '"username"[[:space:]]*:[[:space:]]*"root"'; then
+                    ok=1
+                elif printf '%s' "$_sess" | grep -q 'luci-app-zeroproxy'; then
+                    ok=1
+                fi
+                ;;
         esac
     fi
 fi
@@ -85,13 +108,17 @@ want="$(printf '%s' "$QS" | tr '&' '\n' | sed -n 's/^file=//p' | head -n1)"
 # 端点不需要授权就能访问, 拼路径等于开一个任意文件读取。
 case "$want" in
     app.js|perf.js)
-        printf 'Content-Type: text/javascript; charset=utf-8\r\nCache-Control: no-store\r\n\r\n'
+        printf 'Content-Type: text/javascript; charset=utf-8\r\nCache-Control: no-store\r\n'
+        sec_headers
+        printf '\r\n'
         cat "$PAGE_DIR/$want" 2>/dev/null
         exit 0 ;;
 esac
 act="$(printf '%s' "$QS" | tr '&' '\n' | sed -n 's/^a=//p' | head -n1)"
 if [ -z "$act" ] && [ -z "$want" ]; then
-    printf 'Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n\r\n'
+    printf 'Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n'
+    sec_headers
+    printf '\r\n'
     cat "$PAGE_DIR/index.html" 2>/dev/null
     exit 0
 fi
@@ -110,15 +137,22 @@ jval() {
         printf '%s' "$BODY" | sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1
     fi
 }
-# 把任意文本塞进 JSON 字符串 (换行转义成 \n, 由前端还原)
-jstr() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\r' | awk '{printf "%s\\n", $0}'; }
+# 把任意文本塞进 JSON 字符串 (换行转义成 \n, 由前端还原)。
+# `[[:cntrl:]]` 把控制字符 (裸 TAB / 垂直制表 / 其它 C0) 一并清掉: JSON 字符串里裸控制
+# 字符是非法字符 —— 前端 JSON.parse 会直接失败, 页面显示"无法解析"。旧版只挡了 \r。
+jstr() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/[[:cntrl:]]//g' \
+        | awk '{printf "%s\\n", $0}'
+}
 
 # **单值**用这个: 同样转义, 但不追加那个尾随换行。
 # jstr 是给"多行的 CLI 输出"准备的 —— 它把每行结尾变成字面的 \n, JSON 解出来就是真换行,
 # 前端再按换行切分 (动作回执、日志)。用在 base / version / 服务器键这种单值上, 结果是
 # 值尾巴上多一个换行 (真机实测: "base":"https://hk.i3.pub:8899\n" —— 界面看不出来, 但
 # 值是错的, 排障时对不上)。
-jval_s() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\r\n'; }
+jval_s() {
+    printf '%s' "$1" | tr -d '\r\n' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/[[:cntrl:]]//g'
+}
 
 # 动作名: /cgi-bin/zeroproxy/add → add (PATH_INFO 或 REQUEST_URI 里取最后一段)
 action="$act"
@@ -217,6 +251,22 @@ case "$action" in
         fi
         ver=""
         [ -f "$ZP_DIR/version" ] && ver="$(cat "$ZP_DIR/version" 2>/dev/null)"
+        # 数据面真的过了多少包 —— **规则存在 ≠ 有流量**。cgi 以前没有这个字段, 于是
+        # 本机页面 (80 端口这一条) 永远看不到流量判据 (P2-8); 判据与 zpcore / CLI 同一份。
+        packets=0
+        case "$mode" in
+            tun)
+                _pk="$(cat /sys/class/net/zp-tun/statistics/rx_packets 2>/dev/null | head -n1)"
+                packets="${_pk:-0}" ;;
+            tproxy)
+                packets="$(nft list table inet zp_router 2>/dev/null \
+                    | sed -n 's/.*counter packets \([0-9][0-9]*\).*/\1/p' \
+                    | awk '{s+=$1} END{print s+0}')" ;;
+            redirect)
+                packets="$(iptables -t nat -L zp_router -v -n 2>/dev/null \
+                    | awk 'NR>2 {s+=$1} END{print s+0}')" ;;
+        esac
+        case "$packets" in ''|*[!0-9]*) packets=0 ;; esac
         items=""
         for f in "$ZP_DIR"/servers/*.json; do
             [ -f "$f" ] || continue
@@ -226,8 +276,8 @@ case "$action" in
             items="${items:+$items,}{\"key\":\"$(jval_s "$key")\",\"base\":\"$(jval_s "$base")\",\"id\":\"$(jval_s "$did")\"}"
         done
         header
-        printf '{"ok":true,"core":"%s","mode":"%s","covered":"%s","why":"%s","ipv6":"%s","client":"%s","wan":"%s","servers":[%s],' \
-            "$core" "$mode" "$covered" "$(jstr "$why")" "$ipv6" "$(jval_s "$ver")" "$wan" "$items"
+        printf '{"ok":true,"core":"%s","mode":"%s","covered":"%s","why":"%s","ipv6":"%s","client":"%s","wan":"%s","packets":%s,"servers":[%s],' \
+            "$core" "$mode" "$covered" "$(jstr "$why")" "$ipv6" "$(jval_s "$ver")" "$wan" "$packets" "$items"
         printf '"perf":{"cap":"%s","state":"%s","live":"%s","why":"%s","exit_ip":"%s","wan_ip":"%s","busy":"%s","progress":"%s"}}\n' \
             "$perf_cap" "$perf_state" "$perf_live" "$(jstr "$perf_why")" "$(jval_s "$perf_exit")" \
             "$(jval_s "$perf_wan_ip")" "$perf_busy" "$(jstr "$perf_prog")"
@@ -235,7 +285,13 @@ case "$action" in
     add)
         url="$(jval url)"
         [ -n "$url" ] || fail "没有收到服务器链接"
-        run_cli add "$url"
+        # `replace` 是"接入另一台/更换面板"的显式确认 (P1-4)。CLI 侧对"已配对却换了
+        # base"的 add 会拒绝, 只有带了 --replace 才放行; 这里只负责把确认原样转过去。
+        _repl="$(jval replace)"
+        case "$_repl" in
+            true|1|yes|on) run_cli add --replace "$url" ;;
+            *)             run_cli add "$url" ;;
+        esac
         ;;
     drop)
         key="$(jval key)"
@@ -244,7 +300,12 @@ case "$action" in
         ;;
     toggle)
         on="$(jval on)"
-        if [ "$on" = "true" ] || [ "$on" = "1" ]; then run_cli on; else run_cli off; fi
+        # 与 zpcore 的 asBool **同一套语义** (P2-8: 以前 cgi 只认 true/1, zpcore 还认
+        # yes/on/非零数字 —— `on:"yes"` 在两个入口一个开一个关)。大小写不敏感。
+        case "$(printf '%s' "$on" | tr 'A-Z' 'a-z')" in
+            true|1|yes|on) run_cli on ;;
+            *)             run_cli off ;;
+        esac
         ;;
     refresh)
         run_cli refresh
@@ -266,6 +327,8 @@ case "$action" in
         printf '{"ok":true,"log":"%s"}\n' "$(jstr "$lines")"
         ;;
     *)
-        fail "未知操作: $action"
+        # 动作名来自 PATH_INFO / REQUEST_URI / a= —— 必须转义后再回显, 否则一个带引号的
+        # 路径就能产出非法 JSON (页面侧 JSON.parse 失败, 显示"无法解析")。
+        fail "未知操作: $(jval_s "$action")"
         ;;
 esac

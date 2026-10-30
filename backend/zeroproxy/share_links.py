@@ -18,8 +18,8 @@
 字段级依据 (均为上游一手来源):
   - hysteria2 URI: `app/cmd/client.go` 的 parseURI() — `user:pass@` 会把整串
     "user:pass" 当作 auth 发给服务端, 而 `extras/auth/password.go` 是整串比较,
-    因此这里**只写密码**; 端口跳跃写在 host 的端口部分 (`host:30001,31001`),
-    官方客户端用 isPortHoppingPort() 判定后走 udphop。
+    因此这里**只写密码**。URI authority 只写主端口, 端口跳跃列表放在 `mport`;
+    逗号端口放进 authority 会被 Shadowrocket 和标准 URI 解析器拒绝。
   - 订阅 URL 恒定不变 — 配置变化时仅内容更新, 客户端 App 自动拉取。
 """
 from __future__ import annotations
@@ -549,11 +549,13 @@ def share_links(state: dict) -> dict[str, str]:
         f"#{_q(_node_name('trojan'))}"
     )
 
-    # 端口跳跃: 端口写在 host 上 (官方客户端据此启用 udphop), 同时附 mport 供
-    # 支持该参数的三方客户端使用; 官方客户端会忽略未知查询参数。
+    # authority 的端口必须是单个整数。旧写法把逗号列表塞进 host 端口位, 官方
+    # Hysteria 客户端能识别, 但 Shadowrocket / 标准 URI 解析器会直接抛
+    # "Port could not be cast to integer", 最终整份订阅导入失败。
+    # 跳跃列表统一走 mport; 客户端不支持跳跃时仍可连接主端口, 兼容性更好。
     hop_ports = _hysteria_hop_span(state)
     links["hysteria2"] = (
-        f"hysteria2://{_q(state['hysteria_password'])}@{host}:{hop_ports}"
+        f"hysteria2://{_q(state['hysteria_password'])}@{host}:{ports['hysteria']}"
         f"?sni={_q(host)}&insecure=1"
         f"&mport={_q(hop_ports)}"
         f"#{_q(_node_name('hysteria2'))}"
@@ -1464,6 +1466,11 @@ def panel_base_url(request, state: dict) -> str:
     domain = (state.get("domain") or "").strip()
     if not domain:
         return f"{request.url.scheme}://{request.headers.get('host', request.url.netloc)}"
+    forwarded = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    if forwarded in ("http", "https"):
+        # 经过 nginx 的正式部署统一走 443 的 /panel/。80/443 是 ACME 与
+        # 普通 Web 必需的端口, 通常不要求用户再去云安全组额外放行 8899。
+        return f"https://{domain}/panel"
     # 以面板对外端口为准 (经 nginx 反代时 Host 头不含端口)
     port = config.PANEL_PORT
     netloc = domain if port in (80, 443) else f"{domain}:{port}"

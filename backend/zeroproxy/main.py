@@ -1,8 +1,8 @@
 """ZeroProxy 面板入口。
 
 生产: systemd 启动 (见 systemd/zeroproxy.service)。面板进程仅监听本机回环
-(默认 127.0.0.1:9900), 对外由 nginx 在 8899 端口终结 TLS —— 域名命中真实
-Let's Encrypt 证书, 其余 SNI 回退自签 —— 再反向代理到面板 (见 nginx_config.py)。
+(默认 127.0.0.1:9900), 正式入口是 nginx 443 的 /panel/, 8899 作为兼容入口
+继续保留 (见 nginx_config.py)。
 
 本地: ZP_HOME=... ZP_STATIC=... ZP_BIND_PORT=8899 python -m zeroproxy.main
 """
@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import threading
+from urllib.parse import urlsplit
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -76,8 +77,9 @@ def _check_startup_ports() -> None:
     """
     import socket
 
+    # PANEL_PORT 由 nginx 持有, 面板启动时看到它被占用是正常状态。旧检查把它也
+    # 当成冲突, 每次重启都会留下一条误导性的 "Address already in use"。
     critical_ports = [
-        (config.PANEL_PORT, "tcp", "面板对外端口 (nginx 监听)"),
         (config.PANEL_BIND_PORT, "tcp", "面板进程绑定端口 (uvicorn)"),
     ]
     conflicts = []
@@ -160,6 +162,11 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         stop.set()
+        # 面板托管的链式内层 QUIC (Hysteria 2) 子进程: 退出时一并收掉 ——
+        # 否则开发环境 Ctrl-C / 重启面板会留下孤儿 hysteria 进程 (P3-6)。
+        # stop_all 是幂等的 (第二次调用时 _PROCS 已空), systemd 场景重复调用也安全。
+        with contextlib.suppress(Exception):
+            chain_quic.stop_all()
 
 #: 内联 <script> 块 (带 src 的外链脚本由 'self' 覆盖, 不参与哈希)
 _INLINE_SCRIPT_RE = re.compile(r"<script\b([^>]*)>(.*?)</script>", re.DOTALL | re.IGNORECASE)
@@ -184,6 +191,52 @@ def inline_script_hashes(static_dir: str) -> list[str]:
         digest = hashlib.sha256(body.encode("utf-8")).digest()
         hashes.append("'sha256-" + base64.b64encode(digest).decode("ascii") + "'")
     return hashes
+
+
+#: 写接口的 CSRF 纵深: 浏览器跨源写请求必须带 Origin, 且 Origin 必须与面板同源。
+#: 无 Origin 的请求 (curl / 路由器 CLI / 旧客户端) 不是浏览器跨源请求, 照旧放行。
+_WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+#: 只在 HTTPS 下发的 HSTS (明文响应里浏览器会忽略, 没必要出现)
+HSTS_HEADER = "Strict-Transport-Security"
+HSTS_VALUE = "max-age=31536000; includeSubDomains"
+
+
+def _same_origin(origin: str, request: Request) -> bool:
+    """Origin 头是否与本次请求同源 (主机名必须一致; 端口在 Host 明确给出时也要一致)。
+
+    nginx 反代时 Host 可能被改写成不带端口的形式 (``$host``), 而浏览器 Origin 里
+    带着 8899 这类非默认端口 —— 所以"Host 没写端口"时只比主机名, 避免把正常的
+    面板访问误判成跨源。
+    """
+    try:
+        parsed = urlsplit(origin)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False
+    origin_host = parsed.hostname.lower()
+    host_header = (request.headers.get("host") or "").strip()
+    if not host_header:
+        return False
+    host = host_header
+    explicit_port = None
+    if host.startswith("["):              # IPv6 字面量
+        closing = host.find("]")
+        if closing != -1:
+            host = host[: closing + 1]
+            rest = host_header[closing + 1:]
+            if rest.startswith(":") and rest[1:].isdigit():
+                explicit_port = int(rest[1:])
+    else:
+        name, sep, port = host_header.rpartition(":")
+        if sep and port.isdigit():
+            host, explicit_port = name, int(port)
+    if host.strip("[]").lower() != origin_host:
+        return False
+    if explicit_port is not None:
+        origin_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        return origin_port == explicit_port
+    return True
 
 
 def security_headers(static_dir: str) -> dict:
@@ -238,10 +291,28 @@ def create_app() -> FastAPI:
 
     @app.middleware("http")
     async def add_security_headers(request, call_next):
-        """统一附加安全响应头 (面板是同源单页应用, 不需要开放 CORS)。"""
+        """统一附加安全响应头 (面板是同源单页应用, 不需要开放 CORS)。
+
+        顺带做一层 CSRF 纵深 (P3-11): 写接口 (POST/PUT/PATCH/DELETE) 带 Origin 时
+        必须与面板同源, 否则 403。无 Origin 的请求放行 —— curl、路由器 CLI、
+        同源导航都不发 Origin, 而依赖 SameSite=Lax 之外再加这一道是纯收益。
+        """
+        if request.method in _WRITE_METHODS and request.url.path.startswith("/api/"):
+            origin = (request.headers.get("origin") or "").strip()
+            if origin and not _same_origin(origin, request):
+                return JSONResponse(
+                    {"error": "跨源写请求被拒绝 (Origin 与面板地址不一致)"}, status_code=403
+                )
         response = await call_next(request)
         for key, value in headers.items():
             response.headers.setdefault(key, value)
+        # HSTS: 只在 https (直连或经 nginx 的 X-Forwarded-Proto) 下发
+        fwd_proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+        if request.url.scheme == "https" or fwd_proto == "https":
+            response.headers.setdefault(HSTS_HEADER, HSTS_VALUE)
+        # 认证 JSON 里含订阅地址 / 配对码 / 审计等, 不允许任何中间层缓存 (P3-9)
+        if request.url.path.startswith("/api/"):
+            response.headers.setdefault("cache-control", "no-store")
         # 静态资源必须每次回源校验。
         #
         # FastAPI 的 StaticFiles 只发 Last-Modified/ETag, 不发 Cache-Control —— 浏览器
@@ -291,7 +362,17 @@ def create_app() -> FastAPI:
 
     @app.get("/api/info", include_in_schema=False)
     def info():
-        return {"name": "ZeroProxy", "version": __version__, "home": config.home()}
+        # 未认证端点不返回 home 绝对路径 (P3-10); 面板设置卡片用的路径由
+        # 已认证的仪表盘数据里给。
+        return {"name": "ZeroProxy", "version": __version__}
+
+    @app.exception_handler(config.StateError)
+    async def state_error_handler(request: Request, exc: config.StateError):
+        """state.json 损坏 → 503 维护态 (而不是回落默认值后让面板"像没初始化过")。"""
+        return JSONResponse(
+            {"error": str(exc), "maintenance": True, "state_error": True},
+            status_code=503,
+        )
 
     return app
 

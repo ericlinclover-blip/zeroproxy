@@ -76,21 +76,90 @@ zp_perf_panel() {
     printf '%s %s %s' "$_b" "$_id" "$_sec"
 }
 
+# ---------------------------------------------------------------- 面板请求 (TLS)
+# 与 CLI / agent.sh 同一个口径: **先校验证书, 只有确实是证书/TLS 错误时才降级一次**。
+# 旧版这里一律 `-k` / `--no-check-certificate` —— 性能模式要更新的 dae 内核与配置同样
+# 以 root 落盘/执行, 无条件关掉证书校验等于把分发权交给链路上的任何人 (P1-3)。
+_zp_perf_tls_rc() {
+    case "${1:-}" in
+        35|51|58|59|60|64|66|77|80|83|90|91) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+_zp_perf_tls_warned=""
+_zp_perf_tls_warn() {
+    [ "$_zp_perf_tls_warned" = "1" ] && return 0
+    _zp_perf_tls_warned=1
+    printf '  · %s 的证书校验没通过 (%s) —— 本次改为不校验继续 (降级, 不是正常路径)\n' "$1" "$2"
+}
+
 # 取一个地址存成文件。503 是"面板正在准备" (它要先去上游取), 按它的意思等一会儿再来 ——
 # 与内核 / 分流数据那条协议完全一样。返回 0 = 拿到了 200。
-zp_perf_get() {  # $1=url $2=目标 $3=超时 $4=最多试几次
-    _url="$1"; _dst="$2"; _tmo="${3:-60}"; _tries="${4:-10}"; _i=0
+# 第 5 个参数可选: 请求头 (新面板用 `Authorization: Bearer` 认设备凭据, 旧面板不认头时
+# 自动退回 URL 里带的 ?k=)。
+zp_perf_get() {  # $1=url $2=目标 $3=超时 $4=最多试几次 [$5=请求头] [$6=旧面板回退 query]
+    _url="$1"; _dst="$2"; _tmo="${3:-60}"; _tries="${4:-10}"; _hdr="${5:-}"; _fb="${6:-}"; _i=0
     while [ "$_i" -lt "$_tries" ]; do
         _i=$((_i + 1))
-        _code=""
+        _code=""; _rc=0
         if command -v curl >/dev/null 2>&1; then
-            _code="$(curl -fsSkL -m "$_tmo" -o "$_dst" -w '%{http_code}' "$_url" 2>/dev/null || true)"
+            if [ -n "$_hdr" ]; then
+                _code="$(curl -fsSL -D "$_dst.hdr" -H "$_hdr" -m "$_tmo" -o "$_dst" \
+                    -w '%{http_code}' "$_url" 2>/dev/null)" || _rc=$?
+                # 旧面板不认 Bearer → 去掉头、把 secret 拼回 URL 再来一次 (回退, 不是主路径)
+                if { [ "${_code:-000}" = "403" ] || [ "${_code:-000}" = "401" ]; } && [ -n "$_fb" ]; then
+                    _code="$(curl -fsSL -D "$_dst.hdr" -m "$_tmo" -o "$_dst" \
+                        -w '%{http_code}' "${_url}${_fb}" 2>/dev/null || true)"
+                fi
+            else
+                _code="$(curl -fsSL -D "$_dst.hdr" -m "$_tmo" -o "$_dst" \
+                    -w '%{http_code}' "$_url" 2>/dev/null)" || _rc=$?
+            fi
+            # 证书错误: 只降级这一次
+            if [ -z "$_code" ] && _zp_perf_tls_rc "$_rc"; then
+                _zp_perf_tls_warn "$_url" "curl $_rc"
+                if [ -n "$_hdr" ]; then
+                    _code="$(curl -fsSkL -H "$_hdr" -m "$_tmo" -o "$_dst" \
+                        -w '%{http_code}' "$_url" 2>/dev/null || true)"
+                else
+                    _code="$(curl -fsSkL -m "$_tmo" -o "$_dst" \
+                        -w '%{http_code}' "$_url" 2>/dev/null || true)"
+                fi
+            fi
         else
-            uclient-fetch -q --no-check-certificate -T "$_tmo" -O "$_dst" "$_url" >/dev/null 2>&1 || true
-            if [ -s "$_dst" ]; then _code=200; fi
+            _errf="$(mktemp /tmp/.zp-perf-tls.XXXXXX 2>/dev/null || echo /tmp/.zp-perf-tls.$$)"
+            for _tool in uclient-fetch wget; do
+                command -v "$_tool" >/dev/null 2>&1 || continue
+                if "$_tool" -q -T "$_tmo" -O "$_dst" "$_url" 2>"$_errf"; then _code=200
+                elif grep -Eqi 'ssl|tls|certificate|cert verify|x509' "$_errf" 2>/dev/null; then
+                    _zp_perf_tls_warn "$_url" "$_tool 证书校验失败"
+                    "$_tool" -q --no-check-certificate -T "$_tmo" -O "$_dst" "$_url" >/dev/null 2>&1 || true
+                    [ -s "$_dst" ] && _code=200
+                fi
+                break
+            done
+            rm -f "$_errf"
         fi
         case "$_code" in
-            200) return 0 ;;
+            200)
+                # 面板下发的 X-ZP-Sha256 必须比对 (拿不到响应头的旧面板只告警, 不静默)。
+                _want="$( [ -s "$_dst.hdr" ] && tr -d '\r' < "$_dst.hdr" \
+                    | grep -i '^[[:space:]]*X-ZP-Sha256[[:space:]]*:' | head -n1 \
+                    | sed 's/^[^:]*:[[:space:]]*//' )"
+                if [ -n "$_want" ]; then
+                    if command -v sha256sum >/dev/null 2>&1; then
+                        _have="$(sha256sum "$_dst" 2>/dev/null | cut -d' ' -f1)"
+                    else
+                        _have="$(shasum -a 256 "$_dst" 2>/dev/null | cut -d' ' -f1)"
+                    fi
+                    if [ -n "$_have" ] && [ "$_have" != "$_want" ]; then
+                        printf '  ! 下载到的内容 sha256 与面板下发值不一致 (%s != %s) —— 丢弃\n' "$_have" "$_want"
+                        rm -f "$_dst" "$_dst.hdr"
+                        return 1
+                    fi
+                fi
+                rm -f "$_dst.hdr"
+                return 0 ;;
             503) printf '  · 面板正在准备这一档 (第 %s 次)…\n' "$_i"; sleep 5 ;;
             *)   return 1 ;;
         esac
@@ -223,7 +292,10 @@ zp_perf_prepare() {
 
     # 3) 配置 (由面板渲染: 节点 / 分流模板 / 面板直连都在它手里)
     _lan="$(zp_perf_lan)"
-    _url="$_base/c/perf/config?id=$_id&k=$_sec&lan=$_lan&geo=$_geo"
+    # 设备凭据优先走 `Authorization: Bearer` (secret 不进 URL/访问日志); 旧面板不认头时
+    # zp_perf_get 会把 $_perf_fb 拼回 URL 再试一次 (P2-6 / 向后兼容)。
+    _url="$_base/c/perf/config?id=$_id&lan=$_lan&geo=$_geo"
+    _perf_fb="&k=$_sec"
     printf '  · 取 dae 配置 (局域网口: %s)…\n' "$_lan"
     # 权限是这一档的**硬门槛**, 不是"讲究": dae 的配置合并器自己会拒绝一份"组可写 / 别人
     # 可读"的配置 —— 原话是 `permissions %04o for '%v' are too open; ... suggest 0640 or
@@ -231,7 +303,8 @@ zp_perf_prepare() {
     # 的第一句话永远是权限错, 性能模式在真机上就卡死在这一步 (8.83 之前就是这样)。
     # 两条一起做: 建的时候就按 077 建 (子 shell 里改 umask, 不影响调用方), 落盘后再 chmod
     # 一次 —— 后者管的是"上一版留下的 0644 那份配置/ mv 覆盖"这两种情况。
-    if ! ( umask 077; zp_perf_get "$_url" "$ZP_PERF_CONF.new" 30 2 ) \
+    if ! ( umask 077; zp_perf_get "$_url" "$ZP_PERF_CONF.new" 30 2 \
+            "Authorization: Bearer $_sec" "$_perf_fb" ) \
         || [ ! -s "$ZP_PERF_CONF.new" ]; then
         printf '  面板没有给出 dae 配置\n'; return 1
     fi

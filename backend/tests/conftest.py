@@ -42,6 +42,11 @@ os.environ.setdefault("ZP_GEO_MIRRORS", "http://127.0.0.1:9/{url}")
 # "清单 → 镜像下载"那条路的用例自己 monkeypatch btf_upstream_assets。
 os.environ.setdefault("ZP_BTF_API", "http://127.0.0.1:9")
 
+# 面板侧供应链摘要校验 (router_client.SUPPLY_VERIFY): 夹具里用的都是几 KB 的假内核,
+# 不可能匹配上游发布的官方 sha256。这里关掉与官方常量的比对 (体积闸门仍然生效),
+# 否则"假镜像下载成功"的用例会因为摘要对不上而全红。
+os.environ.setdefault("ZP_SUPPLY_VERIFY", "0")
+
 # 改配置默认走后台任务 (v2.6.9): 接口立刻回执 + 前端轮询 /api/apply/job。
 # 测试里必须同步执行 —— 后台线程活过用例就会踩到下一个用例的 $ZP_HOME
 # (每个用例一个临时目录), 所以默认关掉; 专门验证后台任务的用例自己打开。
@@ -67,9 +72,11 @@ def _clean_router_core_state():
     才收尾)。一个残留的 `error` 加退避时间, 会让下一条用例的 `/prepare` 直接跳过下载,
     于是它看到的状态永远不是它期待的那个 —— 断言莫名其妙地红。
     """
-    from zeroproxy import router_client
+    from zeroproxy import router_client, services
 
     router_client.CORE_STATE.clear()
+    # 版本采样有 5 秒 TTL 缓存: 跨用例残留会让"换了假二进制"的用例读到上一轮的版本
+    services._VERSION_CACHE.clear()
     yield
 
 

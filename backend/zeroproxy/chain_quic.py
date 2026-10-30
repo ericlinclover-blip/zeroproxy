@@ -37,7 +37,6 @@ hysteria 客户端把 SOCKS5 交给 Xray 当出站 —— 两个角色都是"按
 """
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import os
 import shutil
@@ -79,6 +78,21 @@ def _yq(value: str) -> str:
     return '"' + str(value).translate(_YAML_UNSAFE) + '"'
 
 
+def _log(message: str) -> None:
+    """把面板侧的关键事件写进 `data/chain-quic/panel.log`。
+
+    证书重签 / 指纹读取失败这类事既不在子进程日志里, 也没有稳定可写的系统审计
+    出口 (sync 可能由 apply 的独立进程或看门线程调用), 所以单独落一份 —— 出了
+    "链路突然连不上"时, 这是排查的第一手线索。
+    """
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n"
+    try:
+        with open(os.path.join(_ensure_dir(), "panel.log"), "a", encoding="utf-8") as fh:
+            fh.write(line)
+    except OSError:
+        pass
+
+
 # ---------------------------------------------------------------- 落地端 (server)
 
 def exit_sni(state: dict) -> str:
@@ -99,29 +113,58 @@ def exit_sni(state: dict) -> str:
 
 
 def ensure_exit_cert(state: dict) -> tuple[bool, str]:
-    """确保 QUIC 内层的自签证书存在, 且 SAN 与当前 SNI 一致。"""
+    """确保 QUIC 内层的自签证书存在, 且 SAN 与当前 SNI 一致。
+
+    重签 = 证书 DER 指纹变了 = 所有既有入口条目里的 `hy_cert_sha256` 当场过期
+    (客户端会报 `no certificate matches the pinned hash`)。这件事以前只在
+    hysteria 日志里可见 (P2-7), 现在重签时写 `panel.log`, 并在返回说明里带出来 ——
+    `sync()` 会把说明挂到「重载服务」那一步, 用户当场能看到"需要重新配对"。
+    """
     sni = exit_sni(state)
     cert, key = _cert_paths()
     if os.path.exists(cert) and os.path.exists(key) and _cert_sans(cert) == {sni}:
         return True, ""
+    # key 还在而 cert 被删掉, 同样意味着"以前配过一对": 新指纹一样会让旧 pin 失效
+    had_cert = os.path.exists(cert) or os.path.exists(key)
     ok, detail = services.generate_self_signed(sni, cert, key)
-    return ok, detail
+    if not ok:
+        _log(f"落地端 QUIC 证书生成失败 (SAN={sni}): {detail}")
+        return ok, detail
+    if had_cert:
+        reason = f"落地端 QUIC 证书已按 SNI {sni} 重签; 既有入口条目的证书指纹已失效, 需重新配对"
+        _log(reason)
+        return True, reason
+    _log(f"落地端 QUIC 证书已生成 (SAN={sni})")
+    return True, ""
 
 
-def cert_sha256() -> str:
-    """落地端自签证书 DER 的 SHA-256 指纹, 用于 Hysteria 2 证书固定。
+def cert_pin() -> tuple[str, str]:
+    """落地端自签证书 DER 的 SHA-256 指纹 → (pin, 读取失败原因)。
 
-    读不出来时返回空串; 新配对码不会在没有指纹的情况下把 QUIC 条目落地。
+    * 证书文件不存在: 这台机器还没配 QUIC 内层, 返回 `("", "")` —— 不是错误;
+    * 文件存在但读不出来 (损坏 / 权限 / 缺 cryptography): 返回 `("", 原因)` 并
+      写 `panel.log`。旧实现把两种情况都压成空串, 调用方分不清"没开 QUIC"和
+      "读取失败", `chain.exit_code` 于是静默退回 v1 (P3-2)。
     """
+    path = paths()["chain_quic_cert"]
+    if not os.path.exists(path):
+        return "", ""
     try:
         from cryptography import x509
         from cryptography.hazmat.primitives.serialization import Encoding
 
-        with open(paths()["chain_quic_cert"], "rb") as fh:
+        with open(path, "rb") as fh:
             cert = x509.load_pem_x509_certificate(fh.read())
-        return hashlib.sha256(cert.public_bytes(encoding=Encoding.DER)).hexdigest()
-    except Exception:  # noqa: BLE001
-        return ""
+        return hashlib.sha256(cert.public_bytes(encoding=Encoding.DER)).hexdigest(), ""
+    except Exception as exc:  # noqa: BLE001
+        reason = f"落地端 QUIC 证书指纹读取失败: {exc.__class__.__name__}: {exc}"
+        _log(reason)
+        return "", reason
+
+
+def cert_sha256() -> str:
+    """(兼容旧调用方) 落地端证书指纹; 读不出来返回空串, 原因见 `cert_pin` / panel.log。"""
+    return cert_pin()[0]
 
 
 def _cert_paths() -> tuple[str, str]:
@@ -189,8 +232,10 @@ def client_config(entry: dict, state: dict | None = None) -> str:
         f"  sni: {entry.get('hy_sni') or ''}",
     ]
     lines.append("  insecure: true")
-    # 新版配对码携带落地端证书指纹。旧条目没有指纹时只能保持原行为; 新 QUIC
-    # 条目在 API 层会拒绝这种旧配对码, 避免继续新增无身份校验的连接。
+    # 新版配对码携带落地端证书指纹。`insecure: true` 跳过 CA 校验, 但 hysteria 在
+    # 同时给了 `pinSHA256` 时仍会挂 VerifyPeerCertificate 做 DER 哈希比对, 对端
+    # 身份校验是生效的。旧 v2 条目没有指纹 —— 那种配置等于完全不校验, 所以
+    # `desired()` 不会再托管这样的客户端 (由 apply / 诊断要求重新配对, P1-1)。
     pin = str(entry.get("hy_cert_sha256") or "")
     if pin:
         lines.append(f'  pinSHA256: "{pin}"')
@@ -465,6 +510,11 @@ def desired(state: dict) -> list[dict]:
             continue
         if not entry.get("hy_port"):
             continue
+        if not str(entry.get("hy_cert_sha256") or "").strip():
+            # 旧 v2 配对码没有证书指纹 —— 这样的客户端不校验对端身份 (P1-1)。
+            # 宁可不托管这条链路, 也不静默跑一条"谁都能冒充落地端"的连接;
+            # apply / 「一键诊断」会明确要求重新配对。
+            continue
         out.append(
             {
                 "key": f"entry-{entry.get('id')}",
@@ -498,6 +548,7 @@ def sync(state: dict, restart_changed: bool = True) -> tuple[bool, str]:
         _stop(key)
 
     failed: list[str] = []
+    notes: list[str] = []
     for spec in specs:
         key = spec["key"]
         if spec["mode"] == "server":
@@ -508,6 +559,9 @@ def sync(state: dict, restart_changed: bool = True) -> tuple[bool, str]:
             if not cert_ok:
                 failed.append(f"{spec['label']} 证书不可用: {cert_detail}")
                 continue
+            if cert_detail:
+                # 重签说明 (P2-7): 既有入口条目的 pin 已失效, 得让用户当场看见
+                notes.append(cert_detail)
         cfg_path = _write_config(key, spec["yaml"])
         fingerprint = _fingerprint(spec["yaml"])
         with _LOCK:
@@ -535,11 +589,18 @@ def sync(state: dict, restart_changed: bool = True) -> tuple[bool, str]:
         parts.append(f"{servers} 个落地 UDP 监听")
     if clients:
         parts.append(f"{clients} 个入口 QUIC 客户端")
-    return True, "内层 QUIC 已就绪 (" + " / ".join(parts) + ")"
+    detail = "内层 QUIC 已就绪 (" + " / ".join(parts) + ")"
+    if notes:
+        detail += "; " + "; ".join(notes)
+    return True, detail
 
 
 def stop_all() -> None:
-    """面板退出时收尾 (开发环境 / 手工调试用)。"""
+    """面板退出时收尾 (开发环境 / 手工调试用)。
+
+    幂等: 可以安全地重复调用 —— 第二次进来 `_PROCS` 已空, 只剩几个
+    `os.remove` 的 FileNotFoundError 被就地吞掉, 不抛异常。
+    """
     with _LOCK:
         keys = list(_PROCS)
     for key in keys:
@@ -551,15 +612,19 @@ def supervisor_loop(stop: threading.Event) -> None:
 
     子进程被 OOM / 崩溃带走时, 面板不会立刻知道 —— 这条链会一直不通用到用户
     下次点"重新应用"。每 20 秒对一次账, 代价可以忽略。
+
+    整轮同步包在 try/except 里: 看门线程**绝不能**因一次异常 (锁超时、state 被
+    外部改坏、fork 失败) 退出 —— 它挂了就再没人把掉线的子进程拉回来 (P3 panic 边界)。
     """
     from . import config as _config
 
-    while True:
-        # 看门线程绝不能因异常退出 —— 挂了就再没人把掉线的子进程拉回来。
-        with contextlib.suppress(Exception):
+    while not stop.is_set():
+        try:
             with _config.locked():
                 state = _config.load_state()
             sync(state)
+        except Exception as exc:  # noqa: BLE001 - 单轮异常只跳过本轮, 下一轮继续
+            _log(f"看门线程本轮同步异常 (已跳过, 下一轮继续): {exc.__class__.__name__}: {exc}")
         if stop.wait(SUPERVISE_INTERVAL):
             return
 

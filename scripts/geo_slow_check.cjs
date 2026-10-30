@@ -33,6 +33,32 @@ for (const extra of (process.env.ZP_NODE_PATH || "").split(path.delimiter)) {
   if (extra && !module.paths.includes(extra)) module.paths.push(extra);
 }
 
+// playwright 必须在 spawn 面板**之前** require: 本机没有这个模块时, 旧写法是在面板
+// 子进程已经起来之后才抛 MODULE_NOT_FOUND, catch 直接 exit(1), 子进程没人收尸 ——
+// 端口一直 LISTEN (实测残留过)。先 require 再 spawn: 缺依赖就干净退出 1。
+let chromium;
+try {
+  ({ chromium } = require("playwright"));
+} catch (e) {
+  console.error(
+    "缺少 playwright: 本脚本需要 node + playwright + Chromium。\n" +
+      "本机没有时请明确跳过 (不能当作\"通过\"), 不要安装到项目里来跑。\n" +
+      "原始错误: " + (e && e.message ? e.message : e)
+  );
+  process.exit(1);
+}
+
+// 面板子进程 (缺依赖 / 中途抛错时统一在 catch 里收尸)
+let server = null;
+/** 收掉面板子进程: 已退出就立即返回, 否则等它真的退出 (不留 LISTEN 的孤儿)。 */
+function stopServer() {
+  if (!server || server.exitCode !== null || server.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    server.once("exit", resolve);
+    server.kill("SIGTERM");
+  });
+}
+
 const results = [];
 function check(name, ok, detail = "") {
   results.push({ name, ok, detail });
@@ -56,7 +82,7 @@ async function main() {
   fs.mkdirSync(path.join(home, "data"), { recursive: true });
   fs.writeFileSync(path.join(home, "data", "bootstrap_token"), TOKEN + "\n", { mode: 0o600 });
 
-  const server = spawn(PYTHON, [path.join(__dirname, "geo_slow_panel.py")], {
+  server = spawn(PYTHON, [path.join(__dirname, "geo_slow_panel.py")], {
     cwd: BACKEND,
     env: {
       ...process.env,
@@ -73,7 +99,6 @@ async function main() {
   server.stdout.on("data", (d) => process.stdout.write(`[panel] ${d}`));
   server.stderr.on("data", (d) => process.stderr.write(`[panel] ${d}`));
 
-  const { chromium } = require("playwright");
   const base = `http://127.0.0.1:${PORT}`;
   let browser;
   try {
@@ -162,7 +187,7 @@ async function main() {
     await page.screenshot({ path: path.join(ROOT, "work", "geo-slow-final.png") });
   } finally {
     if (browser) await browser.close();
-    server.kill("SIGTERM");
+    await stopServer();   // 缺依赖 / 中途抛错也走这里: 不能把面板进程留在端口上
   }
 
   const failed = results.filter((r) => !r.ok);
@@ -173,7 +198,8 @@ async function main() {
   }
 }
 
-main().catch((e) => {
+main().catch(async (e) => {
   console.error("验证失败:", e);
+  await stopServer();     // 兜底: 任何未预期的异常都不留面板子进程
   process.exit(1);
 });

@@ -11,6 +11,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import socket
 import ssl
 import subprocess
@@ -81,14 +82,18 @@ def is_prod() -> bool:
     return sys.platform.startswith("linux") and shutil.which("systemctl") is not None
 
 
-def probe_public_panel(domain: str, port: int, timeout: float = 10.0) -> tuple[bool, str]:
-    """按"浏览器的方式"访问一次 https://<域名>:<端口>/api/info。
+def probe_public_panel(domain: str, port: int = 443, timeout: float = 10.0) -> tuple[bool, str]:
+    """按"浏览器的方式"访问一次标准 443 `/panel/api/info`。
 
     用于判断"初始化完成后能不能把用户直接送到域名面板": DNS 是否解析、nginx 是否
     已经在用真实证书、端口是否通 —— 一次请求全验证。证书链按系统 CA 校验, 所以
     自签证书会直接判失败 (那正是我们要避免让用户看到的东西)。
     """
-    url = f"https://{domain}:{port}/api/info"
+    url = (
+        f"https://{domain}/panel/api/info"
+        if int(port) in (80, 443)
+        else f"https://{domain}:{port}/api/info"
+    )
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310 — 固定 https
             if not resp.read(64):
@@ -108,12 +113,29 @@ def run(cmd: list[str], timeout: int = 120, env: dict | None = None) -> tuple[bo
     if env:
         child_env = {**os.environ, **env}
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=child_env)
+        # certbot / nginx 等命令可能再派生子进程。只杀父进程时, 孙子进程仍可能
+        # 握着 stdout/stderr 管道, 让 communicate() 超时后再次无限等待。独立进程组
+        # + 整组 SIGKILL 才能真正兑现 timeout。
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=child_env,
+            start_new_session=True,
+        )
     except FileNotFoundError:
         return False, f"命令不存在: {cmd[0]}"
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (AttributeError, ProcessLookupError, PermissionError, OSError):
+            proc.kill()
+        stdout, stderr = proc.communicate()
         return False, f"超时 ({timeout}s): {' '.join(cmd[:3])} ..."
-    output = (proc.stdout or "") + (proc.stderr or "")
+    output = (stdout or "") + (stderr or "")
     return proc.returncode == 0, output.strip()
 
 
@@ -181,14 +203,26 @@ def version_from_output(out: str) -> str:
     return lines[0][:80] if lines and not _ART_RE.search(lines[0]) else ""
 
 
+#: 版本采样缓存: dashboard 每 20 秒轮询, 而 xray/hysteria 的 `version` 各要起一个
+#: 子进程 —— 并发请求/多标签页时同一份版本被反复采样, 纯浪费 (P2-2)。5 秒 TTL 与
+#: 流量统计缓存同一量级, 不会让升级后的版本迟迟不更新。
+_VERSION_CACHE: dict[tuple[str, str], tuple[float, str]] = {}
+_VERSION_TTL = 5
+
+
 def service_version(name: str) -> str:
     path = bin_path(name)
     if path is None:
         return ""
+    key = (name, path)
+    now = time.time()
+    cached = _VERSION_CACHE.get(key)
+    if cached is not None and now - cached[0] < _VERSION_TTL:
+        return cached[1]
     ok, out = run([path, "version"], timeout=15)
-    if not ok:
-        return ""
-    return version_from_output(out)
+    version = version_from_output(out) if ok else ""
+    _VERSION_CACHE[key] = (now, version)
+    return version
 
 
 def server_info() -> dict:
@@ -381,7 +415,60 @@ def generate_self_signed(
         return False, f"自签证书生成失败: {exc}"
 
 
-def install_cert(host: str) -> tuple[bool, str, dict]:
+#: certbot 续期成功后要跑的 deploy hook。续期只改磁盘上的证书文件: 不 reload 的话
+#: nginx 会一直用旧证书握手、Xray 的 Trojan 入站也仍旧读旧证书 —— 90 天后客户端
+#: 直接报证书过期, 而面板从文件算出来的"剩余天数"看起来还是正常的 (P2-1)。
+RENEW_HOOK_NAME = "zeroproxy-reload.sh"
+# 内容与 install.sh / upgrade.sh 落盘的那一份**逐字一致** (三处都会写同一个文件,
+# 不能让面板和安装脚本各写一个版本 —— 那正是"漂移"最容易发生的地方)。
+RENEW_HOOK_BODY = """#!/bin/sh
+# ZeroProxy: Let's Encrypt 续期成功后让 nginx / Xray 用上新证书。
+# 由 install.sh / upgrade.sh / 面板 services.install_cert 落盘, 内容保持一致。
+# (--webroot 签发不会自动 reload, 没有这个钩子就要等到下一次手动续期/apply)
+set -u
+systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
+systemctl restart xray 2>/dev/null || true
+"""
+
+
+def renew_hook_dir() -> str:
+    """deploy hook 目录: 生产是 certbot 的续期钩子目录, 非生产只写 $ZP_HOME 下。
+
+    ``ZP_LETSENCRYPT_DIR`` 与 install.sh / upgrade.sh 同一套覆盖变量 (演练环境不碰
+    真实 /etc/letsencrypt)。
+    """
+    if is_prod():
+        base = os.environ.get("ZP_LETSENCRYPT_DIR", "/etc/letsencrypt").rstrip("/")
+        return f"{base}/renewal-hooks/deploy"
+    return os.path.join(paths()["home"], "data", "renewal-hooks", "deploy")
+
+
+def ensure_renew_hook() -> tuple[bool, str, str]:
+    """写 certbot deploy hook (reload nginx + restart xray), 返回 (ok, 路径, 说明)。
+
+    非生产环境写到 ``$ZP_HOME/data/renewal-hooks/deploy/`` 下并返回说明 —— 本机
+    没有 certbot, 写 /etc 只会污染开发机; 生产写失败时同样退回 $ZP_HOME 并如实说明
+    (用户至少能看到"续期钩子没装进 certbot", 而不是以为已经装好了)。
+    """
+    target_dir = renew_hook_dir()
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        path = os.path.join(target_dir, RENEW_HOOK_NAME)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(RENEW_HOOK_BODY)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, path)
+    except OSError as exc:
+        return False, "", f"续期钩子写入失败: {exc}"
+    if is_prod():
+        return True, path, f"已写入 certbot deploy hook: {path}"
+    return True, path, (
+        f"非生产环境: 续期钩子只写到 {path} (本机没有 certbot, 不会注册到续期流程)"
+    )
+
+
+def install_cert(host: str, timeout: int = 300) -> tuple[bool, str, dict]:
     """申请 TLS 证书: 优先 Let's Encrypt (webroot), 失败回退自签。
 
     返回 (成功, 说明, cert_state)。
@@ -392,26 +479,29 @@ def install_cert(host: str) -> tuple[bool, str, dict]:
     detail = ""
 
     if is_domain(host) and is_prod() and shutil.which("certbot") and host != "":
-        ok, out = run(
-            [
-                "certbot", "certonly",
-                "--webroot", "-w", webroot,
-                "-d", host,
-                "--non-interactive",
-                "--agree-tos",
-                "--register-unsafely-without-email",
-                # 重复执行 /api/apply 时: 已有证书且未临近过期则复用, 需要时自动扩展域名
-                "--keep-until-expiring",
-                "--expand",
-            ],
-            timeout=300,
-        )
+        # 先落 deploy hook: 否则 certbot 续期成功后没有任何服务 reload (P2-1)
+        hook_ok, hook_path, hook_detail = ensure_renew_hook()
+        cmd = [
+            "certbot", "certonly",
+            "--webroot", "-w", webroot,
+            "-d", host,
+            "--non-interactive",
+            "--agree-tos",
+            "--register-unsafely-without-email",
+            # 重复执行 /api/apply 时: 已有证书且未临近过期则复用, 需要时自动扩展域名
+            "--keep-until-expiring",
+            "--expand",
+        ]
+        if hook_ok:
+            cmd += ["--deploy-hook", hook_path]
+        ok, out = run(cmd, timeout=timeout)
         if ok:
             live = f"/etc/letsencrypt/live/{host}"
             if os.path.exists(f"{live}/fullchain.pem"):
                 run(["systemctl", "enable", "certbot.timer"], timeout=60)  # 自动续期
                 not_after = _cert_not_after(f"{live}/fullchain.pem")
-                return True, "Let's Encrypt 证书已签发 (90 天, 自动续期)", {
+                hook_note = "" if hook_ok else f" (续期钩子未就绪: {hook_detail})"
+                return True, f"Let's Encrypt 证书已签发 (90 天, 自动续期){hook_note}", {
                     "type": "letsencrypt",
                     "issuer": "Let's Encrypt",
                     "cert_file": f"{live}/fullchain.pem",
@@ -451,11 +541,25 @@ def renew_cert(state: dict) -> tuple[bool, str]:
     if not shutil.which("certbot"):
         return False, "certbot 未安装 (apt-get install -y certbot 后重试)"
     if (state.get("cert") or {}).get("type") == "letsencrypt":
-        ok, out = run(["certbot", "renew", "--non-interactive", "--quiet"], timeout=300)
+        # 手动续期也要把服务带上: certbot 只改了磁盘文件, nginx 与 Xray 的 Trojan
+        # 入站不 reload/restart 就继续用旧证书 (P2-1)。
+        hook_ok, hook_path, hook_detail = ensure_renew_hook()
+        cmd = ["certbot", "renew", "--non-interactive", "--quiet"]
+        if hook_ok:
+            cmd += ["--deploy-hook", hook_path]
+        ok, out = run(cmd, timeout=300)
         if not ok:
             return False, f"续期失败: {out[:200]}"
-        ok2, _ = reload_service("nginx")
-        return ok2, "证书已续期"
+        nginx_ok, nginx_detail = reload_service("nginx")
+        xray_ok, xray_detail = restart_service("xray")
+        parts = [
+            "证书已续期",
+            f"nginx: {nginx_detail}",
+            f"xray: {xray_detail}",
+        ]
+        if not hook_ok:
+            parts.append(f"续期钩子未就绪: {hook_detail}")
+        return bool(nginx_ok and xray_ok), " · ".join(parts)
     ok, detail, cert_state = install_cert(state["domain"])
     state["cert"] = cert_state
     if cert_state.get("type") == "letsencrypt":

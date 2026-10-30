@@ -59,18 +59,15 @@ ui_fix() {
         _got=0
         if [ -n "$_base" ]; then
             mkdir -p "$(dirname "$_dst")" 2>/dev/null || true
-            if command -v curl >/dev/null 2>&1; then
-                curl -fsSk -m 15 "$_base/c/ui/$_f" -o "$_tmp" 2>/dev/null && [ -s "$_tmp" ] && _got=1
-            else
-                uclient-fetch -q --no-check-certificate -T 15 -O "$_tmp" "$_base/c/ui/$_f" 2>/dev/null \
-                    && [ -s "$_tmp" ] && _got=1
-            fi
+            # 先校验证书 (只有证书错误才降级一次, 见下面的 http_get_to), 取到就落盘。
+            if http_get_to "$_base/c/ui/$_f" "$_tmp" 15 && [ -s "$_tmp" ]; then _got=1; fi
             if [ "$_got" = "1" ]; then
                 mv "$_tmp" "$_dst" && chmod 644 "$_dst" 2>/dev/null || true
+                rm -f "$_tmp.hdr"
                 _fixed=$((_fixed + 1))
                 continue
             fi
-            rm -f "$_tmp"
+            rm -f "$_tmp" "$_tmp.hdr"
         fi
         # 面板不可达 (或没给这一份) → 用本机那份内置兜底
         if [ -s "$ZP_DIR/luci/$_f" ]; then
@@ -108,6 +105,201 @@ key_of() {
 servers() { ls "$SERVERS"/*.json 2>/dev/null; }
 
 running() { /etc/init.d/zeroproxy running >/dev/null 2>&1 && echo yes || echo no; }
+
+# ---------------------------------------------------------------- 面板请求 (TLS)
+# 这里以前是**一律** `curl -fsSk` / `uclient-fetch --no-check-certificate`: 链路上任何
+# 一个 DNS 劫持 / 反代投毒都能把 update 的 install.sh 换成别人的, 而它由 root 执行
+# (P1-3)。现在改成与 agent.sh 一样的写法 —— **先校验证书, 只有确实是证书/TLS 错误时才
+# 降级一次, 并且把那句话打出来**。超时 / 丢包 / 面板确认拒绝都不降级 (那几类不是证书问题,
+# 降级也解决不了, 只会把"面板还没配好证书"与"链路在丢包"混成同一件事)。
+#
+# 退出码取自 curl: 35/51/58/59/60/64/66/77/80/83/90/91 都是 TLS 层握手或校验失败
+# (60 最常见: 自签证书 / 证书链不全)。
+zp_tls_error() {
+    case "${1:-}" in
+        35|51|58|59|60|64|66|77|80|83|90|91) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 降级告警: 只做一次, 而且必须说清"这是降级"。走 stderr —— 这些函数的 stdout 是面板
+# 返回的正文 (JSON / 脚本), 多一个字节就把它弄坏了。
+zp_tls_warn() {
+    [ "${ZP_TLS_WARNED:-}" = "1" ] && return 0
+    ZP_TLS_WARNED=1
+    printf '  · %s 的证书校验没通过 (%s) —— 本次改为不校验继续。\n' "$1" "${2:-证书错误}" >&2
+    printf '    这是降级: 面板可能还在自签证书阶段。装好后请给面板配一张正式证书。\n' >&2
+}
+
+# 没有 curl 的固件: uclient-fetch / wget 也默认校验证书, 但它们的退出码分不出
+# "证书错误"与"连不上"。所以先按默认 (校验) 跑一次, 只有 stderr 明确是 TLS/证书类的
+# 失败才降级一次 —— 与 curl 那条同一个原则, 只是判据从退出码换成错误文本。
+zp_fetch_plain() {  # <tool> <url> <out|-> [timeout]  (无 --no-check-certificate)
+    case "$1" in
+        uclient-fetch) uclient-fetch -q -T "${4:-15}" -O "$3" "$2" 2>"$ZP_ERR" ;;
+        *)             wget -q -T "${4:-15}" -O "$3" "$2" 2>"$ZP_ERR" ;;
+    esac
+}
+
+zp_err_is_tls() {
+    [ -s "$ZP_ERR" ] || return 1
+    grep -Eqi 'ssl|tls|certificate|cert verify|x509' "$ZP_ERR"
+}
+
+# 取一个 URL 存到文件 (GET)。返回 0 = 拿到; 非 0 = 失败 (与 curl 的退出码同义)。
+# 成功时 `<dest>.hdr` 里是响应头 (curl 那条才有; 面板的 X-ZP-Sha256 / X-ZP-Install-Sha256
+# 从这里读 —— 拿不到时调用方会警告, 不会静默当"校验过了")。
+http_get_to() {
+    _ugt="$1"; _fgt="$2"; _tgt="${3:-15}"
+    rm -f "$_fgt.hdr"
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsS -D "$_fgt.hdr" -m "$_tgt" -o "$_fgt" "$_ugt" 2>/dev/null; then
+            return 0
+        else
+            _rgt=$?
+        fi
+        if zp_tls_error "$_rgt"; then
+            zp_tls_warn "$_ugt" "curl $_rgt"
+            curl -fsSk -m "$_tgt" -o "$_fgt" "$_ugt" 2>/dev/null && return 0
+            return $?
+        fi
+        return "$_rgt"
+    fi
+    # 没有 curl
+    ZP_ERR="$(mktemp /tmp/.zp-tls.XXXXXX 2>/dev/null || echo /tmp/.zp-tls.$$)"
+    for _tool in uclient-fetch wget; do
+        command -v "$_tool" >/dev/null 2>&1 || continue
+        if zp_fetch_plain "$_tool" "$_ugt" "$_fgt" "$_tgt"; then rm -f "$ZP_ERR"; return 0; fi
+        if zp_err_is_tls; then
+            zp_tls_warn "$_ugt" "$_tool 证书校验失败"
+            case "$_tool" in
+                uclient-fetch) uclient-fetch -q --no-check-certificate -T "$_tgt" -O "$_fgt" "$_ugt" 2>/dev/null ;;
+                *)             wget -q --no-check-certificate -T "$_tgt" -O "$_fgt" "$_ugt" 2>/dev/null ;;
+            esac && { rm -f "$ZP_ERR"; return 0; }
+        fi
+        break
+    done
+    rm -f "$ZP_ERR"
+    return 1
+}
+
+# 取一个 URL 到 stdout (GET)。stdout **只有正文** —— 告警/进度都走 stderr。
+http_get_out() {
+    _ugo="$(mktemp /tmp/.zp-get.XXXXXX 2>/dev/null || echo /tmp/.zp-get.$$)"
+    if http_get_to "$1" "$_ugo" "${2:-15}"; then
+        cat "$_ugo"
+        rm -f "$_ugo"
+        return 0
+    else
+        _rgo=$?
+    fi
+    rm -f "$_ugo"
+    return "$_rgo"
+}
+
+# 探一个接口通不通 (只看成功/失败, 不取正文)。同样"先校验证书, 只有证书错误才降级一次"。
+# doctor 的面板可达性用它: 那里只关心"这条接口答没答", 但同样不该无条件关掉证书校验。
+http_probe_ok() {
+    _upr="$1"; _tpr="${2:-6}"
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsS -m "$_tpr" -o /dev/null "$_upr" 2>/dev/null; then
+            return 0
+        else
+            _rpr=$?
+        fi
+        if zp_tls_error "$_rpr"; then
+            zp_tls_warn "$_upr" "curl $_rpr"
+            curl -fsSk -m "$_tpr" -o /dev/null "$_upr" 2>/dev/null && return 0
+        fi
+        return "$_rpr"
+    fi
+    ZP_ERR="$(mktemp /tmp/.zp-tls.XXXXXX 2>/dev/null || echo /tmp/.zp-tls.$$)"
+    for _tool in uclient-fetch wget; do
+        command -v "$_tool" >/dev/null 2>&1 || continue
+        if "$_tool" -q -T "$_tpr" -O /dev/null "$_upr" 2>"$ZP_ERR"; then rm -f "$ZP_ERR"; return 0; fi
+        if zp_err_is_tls; then
+            zp_tls_warn "$_upr" "$_tool 证书校验失败"
+            if "$_tool" -q --no-check-certificate -T "$_tpr" -O /dev/null "$_upr" 2>/dev/null; then
+                rm -f "$ZP_ERR"; return 0
+            fi
+        fi
+        break
+    done
+    rm -f "$ZP_ERR"
+    return 1
+}
+
+# POST 一个 JSON 正文到 stdout。第 4 个参数可选: 设备 secret —— 给了就先带
+# `Authorization: Bearer` (新面板路径, secret 不进 URL/正文); 旧面板不认头时(HTTP 4xx)
+# 自动退回"只发正文" (正文里的 k 是旧面板要的, 由调用方给)。
+http_post_out() {
+    _upo="$1"; _tpo="${2:-20}"; _bpo="$3"; _spo="${4:-}"
+    _opo="$(mktemp /tmp/.zp-post.XXXXXX 2>/dev/null || echo /tmp/.zp-post.$$)"
+    if command -v curl >/dev/null 2>&1; then
+        _rpo=1
+        if [ -n "$_spo" ]; then
+            if curl -fsS -m "$_tpo" -H 'Content-Type: application/json' \
+                -H "Authorization: Bearer $_spo" --data "$_bpo" "$_upo" -o "$_opo" 2>/dev/null; then
+                _rpo=0
+            else _rpo=$?; fi
+        elif curl -fsS -m "$_tpo" -H 'Content-Type: application/json' \
+            --data "$_bpo" "$_upo" -o "$_opo" 2>/dev/null; then
+            _rpo=0
+        else _rpo=$?; fi
+        if [ "$_rpo" != "0" ] && zp_tls_error "$_rpo"; then
+            zp_tls_warn "$_upo" "curl $_rpo"
+            if [ -n "$_spo" ] && curl -fsSk -m "$_tpo" -H 'Content-Type: application/json' \
+                -H "Authorization: Bearer $_spo" --data "$_bpo" "$_upo" -o "$_opo" 2>/dev/null; then
+                _rpo=0
+            elif curl -fsSk -m "$_tpo" -H 'Content-Type: application/json' \
+                --data "$_bpo" "$_upo" -o "$_opo" 2>/dev/null; then
+                _rpo=0
+            fi
+        fi
+        # 旧面板: 不认 Bearer 时把正文原样再发一次 (正文里带 k)
+        if [ "$_rpo" = "22" ] && [ -n "$_spo" ]; then
+            if curl -fsS -m "$_tpo" -H 'Content-Type: application/json' \
+                --data "$_bpo" "$_upo" -o "$_opo" 2>/dev/null; then _rpo=0; fi
+        fi
+        if [ "$_rpo" = "0" ]; then cat "$_opo"; rm -f "$_opo"; return 0; fi
+        rm -f "$_opo"
+        return "$_rpo"
+    fi
+    # 没有 curl: 先校验, 只在证书类错误时降级一次
+    ZP_ERR="$(mktemp /tmp/.zp-tls.XXXXXX 2>/dev/null || echo /tmp/.zp-tls.$$)"
+    for _tool in uclient-fetch wget; do
+        command -v "$_tool" >/dev/null 2>&1 || continue
+        if "$_tool" -q -T "$_tpo" -O "$_opo" --post-data "$_bpo" "$_upo" 2>"$ZP_ERR"; then
+            cat "$_opo"; rm -f "$_opo" "$ZP_ERR"; return 0
+        fi
+        if zp_err_is_tls; then
+            zp_tls_warn "$_upo" "$_tool 证书校验失败"
+            if "$_tool" -q --no-check-certificate -T "$_tpo" -O "$_opo" \
+                --post-data "$_bpo" "$_upo" 2>/dev/null; then
+                cat "$_opo"; rm -f "$_opo" "$ZP_ERR"; return 0
+            fi
+        fi
+        break
+    done
+    rm -f "$_opo" "$ZP_ERR"
+    return 1
+}
+
+# 从 http_get_to 存下的响应头里取一个头 (大小写不敏感)。取不到 → 空串。
+header_get() {  # <hdrfile> <Name>
+    [ -s "$1" ] || return 0
+    tr -d '\r' < "$1" | grep -i "^[[:space:]]*$2[[:space:]]*:" | head -n1 | sed 's/^[^:]*:[[:space:]]*//'
+}
+
+# 一个文件的 sha256 (小写)。本机没有 sha256sum 时返回空串 —— 调用方据此警告。
+file_sha256() {
+    [ -f "$1" ] || return 0
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1
+    fi
+}
 
 # 数据面上真的有流量经过吗 —— **规则存在 ≠ 有流量**。接口名写错 (L3 那一档最容易) 时
 # 规则照样"装得上", 却一个包都不命中; 而这是唯一能证明"真的接管了"的现场证据。
@@ -249,17 +441,47 @@ bench_text() {
 #   (经代理的那一趟是要算节点流量的)。
 BENCH_MB="${ZP_BENCH_MB:-4}"
 bench_run() {
-    _url="$1"; _proxy="$2"
-    if [ "$_proxy" = "proxy" ]; then
+    _url="$1"; _proxy="$2"; _sec="${3:-}"
+    # 先按新面板的路径量: 设备凭据走 `Authorization: Bearer`, URL 里只有 id ——
+    # secret 不再进访问日志/浏览器历史 (P2-6)。
+    #
+    # `?k=` 回退**只在面板明确拒绝 (401/403/404) 时**触发: 超时/连不上/被掐断时把 secret
+    # 拼回 URL, 只会让它出现在下一次可能成功的请求的日志里, 而那不是"旧面板"的证据。
+    if [ -n "$_sec" ]; then
+        _out="$(bench_once "$_url" "$_proxy" "Authorization: Bearer $_sec")"
+        case "${_out%% *}" in
+            401|403|404) _url="$_url&k=$_sec" ;;
+            *)           printf '%s\n' "${_out#* }"; return 0 ;;
+        esac
+    fi
+    _out="$(bench_once "$_url" "$_proxy" "")"
+    printf '%s\n' "${_out#* }"
+}
+
+# 量一次吞吐: 输出 "<http_code> <speed_download>"。空的/失败给 "000 0"。
+bench_once() {
+    _bu="$1"; _bp="$2"; _bh="$3"
+    if [ "$_bp" = "proxy" ]; then
         # `--noproxy ""` 是**必须**的: curl 默认遵守 NO_PROXY, 而多数环境里那个变量含
         # 127.0.0.1 / localhost —— 于是"经代理"这一趟会**绕过代理直连**, 量出一个跟直连
         # 一样漂亮的数字 (演练环境里就这么骗过一次: 代理端口根本没在监听, 却报了 921 MB/s)。
         # 这一趟必须是真经代理, 不然这个数字比不测更糟。
-        curl -s -o /dev/null -m 120 --noproxy "" -x "http://127.0.0.1:$ZP_MIXED" \
-            -w '%{speed_download}' "$_url" 2>/dev/null || true
+        if [ -n "$_bh" ]; then
+            curl -s -o /dev/null -m 120 --noproxy "" -x "http://127.0.0.1:$ZP_MIXED" \
+                -H "$_bh" -w '%{http_code} %{speed_download}' "$_bu" 2>/dev/null || true
+        else
+            curl -s -o /dev/null -m 120 --noproxy "" -x "http://127.0.0.1:$ZP_MIXED" \
+                -w '%{http_code} %{speed_download}' "$_bu" 2>/dev/null || true
+        fi
     else
         # 反过来: "直连"这一趟必须**真的不走代理** —— 环境里若设了 HTTP_PROXY, curl 会用它。
-        curl -s -o /dev/null -m 120 --noproxy '*' -w '%{speed_download}' "$_url" 2>/dev/null || true
+        if [ -n "$_bh" ]; then
+            curl -s -o /dev/null -m 120 --noproxy '*' -H "$_bh" \
+                -w '%{http_code} %{speed_download}' "$_bu" 2>/dev/null || true
+        else
+            curl -s -o /dev/null -m 120 --noproxy '*' \
+                -w '%{http_code} %{speed_download}' "$_bu" 2>/dev/null || true
+        fi
     fi
 }
 
@@ -545,7 +767,7 @@ doctor() {
         _pok=0; _pn="${ZP_DOCTOR_PROBES:-5}"; _pi=0
         while [ "$_pi" -lt "$_pn" ]; do
             _pi=$((_pi + 1))
-            if curl -fsSk -m 6 -o /dev/null "$_b/api/status" 2>/dev/null; then
+            if http_probe_ok "$_b/api/status" 6; then
                 _pok=$((_pok + 1))
             fi
         done
@@ -695,8 +917,12 @@ case "${1:-status}" in
         ;;
     add)
         # 从面板复制一行 (安装命令里的那个 URL), 粘进来即可 —— 不用再走一次完整安装。
-        _url="${2:-}"
-        [ -n "$_url" ] || { echo "用法: zeroproxy add https://面板:8899/c/<配对码>"; exit 2; }
+        # `--replace`: 已经接入过**同一台**面板时, 明确同意用新配对码换掉旧凭据。
+        _replace=0
+        _arg2="${2:-}"
+        if [ "$_arg2" = "--replace" ]; then _replace=1; _arg2="${3:-}"; fi
+        _url="$_arg2"
+        [ -n "$_url" ] || { echo "用法: zeroproxy add [--replace] https://面板:8899/c/<配对码>"; exit 2; }
         case "$_url" in
             http*://*/c/*) ;;
             *) echo "这看起来不是一个面板链接。请到面板「客户端」生成安装命令, 复制其中 https://…/c/… 这一段。"; exit 2 ;;
@@ -705,15 +931,37 @@ case "${1:-status}" in
         _code="${_url##*/c/}"
         _key="$(key_of "$_base")"
         mkdir -p "$SERVERS"
+        # 已配对时的收口 (P1-4): 这台机器上**原来那台面板**写在 panel.base 里 (装机时落的),
+        # 更新只认它。换/加另一台面板必须显式 --replace (多服务器是产品能力, 但需要那句
+        # 确认) —— 否则一个拿到界面令牌的人可以 drop 全部 → add 自己的面板, 让节点来源
+        # 与流量走向由对方决定。
+        _pair_base="$(cat "$ZP_DIR/panel.base" 2>/dev/null | tr -d '\r\n')"
+        if [ -z "$_pair_base" ] && [ -f "$ZP_DIR/device.json" ]; then
+            _pair_base="$(sed -n 's/.*"base"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ZP_DIR/device.json" | head -n1)"
+        fi
+        if [ -n "$_pair_base" ] && [ "$_pair_base" = "$_base" ] && [ "$_replace" != "1" ]; then
+            echo "这台机器已经接入过 ${_base}。"
+            echo "  重新配对会作废旧凭据: 确需重配请加 --replace (zeroproxy add --replace <链接>)。"
+            exit 0
+        fi
+        if [ -n "$_pair_base" ] && [ "$_pair_base" != "$_base" ]; then
+            # 换/加**另一台**面板必须显式确认 (P1-4): 持有界面令牌的人不能借用 add 把
+            # 路由器接到自己的面板上 —— 那会让节点来源、流量走向都由对方决定。
+            # 多服务器 (README 的聚合能力) 仍然支持: 加 --replace 就是那句确认。
+            if [ "$_replace" != "1" ]; then
+                echo "这台机器已经接入 ${_pair_base}。"
+                echo "  接入另一台面板 (或更换面板) 需要显式确认: zeroproxy add --replace <链接>"
+                echo "  注意: update 的更新源永远固定在装机面板 $_pair_base, 新增的面板只贡献节点。"
+                exit 2
+            fi
+            echo "注意: 本机更新走的是已配对的 $_pair_base —— 这次是**新增**一台面板,"
+            echo "      它不会成为更新源 (update 的面板固定为装机/首次配对的那一台)。"
+        fi
         echo "正在与 $_base 配对…"
         _model="$(cat /tmp/sysinfo/model 2>/dev/null || uname -m)"; _hn="$(cat /proc/sys/kernel/hostname 2>/dev/null || echo router)"
         _model="$(printf %s "$_model" | tr -d '"')"
         _body='{"code":"'"$_code"'","kind":"router","model":"'"$_model"'","hostname":"'"$_hn"'","arch":"'"$(uname -m)"'","os":"OpenWrt","version":"'"$ZP_VERSION"'"}'
-        if command -v curl >/dev/null 2>&1; then
-            _resp="$(curl -fsSk -m 30 -H 'Content-Type: application/json' --data "$_body" "$_base/c/pair" 2>/dev/null)"
-        else
-            _resp="$(uclient-fetch -q --no-check-certificate -O - --post-data "$_body" "$_base/c/pair" 2>/dev/null)"
-        fi
+        _resp="$(http_post_out "$_base/c/pair" 30 "$_body")"
         _id="$(printf '%s' "$_resp" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
         _sec="$(printf '%s' "$_resp" | sed -n 's/.*"secret"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
         if [ -z "$_id" ] || [ -z "$_sec" ]; then
@@ -730,6 +978,14 @@ case "${1:-status}" in
 }
 EOF
         chmod 600 "$SERVERS/$_key.json"
+        # 记下"更新走哪台面板": 装机时安装脚本会写, 这里是 CLI 侧补齐 (老装机没有这个文件)。
+        # 只有还没有记录时才写 —— 新增第二台面板**不能**把更新源改掉 (P1-4)。
+        if [ ! -s "$ZP_DIR/panel.base" ]; then
+            umask 077
+            printf '%s\n' "$_base" > "$ZP_DIR/panel.base"
+            chmod 600 "$ZP_DIR/panel.base" 2>/dev/null || true
+            umask 022
+        fi
         echo "已接入: $_key ($_base)"
         # 注意把"重建配置"与"重启内核"分开判断: 重启失败不该把已经写好的配置撤掉
         # (内核本来就是 procd 常驻的, 它自己会重启)。
@@ -850,13 +1106,11 @@ EOF
         _base="$(field_of "$FIRST" base)"
         ID="$(field_of "$FIRST" id)"
         KEY="$(field_of "$FIRST" secret)"
+        # 正文里保留 `k` (旧面板要它); 新面板认 `Authorization: Bearer`, 于是 secret
+        # 不必再出现在任何 URL 上 (P2-6)。http_post_out 会先带 Bearer, 被旧面板拒绝时退回正文。
         BODY='{"device":"'"$ID"'","k":"'"$KEY"'","set_desired":'"$ON"'}'
         _sent=0
-        if command -v curl >/dev/null 2>&1; then
-            curl -fsSk -m 15 -H 'Content-Type: application/json' --data "$BODY" "$_base/c/report" >/dev/null 2>&1 && _sent=1
-        else
-            uclient-fetch -q --no-check-certificate -O - --post-data "$BODY" "$_base/c/report" >/dev/null 2>&1 && _sent=1
-        fi
+        http_post_out "$_base/c/report" 15 "$BODY" "$KEY" >/dev/null 2>&1 && _sent=1
         if [ "$_sent" = "1" ]; then
             # 面板答上了 —— 它是唯一事实来源, 顺手清掉本机覆盖 (否则面板以后改不动它)
             rm -f "$ZP_DIR/local.override" 2>/dev/null || true
@@ -937,14 +1191,15 @@ EOF
         # 还有没有意义"。结果落在 $ZP_DIR/bench, agent 会随心跳带给面板。
         [ -n "$FIRST" ] || { echo "还没有接入任何服务器"; exit 1; }
         command -v curl >/dev/null 2>&1 || { echo "这台固件上没有 curl —— 跑不了基准"; exit 1; }
-        _url="$(field_of "$FIRST" base)/c/bench/$BENCH_MB?id=$(field_of "$FIRST" id)&k=$(field_of "$FIRST" secret)"
+        _bbase="$(field_of "$FIRST" base)"; _bid="$(field_of "$FIRST" id)"; _bsec="$(field_of "$FIRST" secret)"
+        _url="$_bbase/c/bench/$BENCH_MB?id=$_bid"
         echo "路由器基准测试 (靶子是面板, ${BENCH_MB} MB —— 经代理那一趟会算节点流量)"
         printf '  直连   … '
-        _dr="$(bench_run "$_url" direct)"
+        _dr="$(bench_run "$_url" direct "$_bsec")"
         _dk="$(bench_kbps "$_dr")"
         printf '%s\n' "$(bench_text "$_dr")"
         printf '  经代理 … '
-        _pr="$(bench_run "$_url" proxy)"
+        _pr="$(bench_run "$_url" proxy "$_bsec")"
         _pk="$(bench_kbps "$_pr")"
         printf '%s\n' "$(bench_text "$_pr")"
         if [ "${_dk:-0}" -gt 0 ] 2>/dev/null && [ "${_pk:-0}" -gt 0 ] 2>/dev/null; then
@@ -1025,13 +1280,31 @@ EOF
         # 稍后刷新"。过程写进 $ZP_DIR/update.log, 结束时往 syslog 丢一句结论 (界面上的
         # 「最近日志」读的就是 syslog)。
         [ -n "$FIRST" ] || { echo "还没有接入任何服务器"; exit 1; }
+        # 更新源**固定为装机/首次配对的那台面板** (panel.base 由安装脚本在装机时写下),
+        # 而不是"当前 servers/ 里的第一条" —— 否则拿到界面令牌的人可以 drop 全部 →
+        # add 自己的面板 → update, 让路由器 root 执行陌生面板发来的脚本 (P1-4)。
+        # 老装机没有 panel.base: 退回已配对的第一台, 并把这件事如实写进日志。
+        _pin_base="$(cat "$ZP_DIR/panel.base" 2>/dev/null | tr -d '\r\n')"
         _base="$(field_of "$FIRST" base)"
+        if [ -z "$_pin_base" ]; then
+            _pin_base="$_base"
+        elif [ "$_pin_base" != "$_base" ]; then
+            echo "本机记录的装机面板是 $_pin_base, 更新只走它 (不会用后来新增的 $_base)。" >&2
+        fi
+        case "$_pin_base" in
+            http://*|https://*) _base="$_pin_base" ;;
+            *) _base="$(field_of "$FIRST" base)" ;;
+        esac
         _log="$ZP_DIR/update.log"
         : > "$_log" 2>/dev/null || true
         # 一开始就往日志里落一行 —— 界面上的进度面板是**照着这个日志**画的, 而下面取面板
         # 那份脚本要走三次重试 (丢包的链路上最坏几十秒)。没有这一行, 那几十秒里刷新页面
         # 什么都看不到, 用户只能干等; 有了它, 从按下按钮那一刻起就有东西可显示。
         echo "==> 正在取面板的安装脚本" >> "$_log" 2>/dev/null || true
+        if [ -z "$(cat "$ZP_DIR/panel.base" 2>/dev/null)" ]; then
+            echo "  · 本机没有记录装机面板 (老版本安装), 本次按已配对的第一台服务器更新;" >> "$_log"
+            echo "    新安装脚本落盘后会把 panel.base 补上, 之后的更新只认它。" >> "$_log"
+        fi
         # 先把面板要发的那份脚本取下来, **看一眼它的版本** —— 比本机旧就停下。
         #
         # 为什么需要这道闸门: 按钮触发的更新会把路由器上的**全部客户端文件**换成面板那一版。
@@ -1044,25 +1317,53 @@ EOF
         # 界面上什么都没发生, 最后报出来却是"面板不可达" —— 而实际情况是"再试一次就行"。
         # 所以这里试三次 (每次 25 秒上限, 与原来 60 秒的总预算同量级)。半个文件也要清掉:
         # 下一轮若还失败, 留着上一轮的残片会让"脚本有没有拿到"的判断失真。
-        _try=0; _got=0
+        _try=0; _got=0; _sha_fail=0
         while [ "$_try" -lt 4 ]; do
             _try=$((_try + 1))
-            rm -f "$_tmp"
+            rm -f "$_tmp" "$_tmp.hdr"
             _rc=1
-            if command -v curl >/dev/null 2>&1; then
-                if curl -fsSk -m 10 "$_base/c/install.sh" -o "$_tmp" 2>/dev/null; then _rc=0; fi
-            else
-                if uclient-fetch -q --no-check-certificate -T 10 -O "$_tmp" "$_base/c/install.sh" 2>/dev/null; then _rc=0; fi
-            fi
-            # 只有 curl/uclient-fetch 自己说"传完了"才算拿到 —— 被掐断的那次也会留下
+            # 先校验证书 (只有证书错误才降级一次, 见 http_get_to); 响应头留在 .hdr 里,
+            # 面板下发的 X-ZP-Install-Sha256 从那里取。
+            if http_get_to "$_base/c/install.sh" "$_tmp" 10; then _rc=0; fi
+            # 只有下载工具自己说"传完了"才算拿到 —— 被掐断的那次也会留下
             # 半个文件, 而半份脚本里的版本号照样能被 sed 抠出来, 拿去跑就是另一回事了。
-            if [ "$_rc" = "0" ] && [ -s "$_tmp" ]; then _got=1; break; fi
+            if [ "$_rc" = "0" ] && [ -s "$_tmp" ]; then
+                # 供应链闸门: 面板下发的摘要 == 本机拿到的正文摘要, 才允许执行。
+                # 旧面板没有这个头 → 只告警 (不静默), 行为与以前一致 (向后兼容)。
+                _want_sha="$(header_get "$_tmp.hdr" X-ZP-Install-Sha256)"
+                _have_sha="$(file_sha256 "$_tmp")"
+                if [ -n "$_want_sha" ]; then
+                    if [ -z "$_have_sha" ]; then
+                        echo "  · 面板下发了脚本摘要, 但本机没有 sha256sum/shasum —— 无法校验, 继续 (如实记录)。" >> "$_log"
+                    elif [ "$_want_sha" != "$_have_sha" ]; then
+                        echo "  ! 安装脚本 sha256 与面板下发的值不一致 (期望 ${_want_sha}, 实际 ${_have_sha})。" >> "$_log"
+                        echo "    这可能是镜像/链路上的替换或半截文件 —— 本次不更新。" >> "$_log"
+                        rm -f "$_tmp" "$_tmp.hdr"
+                        _sha_fail=1
+                        break
+                    else
+                        echo "  ✓ 安装脚本 sha256 与面板下发值一致 (${_want_sha})" >> "$_log"
+                    fi
+                elif command -v curl >/dev/null 2>&1; then
+                    echo "  · 面板没有下发 X-ZP-Install-Sha256 (旧面板) —— 本次不做摘要比对, 只校验版本号。" >> "$_log"
+                else
+                    echo "  · 本机只有 uclient-fetch/wget, 拿不到响应头 —— 无法比对脚本摘要 (如实记录)。" >> "$_log"
+                fi
+                _got=1
+                break
+            fi
             # 让界面那句"正在取面板的安装脚本"有进展可看: 这一步的每一次重试都要等到超时,
             # 静悄悄等几十秒正是"点了没反应"的来源之一。
             echo "  · 面板第 $_try 次没回话 (链路丢包), 正在重试…" >> "$_log" 2>/dev/null || true
             sleep "$_try"
         done
-        [ "$_got" = "1" ] || rm -f "$_tmp"
+        if [ "$_sha_fail" = "1" ]; then
+            echo "SKIP=1" >> "$_log"
+            echo "面板下发的安装脚本摘要对不上 (可能被替换/只传到一半) —— 本次没有更新。"
+            echo "  稍后重试; 若反复出现, 检查面板到路由器之间的链路/反代。详见 zeroproxy update-log"
+            exit 1
+        fi
+        [ "$_got" = "1" ] || rm -f "$_tmp" "$_tmp.hdr"
         _panel_ver=""
         if [ -s "$_tmp" ]; then
             _panel_ver="$(sed -n 's/^ZP_CLIENT_VERSION="\(.*\)"/\1/p' "$_tmp" | head -n1)"
@@ -1099,7 +1400,7 @@ EOF
             # 用刚取下来的那一份跑 —— 不再下第二次 (版本也已经核对过了)
             sh "$_tmp" >>"$_log" 2>&1
             _rc=$?
-            rm -f "$_tmp"
+            rm -f "$_tmp" "$_tmp.hdr"
             echo "EXIT=$_rc" >> "$_log"
             if [ "$_rc" = "0" ]; then
                 logger -t zeroproxy "客户端更新完成 (刷新本页看版本号)"

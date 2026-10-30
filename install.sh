@@ -14,20 +14,37 @@
 #  可覆盖的变量:
 #    ZP_REPO=owner/repo      改用 fork / 镜像仓库 (默认 ericlinclover-blip/zeroproxy)
 #    ZP_REF=main|v2.2        指定分支或 tag (默认取最新 release, 仓库无 release 时用 main)
-#    ZP_PORT=8899            面板端口
+#    ZP_HOME=/opt/zeroproxy  安装目录 (与 upgrade.sh / uninstall.sh 读同一个变量)
+#    ZP_PORT=8899            兼容入口的 TLS 端口 (标准入口仍是 80/443; 见下)
 #    XRAY_VERSION=24.11.30   指定 Xray 版本 (默认 latest)
+#    ZP_ALLOW_UNVERIFIED=1   跳过代码包 SHA256SUMS 校验 (默认严格校验, 仅镜像没有清单时应急)
+#    ZP_XRAY_SHA256_AMD64=<hex> / ZP_XRAY_SHA256_ARM64=<hex>
+#                            固定 Xray 压缩包的 sha256 (默认未知, 只告警不中止)
+#
+#  供应链校验: 下载代码包后会用**同一 ref 的原始 raw 地址**另取一份仓库根 SHA256SUMS,
+#  逐文件比对 (镜像只承担传输); 不一致立即中止。内核二进制可用上面的固定 sha256 常量钉住。
 #
 #  完成后终端输出初始化页地址 http://<IP>/ (80 端口, 打开即初始化页, 没有证书警告;
-#  同一页也挂在 https://<IP>:8899, 那是自签证书 —— 打不开 80 时用它, 浏览器需点一次
-#  "继续访问"), 浏览器打开 → 输入 域名/用户名/密码 → 一键生成全部配置。
+#  同一页也挂在 https://<IP>:8899, 那是自签证书的**兼容/备用入口** —— 打不开 80 时用它,
+#  浏览器需点一次 "继续访问"), 浏览器打开 → 输入 域名/用户名/密码 → 一键生成全部配置。
+#  正式入口始终是 https://<域名>/panel/ (443, 真实证书), 8899 只是兼容旧链接, 不是唯一入口。
 # ============================================================
 set -Eeuo pipefail
 
 # ---------------- 常量 ----------------
-ZP_HOME="/opt/zeroproxy"
+# 安装目录统一读 $ZP_HOME (与 upgrade.sh / uninstall.sh 同一套变量); 默认 /opt/zeroproxy。
+# 自定义目录时, 落盘的 systemd 单元会同步替换里面的 /opt/zeroproxy (见 install_units)。
+ZP_HOME="${ZP_HOME:-/opt/zeroproxy}"
+SYSTEMD_DIR="${ZP_SYSTEMD_DIR:-/etc/systemd/system}"
+LETSENCRYPT_DIR="${ZP_LETSENCRYPT_DIR:-/etc/letsencrypt}"
 PANEL_PORT="${ZP_PORT:-8899}"
 XRAY_BIN="/usr/local/bin/xray"
 HYSTERIA_BIN="/usr/local/bin/hysteria"
+#: 代码包校验的总开关。默认严格: 取不到 / 对不上清单就中止。只有镜像临时没有清单、
+#: 而用户明确知情时才用 ZP_ALLOW_UNVERIFIED=1 跳过 (跳过会在终端和日志里留一条警告)。
+ZP_ALLOW_UNVERIFIED="${ZP_ALLOW_UNVERIFIED:-0}"
+# 权限: 系统文件按 022 (nginx worker 要读 $ZP_HOME/static 与 www); 引导令牌 / 日志单独收紧。
+umask 022
 GH="https://github.com"
 GH_API="https://api.github.com"
 #: GitHub 反代前缀。**自建的反代排第一** —— 与面板那边内核 / 分流数据两张表同一套策略
@@ -61,7 +78,130 @@ fetch_github_file() {
   rm -f "$out"
   return 1
 }
-# 面板核心来源: 默认官方仓库; 远程安装时从这里拉取 tarball。
+
+# ---------------- 供应链完整性 (P1-2) ----------------
+# 信任模型: 代码包的**期望摘要**来自仓库根 SHA256SUMS, 用**同一 ref 的原始 raw 地址**
+# 独立取一次 (不走 tarball 里那份); 镜像只承担传输。这样"某个反代把 tarball 换成自己的"
+# 会在逐文件比对时失败 —— 除非它连清单一起伪造 (清单没有签名, 这是残余风险, 见 README)。
+# 更强的做法是给 release 签名; 在没有签名的前提下, 独立通道 + 固定摘要已经能把
+# "单点镜像投毒"挡在安装之外。
+sha256_file() { # sha256_file <文件> → 打印小写 hex; 没有可用工具时返回 1
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$1" | sed 's/^.*= *//'
+  else
+    return 1
+  fi
+}
+
+# manifest_hash_of <清单文件> <相对路径> → 打印清单里这一行的 hash; 没有该行/清单无效时返回 1
+manifest_hash_of() {
+  local sums="$1" want="$2" line hash path
+  [ -s "$sums" ] || return 1
+  while IFS= read -r line; do
+    case "$line" in ""|"#"*) continue ;; esac
+    hash="${line%% *}"
+    path="${line#"$hash"}"
+    path="${path# }"
+    path="${path# }"
+    path="${path#\*}"                 # 允许 "hash *path" (二进制模式) 的写法
+    [ "$path" = "$want" ] || continue
+    case "$hash" in *[!0-9a-fA-F]*) return 1 ;; esac
+    [ "${#hash}" -eq 64 ] || return 1
+    printf '%s' "$hash"
+    return 0
+  done < "$sums"
+  return 1
+}
+
+# verify_sums_file <清单> <根目录> [只校验的相对路径]
+#   0 = 全部一致   2 = 有不一致/缺失   3 = 清单里没有可用条目 (取错了内容/哈希工具缺失)
+verify_sums_file() {
+  local sums="$1" root="$2" only="${3:-}" line hash path actual n=0 bad=0 ok_n=0
+  [ -s "$sums" ] || return 3
+  while IFS= read -r line; do
+    case "$line" in ""|"#"*) continue ;; esac
+    hash="${line%% *}"
+    path="${line#"$hash"}"
+    path="${path# }"
+    path="${path# }"
+    path="${path#\*}"
+    case "$hash" in *[!0-9a-fA-F]*) continue ;; esac
+    [ "${#hash}" -eq 64 ] || continue
+    [ -n "$only" ] && [ "$path" != "$only" ] && continue
+    n=$((n + 1))
+    if [ ! -f "$root/$path" ]; then
+      printf '  缺少文件: %s\n' "$path" >&2
+      bad=$((bad + 1))
+      continue
+    fi
+    actual="$(sha256_file "$root/$path" 2>/dev/null || true)"
+    [ -n "$actual" ] || continue          # 没有哈希工具: 由调用方按 3 处理
+    ok_n=$((ok_n + 1))
+    if [ "$actual" != "$hash" ]; then
+      printf '  摘要不一致: %s\n' "$path" >&2
+      bad=$((bad + 1))
+    fi
+  done < "$sums"
+  [ "$n" -gt 0 ] || return 3
+  [ "$bad" -eq 0 ] || return 2
+  [ "$ok_n" -eq "$n" ] || return 3
+  return 0
+}
+
+# fetch_zp_sums <输出文件> <ref> —— 从同一 ref 的原始 raw 地址独立取 SHA256SUMS (镜像只作传输)
+fetch_zp_sums() {
+  local out="$1" ref="$2"
+  fetch_github_file "https://raw.githubusercontent.com/$ZP_REPO/$ref/SHA256SUMS" "$out"
+}
+
+# install_units <源码目录>: 落 systemd 单元; ZP_HOME 非默认值时同步替换单元里的路径
+install_units() {
+  local src="$1" f base repl
+  repl="$(printf '%s' "$ZP_HOME" | sed -e 's/[\\&|]/\\&/g')"
+  for f in "$src"/systemd/*.service; do
+    [ -f "$f" ] || continue
+    base="$(basename "$f")"
+    if [ "$ZP_HOME" = "/opt/zeroproxy" ]; then
+      cp -f "$f" "$SYSTEMD_DIR/$base"
+    else
+      sed "s|/opt/zeroproxy|$repl|g" "$f" > "$SYSTEMD_DIR/$base"
+    fi
+    chmod 644 "$SYSTEMD_DIR/$base"
+  done
+}
+
+# 证书续期钩子 (P2-1): certbot 自动续期成功后, 让 nginx / Xray 用上新证书。
+# 内容必须与 upgrade.sh / 面板 services.install_cert 落的那份保持一致 (同一文件名)。
+install_le_hook() {
+  local dir="$LETSENCRYPT_DIR/renewal-hooks/deploy"
+  local f="$LETSENCRYPT_DIR/renewal-hooks/deploy/zeroproxy-reload.sh"
+  mkdir -p "$dir" || return 1
+  cat > "$f" <<'HOOK'
+#!/bin/sh
+# ZeroProxy: Let's Encrypt 续期成功后让 nginx / Xray 用上新证书。
+# 由 install.sh / upgrade.sh / 面板 services.install_cert 落盘, 内容保持一致。
+# (--webroot 签发不会自动 reload, 没有这个钩子就要等到下一次手动续期/apply)
+set -u
+systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
+systemctl restart xray 2>/dev/null || true
+HOOK
+  chmod 755 "$f" || return 1
+  [ -x "$f" ]
+}
+
+# 安装失败不留半成品: /tmp 里的下载物与解压目录统一清掉
+zp_tmp_cleanup() {
+  rm -f /tmp/xray.zip /tmp/hysteria-dl /tmp/hysteria /tmp/zp.tar.gz /tmp/zp.SHA256SUMS 2>/dev/null || true
+  rm -rf /tmp/zp-src 2>/dev/null || true
+  [ -n "${ZP_SELF:-}" ] && rm -f "$ZP_SELF" 2>/dev/null || true
+  return 0
+}
+trap zp_tmp_cleanup EXIT
+
 ZP_REPO="${ZP_REPO:-ericlinclover-blip/zeroproxy}"
 ZP_DEFAULT_REF="${ZP_DEFAULT_REF:-main}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -86,18 +226,44 @@ fail() { printf '\033[1;31m[ZeroProxy]\033[0m %s\n' "$*"; exit 1; }
 if [ -z "${ZP_DETACHED:-}" ] && [ -z "${ZP_NO_DETACH:-}" ] && [ -n "${SSH_CONNECTION:-}" ] \
    && [ -z "${TMUX:-}" ] && [ ! -f "$SCRIPT_DIR/backend/zeroproxy/main.py" ] \
    && command -v setsid >/dev/null 2>&1; then
-  mkdir -p "$ZP_HOME/data"
+  mkdir -p "$ZP_HOME/data" 2>/dev/null || true
+  # 日志里有引导令牌的上下文: 显式 0600, 且目录收紧到 0700 (P2-11)
   ZP_LOG="$ZP_HOME/data/install.log"
+  : > "$ZP_LOG" 2>/dev/null || true
+  chmod 600 "$ZP_LOG" 2>/dev/null || true
+  chmod 700 "$ZP_HOME/data" 2>/dev/null || true
   ZP_SELF="/tmp/zp-install-$$.sh"
   ZP_SELF_OK=0
-  # 取一份自己: 与用户手上这份同源 (同一仓库 / 同一 ref), 走同一张镜像表
-  for _p in "${GH_PROXIES[@]}" ""; do
-    if fetch_github_file "$(zp_url "$_p" "$GH/$ZP_REPO/${ZP_REF:-$ZP_DEFAULT_REF}/install.sh")" "$ZP_SELF" \
-       && grep -q "ZP_DETACHED" "$ZP_SELF"; then
-      ZP_SELF_OK=1
-      break
+  _zp_ref="${ZP_REF:-$ZP_DEFAULT_REF}"
+  # 取一份自己: 与用户手上这份同源 (同一仓库 / 同一 ref), 走同一张镜像表。
+  # 取回来之后先用**同一 ref 的 SHA256SUMS** 校验它的 sha256 (清单同样是独立通道取的);
+  # 对不上就拒绝在独立会话里执行这份副本, 退回当前会话继续 —— 镜像返回一页恶意脚本时
+  # 骗不过去。清单取不到时只告警 (老版本仓库还没有这个文件), 不阻断安装。
+  if fetch_github_file "https://raw.githubusercontent.com/$ZP_REPO/$_zp_ref/install.sh" "$ZP_SELF" \
+     && grep -q "ZP_DETACHED" "$ZP_SELF"; then
+    _expected=""
+    if command -v manifest_hash_of >/dev/null 2>&1 && command -v sha256_file >/dev/null 2>&1; then
+      _sums="$(mktemp 2>/dev/null || echo /tmp/zp-self-sums.$$)"
+      if fetch_zp_sums "$_sums" "$_zp_ref" 2>/dev/null; then
+        _expected="$(manifest_hash_of "$_sums" "install.sh" 2>/dev/null || true)"
+      fi
+      rm -f "$_sums"
     fi
-  done
+    _actual="$(sha256_file "$ZP_SELF" 2>/dev/null || true)"
+    if [ "${ZP_ALLOW_UNVERIFIED:-0}" = "1" ]; then
+      warn "ZP_ALLOW_UNVERIFIED=1: 跳过自取副本的 SHA256 校验"
+      ZP_SELF_OK=1
+    elif [ -n "$_expected" ] && [ -n "$_actual" ]; then
+      if [ "$_expected" = "$_actual" ]; then
+        ZP_SELF_OK=1
+      else
+        warn "自取副本的 SHA256 与同 ref 清单不符 (期望 ${_expected:0:12}…, 实际 ${_actual:0:12}…) —— 拒绝执行它"
+      fi
+    else
+      warn "取不到 SHA256SUMS (镜像没有清单?), 无法校验自取副本 —— 仍继续, 可用 ZP_ALLOW_UNVERIFIED=1 消除此警告"
+      ZP_SELF_OK=1
+    fi
+  fi
   if [ "$ZP_SELF_OK" = "1" ]; then
     printf '\n[ZeroProxy] ===== %s 这次安装放到独立会话里跑 (SSH 断线不影响) =====\n' \
       "$(date '+%F %T')" >>"$ZP_LOG"
@@ -115,6 +281,13 @@ if [ -z "${ZP_DETACHED:-}" ] && [ -z "${ZP_NO_DETACH:-}" ] && [ -n "${SSH_CONNEC
       ok "安装结束 (退出码 0); 全文日志: $ZP_LOG"
     else
       warn "安装以退出码 $ZP_RC 结束 —— 原因在日志里: $ZP_LOG"
+    fi
+    # 日志里那条带 token 的链接是**打码**的 (token 不进 install.log); 完整链接单独落在
+    # 0600 的 bootstrap_urls 里, 这里由前台会话读出来打到终端。令牌文件初始化后会自删。
+    if [ -s "$ZP_HOME/data/bootstrap_urls" ]; then
+      echo
+      sed 's/^/  /' "$ZP_HOME/data/bootstrap_urls"
+      echo "  (引导令牌只显示这一次; 日志里的 token 已打码。文件: $ZP_HOME/data/bootstrap_urls, 0600)"
     fi
     exit "$ZP_RC"
   fi
@@ -272,6 +445,26 @@ XRAY_URL="$(printf '%s' "$XRAY_JSON" | grep -oE '"browser_download_url": *"[^"]+
 rm -f /tmp/xray.zip
 fetch_github_file "$XRAY_URL" /tmp/xray.zip \
   || fail "Xray 下载失败 (反代与直连都没成): $XRAY_URL"
+# 上游 Xray 的 release 不附带仓库内的固定摘要, 所以这里给一个**可选**的钉扎开关:
+#   ZP_XRAY_SHA256_AMD64=<hex> / ZP_XRAY_SHA256_ARM64=<hex>
+# 提供时只接受逐字节相等; 不提供时打印警告并继续 (至少做 zip 结构校验, 挡住"反代回 HTML")。
+case "$ARCH" in
+  arm64) XRAY_SHA_ENV="ZP_XRAY_SHA256_ARM64" ;;
+  *)     XRAY_SHA_ENV="ZP_XRAY_SHA256_AMD64" ;;
+esac
+XRAY_SHA_EXPECT="${!XRAY_SHA_ENV:-}"
+XRAY_ZIP_SHA="$(sha256_file /tmp/xray.zip 2>/dev/null || true)"
+if [ -n "$XRAY_SHA_EXPECT" ]; then
+  if [ "$(printf '%s' "$XRAY_SHA_EXPECT" | tr 'A-F' 'a-f')" != "$XRAY_ZIP_SHA" ]; then
+    fail "Xray 压缩包 SHA256 与 $XRAY_SHA_ENV 不一致 (期望 $XRAY_SHA_EXPECT, 实际 ${XRAY_ZIP_SHA:-无法计算})
+       下载源可能被投毒或版本已变更; 确认后清除该变量并显式指定 XRAY_VERSION 再试。"
+  fi
+  ok "Xray 压缩包 SHA256 与 $XRAY_SHA_ENV 一致"
+else
+  warn "未固定 Xray 压缩包 SHA256 (设 $XRAY_SHA_ENV=<hex> 可钉死; 本次只校验 zip 结构, 实际 ${XRAY_ZIP_SHA:-未知})"
+fi
+unzip -t /tmp/xray.zip >/dev/null 2>&1 \
+  || fail "Xray 压缩包结构校验失败 (反代可能回了一页 HTML): $XRAY_URL"
 unzip -oq /tmp/xray.zip -d /usr/local/bin \
   || fail "Xray 压缩包解不开 (反代可能回了一页 HTML): $XRAY_URL"
 chmod +x /usr/local/bin/xray
@@ -286,14 +479,30 @@ HY_URL="$(printf '%s' "$HY_JSON" | grep -oE '"browser_download_url": *"[^"]+"' |
 [ -n "$HY_URL" ] || HY_URL="$GH/apernet/hysteria/releases/download/${HY_TAG:-v1.1.5}/hysteria-linux-${ARCH}.tar.gz"
 HY_TAG="${HY_TAG#v}"; HY_TAG="${HY_TAG:-1.1.5}"
 if fetch_github_file "$HY_URL" /tmp/hysteria-dl; then
+  case "$ARCH" in
+    arm64) HY_SHA_ENV="ZP_HYSTERIA_SHA256_ARM64" ;;
+    *)     HY_SHA_ENV="ZP_HYSTERIA_SHA256_AMD64" ;;
+  esac
+  HY_SHA_EXPECT="${!HY_SHA_ENV:-}"
+  HY_DL_SHA="$(sha256_file /tmp/hysteria-dl 2>/dev/null || true)"
+  if [ -n "$HY_SHA_EXPECT" ] && [ "$(printf '%s' "$HY_SHA_EXPECT" | tr 'A-F' 'a-f')" != "$HY_DL_SHA" ]; then
+    fail "Hysteria 压缩包 SHA256 与 $HY_SHA_ENV 不一致 (期望 $HY_SHA_EXPECT, 实际 ${HY_DL_SHA:-无法计算})
+       确认后清除该变量再试 (或指定版本), 不要带着被替换的二进制继续部署。"
+  fi
   case "$HY_URL" in
     *.tar.gz)
+      tar -tzf /tmp/hysteria-dl >/dev/null 2>&1 \
+        || fail "Hysteria 压缩包结构校验失败 (反代可能回了一页 HTML): $HY_URL"
       tar -xzf /tmp/hysteria-dl -C /tmp
       install -m 755 /tmp/hysteria "$HYSTERIA_BIN" ;;
     *)
       install -m 755 /tmp/hysteria-dl "$HYSTERIA_BIN" ;;
   esac
-  ok "Hysteria $HY_TAG"
+  if [ -n "$HY_SHA_EXPECT" ]; then
+    ok "Hysteria $HY_TAG (SHA256 与 $HY_SHA_ENV 一致)"
+  else
+    warn "未固定 Hysteria 压缩包 SHA256 (设 $HY_SHA_ENV=<hex> 可钉死; 实际 ${HY_DL_SHA:-未知})"
+  fi
 else
   warn "Hysteria 下载失败 (Hysteria 2 节点不可用, 其余协议正常)"
 fi
@@ -321,6 +530,7 @@ resolve_zp_ref() {
 fetch_zp_tarball() {
   local out="$1" ref="$2" url err sha bust
   err="$(mktemp)"
+  ZP_TARBALL_SHA=""
   # 先把分支 / tag 解析成提交 SHA: `archive/refs/heads/<分支>.tar.gz` 在推送后被 CDN
   # 缓存住时会**装到上一个版本** (真机上遇到过"刚发版, 装完还是旧号"); 按 SHA 下的是
   # 不可变快照, 永远是我们要的那一份。拿不到 SHA (API 被挡) 就退回原来的三级兜底,
@@ -347,6 +557,7 @@ fetch_zp_tarball() {
       wget -q --timeout=30 --tries=1 -O "$out" "$url" 2>"$err" || { rm -f "$out"; continue; }
     fi
     if tar -tzf "$out" >/dev/null 2>&1; then
+      ZP_TARBALL_SHA="$sha"
       rm -f "$err"
       return 0
     fi
@@ -361,6 +572,15 @@ fetch_zp_tarball() {
 if [ -f "$SCRIPT_DIR/backend/zeroproxy/main.py" ] && [ -d "$SCRIPT_DIR/systemd" ]; then
   info "检测到本地代码目录, 直接安装: $SCRIPT_DIR"
   SRC_DIR="$SCRIPT_DIR"
+  # 本地目录安装没有"下载"这一跳, 不做远端清单校验 (代码就是用户手上这份);
+  # 如果目录里带 SHA256SUMS, 仍然给出一次自检结果, 方便发布前确认清单与代码同步。
+  if [ -f "$SRC_DIR/SHA256SUMS" ]; then
+    if verify_sums_file "$SRC_DIR/SHA256SUMS" "$SRC_DIR"; then
+      ok "本地 SHA256SUMS 自检通过"
+    else
+      warn "本地 SHA256SUMS 与代码不一致 (发布前请重跑 scripts/gen_sha256sums.sh); 本地安装继续"
+    fi
+  fi
 else
   # 远程安装 (curl | bash): 下载仓库 tarball, 需服务器能访问 GitHub
   ZP_REF_RESOLVED="$(resolve_zp_ref)"
@@ -376,6 +596,40 @@ else
   tar -xzf /tmp/zp.tar.gz -C /tmp/zp-src
   SRC_DIR="$(find /tmp/zp-src -mindepth 1 -maxdepth 1 -type d | head -1)"
   [ -n "$SRC_DIR" ] || fail "解压失败: /tmp/zp.tar.gz"
+
+  # ---- 供应链校验 (P1-2): 逐文件比对同一 ref 的 SHA256SUMS ----
+  # 清单从**原始 raw 地址**独立取 (镜像只作传输), 所以 tarball 里那份清单即使被一起换掉
+  # 也没用。任何一条不一致 / 缺文件都中止安装; 只有显式 ZP_ALLOW_UNVERIFIED=1 才跳过。
+  ZP_VERIFIED=0
+  if [ "${ZP_ALLOW_UNVERIFIED:-0}" = "1" ]; then
+    warn "ZP_ALLOW_UNVERIFIED=1: 跳过 $ZP_REPO@$ZP_REF_RESOLVED 的 SHA256SUMS 校验 (不推荐)"
+    ZP_VERIFIED=1
+  else
+    _sums_ref="${ZP_TARBALL_SHA:-$ZP_REF_RESOLVED}"
+    rm -f /tmp/zp.SHA256SUMS
+    if ! fetch_zp_sums /tmp/zp.SHA256SUMS "$_sums_ref"; then
+      fail "取不到代码包校验清单 (SHA256SUMS): $ZP_REPO@$_sums_ref
+       镜像只承担传输, 清单必须从同一 ref 的原始 raw 地址取; 现在这条通道不通。
+       应急可显式跳过 (不推荐): ZP_ALLOW_UNVERIFIED=1 bash install.sh
+       或指定可用的 ref 重试: ZP_REF=<tag> bash install.sh"
+    fi
+    # 清单与 tarball 的 ref 必须一致: tarball 里若是另一份清单, 直接判为不一致 (可见日志)
+    if [ -f "$SRC_DIR/SHA256SUMS" ]; then
+      _in_pkg="$(sha256_file "$SRC_DIR/SHA256SUMS" 2>/dev/null || true)"
+      _raw="$(sha256_file /tmp/zp.SHA256SUMS 2>/dev/null || true)"
+      if [ -n "$_in_pkg" ] && [ -n "$_raw" ] && [ "$_in_pkg" != "$_raw" ]; then
+        fail "代码包内的 SHA256SUMS 与同 ref 的原始清单不一致 —— 镜像可能被篡改, 已中止安装"
+      fi
+    fi
+    if verify_sums_file /tmp/zp.SHA256SUMS "$SRC_DIR"; then
+      ok "代码包已按 SHA256SUMS 逐文件校验通过 ($ZP_REPO@$_sums_ref)"
+      ZP_VERIFIED=1
+    else
+      fail "代码包 SHA256SUMS 校验失败 (文件被改动 / 不完整) —— 已中止安装
+       镜像可能被投毒, 换一个 ref 或镜像重试; 确认无风险时才用 ZP_ALLOW_UNVERIFIED=1 跳过。"
+    fi
+  fi
+  [ "$ZP_VERIFIED" = "1" ] || fail "代码包未通过供应链校验"
 fi
 
 [ -f "$SRC_DIR/backend/zeroproxy/main.py" ] || fail "代码目录不完整 (缺少 backend/zeroproxy/main.py): $SRC_DIR"
@@ -386,7 +640,9 @@ cp -r "$SRC_DIR/backend/zeroproxy" "$ZP_HOME/zeroproxy"
 cp -r "$SRC_DIR/backend/static" "$ZP_HOME/static"
 cp "$SRC_DIR/backend/requirements.txt" "$ZP_HOME/requirements.txt"
 rm -rf "$ZP_HOME/zeroproxy/__pycache__" "$ZP_HOME/zeroproxy"/*/__pycache__
-cp "$SRC_DIR"/systemd/*.service /etc/systemd/system/
+# systemd 单元: 自定义 ZP_HOME 时同步替换单元里的 /opt/zeroproxy (见 install_units)
+mkdir -p "$SYSTEMD_DIR"
+install_units "$SRC_DIR"
 # 一键升级脚本: 随代码装到面板目录, 供「程序更新」按钮与命令行共用
 if [ -f "$SRC_DIR/upgrade.sh" ]; then
   cp "$SRC_DIR/upgrade.sh" "$ZP_HOME/upgrade.sh"
@@ -395,7 +651,9 @@ fi
 if [ -f "$SRC_DIR/uninstall.sh" ]; then
   cp "$SRC_DIR/uninstall.sh" "$ZP_HOME/uninstall.sh"
 fi
-rm -rf /tmp/zp.tar.gz /tmp/zp-src
+rm -rf /tmp/zp.tar.gz /tmp/zp-src /tmp/zp.SHA256SUMS
+# $ZP_HOME 可能是 0700 的 data: 确保 nginx worker 能读 www/static (静态资源 & ACME)
+chmod 755 "$ZP_HOME" "$ZP_HOME/www" "$ZP_HOME/static" 2>/dev/null || true
 ok "面板核心已就位 ($(basename "$ZP_REPO") @ ${ZP_REF_RESOLVED:-本地目录})"
 
 info "创建 Python 虚拟环境并安装依赖 ..."
@@ -607,6 +865,15 @@ fi
 systemctl restart xray hysteria2 zeroproxy || true
 systemctl enable certbot.timer 2>/dev/null || true
 
+# 证书续期钩子 (P2-1): certbot 用 --webroot 签发, 自动续期**不会**自己 reload ——
+# 没有这个钩子, 90 天后续期成功而 nginx / Xray 仍用旧证书, 客户端报证书过期。
+# 内容与 upgrade.sh / 面板 services.install_cert 落的那份保持一致。
+if install_le_hook; then
+  ok "证书续期钩子已就位 ($LETSENCRYPT_DIR/renewal-hooks/deploy/zeroproxy-reload.sh)"
+else
+  warn "证书续期钩子写入失败 ($LETSENCRYPT_DIR) —— 续期后请手动: systemctl reload nginx && systemctl restart xray"
+fi
+
 # ---------------- 9. 防火墙 ----------------
 if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
   ufw allow 80/tcp >/dev/null
@@ -618,8 +885,17 @@ if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active
   ufw allow 30001:32001/udp >/dev/null   # Hysteria 2 + 端口跳跃
   ufw allow 51820/udp >/dev/null         # 原生 WireGuard
   ok "防火墙已放行 80/443/$PANEL_PORT/8443/8444/8445/tcp, 30001-32001/udp, 51820/udp"
+elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+  # firewalld 不在本脚本的自动处理范围内, 但至少把**可执行的命令**给出来 (F-10)
+  warn "检测到 firewalld (本脚本只自动配置 ufw)。请执行以下命令放行:"
+  printf '    firewall-cmd --permanent --add-port=80/tcp --add-port=443/tcp --add-port=%s/tcp\n' "$PANEL_PORT"
+  printf '    firewall-cmd --permanent --add-port=8443/tcp --add-port=8444/tcp --add-port=8445/tcp\n'
+  printf '    firewall-cmd --permanent --add-port=30001-32001/udp --add-port=51820/udp\n'
+  printf '    firewall-cmd --reload\n'
+  warn "云厂商安全组也要放行同样的 TCP/UDP 端口"
 else
   warn "请确认防火墙/安全组放行: 80,443,$PANEL_PORT,8443,8444,8445 (TCP) 与 30001-32001,51820 (UDP)"
+  warn "(nftables / iptables 用户请用 nft/iptables 自行放行; 面板侧的自动放行只覆盖 ufw)"
 fi
 
 # ---------------- 9b. 第一跳自检 (链接现在就通吗) ----------------
@@ -666,6 +942,19 @@ else
   PANEL_URL="http://${SERVER_IP}/"
   PANEL_URL_TLS="https://${SERVER_IP}:$PANEL_PORT/"
 fi
+# P2-11: 引导令牌只进终端, **不落 install.log**。detach 模式下 stdout 就是日志文件 ——
+# 那种情况打印打码链接, 完整链接单独写进 0600 的 bootstrap_urls, 由前台会话读出来打到终端
+# (前台 Tail 会话退出后, 管理员也能 cat 这个文件拿到链接; 初始化成功后它随令牌一起失效)。
+if [ -n "$ZP_TOKEN" ] && [ ! -t 1 ]; then
+  mkdir -p "$ZP_HOME/data"
+  {
+    printf '  初始化页:  %s\n' "$PANEL_URL"
+    printf '  备用地址:  %s\n' "$PANEL_URL_TLS"
+  } > "$ZP_HOME/data/bootstrap_urls"
+  chmod 600 "$ZP_HOME/data/bootstrap_urls"
+  PANEL_URL="http://${SERVER_IP}/?token=***"
+  PANEL_URL_TLS="https://${SERVER_IP}:$PANEL_PORT/?token=***"
+fi
 ok "=============================================="
 ok "  ZeroProxy 部署完成!"
 ok "  初始化页:  $PANEL_URL"
@@ -673,8 +962,12 @@ ok "  (80 端口明文 HTTP —— 打开就是初始化页, 没有证书警告,
 ok "  备用地址:  $PANEL_URL_TLS"
 ok "  (面板自签证书, 浏览器会提示不安全, 点「继续访问」; 80 被占用 / 被拦时用它)"
 ok "  打开链接 → 输入 域名/用户名/密码 → 一键生成"
-ok "  完成后请改用 https://<你的域名>:$PANEL_PORT 访问面板 (真实证书, 无警告)"
+ok "  完成后请改用 https://<你的域名>/panel/ 访问面板 (标准 443, 真实证书, 无警告)"
 ok "=============================================="
+if [ -n "$ZP_TOKEN" ] && [ -f "$ZP_HOME/data/bootstrap_urls" ]; then
+  echo "  日志里的 token 已打码; 完整初始化链接在 $ZP_HOME/data/bootstrap_urls (0600),"
+  echo "  前台会话结束时也会打印一次 (初始化成功后该文件随令牌一起失效)。"
+fi
 if [ -n "$ZP_TOKEN" ]; then
   echo "  ⚠ 上面的 ?token=... 是初始化引导令牌, 只可使用一次;"
   echo "    请勿转发给他人 — 拿到它的人可以先完成初始化。"

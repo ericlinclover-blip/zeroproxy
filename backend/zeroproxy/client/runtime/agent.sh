@@ -215,6 +215,22 @@ json_get_bool() {
     fi
 }
 
+# curl/uclient-fetch 的"证书类错误"判据 (与 CLI 里那一份同一个口径)。
+zp_tls_rc() {
+    case "${1:-}" in
+        35|51|58|59|60|64|66|77|80|83|90|91) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+# 证书降级告警: 只做一次, 且必须说清是降级 —— 旧版这里对 uclient-fetch 直接
+# `--no-check-certificate`, 等于把 TLS 从信任锚降成"尽力而为" (P1-3)。
+ZP_TLS_WARNED=""
+zp_tls_warn() {
+    [ "$ZP_TLS_WARNED" = "1" ] && return 0
+    ZP_TLS_WARNED=1
+    log "面板证书校验没通过 ($2) —— 本次改为不校验继续 (降级, 不是正常路径)"
+}
+
 http_post() {
     # 心跳 (/c/report) 专用。它是**幂等**的 —— 报两次"我还活着"没有任何副作用, 所以丢包
     # 值得重试: 真机上这条路的四成 SYN 是被丢掉的, 只发一次的话面板上这台设备会一直在
@@ -222,24 +238,57 @@ http_post() {
     #
     # 装机时那个 POST (/c/pair) **故意不在这里**: 它要用掉一个一次性配对码, 重放等于赌
     # "第一次其实没生效" —— 那条路见安装脚本里的 http_post (不重试)。
-    _url="$1"; _body="$2"
+    #
+    # 第 3 个参数是设备 secret: 给了就先发 `Authorization: Bearer` (新面板路径,
+    # secret 不进 URL); 旧面板不认头 (4xx) 时自动退回"只发正文" (正文里的 k 旧面板要)。
+    _url="$1"; _body="$2"; _sec="${3:-}"
     _tries=0
     while :; do
         _tries=$((_tries + 1))
         _rc=1
         if command -v curl >/dev/null 2>&1; then
-            if curl -fsS -m 20 -H 'Content-Type: application/json' --data "$_body" "$_url" 2>/dev/null; then
+            _hdr=""; [ -n "$_sec" ] && _hdr="Authorization: Bearer $_sec"
+            if [ -n "$_hdr" ]; then
+                if curl -fsS -m 20 -H 'Content-Type: application/json' -H "$_hdr" \
+                    --data "$_body" "$_url" 2>/dev/null; then _rc=0; else _rc=$?; fi
+            elif curl -fsS -m 20 -H 'Content-Type: application/json' \
+                --data "$_body" "$_url" 2>/dev/null; then
                 _rc=0
             else
                 _rc=$?
-                if [ "$_rc" = "60" ] && curl -fsSk -m 20 -H 'Content-Type: application/json' --data "$_body" "$_url" 2>/dev/null; then
+            fi
+            if [ "$_rc" != "0" ] && zp_tls_rc "$_rc"; then
+                zp_tls_warn "$_url" "curl $_rc"
+                if [ -n "$_hdr" ]; then
+                    if curl -fsSk -m 20 -H 'Content-Type: application/json' -H "$_hdr" \
+                        --data "$_body" "$_url" 2>/dev/null; then _rc=0; fi
+                elif curl -fsSk -m 20 -H 'Content-Type: application/json' \
+                    --data "$_body" "$_url" 2>/dev/null; then
                     _rc=0
                 fi
             fi
-        elif uclient-fetch -q --no-check-certificate -O - --post-data "$_body" "$_url" 2>/dev/null; then
-            _rc=0
-        elif wget -q --no-check-certificate -O - --post-data "$_body" "$_url" 2>/dev/null; then
-            _rc=0
+            # 旧面板: 不认 Bearer 时把正文原样再发一次 (正文里带 k)
+            if [ "$_rc" = "22" ] && [ -n "$_sec" ]; then
+                if curl -fsS -m 20 -H 'Content-Type: application/json' \
+                    --data "$_body" "$_url" 2>/dev/null; then _rc=0; fi
+            fi
+        else
+            _errf="$(mktemp /tmp/.zp-agent-tls.XXXXXX 2>/dev/null || echo /tmp/.zp-agent-tls.$$)"
+            for _tool in uclient-fetch wget; do
+                command -v "$_tool" >/dev/null 2>&1 || continue
+                if "$_tool" -q -T 20 -O - --post-data "$_body" "$_url" 2>"$_errf"; then
+                    _rc=0
+                elif grep -Eqi 'ssl|tls|certificate|cert verify|x509' "$_errf" 2>/dev/null; then
+                    # 只有 stderr 明确是 TLS/证书类时才降级一次
+                    zp_tls_warn "$_url" "$_tool 证书校验失败"
+                    if "$_tool" -q --no-check-certificate -T 20 -O - \
+                        --post-data "$_body" "$_url" 2>/dev/null; then
+                        _rc=0
+                    fi
+                fi
+                break
+            done
+            rm -f "$_errf"
         fi
         [ "$_rc" = "0" ] && return 0
         [ "$_rc" != "22" ] || return "$_rc"     # HTTP 层面失败 (403/404…): 面板已明确答复
@@ -267,14 +316,26 @@ http_get() {
                 _rc=0
             else
                 _rc=$?
-                if [ "$_rc" = "60" ] && _out="$(curl -fsSk -m 10 "$1" 2>/dev/null)"; then
-                    _rc=0
+                # 只有证书类错误才降级一次 (旧版只认 60, 而 35/51/58/77 同样是 TLS 层失败)
+                if zp_tls_rc "$_rc"; then
+                    zp_tls_warn "$1" "curl $_rc"
+                    if _out="$(curl -fsSk -m 10 "$1" 2>/dev/null)"; then _rc=0; fi
                 fi
             fi
-        elif command -v uclient-fetch >/dev/null 2>&1; then
-            if _out="$(uclient-fetch -q --no-check-certificate -O - "$1" 2>/dev/null)"; then _rc=0; fi
         else
-            if _out="$(wget -q --no-check-certificate -O - "$1" 2>/dev/null)"; then _rc=0; fi
+            # 没有 curl: 先按默认 (校验) 跑, 只有 stderr 明确是证书类才降级一次。
+            _egt="$(mktemp /tmp/.zp-agent-tls.XXXXXX 2>/dev/null || echo /tmp/.zp-agent-tls.$$)"
+            for _tool in uclient-fetch wget; do
+                command -v "$_tool" >/dev/null 2>&1 || continue
+                if _out="$("$_tool" -q -O - "$1" 2>"$_egt")"; then
+                    _rc=0
+                elif grep -Eqi 'ssl|tls|certificate|cert verify|x509' "$_egt" 2>/dev/null; then
+                    zp_tls_warn "$1" "$_tool 证书校验失败"
+                    if _out="$("$_tool" -q --no-check-certificate -O - "$1" 2>/dev/null)"; then _rc=0; fi
+                fi
+                break
+            done
+            rm -f "$_egt"
         fi
         if [ "$_rc" = "0" ]; then printf '%s' "$_out"; return 0; fi
         [ "$_rc" != "22" ] || return "$_rc"
@@ -305,10 +366,30 @@ http_get() {
 http_get_file() {
     _tmo="${2:-600}"
     if command -v curl >/dev/null 2>&1; then
-        curl -fsS -m "$_tmo" "$1" 2>/dev/null || curl -fsSk -m "$_tmo" "$1" 2>/dev/null
-    else uclient-fetch -q --no-check-certificate -T "$_tmo" -O - "$1" 2>/dev/null \
-        || wget -q --no-check-certificate -T "$_tmo" -O - "$1" 2>/dev/null
+        # 先校验证书; 只有证书类错误 (curl 35/51/…/60) 才降级一次并说出来。
+        if curl -fsS -m "$_tmo" "$1" 2>/dev/null; then return 0; fi
+        _rgf=$?
+        if zp_tls_rc "$_rgf"; then
+            zp_tls_warn "$1" "curl $_rgf"
+            curl -fsSk -m "$_tmo" "$1" 2>/dev/null && return 0
+        fi
+        return "$_rgf"
     fi
+    # 没有 curl: 先按默认 (校验) 跑, 只有 stderr 明确是证书类才降级一次。
+    _egf="$(mktemp /tmp/.zp-agent-get.XXXXXX 2>/dev/null || echo /tmp/.zp-agent-get.$$)"
+    for _tool in uclient-fetch wget; do
+        command -v "$_tool" >/dev/null 2>&1 || continue
+        if "$_tool" -q -T "$_tmo" -O - "$1" 2>"$_egf"; then rm -f "$_egf"; return 0; fi
+        if grep -Eqi 'ssl|tls|certificate|cert verify|x509' "$_egf" 2>/dev/null; then
+            zp_tls_warn "$1" "$_tool 证书校验失败"
+            if "$_tool" -q --no-check-certificate -T "$_tmo" -O - "$1" 2>/dev/null; then
+                rm -f "$_egf"; return 0
+            fi
+        fi
+        break
+    done
+    rm -f "$_egf"
+    return 1
 }
 
 # 内核是否在跑 —— 这是要上报给面板的 actual。
@@ -589,6 +670,11 @@ caps_flag() {
 LAST_REV=""
 LAST_PULL=0
 FAILS=0
+#: "已应用版本" (面板的 applied_rev)。**只有 apply_config 成功** (配置校验通过 + 落盘)
+#: 才写它 —— 下载 ≠ 应用。面板据此区分"已下载未应用/已应用" (P2-9): 以前面板把
+#: "把订阅发给了设备"当成"设备已经在用", 于是升级后界面永远显示已应用。
+#: 落盘是为了 agent 重启后还能如实回答, 不必等下一次配置变更。
+APPLIED_REV="$(cat "$ZP_DIR/applied.rev" 2>/dev/null | tr -d '\r\n')"
 # 修复3: 心跳状态机 —— 稳定/不稳定
 HEARTBEAT_STATE="unstable"  # unstable | stable
 # 稳定计数: 连续 N 轮无变更才进入稳定态
@@ -678,8 +764,13 @@ while true; do
         if proxy_up; then BODY="$BODY"',"actual":true'; else BODY="$BODY"',"actual":false'; fi
         [ -n "$UI_URL_REPORT" ] && BODY="$BODY"',"ui":"'"$UI_URL_REPORT"'"'
         [ -n "$LAST_REV" ] && BODY="$BODY"',"rev":"'"$LAST_REV"'"'
+        # 已应用版本 + 数据面健康 (P2-9): 面板只在设备**显式**报这两个时才推进
+        # applied_rev (下载不算应用)。applied 由 apply_config 成功时写下; healthy 只在
+        # 代理真的在提供 (core/dae 在跑) 时为 true —— 不拿"配置写好了"冒充健康。
+        [ -n "$APPLIED_REV" ] && BODY="$BODY"',"applied_rev":"'"$APPLIED_REV"'"'
+        if proxy_up; then BODY="$BODY"',"healthy":true'; fi
         BODY="$BODY"',"report":'"$(report_fields_json)"'}'
-        RESP="$(http_post "$_b/c/report" "$BODY" || true)"
+        RESP="$(http_post "$_b/c/report" "$BODY" "$_k" || true)"
         if [ -z "$RESP" ]; then
             FAILS=$((FAILS + 1))
             continue
@@ -770,6 +861,14 @@ while true; do
             LAST_REV="$REV"
             LAST_PULL="$_now"
             _config_changed=1
+            # 配置已校验通过并落盘 —— 这才是"已应用"。下次心跳把它显式报给面板
+            # (applied_rev), 面板才把设备卡从"已下载未应用"推进到"已应用" (P2-9)。
+            if [ -n "$REV" ]; then
+                APPLIED_REV="$REV"
+                umask 077
+                printf '%s\n' "$APPLIED_REV" > "$ZP_DIR/applied.rev" 2>/dev/null || true
+                umask 022
+            fi
         fi
     fi
 

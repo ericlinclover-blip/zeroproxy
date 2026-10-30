@@ -52,7 +52,9 @@ export function renderUpdate() {
       )})。<br><span class="muted">面板本身仍可用; 需要升级时可在服务器上执行 README 里的一键升级命令。</span></span></div>`
     );
   }
-  if (last.state) lines.push(updateResultHtml(u, last));
+  // 结果卡单独包一层 (#update-result): 上面"无法访问远端版本源"那条 info banner 也是
+  // `.banner`, 不分开的话"结果卡是不是绿的/红的"会被第一条 banner 抢先答错。
+  if (last.state) lines.push(`<div id="update-result">${updateResultHtml(u, last)}</div>`);
   else if (!u.check_ok) {
     lines.push(`<div class="note">还没跑过升级。</div>`);
   }

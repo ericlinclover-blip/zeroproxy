@@ -1,5 +1,5 @@
 [Unit]
-Description=ZeroProxy Panel (FastAPI; 仅回环 127.0.0.1:9900, 由 nginx 在 8899 终结 TLS 反代)
+Description=ZeroProxy Panel (FastAPI; 仅回环 127.0.0.1:9900, 由 nginx 在 443 /panel/ 与 8899 终结 TLS 反代)
 After=network-online.target nginx.service xray.service hysteria2.service
 Wants=network-online.target
 
@@ -11,6 +11,26 @@ ExecStart=/opt/zeroproxy/venv/bin/python -m zeroproxy.main
 Restart=always
 RestartSec=2
 LimitNOFILE=65536
+
+# ---- 沙箱与资源上限 (P2-13) ----
+# 面板需要 root (systemctl / certbot / 写 /etc/nginx), 所以**不降 User** —— 降权会让
+# 既有部署的文件属主/权限全部坏死。这里只收紧它**能碰到的文件系统与资源**:
+#   * ProtectSystem=strict: 除下面 ReadWritePaths 之外的 /usr /boot /etc 全部只读
+#   * 写入白名单: 自己的 ZP_HOME、nginx 配置与运行目录、Let's Encrypt 目录、
+#     ufw 规则、/run。nginx -t 启动时会写 /var/log/nginx 的 error log, 不在白名单里
+#     的话"配置校验"会因写不了日志而失败。
+#   * apt/pip 装系统包不在白名单里: 面板在线升级走 systemd-run 独立单元;
+#     WireGuard 缺系统包时用 install.sh 或手工 apt-get 安装 (见 README 安全模型)。
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/zeroproxy /etc/nginx /var/log/nginx /var/lib/nginx /var/cache/nginx /etc/letsencrypt /var/lib/letsencrypt /var/log/letsencrypt /etc/ufw /var/lib/ufw /run
+PrivateTmp=yes
+ProtectHome=read-only
+# 注意: 不能开 ProtectKernelTunables —— WireGuard 的 NAT 脚本要写
+# /proc/sys/net/ipv4/ip_forward, 那属于面板的代跑动作。
+ProtectControlGroups=yes
+MemoryMax=1G
+TasksMax=512
 
 [Install]
 WantedBy=multi-user.target

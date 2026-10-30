@@ -40,6 +40,9 @@ ZP_MIXED=7890
 TUN_DEV="${ZP_TUN_DEV:-/dev/net/tun}"
 
 TLS_OPTS=""
+#: 最近一次 GET 的响应头落在这里 (http_get 的 curl 分支写)。面板下发的 X-ZP-Sha256
+#: 从它里面取 —— 装机件也是要 root 落盘/执行的东西, 一样要过摘要闸门。
+HDRS="${TMPDIR:-/tmp}/.zp-http-hdrs.$$"
 ARCH=""
 #: 最近一次带状态码的请求结果 (http_fetch_to 会写它)
 HTTP_CODE=""
@@ -134,13 +137,36 @@ detect_http() {
     return 1
 }
 
-# 面板默认用真实证书 (Let's Encrypt); 若用户还在 IP/自签阶段, 第一次请求会因
-# 证书校验失败 —— 这时回退到"跳过校验"并明确告警, 而不是让安装卡在一个
-# 用户看不懂的 SSL 错误上。
+# 面板默认用真实证书 (Let's Encrypt); 若用户还在 IP/自签阶段, 第一次请求会因证书校验
+# 失败。**只有这一种情况**才回退到"跳过校验", 而且要明确告警 (P1-3):
+#
+#   * 旧版这里是"任何失败都降级, 并在本次安装内永久 insecure" —— 一次临时丢包 / 一次
+#     DNS 污染就能让整段安装(内核、runtime、zpcore 全由 root 落盘执行)退出证书校验;
+#   * 超时 / 丢包 / 面板明确拒绝 都不是证书问题, 降级解决不了它们, 只会把
+#     "面板还没配好证书"与"链路在丢包"混成同一件事 —— 而后者在真机链路上占四成。
+#
+# 判据: curl 走退出码 (35/51/58/59/60/64/66/77/80/83/90/91); 没有 curl 的固件看一次
+# uclient-fetch/wget 的 stderr, 只有明确是 SSL/TLS/证书类才降级。
+TLS_WHY=""
 http_probe() {
     _url="$1"
-    if http_get "$_url" >/dev/null 2>&1; then return 0; fi
+    http_get "$_url" >/dev/null 2>&1 && return 0
+    _rc=$?
+    _tls_bad=0
+    if [ "$HTTP" = "curl" ]; then
+        case "$_rc" in
+            35|51|58|59|60|64|66|77|80|83|90|91) _tls_bad=1 ;;
+        esac
+    else
+        _pe="$(mktemp /tmp/.zp-probe.XXXXXX 2>/dev/null || echo /tmp/.zp-probe.$$)"
+        "$HTTP" -q -T 10 -O /dev/null "$_url" >/dev/null 2>"$_pe" || true
+        grep -Eqi 'ssl|tls|certificate|cert verify|x509' "$_pe" 2>/dev/null && _tls_bad=1
+        rm -f "$_pe"
+    fi
+    [ "$_tls_bad" = "1" ] || return "$_rc"
     TLS_OPTS="insecure"
+    TLS_WHY="面板证书校验没通过 (可能还在自签证书阶段)"
+    warn "$TLS_WHY —— 本次安装改为不校验继续。这是降级: 装好后请给面板配一张正式证书。"
     http_get "$_url" >/dev/null 2>&1
 }
 
@@ -163,10 +189,12 @@ http_get() {
         _out=""
         case "$HTTP" in
             curl)
+                # -D: 把响应头留下 —— /c/rt/<name> 这些装机件的 X-ZP-Sha256 在里面。
+                # 落在 /tmp: 这条函数在写 dir 之前就会被调用 (http_probe), 不能依赖 ${ZP_DIR}。
                 if [ "$TLS_OPTS" = "insecure" ]; then
-                    if _out="$(curl -fsSk -m 10 "$1")"; then _rc=0; else _rc=$?; fi
+                    if _out="$(curl -fsSk -D "$HDRS" -m 10 "$1")"; then _rc=0; else _rc=$?; fi
                 else
-                    if _out="$(curl -fsS -m 10 "$1")"; then _rc=0; else _rc=$?; fi
+                    if _out="$(curl -fsS -D "$HDRS" -m 10 "$1")"; then _rc=0; else _rc=$?; fi
                 fi ;;
             *)
                 if [ "$TLS_OPTS" = "insecure" ]; then
@@ -256,19 +284,21 @@ http_fetch_to() {
     _url="$1"; _dest="$2"; _tmo="${3:-900}"; _min_kbps="${4:-0}"; _win="${5:-25}"
     HTTP_CODE=""
     _speed=""
+    rm -f "$_dest.hdr"
     if [ "${_min_kbps:-0}" -gt 0 ] 2>/dev/null; then
         _speed="--speed-limit $((_min_kbps * 1024)) --speed-time $_win"
     fi
     # -L 不能少: GitHub 官方直链会 302 到 objects.githubusercontent.com, 有的反代也会跳。
     # 不跟随重定向的话, 拿到的只是那几十字节的跳转页 —— 大小闸门会把它当"面板的一句话"。
+    # -D "$_dest.hdr": 把响应头留下来 —— 面板下发的 X-ZP-Sha256 在那里 (供应链校验用)。
     case "$HTTP" in
         curl)
             if [ "$TLS_OPTS" = "insecure" ]; then
                 # shellcheck disable=SC2086
-                if HTTP_CODE="$(curl -sSkL -m "$_tmo" $_speed -o "$_dest" -w '%{http_code}' "$_url" 2>/dev/null)"; then _rc=0; else _rc=1; fi
+                if HTTP_CODE="$(curl -sSkL -D "$_dest.hdr" -m "$_tmo" $_speed -o "$_dest" -w '%{http_code}' "$_url" 2>/dev/null)"; then _rc=0; else _rc=1; fi
             else
                 # shellcheck disable=SC2086
-                if HTTP_CODE="$(curl -sSL -m "$_tmo" $_speed -o "$_dest" -w '%{http_code}' "$_url" 2>/dev/null)"; then _rc=0; else _rc=1; fi
+                if HTTP_CODE="$(curl -sSL -D "$_dest.hdr" -m "$_tmo" $_speed -o "$_dest" -w '%{http_code}' "$_url" 2>/dev/null)"; then _rc=0; else _rc=1; fi
             fi
             [ -n "$HTTP_CODE" ] || HTTP_CODE="000"
             # curl 自己的退出码也要认: `-m` 到点被掐断时它**照样会打出 200** (响应头早
@@ -287,6 +317,41 @@ http_fetch_to() {
                 "$HTTP" -q -T "$_tmo" -O "$_dest" "$_url" >/dev/null 2>&1
             fi
             ;;
+    esac
+}
+
+# 面板下发的摘要 (响应头 X-ZP-Sha256) 与本地文件的 sha256 比对。
+# 返回: 0=一致 / 1=不一致(调用方必须丢弃) / 2=面板没下发头(旧面板, 调用方告警后继续)
+#       3=本机没有 sha256 工具(告警后继续)
+# 为什么必须比对: /c/bin、/c/agent/bin、/c/rt 里发来的字节会被**以 root 落盘/执行**,
+# 而面板自己的上游是 GitHub + 一串公共反代 —— 只验体积 (旧的 MIN_BYTES) 挡不住换成
+# 同样大小的另一份二进制 (P1-2)。
+zp_verify_sha() {  # <文件> <响应头文件> <说明>
+    _vsha_want=""
+    if [ -s "$2" ]; then
+        _vsha_want="$(tr -d '\r' < "$2" | grep -i '^[[:space:]]*X-ZP-Sha256[[:space:]]*:' \
+            | head -n1 | sed 's/^[^:]*:[[:space:]]*//')"
+    fi
+    [ -n "$_vsha_want" ] || return 2
+    if command -v sha256sum >/dev/null 2>&1; then
+        _vsha_have="$(sha256sum "$1" 2>/dev/null | cut -d' ' -f1)"
+    elif command -v sha256 >/dev/null 2>&1; then
+        _vsha_have="$(sha256 -q "$1" 2>/dev/null)"
+    else
+        return 3
+    fi
+    if [ -z "$_vsha_have" ] || [ "$_vsha_have" != "$_vsha_want" ]; then
+        warn "$3 的 sha256 与面板下发值不一致 (${_vsha_have:-?} != $_vsha_want) —— 丢弃"
+        return 1
+    fi
+    return 0
+}
+
+# 拿不到摘要头时的那句话。旧面板没有这个头 —— 行为与以前一致 (继续), 但绝不静默。
+zp_sha_note() {  # <说明> <返回码>
+    case "$2" in
+        2) note "$1: 面板没有下发 X-ZP-Sha256 (旧面板) —— 本次只过了体积/内容闸门" ;;
+        3) warn "$1: 本机没有 sha256 工具 —— 无法比对面板下发的摘要" ;;
     esac
 }
 
@@ -1039,6 +1104,16 @@ btf_from_panel() {
         progress_note "面板正在准备内核 BTF 包 (内核 $KERNEL · $_a)…"
         # 面板那一侧有硬上限 (ZP_BTF_DEADLINE, 默认 90 秒); 这里给足余量。
         if http_fetch_to "$_url" "$_tmp" 180 0 && btf_plausible "$_tmp"; then
+            # 这个包会被 `apk/opkg install` 以 root 装上 —— 摘要对不上就换下一个架构候选。
+            _sha_rc=0
+            zp_verify_sha "$_tmp" "$_tmp.hdr" "内核 BTF 包" || _sha_rc=$?
+            if [ "$_sha_rc" = "1" ]; then
+                _err="面板下发的 BTF 包摘要对不上 —— 拒绝安装"
+                rm -f "$_tmp" "$_tmp.hdr"
+                continue
+            fi
+            zp_sha_note "内核 BTF 包" "$_sha_rc"
+            rm -f "$_tmp.hdr"
             _got=1
             break
         fi
@@ -2120,7 +2195,21 @@ snapshot_baseline() {
 runtime_put() {  # $1=名字  $2=落盘路径  $3=期望的首字符 ('' = 只要非空)  $4=可执行 (1=是)
     _name="$1"; _dst="$2"; _want="$3"; _exec="$4"
     _tmp="$ZP_DIR/.rt.$$.$_name"
+    _rt_ok=0
     if http_get "$ZP_BASE/c/rt/$_name" > "$_tmp" && [ -s "$_tmp" ]; then
+        # 供应链闸门: 这份文件下一步要以 root 落盘 (CLI/init 还会被执行)。面板下发的
+        # X-ZP-Sha256 与它不一致 → 丢弃。注意"取不到摘要头"时不能静默: 那是旧面板
+        # (行为与以前一致), 由 zp_sha_note 说出来。
+        _sha_rc=0
+        zp_verify_sha "$_tmp" "$HDRS" "装机件 $_name" || _sha_rc=$?
+        if [ "$_sha_rc" = "1" ]; then
+            rm -f "$_tmp"
+        else
+            zp_sha_note "装机件 $_name" "$_sha_rc"
+            _rt_ok=1
+        fi
+    fi
+    if [ "$_rt_ok" = "1" ]; then
         # 只替两个占位符: 版本号 (面板那边已经替过, 这里兜底) 与局域网接口名 (机器相关)。
         # 装机件里写的安装目录 (/etc/zeroproxy 那几个) 就是这台机器要用的那一个 —— 不在这里
         # 再改一次。
@@ -2165,8 +2254,18 @@ runtime_dest() {
 runtime_from_bundle() {
     _b="$ZP_DIR/.rt.tar.gz"
     _stage="$ZP_DIR/.rt.stage"
-    http_fetch_to "$ZP_BASE/c/rt/bundle" "$_b" 120 0 || { rm -f "$_b"; return 1; }
-    [ -s "$_b" ] || { rm -f "$_b"; return 1; }
+    http_fetch_to "$ZP_BASE/c/rt/bundle" "$_b" 120 0 || { rm -f "$_b" "$_b.hdr"; return 1; }
+    [ -s "$_b" ] || { rm -f "$_b" "$_b.hdr"; return 1; }
+    # 供应链闸门: 这一包里就是下一步要以 root 落盘/执行的 CLI 与 init 脚本,
+    # 面板下发的 X-ZP-Sha256 与它不一致就整包丢弃 (逐件取那条路仍是兜底)。
+    _sha_rc=0
+    zp_verify_sha "$_b" "$_b.hdr" "运行时装机件包" || _sha_rc=$?
+    if [ "$_sha_rc" = "1" ]; then
+        rm -f "$_b" "$_b.hdr"
+        return 1
+    fi
+    zp_sha_note "运行时装机件包" "$_sha_rc"
+    rm -f "$_b.hdr"
     rm -rf "$_stage"; mkdir -p "$_stage"
     # busybox 的 tar 绝大多数固件都有; 真没有 (或这份包坏了) 就退回逐个取 —— 那才是兜底,
     # 所以这里**不 die**。
@@ -2218,6 +2317,13 @@ write_files() {
     printf '%s' "$ZP_CLIENT_VERSION" > "$ZP_DIR/version"
     # 架构也落盘: CLI 的 `zeroproxy perf on` 要按它去面板取性能模式内核 (dae)。
     printf '%s' "$ARCH" > "$ZP_DIR/arch"
+    # 装机面板 = **更新源**。`zeroproxy update` 只认这个文件里的地址 (P1-4: 不认后来
+    # `zeroproxy add` 进来的服务器 —— 否则拿到界面令牌的人可以 drop 全部 → add 自己的
+    # 面板 → update, 让这台路由器 root 执行陌生脚本)。
+    umask 077
+    printf '%s\n' "$ZP_BASE" > "$ZP_DIR/panel.base"
+    umask 022
+    chmod 600 "$ZP_DIR/panel.base" 2>/dev/null || true
     # 运行时装机件 (live.sh / nft 规则 / 数据面脚本 / agent / CLI / init) 由面板分发 ——
     # 见 install_runtime。以前它们在这里用 heredoc 现场生成, 于是改不动也测不了。
     install_runtime
@@ -2328,11 +2434,22 @@ install_zpcore() {
     fi
     _size="$(wc -c < "$_tmp" 2>/dev/null | tr -d ' ' || true)"
     if [ "${_size:-0}" -lt "$ZPCORE_MIN_BYTES" ]; then
-        rm -f "$_tmp"
+        rm -f "$_tmp" "$_tmp.hdr"
         note "面板没有准备 $ARCH 这一档本地控制面 (可选件) —— 界面走原来的路径"
         if [ "$_have" = "1" ]; then ok "沿用本机已有的: $_old_ver"; fi
         return 0
     fi
+    # 供应链闸门 (P1-2): 面板下发的 X-ZP-Sha256 必须与这份字节一致。
+    _sha_rc=0
+    zp_verify_sha "$_tmp" "$_tmp.hdr" "本地控制面 (zpcore $ARCH)" || _sha_rc=$?
+    if [ "$_sha_rc" = "1" ]; then
+        rm -f "$_tmp" "$_tmp.hdr"
+        note "本地控制面摘要对不上面板下发值 —— 不落盘, 界面走原来的路径"
+        if [ "$_have" = "1" ]; then ok "沿用本机已有的: $_old_ver"; fi
+        return 0
+    fi
+    zp_sha_note "本地控制面 (zpcore)" "$_sha_rc"
+    rm -f "$_tmp.hdr"
     # gzip 判定只用 gzip -t (busybox 一定有) —— 与内核那一步同一条路, 同一套理由。
     if gzip -t "$_tmp" >/dev/null 2>&1; then
         if ! gzip -dc "$_tmp" > "$ZP_DIR/zpcore.new" 2>/dev/null; then

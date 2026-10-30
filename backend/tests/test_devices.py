@@ -3238,3 +3238,206 @@ def test_luci_cgi_reports_cli_failure_honestly():
     assert '{"ok":false,"error":"%s"}' in cgi_src, "退出码非 0 时必须返回 ok:false 和 error"
 
 
+
+
+# ---------------------------------------------------------------- 凭据不进 URL / 已下载≠已应用
+
+def test_device_endpoints_accept_authorization_bearer(client, configured):
+    """路由器 1.4.45+ 把 secret 放进 Authorization 头; ?k= 作为旧面板兼容继续可用。"""
+    _login(client)
+    device = _register(client, _pair_code(client)["code"])
+    auth = {"authorization": f"Bearer {device['secret']}"}
+
+    # 订阅: 头认证与 query 认证等价
+    by_header = client.get(f"/c/sub/{device['id']}", headers=auth)
+    by_query = client.get(f"/c/sub/{device['id']}?k={device['secret']}")
+    assert by_header.status_code == 200 and by_query.status_code == 200
+    assert by_header.text == by_query.text
+    assert client.get(f"/c/sub/{device['id']}?k=wrong").status_code == 403
+    assert client.get(
+        f"/c/sub/{device['id']}", headers={"authorization": "Bearer wrong"}
+    ).status_code == 403
+
+    # 心跳: 头里给 secret, body 里 k 留空
+    report = client.post(
+        "/c/report", json={"device": device["id"], "actual": True}, headers=auth
+    )
+    assert report.status_code == 200, report.text
+
+    # 性能模式 dae 配置
+    perf = client.get(f"/c/perf/config?id={device['id']}", headers=auth)
+    assert perf.status_code == 200
+    assert "proxy" in perf.text or "dae" in perf.text.lower()
+
+    # 测速靶子
+    bench = client.get(f"/c/bench/1?id={device['id']}", headers=auth)
+    assert bench.status_code == 200 and len(bench.content) == 1 << 20
+
+
+def test_download_only_advances_downloaded_rev_not_applied_rev(client, configured):
+    """P2-9: 下载订阅 ≠ 配置已应用。applied_rev 只由设备显式上报推进。"""
+    from zeroproxy import devices
+
+    _login(client)
+    device = _register(client, _pair_code(client)["code"])
+    rev = client.post("/c/report", json={"device": device["id"], "k": device["secret"]}).json()["rev"]
+
+    # 拉一次订阅: 只记 downloaded_rev
+    assert client.get(f"/c/sub/{device['id']}?k={device['secret']}").status_code == 200
+    item = client.get("/api/devices").json()["devices"]["items"][0]
+    assert item["downloaded_rev"] == rev
+    assert item["applied_rev"] == "", "下载不能把 applied_rev 推上去"
+
+    # 旧客户端只报 rev: 仍然不算已应用 (它只证明设备手里的最后一版)
+    client.post(
+        "/c/report",
+        json={"device": device["id"], "k": device["secret"], "rev": "old-rev"},
+    )
+    item = client.get("/api/devices").json()["devices"]["items"][0]
+    assert item["rev"] == "old-rev" and item["applied_rev"] == ""
+
+    # 新客户端显式上报 applied_rev → 推进
+    client.post(
+        "/c/report",
+        json={"device": device["id"], "k": device["secret"], "applied_rev": rev},
+    )
+    item = client.get("/api/devices").json()["devices"]["items"][0]
+    assert item["applied_rev"] == rev
+
+
+def test_healthy_report_counts_as_applied(client, configured):
+    """设备明确回报数据面健康时, 它报的 rev 才视为已应用。"""
+    _login(client)
+    device = _register(client, _pair_code(client)["code"])
+    rev = client.post("/c/report", json={"device": device["id"], "k": device["secret"]}).json()["rev"]
+    client.post(
+        "/c/report",
+        json={"device": device["id"], "k": device["secret"], "rev": rev, "healthy": True},
+    )
+    item = client.get("/api/devices").json()["devices"]["items"][0]
+    assert item["applied_rev"] == rev
+
+
+def test_distribution_endpoints_carry_sha256_headers(client, configured, tmp_path, monkeypatch):
+    """分发端点带摘要头, 路由器端落盘前可比对 (旧端缺失只警告不阻断)。"""
+    from zeroproxy import router_client
+
+    # 安装脚本: X-ZP-Install-Sha256 = 下发脚本文本的 sha256
+    for path in ("/c/install.sh",):
+        res = client.get(path)
+        assert res.status_code == 200
+        assert res.headers["x-zp-install-sha256"] == hashlib.sha256(res.content).hexdigest()
+
+    code = _pair_code(client)["code"]
+    res = client.get(f"/c/{code}")
+    assert res.headers["x-zp-install-sha256"] == hashlib.sha256(res.content).hexdigest()
+
+    # 内核二进制: X-ZP-Sha256 = 下发字节的 sha256
+    blob = tmp_path / "mihomo-arm64.gz"
+    payload = b"\x1f\x8b" + b"1" * 64
+    blob.write_bytes(payload)
+    monkeypatch.setattr(router_client, "core_ready", lambda arch: arch == "arm64")
+    monkeypatch.setattr(router_client, "core_file", lambda arch: str(blob))
+    got = client.get("/c/bin/arm64")
+    assert got.status_code == 200
+    assert got.headers["x-zp-sha256"] == hashlib.sha256(payload).hexdigest()
+
+    # 界面文件 / 运行时装机件: 同样带头
+    ui = client.get("/c/ui/app.js")
+    assert ui.status_code == 200
+    assert ui.headers["x-zp-sha256"] == hashlib.sha256(ui.content).hexdigest()
+    runtime = client.get("/c/rt/live.sh")
+    assert runtime.status_code == 200
+    assert runtime.headers["x-zp-sha256"] == hashlib.sha256(runtime.content).hexdigest()
+
+
+def test_register_at_capacity_does_not_burn_the_pair_code(client, configured, monkeypatch):
+    """设备数已满时不能白烧配对码 (P3-14)。"""
+    from zeroproxy import devices
+
+    _login(client)
+    from zeroproxy import config
+
+    monkeypatch.setattr(devices, "MAX_DEVICES", 0)
+    code = _pair_code(client)["code"]
+    res = client.post("/c/pair", json={"code": code, "kind": "router"})
+    assert res.status_code == 403
+    state = config.load_state()
+    assert devices.pair_code_live(state, code) is not None, "配对码不该被消费掉"
+
+
+def test_perf_config_template_goes_through_the_whitelist(client, configured):
+    """`?tpl=` 只认白名单, 未知值回退默认 —— 它会被拼进配置头部的注释行 (P3-16)。"""
+    _login(client)
+    device = _register(client, _pair_code(client)["code"])
+    ok = client.get(
+        f"/c/perf/config", params={"id": device["id"], "k": device["secret"], "tpl": "global"}
+    )
+    assert ok.status_code == 200
+    assert "# 分流模板: global" in ok.text
+
+    injected = client.get(
+        "/c/perf/config",
+        params={
+            "id": device["id"],
+            "k": device["secret"],
+            "tpl": "evil\nproxy {\n\tdial_mode: direct\n}",
+        },
+    )
+    assert injected.status_code == 200
+    assert "evil" not in injected.text, "未知模板值不许进配置"
+    assert "# 分流模板: smart" in injected.text  # 回退面板默认
+    assert "\nproxy {" not in injected.text
+
+
+def test_clean_ui_url_only_allows_lan_targets():
+    """设备上报的"打开管理界面"地址只接受局域网目标 (P3-15)。"""
+    from zeroproxy import devices
+
+    # 正常路径: 路由器 LAN 地址 + 界面令牌
+    lan = "http://192.168.8.1/cgi-bin/zeroproxy?k=" + "a" * 32
+    assert devices.clean_ui_url(lan) == lan
+    assert devices.clean_ui_url("http://10.0.0.2/zeroproxy")
+    assert devices.clean_ui_url("http://172.16.5.5/zeroproxy")
+    assert devices.clean_ui_url("http://127.0.0.1:8080/zeroproxy")
+    assert devices.clean_ui_url("http://router.local/zeroproxy")
+    assert devices.clean_ui_url("http://[fd00::1]/zeroproxy")
+    # 面板自己的域名 (设备经面板域名访问本机界面时) 是唯一允许的非私网主机
+    assert devices.clean_ui_url(
+        "https://proxy.example.com/zeroproxy", allowed_hosts=("proxy.example.com",)
+    )
+    # 钓鱼跳板: 外部域名 / 公网 IP / userinfo 伪装一律丢弃
+    assert devices.clean_ui_url("http://evil.example.com/zeroproxy?k=x") == ""
+    assert devices.clean_ui_url("http://203.0.113.5/zeroproxy") == ""
+    assert devices.clean_ui_url("http://192.168.1.1@evil.example.com/zeroproxy") == ""
+    assert devices.clean_ui_url("javascript:alert(1)") == ""
+    # 与来源同私网网段 = 正常管理访问
+    assert devices.clean_ui_url("http://192.168.1.50/zeroproxy", peer_ip="192.168.1.9")
+
+
+def test_reported_ui_url_cannot_point_at_a_phishing_host(client, configured):
+    """上报公网主机不会进面板视图 (但面板域名可以, 见上一测试的 allowed_hosts)。"""
+    _login(client)
+    device = _register(client, _pair_code(client)["code"])
+    good = "http://192.168.8.1/cgi-bin/zeroproxy?k=" + "a" * 32
+    client.post("/c/report", json={
+        "device": device["id"], "k": device["secret"], "actual": True, "ui": good,
+    })
+    assert client.get("/api/devices").json()["devices"]["items"][0]["ui"] == good
+
+    for bad in (
+        "http://evil.example.com/zeroproxy?k=deadbeef",
+        "http://203.0.113.5/zeroproxy",
+        "http://192.168.8.1@evil.example.com/zeroproxy",
+    ):
+        client.post("/c/report", json={
+            "device": device["id"], "k": device["secret"], "ui": bad,
+        })
+        assert client.get("/api/devices").json()["devices"]["items"][0]["ui"] == good, bad
+
+    # 面板自己的域名允许 (设备经域名反代访问本机界面)
+    panel_ui = f"https://{DOMAIN}/zeroproxy/?k=" + "b" * 32
+    client.post("/c/report", json={
+        "device": device["id"], "k": device["secret"], "ui": panel_ui,
+    })
+    assert client.get("/api/devices").json()["devices"]["items"][0]["ui"] == panel_ui

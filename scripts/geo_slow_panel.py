@@ -33,8 +33,15 @@ def slow_update(state, *, timeout=geodata.SOURCE_TIMEOUT, validate=True, deadlin
         time.sleep(SLOW / ticks)
         if progress is not None:
             progress(2 if i % 2 else 1, 3, "下载 geosite.dat" if i % 2 else "下载 geoip.dat")
-    _orig(state, timeout=timeout, validate=False, deadline=deadline, progress=progress)
-    return True, f"本地慢速桩 ({SLOW:.0f}s): 已就绪", geodata.status(state)
+    # 桩只负责"慢", **不负责"成功"**: 真实 update 的返回值必须原样透传。
+    # 以前这里丢弃返回值无条件返回 True —— 真 update 失败时前端仍会看到"已更新并生效",
+    # 于是 geo_slow_check 断言的是桩的成功, 而不是产品的行为 (假阳性)。
+    ok, msg, status = _orig(
+        state, timeout=timeout, validate=False, deadline=deadline, progress=progress
+    )
+    if ok:
+        return True, f"本地慢速桩 ({SLOW:.0f}s): {msg}", status
+    return False, f"本地慢速桩 ({SLOW:.0f}s): {msg}", status
 
 
 geodata.update = slow_update

@@ -14,13 +14,17 @@
     ZP_MIHOMO_BIN=/path/to/mihomo ZP_SINGBOX_BIN=/path/to/sing-box \
         python3 scripts/verify.py
 
-环境变量全部可选: 缺少哪个就跳过对应步骤 (面板本身的流程仍然会跑)。
+环境变量 (Xray / Hysteria / mihomo / sing-box 路径) 全部可选; 但**核心段被跳过时本脚本
+默认以非 0 退出**: 没有 Xray / Hysteria 的机器上, 以前它会打印几行"跳过"然后以 0 结束,
+看起来"全绿"而其实内核校验一段都没跑 —— 这正是本脚本最容易骗过 CI 的地方。
+允许跳过时显式加 `--allow-skip` (或 ZP_ALLOW_SKIP=1), 脚本仍会打印跳过清单。
     ZP_MIHOMO_GEO_DIR=/path/to/geo 里的 geosite.dat + geoip.metadb 会铺进 mihomo 的
     工作目录 —— 与真机上安装脚本做的事一致。不给它, mihomo 会自己去 GitHub 拉, 于是
     "配置能不能被内核吃下去"会变成"这个网络能不能连上 GitHub"。
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shutil
@@ -43,11 +47,19 @@ PASSWORD = "s3cretpass"
 TOKEN = "verify-token"
 
 results: list[tuple[str, bool, str]] = []
+#: 被跳过的核心段 (缺二进制等). 默认非 0 退出, 避免"跳过 = 全绿"的假象。
+skipped: list[tuple[str, str]] = []
 
 
 def record(name: str, ok: bool, detail: str = "") -> None:
     results.append((name, ok, detail))
     print(f"  {'✓' if ok else '✗'} {name}{(' — ' + detail) if detail else ''}")
+
+
+def skip(name: str, reason: str) -> None:
+    """记录并打印一次跳过; 收尾时汇总, 默认让进程以非 0 退出。"""
+    skipped.append((name, reason))
+    print(f"  - 跳过 {name} ({reason})")
 
 
 def last_line(text: str, fallback: str = "无输出") -> str:
@@ -220,7 +232,16 @@ def _live_singbox(binary: str, client, sub_path: str, home: Path) -> None:
         httpd.shutdown()
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="ZeroProxy 端到端验证 (真实内核二进制)")
+    parser.add_argument(
+        "--allow-skip",
+        action="store_true",
+        help="核心段因缺少内核二进制被跳过时仍以 0 退出 (默认非 0)",
+    )
+    args = parser.parse_args(argv)
+    allow_skip = args.allow_skip or os.environ.get("ZP_ALLOW_SKIP") == "1"
+
     home = Path(tempfile.mkdtemp(prefix="zp-verify-home-"))
     os.environ["ZP_HOME"] = str(home)
     os.environ["ZP_STATIC"] = str(BACKEND / "static")
@@ -478,7 +499,7 @@ def main() -> int:
             proc.terminate()
             proc.wait(timeout=10)
     else:
-        print("  - 跳过 (未提供 ZP_XRAY_BIN)")
+        skip("[4] 真 Xray 校验", "未提供 ZP_XRAY_BIN")
 
     print("\n[5] Hysteria 2")
     if hy_bin:
@@ -508,7 +529,7 @@ def main() -> int:
         conf = (home / "hysteria" / "config.yaml").read_text()
         record("端口跳跃多端口配置", '"0.0.0.0:30001,31001,32001"' in conf)
     else:
-        print("  - 跳过 (未提供 ZP_HYSTERIA_BIN)")
+        skip("[5] Hysteria 2 校验", "未提供 ZP_HYSTERIA_BIN")
 
     print("\n[6] 诊断与自愈")
     diag = client.get("/api/diagnose").json()
@@ -656,9 +677,15 @@ def main() -> int:
         apply_post("/api/apply")
 
     print("\n[8] 备份 / 恢复")
-    exported = client.get("/api/backup")
+    # P2-5: 导出改成 POST (有副作用的 GET 会被缓存/预取/爬虫带走); GET 已明确 405。
+    exported = client.post("/api/backup")
     payload = exported.json()
-    record("备份导出", exported.status_code == 200, f"{len(exported.content)} 字节")
+    record("备份导出 (POST)", exported.status_code == 200, f"{len(exported.content)} 字节")
+    record(
+        "GET /api/backup 已被拒绝 (405)",
+        client.get("/api/backup").status_code == 405,
+        "有副作用的导出只允许 POST",
+    )
     record("备份含校验和", bool(payload.get("checksum")), payload.get("checksum", "")[:16])
     record(
         "备份不含会话",
@@ -706,12 +733,17 @@ def main() -> int:
             )
         time.sleep(3)
         probe = client.get("/api/probe?force=1").json()
-        for item in probe["nodes"]:
-            record(
-                f"探测 {item['node']}",
-                bool(item["ok"]) or item["ok"] is None,
-                f"{item['detail']}" + (f" · {item['ms']}ms" if item["ms"] else ""),
-            )
+        if xray_bin or hy_bin:
+            for item in probe["nodes"]:
+                record(
+                    f"探测 {item['node']}",
+                    bool(item["ok"]) or item["ok"] is None,
+                    f"{item['detail']}" + (f" · {item['ms']}ms" if item["ms"] else ""),
+                )
+        else:
+            # 没有本地内核进程在跑时, "探测节点"必然全是 connection refused ——
+            # 那不是产品失败, 是这一节没条件跑。按跳过处理并计入跳过清单。
+            skip("[9] 连通性探测 (逐节点)", "未提供 ZP_XRAY_BIN / ZP_HYSTERIA_BIN")
         record("出站 RTT (Reality dest)", bool(probe["dest"]["ok"]), f"{probe['dest']['ms']}ms")
         if xray_bin:
             reality = next(n for n in probe["nodes"] if n["node"] == "vless-reality")
@@ -732,7 +764,7 @@ def main() -> int:
     # 客户端拿 B 的入站凭据连进去, 只有三跳全通才能读到出口 IP —— 任何一跳坏了
     # (Reality 密钥 / shortId / 专用 UUID / 路由规则) 都会变成"读不到 IP"。
     if not xray_bin:
-        print("  - 跳过 (未提供 ZP_XRAY_BIN)")
+        skip("[10] 链式代理端到端", "未提供 ZP_XRAY_BIN")
     else:
         import uuid as uuid_mod
 
@@ -869,12 +901,28 @@ def main() -> int:
     print(f"\n结论: {len(results) - len(failed)}/{len(results)} 项通过")
     if failed:
         print("未通过: " + ", ".join(failed))
+    if skipped:
+        print("跳过清单 (这些段没有被校验):")
+        for name, why in skipped:
+            print(f"  - {name}: {why}")
 
     if os.environ.get("ZP_KEEP_VERIFY_HOME") != "1":
         shutil.rmtree(home, ignore_errors=True)
     else:
         print(f"临时目录保留: {home}")
-    return 1 if failed else 0
+
+    if failed:
+        return 1
+    if skipped:
+        if allow_skip:
+            print("注意: 有核心段被跳过, 但 --allow-skip / ZP_ALLOW_SKIP=1 允许本次以 0 退出")
+            return 0
+        print(
+            "失败: 有核心段被跳过 (缺内核二进制), 不能当作\"全绿\"。\n"
+            "      提供 ZP_XRAY_BIN / ZP_HYSTERIA_BIN 后重跑; 明确接受跳过时加 --allow-skip。"
+        )
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

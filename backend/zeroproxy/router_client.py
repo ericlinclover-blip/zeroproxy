@@ -159,7 +159,12 @@ from .config import paths
 #: 1.4.42: 修复 VLESS Reality 与链式代理在 Clash Verge 等客户端超时: 补齐 packet-encoding: xudp, support-x25519mlkem768, fingerprint: chrome; 修复 Xray 顶层 DNS 与 UseIPv4 出站协同; 根除链式中转入站二次 Vision splice 冲突。
 #: 1.4.43: 公网入站禁用 TFO, 出站保留 TFO; 链式 Reality 全链路统一 flow=""。
 #: 1.4.44: 路由器有副作用动作只允许 POST, 页面同步改为 POST。
-SCRIPT_VERSION = "1.4.44"
+#: 1.4.45: 供应链与鉴权收口 —— ① CLI 恢复证书校验 (只在证书错误时降级一次并告警);
+#:         ② add 只在未配对/显式 --replace 时更换面板, update 的 base 固定为已配对面板;
+#:         ③ 设备凭据优先走 `Authorization: Bearer` (?k= 只作旧面板回退);
+#:         ④ 更新的 install.sh、内核/性能内核/运行时件按面板下发的 sha256 校验后再落盘;
+#:         ⑤ zpcore 1.3.2: LuCI 会话校验 username=root (或 ACL)、安全响应头、PATH_INFO 动作。
+SCRIPT_VERSION = "1.4.45"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"
@@ -403,6 +408,150 @@ def core_sha256(path: str) -> str:
     return value
 
 
+# ---------------------------------------------------------------- 供应链摘要
+# 面板是路由器的**信任根**: /c/bin、/c/agent/bin、/c/perf、/c/btf 发出去的字节会被路由器
+# 以 root 落盘/执行, 而它们的上游是 GitHub + 一串公共反代 —— 反代 / CDN 被投毒、自建反代
+# 失守, 就能把任意二进制送进用户家里 (P1-2)。只校验体积 (以前的 MIN_BYTES) 挡不住这个:
+# 换一份体积相同的二进制就绕过去了。所以每个上游资产都要有一个**独立于传输通道**的期望
+# 摘要:
+#
+#   * mihomo / dae: 固定值 —— 逐资产取自对应 GitHub release 发布页的官方 digest
+#     (v1.19.32 / v2.1.1, 2026-10 核对)。反代只能骗传输, 骗不了发布页上的期望值;
+#     版本一换就必须同步改表, 表里没有的版本走"警告 + 记录", 不假装校验过。
+#   * zpcore: 仓库里的 client/agent/dist/SHA256SUMS (scripts/build-agent.sh 生成),
+#     没有网络依赖 —— 它是我们自己的产物, 摘要跟着制品一起进仓库。
+#   * BTF: 上游 tag 是 latest (没有可固定的版本号), 用 release 附带的 SHA256SUMS / API
+#     资产的 digest 校验; 两者都拿不到时只放行并如实记录 (见 btf_fetch)。
+#
+# 不一致就**拒绝下发**: 路由器端看到的是"面板还没准备好", 而不是一份被替换过的 root 二进制。
+PINNED_SHA256: dict[str, str] = {
+    # ---- mihomo v1.19.32 (CORE_VERSION) · 官方 release 页面的 sha256 digest ----
+    "mihomo-linux-arm64-v1.19.32.gz":
+        "9dd862e28b46ff7d775f169cceebc28deccaa0a9e804237d421cd2571e0caba0",
+    "mihomo-linux-armv6-v1.19.32.gz":
+        "efa575b877b1c177e261492f994e4ec0d9bd6b92deed2015e25612396a9ce487",
+    "mihomo-linux-armv7-v1.19.32.gz":
+        "f622cbe903ba1a11d30e9071d1c5373929c675b854856ff3e7f977255a25bb66",
+    "mihomo-linux-amd64-v1-v1.19.32.gz":
+        "306f81e723e60ce6b828899a6fe83e1d00e9ecefb2dc8d4d849312a5bc00efdc",
+    "mihomo-linux-mips-softfloat-v1.19.32.gz":
+        "8b6c0e437ca388d7849db5343ef24304a9b4cf63f12e926eb75d4c7251cd6ab1",
+    "mihomo-linux-mipsle-softfloat-v1.19.32.gz":
+        "69b10ecd1db5244ab2bf1fac3c629a2e0f9b19f84728fe51b043a9767832d38c",
+    "mihomo-linux-mips64-v1.19.32.gz":
+        "992fba903e55c1d9ac60c88356744eec059e9568d5743374f6c2edfd784a4321",
+    "mihomo-linux-mips64le-v1.19.32.gz":
+        "f692484a0e924acaf603a58502d66c930a9d592dd36e310990591da81da9035b",
+    # ---- dae v2.1.1 (PERF_VERSION) · 官方 release 页面的 sha256 digest ----
+    "dae-linux-arm64.tar.xz":
+        "bd84b6770cb335b8a45d8b1e16a95f68cf940b3edaaeeb449c187ce4b1058d0b",
+    "dae-linux-armv6.tar.xz":
+        "1b400b973e01bd4269b2c06d300879040b02c3410a26c62bbc9cb0410b1977c1",
+    "dae-linux-armv7.tar.xz":
+        "3875281543fcb3d4bbed38c7f2c11c6daa47ce845ec385033689d0c2ed99ca99",
+    "dae-linux-x86_64.tar.xz":
+        "c550af580dc97cc90986260da78c4bf72917f3213c2b5d8b79c45199d9c3dc90",
+    "dae-linux-mips32.tar.xz":
+        "77c6231627aa314ccaac99f03fe36c2fdf86b597a82c1ba6c3f12f19ba44dcdb",
+    "dae-linux-mips32le.tar.xz":
+        "b03d7bbc1be05305208c1bd0cb846c21c27a4a3a05c441acf47a4361d085cdb2",
+    "dae-linux-mips64.tar.xz":
+        "3c4d4524a160709d51626004b08ad0943b060e3ef1bf9cc18efba99000f2bc0f",
+    "dae-linux-mips64le.tar.xz":
+        "49028e34f48b57fafa60dbb2702b5bb27ec63ef29543eac1f7dea141fd215bff",
+}
+
+#: 关闭摘要比对的口子: **只给演练 / 测试夹具用** (它们把几 KB 的假内核塞进下载链路,
+#: 不可能匹配官方摘要)。生产不设这个变量 = 严格校验。用 "0" 关闭。
+SUPPLY_VERIFY = os.environ.get("ZP_SUPPLY_VERIFY", "1").strip() != "0"
+
+#: 供应链事件的落盘位置 (与内核缓存同一个 data/client 下): "为什么这份我没校验/为什么
+#: 拒了"必须在事后查得到, 不能只活在这一次 HTTP 请求的返回值里。
+SUPPLY_LOG_NAME = "supply.log"
+
+
+def supply_log(message: str) -> None:
+    """记一条供应链事件: 落 data/client/supply.log + 打 stderr (面板日志里也看得到)。"""
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [supply] {message}"
+    try:
+        os.makedirs(os.path.join(paths()["data_dir"], "client"), exist_ok=True)
+        with open(os.path.join(paths()["data_dir"], "client", SUPPLY_LOG_NAME), "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
+    try:
+        import sys
+
+        print(line, file=sys.stderr)
+    except Exception:  # pragma: no cover - 打日志不能反过来把请求打挂
+        pass
+
+
+def sha256_hex(data: bytes) -> str:
+    """一段字节的 sha256 小写 hex (响应头 X-ZP-Sha256 / X-ZP-Install-Sha256 用它)。"""
+    return hashlib.sha256(data).hexdigest()
+
+
+def expected_sha256(asset: str) -> str:
+    """固定摘要表里的期望值; 没登记返回空串 (= 这一档还没有可信锚点)。"""
+    return PINNED_SHA256.get(asset, "")
+
+
+def verify_asset(path: str, asset: str, *, kind: str = "上游资产") -> tuple[bool, str]:
+    """校验一个刚下载完的上游资产。返回 (ok, 说明)。
+
+    * 表里有期望值 → 必须完全一致, 不一致即拒绝 (调用方丢弃文件并报错);
+    * 表里没有 → 记一条警告后放行, 但把"未校验"说出来 —— 绝不静默当成功;
+    * `ZP_SUPPLY_VERIFY=0` (演练 / 夹具用假制品) → 跳过比对, 仍记一条。
+    """
+    if not SUPPLY_VERIFY:
+        supply_log(f"{kind} {asset}: 本次关闭了摘要比对 (ZP_SUPPLY_VERIFY=0), 只过了体积闸门")
+        return True, ""
+    expected = expected_sha256(asset)
+    actual = core_sha256(path)
+    if not expected:
+        supply_log(
+            f"{kind} {asset} 没有固定摘要可校验 (sha256={actual or '?'}), 按未校验放行"
+        )
+        return True, "未校验 (没有固定摘要)"
+    if not actual:
+        return False, f"{asset} 读不出摘要 (文件损坏?)"
+    if actual != expected:
+        supply_log(f"{kind} {asset} 摘要不一致: 期望 {expected} 实际 {actual} —— 已拒绝下发")
+        return False, f"{asset} 的 sha256 与官方发布值不一致 (镜像/链路可能被替换了)"
+    return True, ""
+
+
+def _sha256_file_cached(path: str) -> str:
+    """文件摘要 (带缓存)。与 core_sha256 同一个实现, 这里是给"非内核"路径的别名。"""
+    return core_sha256(path)
+
+
+# ---------------------------------------------------------------- 本地控制面摘要
+# zpcore 的期望摘要在仓库里 (client/agent/dist/SHA256SUMS, 由 scripts/build-agent.sh 生成),
+# 不依赖网络: 它本来就是我们自己的产物, 摘要跟着制品一起进仓库。路由器端拿到面板下发的
+# X-ZP-Sha256 后比对 —— 面板这一跳被换掉也会被抓住。
+def agent_sums_path() -> str:
+    return os.path.join(agent_dir(), "SHA256SUMS")
+
+
+def agent_sha256(arch: str) -> str:
+    """dist/SHA256SUMS 里 zpcore-<arch>-<AGENT_VERSION>.gz 的摘要 (没有则空串)。"""
+    if arch not in ARCHES:
+        return ""
+    name = f"zpcore-{arch}-{AGENT_VERSION}.gz"
+    try:
+        with open(agent_sums_path(), "r", encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) >= 2 and parts[-1].lstrip("*") == name:
+                    digest = parts[0].strip().lower()
+                    return digest if re.fullmatch(r"[0-9a-f]{64}", digest) else ""
+    except OSError:
+        return ""
+    return ""
+
+
 def mirror_urls(arch: str) -> list[str]:
     """这一档内核的全部镜像地址 (完整 URL, 路由器端直接拿去用)。
 
@@ -555,6 +704,11 @@ def fetch_core(
                                     )
             if size < MIN_BYTES:
                 errors.append(f"{source} 体积异常 ({size} 字节)")
+                continue
+            # 供应链闸门: 官方发布页上的摘要必须对得上 —— 反代/CDN 只能骗传输。
+            good, why = verify_asset(tmp, asset_name(arch), kind="mihomo 内核")
+            if not good:
+                errors.append(f"{source} {why}")
                 continue
             os.replace(tmp, dst)
             if progress is not None:
@@ -960,6 +1114,89 @@ def btf_asset_url(name: str) -> str:
     return f"https://github.com/{BTF_REPO}/releases/download/latest/{name}"
 
 
+#: 上游 release 里那份摘要清单的名字 (kenzok8/vmlinux-btf 的资产列表里确实有它)。
+BTF_SUMS_NAME = "SHA256SUMS"
+#: SHA256SUMS 很小; 但"解析失败就重下一次"也不该把装机拖住, 所以只试一轮镜像。
+BTF_SUMS_MAX_BYTES = 512 << 10
+
+#: 解析过的摘要清单缓存: (取到的时间, 名字 → 摘要)。一份清单覆盖全部架构, 一次装机
+#: 只需要取一次 (BTF 的 tag 是 latest, 没有版本号可固定, 这是它能拿到的最好锚点)。
+_BTF_SUMS_CACHE: dict[str, str] = {}
+_BTF_SUMS_AT = 0.0
+#: 清单缓存多久 (秒)。取不到时也按同一个间隔退避, 免得每台设备装机都去撞一次上游。
+BTF_SUMS_TTL = int(os.environ.get("ZP_BTF_SUMS_TTL", "600"))
+
+
+def _parse_sha256sums(text: str) -> dict[str, str]:
+    """解析 `sha256sum` 风格的清单: 每行 `<64hex>␣␣<名字>` (也认 `SHA256 (name) = hex`)。"""
+    out: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) >= 2 and re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]):
+            out[parts[-1].lstrip("*")] = parts[0].lower()
+            continue
+        m = re.match(r"^SHA256\s*\((.+)\)\s*=\s*([0-9a-fA-F]{64})$", line)
+        if m:
+            out[m.group(1).strip()] = m.group(2).lower()
+    return out
+
+
+def btf_sums_lookup(asset: str, *, timeout: int = 25) -> str:
+    """从上游 release 的 SHA256SUMS 里取一个资产的摘要 (取不到返回空串)。
+
+    只走默认镜像表 (与资产本身同一条路): 它挡不住"整条链路一起被换", 但能挡住
+    "某个反代回了一份别的字节 / 半截文件"。真正的固定锚点还是要靠上游发布版本号 ——
+    BTF 的 tag 是 latest, 这一档只能做到这里 (残余风险已在报告里写明)。
+    """
+    global _BTF_SUMS_AT
+    if asset == BTF_SUMS_NAME:
+        return ""
+    if not _BTF_SUMS_CACHE and (time.time() - _BTF_SUMS_AT) < BTF_SUMS_TTL:
+        return ""  # 刚试过、没取到: TTL 内不重复撞上游
+    if not _BTF_SUMS_CACHE:
+        _BTF_SUMS_AT = time.time()
+        url = btf_asset_url(BTF_SUMS_NAME)
+        for template in MIRRORS:
+            source = template.format(url=url)
+            try:
+                request = urllib.request.Request(source, headers={"User-Agent": UA})
+                with urllib.request.urlopen(request, timeout=timeout) as resp:
+                    status = getattr(resp, "status", 200)
+                    if status is not None and status != 200:
+                        continue
+                    raw = resp.read(BTF_SUMS_MAX_BYTES)
+            except (urllib.error.URLError, OSError, TimeoutError):
+                continue
+            parsed = _parse_sha256sums(raw.decode("utf-8", "replace"))
+            if parsed:
+                _BTF_SUMS_CACHE.update(parsed)
+                break
+    return _BTF_SUMS_CACHE.get(asset, "")
+
+
+def btf_verify(path: str, asset: str, digest: str = "") -> tuple[bool, str]:
+    """BTF 包的摘要校验: 资产 digest > SHA256SUMS > (都没有) 如实记录后放行。"""
+    if not SUPPLY_VERIFY:
+        supply_log(f"BTF {asset}: 本次关闭了摘要比对 (ZP_SUPPLY_VERIFY=0)")
+        return True, ""
+    want = (digest or "").strip().lower()
+    if want.startswith("sha256:"):
+        want = want[len("sha256:"):].strip()
+    if not want:
+        want = btf_sums_lookup(asset)
+    if not want:
+        supply_log(f"BTF {asset}: 上游没有给 digest / SHA256SUMS 也取不到, 只过了体积闸门")
+        return True, "未校验 (上游没有摘要)"
+    actual = core_sha256(path)
+    if actual != want:
+        supply_log(f"BTF {asset} 摘要不一致: 期望 {want} 实际 {actual} —— 已拒绝下发")
+        return False, f"{asset} 的 sha256 与上游发布值不一致"
+    return True, ""
+
+
 def btf_upstream_assets() -> tuple[bool, str, list[dict]]:
     """问一次上游 release 的资产清单。返回 (ok, 说明, [{name, url, size}])。
 
@@ -985,6 +1222,9 @@ def btf_upstream_assets() -> tuple[bool, str, list[dict]]:
             "name": name,
             "url": str(item.get("browser_download_url") or btf_asset_url(name)),
             "size": int(item.get("size") or 0),
+            # GitHub 给每个 release 资产算了 digest (`sha256:…`)。有它就不必再取
+            # SHA256SUMS —— 它是发布侧给出的期望值, 与下载链路无关。
+            "digest": str(item.get("digest") or ""),
         })
     if not assets:
         return False, "上游 release 里一个资产都没有", []
@@ -1101,6 +1341,11 @@ def btf_fetch(kver: str, arch: str, ext: str, *, deadline: float | None = None) 
                             size += len(chunk)
                 if size < BTF_MIN_BYTES:
                     errors.append(f"{source} 体积异常 ({size} 字节)")
+                    continue
+                # 摘要闸门: 上游 release 的资产 digest / SHA256SUMS 对得上才发出去。
+                good, why = btf_verify(tmp, name, str(pick.get("digest") or ""))
+                if not good:
+                    errors.append(f"{source} {why}")
                     continue
                 os.replace(tmp, dst)
                 return True, f"已下载 {size // 1024} KB", dst
@@ -1300,6 +1545,11 @@ def fetch_perf(arch: str, *, deadline: float | None = None) -> tuple[bool, str, 
                             size += len(chunk)
                 if size < (PERF_MIN_BYTES // 2):
                     errors.append(f"{source} 体积异常 ({size} 字节)")
+                    continue
+                # 与 mihomo 内核同一条闸门: 上游 tar.xz 的官方摘要必须对得上。
+                good, why = verify_asset(tmp, PERF_ASSET.get(arch, ""), kind="dae 性能内核")
+                if not good:
+                    errors.append(f"{source} {why}")
                     continue
                 os.replace(tmp, tar_path)
                 downloaded = True
@@ -1533,6 +1783,15 @@ def render_script(base: str, code: str) -> str:
     )
 
 
+def install_script_sha256(base: str, code: str) -> str:
+    """面板要下发的安装脚本文本的 sha256 (响应头 `X-ZP-Install-Sha256`)。
+
+    路由器端 (CLI 的 update) 拿到之后**执行前**比对: 面板这一跳被换掉、正文传了一半,
+    都会在这里暴露。必须与正文逐字节对应 —— 所以这里走的是同一条 render_script。
+    """
+    return sha256_hex(render_script(base, code).encode("utf-8"))
+
+
 def summary() -> dict:
     """面板卡片要展示的元信息。"""
     return {
@@ -1575,7 +1834,11 @@ def summary() -> dict:
 #:        四处各拼一遍, 真机上漂过 (8.88)。新增 `state [--json]` 子命令与 --dir/--cli/--init
 #:        通用选项; `serve` 的 status 与 `state` 由同一份 snapshot 组装 (8.91)。
 #: 1.3.1: 接受真实 ubus 的有效会话响应 `{"values":{}}`; 修改动作拒绝 GET。
-AGENT_VERSION = os.environ.get("ZP_AGENT_VERSION", "1.3.1")
+#: 1.3.2: LuCI 会话再验一层身份 —— `username` 必须是 root 或该会话的 ACL 放行
+#:        (多账号固件上, 被 ACL 限制的账号以前能借用 root 的 cgi 执行 update/perf);
+#:        两个入口 (cgi / zpcore) 都补 X-Frame-Options / CSP frame-ancestors / nosniff;
+#:        cgi status 补 packets 字段; zpcore 认 PATH_INFO 里的动作名 (与 cgi 对齐)。
+AGENT_VERSION = os.environ.get("ZP_AGENT_VERSION", "1.3.2")
 
 #: 小于这个大小的一律不当二进制 (一份正常的 zpcore.gz 约 2.5 MB)。演练里可以用
 #: ZP_AGENT_MIN_BYTES 调低。

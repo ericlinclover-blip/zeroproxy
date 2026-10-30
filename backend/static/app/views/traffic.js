@@ -454,13 +454,18 @@ export function renderSystem(d) {
         <span class="badge vless">备份 / 恢复</span>
       </div>
       <div class="note mt-3 mb-3">
-        导出含全部密钥、口令与订阅令牌, 请妥善保管; 换机 / 重装时可一键还原。
+        备份里含 Reality 私钥 / WireGuard 私钥与 PSK / 管理员密码哈希 / 订阅令牌 ——
+        <b>拿到它等价于拿到这台服务器的 root</b>。导出时可以设一个口令加密 (AES-GCM),
+        明文导出只建议在本机安全环境使用。
       </div>
       <div class="row">
-        <button class="btn ghost small" id="btn-backup">下载备份</button>
+        <button class="btn small" id="btn-backup">导出备份 (可选加密)</button>
         <button class="btn ghost small" id="btn-restore">从备份恢复</button>
-        <input type="file" id="restore-file" class="hidden" accept="application/json,.json">
+        <input type="file" id="restore-file" class="hidden"
+          accept="application/json,.json,.enc,.zpbackup,application/octet-stream">
       </div>
+      <div class="note mt-2">恢复接受明文 JSON 与加密备份 (加密备份需要在确认框里填同一个口令)。
+        恢复是覆盖操作: 密钥 / 管理员口令 / 订阅地址都会换成备份里的那一份。</div>
     </div>`;
   applyWidths($("#sys-grid"));   // 证书有效期条的宽度与底色都走 CSSOM (见 lib/dom.js)
   const renewBtn = $("#btn-renew");
@@ -481,8 +486,25 @@ export function renderSystem(d) {
   };
 
   // 备份 / 恢复
+  //   - 备份: POST /api/backup (旧版是 GET 直接跳转下载)。导出前先弹确认: 说清"等价 root",
+  //     并给一个可选口令 → encrypt=1 + X-ZP-Passphrase 头, 后端返回 AES-GCM 加密文件
+  //     (恢复时用同一个口令)。
+  //   - 恢复: 原文件直接上传 (明文 JSON / 加密包都行, 由后端自动识别; 加密包需要口令)。
   const backupBtn = $("#btn-backup");
-  if (backupBtn) backupBtn.onclick = () => { window.location.href = "/api/backup"; };
+  if (backupBtn) backupBtn.onclick = () => {
+    openConfirm({
+      title: "导出备份?",
+      okLabel: "导出",
+      html: `<div class="qr-sub">备份包含 <b>Reality 私钥 / WireGuard 私钥与 PSK / 管理员密码哈希 /
+        订阅令牌 / 链式凭据</b> —— 拿到它等价于拿到这台服务器的 root。<br><br>
+        建议设置一个口令加密导出 (AES-GCM); 口令不会被面板保存, 恢复时必须输入同一个。</div>
+        <div class="field mt-3"><label>加密口令 (留空 = 明文导出, 不推荐)</label>
+          <input type="password" id="backup-pass" autocomplete="new-password"
+            placeholder="留空则导出明文 JSON"></div>
+        <div class="note">明文备份请只落在本机安全位置; 加密备份忘记口令将无法恢复。</div>`,
+      onOk: () => downloadBackup(($("#backup-pass") || {}).value || ""),
+    });
+  };
   const restoreBtn = $("#btn-restore");
   const fileInput = $("#restore-file");
   if (restoreBtn && fileInput) {
@@ -500,16 +522,27 @@ export function renderSystem(d) {
         html: `<div class="qr-sub">将用 <b>${esc(file.name)}</b> 覆盖当前配置:<br>
           节点开关 / 端口 / <b>密钥</b> / 管理员口令都会被备份里的内容替换。<br><br>
           恢复后会按备份重新生成全部配置并热重载; 订阅地址也会跟着变成备份里的那一个
-          —— 客户端需要重新导入订阅。</div>`,
+          —— 客户端需要重新导入订阅。</div>
+          <div class="field mt-3"><label>备份口令 (明文备份留空)</label>
+            <input type="password" id="restore-pass" autocomplete="current-password"
+              placeholder="加密导出时设置的口令"></div>`,
         onOk: async () => {
           restoreBtn.disabled = true;
           restoreBtn.textContent = "恢复中…";
           try {
-            S.dash = await api("/api/restore", {
+            const pass = ($("#restore-pass") || {}).value || "";
+            const headers = { "Content-Type": "application/octet-stream" };
+            if (pass) headers["X-ZP-Passphrase"] = pass;
+            // 原文件按字节上传: 加密包不是 JSON (也读不成 text), 明文 JSON 由后端自己识别。
+            const res = await fetch("/api/restore", {
               method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: await file.text(),
+              credentials: "same-origin",
+              headers,
+              body: await file.arrayBuffer(),
             });
+            const body = await res.json().catch(() => null);
+            if (!res.ok) throw new Error((body && body.error) || `HTTP ${res.status}`);
+            S.dash = body;
             redrawDash(true);
             toast("备份已恢复, 配置已重新生成");
           } catch (e) {
@@ -520,5 +553,63 @@ export function renderSystem(d) {
         },
       });
     };
+  }
+}
+
+/** 导出备份: POST /api/backup, 口令可选 (走请求头, 不留在 URL / 历史 / access log)。
+ *
+ *  旧实现是 `window.location.href = "/api/backup"` —— GET 有副作用、无法带口令, 而且
+ *  "要不要加密"这类选择只能塞进 URL。现在改为 POST + blob 下载, 响应文件名由
+ *  Content-Disposition 决定 (.json 明文 / .enc 加密)。 */
+async function downloadBackup(passphrase) {
+  const btn = $("#btn-backup");
+  // 后端对加密口令有最小长度 (备份等价 root, 短口令等于没加密); 这里先挡一次,
+  // 免得用户填一个 3 位口令、点导出才收到 400。
+  if (passphrase && passphrase.length < 8) {
+    toast("加密口令至少 8 个字符 —— 备份等价于 root 凭据, 口令太短等于没加密");
+    return;
+  }
+  const label = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "导出中…"; }
+  try {
+    const headers = { "Content-Type": "application/json" };
+    if (passphrase) headers["X-ZP-Passphrase"] = passphrase;
+    // encrypt=1 同时放在 query 与 body: 后端两种读法都能识别, 前端不必猜实现细节。
+    const res = await fetch("/api/backup" + (passphrase ? "?encrypt=1" : ""), {
+      method: "POST",
+      credentials: "same-origin",
+      headers,
+      body: JSON.stringify({ encrypt: passphrase ? 1 : 0 }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => null);
+      throw new Error((body && body.error) || `HTTP ${res.status}`);
+    }
+    const blob = await res.blob();
+    const cd = res.headers.get("content-disposition") || "";
+    const m = /filename\*?=(?:UTF-8''|")?([^";]+)/i.exec(cd);
+    let name = passphrase ? "zeroproxy-backup.enc" : "zeroproxy-backup.json";
+    if (m) {
+      const raw = m[1].replace(/"/g, "").trim();
+      try {
+        name = decodeURIComponent(raw);
+      } catch (e) {
+        name = raw;        // 非法百分号编码: 原样用服务器给的文件名, 不因此让下载失败
+      }
+    }
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    toast(passphrase ? "已导出加密备份 (恢复时需要同一口令)" : "已导出明文备份 —— 请妥善保管");
+  } catch (e) {
+    toast("导出失败: " + e.message);
+  }
+  if (btn && document.body.contains(btn)) {
+    btn.disabled = false;
+    btn.textContent = label || "导出备份 (可选加密)";
   }
 }

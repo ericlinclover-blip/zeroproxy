@@ -24,10 +24,12 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import re
 import secrets
 import time
+from urllib.parse import urlsplit
 
 #: 配对码有效期 (30 分钟)。安装命令会出现在终端回滚、聊天记录、截图里, 所以它必须是
 #: 一次性的; 有效期只是给"复制命令 → 去路由器粘贴"这段操作留出余量。
@@ -164,11 +166,15 @@ def register(state: dict, info: dict) -> tuple[dict | None, str, str]:
     只有 hash, 再也拿不回来。
     """
     code = str(info.get("code") or "").strip()
-    entry = consume_pair_code(state, code)
-    if entry is None:
+    # 先判上限再消费配对码: 设备数满了的时候白烧一个码, 用户只能回面板重新生成
+    # (P3-14)。
+    if pair_code_live(state, code) is None:
         return None, "", "配对码无效或已过期, 请回面板重新生成安装命令"
     if len(items(state)) >= MAX_DEVICES:
         return None, "", f"设备数已达上限 ({MAX_DEVICES}), 请先移除不用的客户端"
+    entry = consume_pair_code(state, code)
+    if entry is None:
+        return None, "", "配对码无效或已过期, 请回面板重新生成安装命令"
 
     kind = str(info.get("kind") or DEFAULT_KIND).strip().lower()
     if kind not in KINDS:
@@ -220,8 +226,14 @@ def touch(state: dict, device: dict, info: dict) -> bool:
     寿命代价的。所以 last_seen 只在超过 HEARTBEAT_WRITE_S 时才更新 (面板判断
     在线用 90 秒窗口, 精度足够), 其余字段变化一律算变化。
 
-    F10: 如果心跳 payload 里的 rev 与面板当前 config_rev 一致, 说明设备已真正
-    应用了这份配置, 标记 applied_rev (设备可能收到新 rev 但还没下载/应用)。
+    版本语义 (P2-9, 四个版本分开):
+      * 面板当前版本 —— `config_rev(state)`, 接口回执里的 `rev`;
+      * `downloaded_rev` —— 面板把订阅发出去时写下的版本 (只证明"拿到了");
+      * `applied_rev` —— **只有设备显式上报应用成功时才推进**: 新客户端报
+        `applied_rev`, 或报 `healthy=true` + `rev` (数据面健康 = 它报的版本在跑);
+      * 设备上报的 `rev` 只是它自己的最后一版 (旧客户端字段), 本身不证明已应用。
+    下载端点以前把 `heartbeat_rev=panel_rev` 直接喂进来, 于是"下载"被当成"应用" ——
+    这正是要拆开的原因。
     """
     now = _now()
     changed = False
@@ -242,17 +254,24 @@ def touch(state: dict, device: dict, info: dict) -> bool:
     if info.get("rev") and device.get("rev") != str(info["rev"])[:32]:
         device["rev"] = str(info["rev"])[:32]
         changed = True
-    # F10: 心跳 payload 携带设备端实际 rev, 与面板当前 rev 一致则标记"已应用"
-    heartbeat_rev = str(info.get("heartbeat_rev") or "")
-    if heartbeat_rev:
-        panel_rev = config_rev(state)
-        if device.get("applied_rev") != panel_rev:
-            # heartbeat_rev 来自设备端 LAST_REV, 如果匹配面板当前 rev, 说明已应用
-            if heartbeat_rev == panel_rev:
-                if device.get("applied_rev") != panel_rev:
-                    device["applied_rev"] = panel_rev
-                    changed = True
-    ui = clean_ui_url(info.get("ui"))
+    # 面板最近一次下发给这台设备的配置版本 (拉订阅时由 routes 写入)
+    downloaded = str(info.get("downloaded_rev") or "").strip()[:32]
+    if downloaded and device.get("downloaded_rev") != downloaded:
+        device["downloaded_rev"] = downloaded
+        changed = True
+    # 已应用版本: 只认设备的**显式**上报 (applied_rev, 或 healthy + rev), 不再由
+    # "下载了" 或 "心跳带了个 rev" 推断 (P2-9)。
+    applied = str(info.get("applied_rev") or "").strip()[:32]
+    if not applied and info.get("healthy") is True:
+        applied = str(info.get("rev") or "").strip()[:32]
+    if applied and device.get("applied_rev") != applied:
+        device["applied_rev"] = applied
+        changed = True
+    ui = clean_ui_url(
+        info.get("ui"),
+        allowed_hosts=(str(state.get("domain") or ""),),
+        peer_ip=str(info.get("ip") or ""),
+    )
     if ui and device.get("ui") != ui:
         device["ui"] = ui
         changed = True
@@ -309,11 +328,90 @@ def online(device: dict, now: int | None = None) -> bool:
 _UI_URL_RE = re.compile(r"^https?://[^\s\"'<>]{1,180}$")
 
 
-def clean_ui_url(value: object) -> str:
+#: 允许的管理界面目标网段。刻意列成显式网段而不是用 `ipaddress.is_private`:
+#: 后者按"非 is_global"定义, 连 TEST-NET / 文档保留段 (203.0.113.0/24 等) 也会被
+#: 当成 private —— 那些恰恰是"看起来像内网"的外部地址。
+_UI_LAN_NETWORKS = tuple(
+    ipaddress.ip_network(net)
+    for net in (
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "::1/128",
+        "fc00::/7",     # IPv6 ULA
+        "fe80::/10",    # IPv6 链路本地
+    )
+)
+
+
+def _is_lan_host(host: str) -> bool:
+    """host 是否是私网/回环/链路本地地址 (IPv4 与 IPv6 都算)。"""
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return False
+    return any(ip.version == net.version and ip in net for net in _UI_LAN_NETWORKS)
+
+
+def _same_lan(host: str, peer: str) -> bool:
+    """host 与请求来源是否在同一私网网段 (v4 /24, v6 /64)。
+
+    这是"设备上报的是它的 LAN 地址、而面板只看到它 NAT 后的公网地址"场景的兜底:
+    同一网段内互访是路由器管理界面的正常用法, 而任意外部主机不是。
+    """
+    try:
+        target = ipaddress.ip_address(host.strip("[]"))
+        source = ipaddress.ip_address(str(peer).strip().strip("[]"))
+    except ValueError:
+        return False
+    if target.version != source.version:
+        return False
+    if not (_is_lan_host(str(target)) and _is_lan_host(str(source))):
+        return False
+    if target.version == 4:
+        return source in ipaddress.ip_network(f"{target}/24", strict=False)
+    return source in ipaddress.ip_network(f"{target}/64", strict=False)
+
+
+def clean_ui_url(
+    value: object, *, allowed_hosts: tuple[str, ...] = (), peer_ip: str = ""
+) -> str:
+    """校验设备上报的管理界面地址, 只放行局域网目标。
+
+    为什么不像以前那样"任意外部主机都行" (P3-15): 这个值会渲染成面板上的一枚
+    「打开管理界面」按钮 —— 任何能配对/上报的设备都能把它指向自己的钓鱼页, 管理员
+    在面板里点一下就把界面令牌交出去了。所以只接受:
+      * localhost / ``*.local`` (mDNS);
+      * 私网 / 回环 / 链路本地 IP (含 IPv6 ULA);
+      * 面板自己的域名 (``allowed_hosts``, 例如设备经面板域名反代访问本机界面);
+      * 与请求来源同私网网段 (v4 /24, v6 /64) 的地址。
+    其余 (公网域名、公网 IP、带 userinfo 的 URL) 一律丢弃上报值。
+    """
     text = str(value or "").strip()
     if not _UI_URL_RE.match(text) or "/zeroproxy" not in text:
         return ""
-    return text
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        return ""
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        return ""
+    # userinfo 是典型的"看起来像内网、实际连到别处"的写法 (http://192.168.1.1@evil/)
+    if parsed.username or parsed.password:
+        return ""
+    if host == "localhost" or host.endswith(".local"):
+        return text
+    if _is_lan_host(host):
+        return text
+    allowed = {str(item).strip().lower().rstrip(".") for item in allowed_hosts if str(item).strip()}
+    if host in allowed:
+        return text
+    if peer_ip and _same_lan(host, peer_ip):
+        return text
+    return ""
 
 
 # ---------------------------------------------------------------- 配置版本
@@ -361,7 +459,12 @@ def device_view(device: dict, *, now: int | None = None) -> dict:
         # 期望开、但设备自己也说开着 → 才是真的"已连接"
         "connected": desired and actual,
         "template": device.get("template", ""),
+        # 设备自己上报的最后一版 (旧客户端字段, 不代表已应用)
         "rev": device.get("rev", ""),
+        # 面板最近一次把订阅发给它的配置版本 (只证明"已下载")
+        "downloaded_rev": device.get("downloaded_rev", ""),
+        # 设备显式上报的"已应用"版本 (只有设备说应用成功/数据面健康才推进)
+        "applied_rev": device.get("applied_rev", ""),
         # 路由器管理界面地址 (带界面令牌, 只在路由器所在的局域网内可用);
         # 手机/电脑端没有这个值 —— 前端按有没有它决定要不要显示"打开管理界面"。
         "ui": device.get("ui", ""),

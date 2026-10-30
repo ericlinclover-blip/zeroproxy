@@ -614,7 +614,8 @@ def test_diagnose_flags_unreachable_exit(client, configured, monkeypatch):
 
 def test_chain_kept_in_backup(client, configured, monkeypatch):
     entry = _add_entry(client, monkeypatch, label="美国落地")
-    backup = client.get("/api/backup").json()
+    # P2-5: 导出改成了 POST (GET 有副作用); 明文导出仍带完整 chain 段
+    backup = client.post("/api/backup").json()
     assert backup["state"]["chain"]["entries"][0]["id"] == entry["id"]
 
 
@@ -1095,3 +1096,316 @@ def test_quic_already_running_elsewhere_requires_matching_cmdline(monkeypatch, t
     monkeypatch.setattr(chain_quic, "_cmdline", lambda pid: our_cmd)
     assert chain_quic._already_running_elsewhere(key, "fake-fingerprint") is True
 
+
+# ---------------------------------------------------------------- P1-1 / P2-7 证书固定闭环
+
+def _quic_entry(state: dict, **over) -> dict:
+    """造一条 state 里的 QUIC 内层条目 (默认模拟旧 v2 配对码落地: 没有 pin)。"""
+    entry = {
+        "id": uuid_mod.uuid4().hex[:8],
+        "label": "旧 QUIC 落地",
+        "host": "203.0.113.77",
+        "port": 8447,
+        "uuid": str(uuid_mod.uuid4()),
+        "pbk": state["reality"]["public_key"],
+        "sid": state["reality"]["short_id"],
+        "sni": state["reality"]["server_name"],
+        "flow": "",
+        "transport": "hysteria2",
+        "hy_port": 8448,
+        "hy_pw": "old-quic-secret",
+        "hy_sni": "us.example.com",
+        "hy_cert_sha256": "",
+        "hy_socks_port": 18470,
+        "local_port": 18466,
+        "enabled": True,
+        "default_out": False,
+        "created_at": int(time.time()),
+    }
+    entry.update(over)
+    return entry
+
+
+def _with_entries(state: dict, *entries: dict) -> dict:
+    state.setdefault("chain", {}).setdefault("entries", []).extend(entries)
+    return state
+
+
+def test_legacy_quic_entry_without_pin_is_flagged(client, configured):
+    """旧 v2 配对码落地的 QUIC 条目没有证书指纹 → 诊断必须报出来 (P1-1)。
+
+    v2.12.12 只修了"新增条目"; state 里已存在的条目继续以 insecure 运行, 面板
+    以前没有任何出口能看到它们。这里锁住 unpinned_quic_entries / diagnose_items。
+    """
+    state = config.load_state()
+    legacy = _quic_entry(state)
+    _with_entries(state, legacy)
+    assert chain.unpinned_quic_entries(state) == [
+        {"id": legacy["id"], "label": "旧 QUIC 落地", "host": "203.0.113.77", "port": 8448}
+    ]
+    items = {item["id"]: item for item in chain.diagnose_items(state)}
+    assert items["chain_quic_pin"]["ok"] is False
+    assert "证书指纹" in items["chain_quic_pin"]["detail"]
+    assert "重新生成配对码" in items["chain_quic_pin"]["hint"]
+    # 字段与 _diagnose 的项一套 (name 是给现前端渲染的兼容别名)
+    assert {"id", "name", "title", "ok", "detail", "hint", "fixable"} <= set(items["chain_quic_pin"])
+
+    # 有指纹的条目不再算"旧条目"
+    legacy["hy_cert_sha256"] = "ab" * 32
+    assert chain.unpinned_quic_entries(state) == []
+    assert {i["id"]: i for i in chain.diagnose_items(state)}["chain_quic_pin"]["ok"] is True
+
+    # 停用也照样是隐患: 重新启用后它又会以 insecure 跑起来
+    legacy["hy_cert_sha256"] = ""
+    legacy["enabled"] = False
+    assert [e["id"] for e in chain.unpinned_quic_entries(state)] == [legacy["id"]]
+    # Reality 内层条目与 QUIC 无关, 不进这个清单
+    _with_entries(state, _quic_entry(state, transport="reality"))
+    assert [e["id"] for e in chain.unpinned_quic_entries(state)] == [legacy["id"]]
+
+
+def test_diagnose_items_detects_a_stale_exit_pin(client, configured, monkeypatch):
+    """落地端重签证书后, 入口条目里的指纹过期 → 诊断报出来 (P2-7)。"""
+    from zeroproxy import chain_quic
+
+    monkeypatch.setattr(chain_quic, "cert_pin", lambda: ("f" * 64, ""))   # 落地端当前指纹
+    state = config.load_state()
+    state.setdefault("chain", {})["exit"] = {
+        "enabled": True, "hy_enabled": True, "hy_password": "x",
+        "hy_port": 8448, "port": 8447, "uuid": "u",
+    }
+    entry = _quic_entry(state, hy_cert_sha256="a" * 64)
+    _with_entries(state, entry)
+    items = {i["id"]: i for i in chain.diagnose_items(state)}
+    assert items["chain_quic_pin_mismatch"]["ok"] is False
+    assert "过期" in items["chain_quic_pin_mismatch"]["detail"]
+    # 指纹一致时不报
+    entry["hy_cert_sha256"] = "f" * 64
+    items = {i["id"]: i for i in chain.diagnose_items(state)}
+    assert items["chain_quic_pin_mismatch"]["ok"] is True
+    assert "一致" in items["chain_quic_pin_mismatch"]["detail"]
+
+
+def test_cert_pin_separates_not_configured_from_read_failure(configured):
+    """P3-2: "没开 QUIC"和"证书读不出来"必须能区分 (以前都静默返回空串)。"""
+    from zeroproxy import chain_quic
+
+    p = paths_of()
+    os.makedirs(os.path.dirname(p["chain_quic_cert"]), exist_ok=True)
+    # 文件不存在 = 这台机器还没配 QUIC 内层, 不是错误
+    assert chain_quic.cert_pin() == ("", "")
+    with open(p["chain_quic_cert"], "w", encoding="utf-8") as fh:
+        fh.write("not a pem")
+    pin, reason = chain_quic.cert_pin()
+    assert pin == "" and "证书指纹读取失败" in reason
+    assert chain_quic.cert_sha256() == ""
+    with open(os.path.join(chain_quic.work_dir(), "panel.log"), encoding="utf-8") as fh:
+        assert "证书指纹读取失败" in fh.read()
+
+
+def test_exit_cert_resign_is_recorded(client, configured, monkeypatch):
+    """P2-7: 落地端重签证书会让既有 pin 全部失效, 必须留痕并说出来。"""
+    from zeroproxy import chain_quic
+
+    client.post(
+        "/api/chain/exit",
+        json={"action": "generate", "port": 8666, "hy_enabled": True, "hy_port": 8667},
+    )
+    first = chain_quic.cert_pin()[0]
+    assert len(first) == 64
+    monkeypatch.setattr(chain_quic, "_cert_sans", lambda path: set())   # 模拟 SAN 变化 → 重签
+    ok, detail = chain_quic.ensure_exit_cert(config.load_state())
+    assert ok is True
+    assert "重签" in detail and "重新配对" in detail
+    assert chain_quic.cert_pin()[0] != first
+    with open(os.path.join(chain_quic.work_dir(), "panel.log"), encoding="utf-8") as fh:
+        assert "重签" in fh.read()
+
+
+def test_chain_quic_does_not_spawn_an_unpinned_client(configured):
+    """没有 pin 的旧条目 → 不托管它的 hysteria 客户端 (宁可链路不通也不无校验运行)。"""
+    from zeroproxy import chain_quic
+
+    state = config.load_state()
+    legacy = _quic_entry(state)
+    _with_entries(state, legacy)
+    assert chain_quic.desired(state) == []
+    legacy["hy_cert_sha256"] = "ab" * 32
+    specs = chain_quic.desired(state)
+    assert [s["key"] for s in specs] == [f"entry-{legacy['id']}"]
+    assert f'pinSHA256: "{"ab" * 32}"' in specs[0]["yaml"]
+
+
+def test_restart_step_skips_but_does_not_fail_on_an_enabled_unpinned_entry(configured, monkeypatch):
+    """P1-1: 启用中的旧 v2 条目 → 跳过它的 QUIC 客户端 (fail-closed), 但**不判红**。
+
+    判红会让 `python -m zeroproxy.apply` 退出码 1 → upgrade.sh 回滚整次升级, 老部署
+    就永远升不上来。安全兜底靠两处: 不生成 insecure 客户端 + 诊断里 chain_quic_pin
+    仍是红项 (面板链式卡片也有 needs_repair 红条)。
+    """
+    from zeroproxy import apply as zp_apply
+    from zeroproxy import chain as chain_mod, chain_quic
+
+    state = config.load_state()
+    legacy = _quic_entry(state)
+    _with_entries(state, legacy)
+    synced: list[int] = []
+    monkeypatch.setattr(
+        chain_quic, "sync",
+        lambda state, restart_changed=True: synced.append(1) or (True, ""),
+    )
+    monkeypatch.setattr(chain_mod, "warmup_in_background", lambda state: None)
+    monkeypatch.setattr(zp_apply.services, "bin_path", lambda name: "/bin/true")
+    monkeypatch.setattr(zp_apply.services, "service_state", lambda name: "active")
+    monkeypatch.setattr(zp_apply.services, "restart_service", lambda name, timeout=0: (True, "已重启"))
+    monkeypatch.setattr(zp_apply.services, "reload_service", lambda name, timeout=0: (True, "已重载"))
+
+    ok, detail = zp_apply.restart_services(state)
+    assert ok is True, detail                       # 不阻断 apply / 升级
+    assert "⚠" in detail and "缺少证书指纹" in detail and "重新配对" in detail
+    assert synced == []                             # 没有生成无身份校验的客户端配置
+    assert any(row["action"] == "chain_quic_pin_blocked" for row in state["audit"])
+    # 诊断仍是红项 (真正的告警出口)
+    assert {i["id"]: i for i in chain_mod.diagnose_items(state)}["chain_quic_pin"]["ok"] is False
+    # verify_listeners 不会因为被跳过的 QUIC SOCKS 端口判红: 它不在"应当监听"清单里
+    wanted = {port for port, _, _ in zp_apply._wanted_ports(state)}
+    assert legacy["hy_socks_port"] not in wanted
+    assert legacy["local_port"] in wanted           # 入口 Xray 入站照旧要验
+
+
+def test_restart_step_only_warns_for_a_disabled_unpinned_quic_entry(configured, monkeypatch):
+    """已停用的旧 QUIC 条目只提示, 不阻断 apply (升级回滚的代价太大)。"""
+    from zeroproxy import apply as zp_apply
+    from zeroproxy import chain as chain_mod, chain_quic
+
+    state = config.load_state()
+    _with_entries(state, _quic_entry(state, enabled=False))
+    synced: list[int] = []
+    monkeypatch.setattr(
+        chain_quic, "sync",
+        lambda state, restart_changed=True: synced.append(1) or (True, ""),
+    )
+    monkeypatch.setattr(chain_mod, "warmup_in_background", lambda state: None)
+    monkeypatch.setattr(zp_apply.services, "bin_path", lambda name: "/bin/true")
+    monkeypatch.setattr(zp_apply.services, "service_state", lambda name: "active")
+    monkeypatch.setattr(zp_apply.services, "restart_service", lambda name, timeout=0: (True, "已重启"))
+    monkeypatch.setattr(zp_apply.services, "reload_service", lambda name, timeout=0: (True, "已重载"))
+
+    ok, detail = zp_apply.restart_services(state)
+    assert ok is True, detail
+    assert "缺少证书指纹" in detail and "重新启用前需要重新配对" in detail
+    assert synced                     # 正常路径照旧跑
+
+
+def test_hysteria_validate_rejects_broken_configs(configured):
+    """P2-12: 坏 YAML / 缺段必须在 apply 重启 Hysteria 之前被拦下。"""
+    from zeroproxy import hysteria_config
+
+    good = hysteria_config.build_hysteria_config(config.load_state())
+    assert hysteria_config.validate(good) == []
+    bad_yaml = hysteria_config.validate("listen: [0.0.0.0:8443\n")
+    assert bad_yaml and "YAML" in bad_yaml[0]
+    missing = " ".join(hysteria_config.validate('listen: "0.0.0.0:8443"\n'))
+    assert "auth" in missing and "tls" in missing
+    wrong_auth = hysteria_config.validate(
+        'listen: "0.0.0.0:8443"\n'
+        'auth:\n  type: password\n  password: ""\n'
+        "tls:\n  cert: /tmp/c.pem\n  key: /tmp/k.pem\n"
+    )
+    assert any("password" in problem for problem in wrong_auth)
+    bad_listen = hysteria_config.validate(
+        'listen: "0.0.0.0:99999"\n'
+        'auth:\n  type: password\n  password: "x"\n'
+        "tls:\n  cert: /tmp/c.pem\n  key: /tmp/k.pem\n"
+    )
+    assert any("端口" in problem for problem in bad_listen)
+
+
+def test_apply_hysteria_step_fails_on_a_broken_generated_config(configured, monkeypatch):
+    """生成器写出坏配置时, 该步必须失败 (不能只看证书文件在不在)。"""
+    from zeroproxy import apply as zp_apply
+    from zeroproxy import hysteria_config
+
+    p = paths_of()
+
+    def write_broken(state: dict) -> None:
+        with open(p["hysteria_config"], "w", encoding="utf-8") as fh:
+            fh.write("listen: [0.0.0.0:8443\n")
+
+    monkeypatch.setattr(hysteria_config, "write_hysteria_config", write_broken)
+    ok, detail = zp_apply.gen_hysteria(config.load_state())
+    assert ok is False
+    assert "校验" in detail and "YAML" in detail
+
+
+@pytest.mark.parametrize("bad_version", [{"a": 1}, [1, 2], "v3"])
+def test_code_rejects_a_non_numeric_version_with_code_error(configured, bad_version):
+    """P3-1: `v` 是 dict/list 时以前抛 TypeError → 路由 500; 现在统一 CodeError。"""
+    reality = config.load_state()["reality"]
+    payload = {
+        "v": bad_version,
+        "h": "203.0.113.9",
+        "n": reality["server_name"],
+        "l": "",
+        "p": 8447,
+        "u": str(uuid_mod.uuid4()),
+        "k": reality["public_key"],
+        "s": reality["short_id"],
+        "f": "xtls-rprx-vision",
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    code = chain.CODE_SEP.join((chain.CODE_PREFIX, chain._b64e(raw), chain._checksum(raw)))
+    with pytest.raises(chain.CodeError):
+        chain.parse_code(code)
+
+
+def test_restart_step_warns_but_never_fails_on_a_stale_pin(configured, monkeypatch):
+    """P2-7: pin 过期只作警告 + 写审计, 不阻断升级 apply (回滚代价更大)。"""
+    from zeroproxy import apply as zp_apply
+    from zeroproxy import chain as chain_mod, chain_quic
+
+    monkeypatch.setattr(chain_quic, "cert_pin", lambda: ("f" * 64, ""))   # 落地端重签后的新指纹
+    state = config.load_state()
+    state.setdefault("chain", {})["exit"] = {
+        "enabled": True, "hy_enabled": True, "hy_password": "x",
+        "hy_port": 8448, "port": 8447, "uuid": "u",
+    }
+    _with_entries(state, _quic_entry(state, hy_cert_sha256="a" * 64))
+    synced: list[int] = []
+    monkeypatch.setattr(
+        chain_quic, "sync",
+        lambda state, restart_changed=True: synced.append(1) or (True, ""),
+    )
+    monkeypatch.setattr(chain_mod, "warmup_in_background", lambda state: None)
+    monkeypatch.setattr(zp_apply.services, "bin_path", lambda name: "/bin/true")
+    monkeypatch.setattr(zp_apply.services, "service_state", lambda name: "active")
+    monkeypatch.setattr(zp_apply.services, "restart_service", lambda name, timeout=0: (True, "已重启"))
+    monkeypatch.setattr(zp_apply.services, "reload_service", lambda name, timeout=0: (True, "已重载"))
+
+    ok, detail = zp_apply.restart_services(state)
+    assert ok is True, detail                       # 不能因为 pin 过期把整步判红
+    assert "过期" in detail and "⚠" in detail        # 但必须说出来
+    assert synced                                   # QUIC 进程照常对齐
+    assert any(row["action"] == "chain_quic_pin_warning" for row in state["audit"])
+
+
+def test_diagnose_endpoint_reports_an_unpinned_legacy_quic_entry(client, configured):
+    """端到端接线：state 里的旧 v2 QUIC 条目要出现在 /api/diagnose 的结果里。
+
+    routes.py 由 api-security 接线 (调 chain.diagnose_items), 这里锁住"函数名/字段
+    约定"真的跑通 —— 只测 chain 侧会漏掉接线断了的情况。
+    """
+    state = config.load_state()
+    _with_entries(state, _quic_entry(state))
+    config.save_state(state)
+
+    checks = {c["name"]: c for c in client.get("/api/diagnose").json()["checks"]}
+    assert "链式 QUIC 证书固定" in checks, "旧 v2 QUIC 条目必须被一键诊断报出来"
+    assert checks["链式 QUIC 证书固定"]["ok"] is False
+    assert checks["链式 QUIC 证书固定"]["id"] == "chain_quic_pin"
+    assert "证书指纹" in checks["链式 QUIC 证书固定"]["detail"]
+
+    # 仪表盘的链式卡片同样要标记"需要重新配对"
+    view = client.get("/api/dashboard").json()["chain"]
+    entry = next(e for e in view["entries"] if e["host"] == "203.0.113.77")
+    assert entry["pin_ok"] is False and entry["needs_repair"] is True

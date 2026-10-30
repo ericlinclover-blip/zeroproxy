@@ -1,6 +1,6 @@
 # ZeroProxy 架构现状
 
-> 快照: **2026-10-28** · 面板 **v2.12.6** · 路由器客户端 **v1.4.39** (zpcore **1.3.0**) · `state.json` schema **v6**
+> 快照: **2026-10-30** · 面板 **v2.12.15** · 路由器客户端 **v1.4.45** (zpcore **1.3.2**) · `state.json` schema **v6**
 > 本文回答"**现在是什么样**"。另外两份文档分工不同, 不要混读:
 > `README.md` 是逐版开发日志 (4000+ 行, 每一版为什么这么改、哪次真机踩的坑);
 > `docs/RESEARCH.md` 与 `docs/ROUTER-CLIENT-REDESIGN.md` 是竞品调研与设计依据。
@@ -30,16 +30,16 @@ Nginx / Let's Encrypt 证书 / 订阅链接 / 防火墙——全部由面板按�
 
 ## 2. 目录与产物
 
-仓库共 87 个跟踪文件。代码分布:
+仓库共 **116 个跟踪文件**（v2.12.15 实测；含随仓库发布的 zpcore 制品与校验清单）。代码分布 (以 `wc -l` 实测为准):
 
 | 部分 | 位置 | 规模 |
 |---|---|---|
-| 后端 Python | `backend/zeroproxy/` (21 个 `.py`) | ~13 600 行 |
-| 前端 JS / CSS | `backend/static/app/` | ~4 400 / ~840 行 |
-| 回归测试 | `backend/tests/` | ~6 800 行 |
-| 部署 / 客户端 Shell | `install.sh` `upgrade.sh` `uninstall.sh` `client/router-install.sh` | ~4 700 行 |
-| 验证脚本 | `scripts/` | ~5 000 行 |
-| 路由器控制面 | `backend/zeroproxy/client/agent/` (Go) | ~790 行 |
+| 后端 Python | `backend/zeroproxy/` (21 个 `.py`) | **17 755 行** |
+| 前端 JS / CSS | `backend/static/app/` | **4 794 / 882 行** |
+| 回归测试 | `backend/tests/` (9 个文件) | **11 107 行** |
+| 部署 / 客户端 Shell | `install.sh` `upgrade.sh` `uninstall.sh` `client/router-install.sh` | **5 076 行** |
+| 验证脚本 | `scripts/` | **6 948 行** |
+| 路由器控制面 | `backend/zeroproxy/client/agent/` (Go) | **1 451 行** |
 
 ```
 zeroproxy/
@@ -62,11 +62,12 @@ zeroproxy/
 │   └── zeroproxy/
 │       ├── main.py                 # FastAPI 入口 + 安全响应头中间件 + 后台线程
 │       ├── config.py               # 状态模型 / 文件锁 / 引导令牌 / 审计日志
-│       ├── routes.py               # 全部 API (72 条路由)
+│       ├── routes.py               # 全部 API (73 条路由)
 │       ├── apply.py                # 配置落地闭环 (面板与 upgrade.sh 共用)
 │       ├── services.py             # systemctl / certbot / 自签 / 流量 / 握手探测 / 诊断
 │       ├── xray_config.py          # Xray 配置生成
-│       ├── hysteria_config.py      # Hysteria 2 配置生成
+│       ├── hysteria_config.py      # Hysteria 2 配置生成 + 结构校验
+│       ├── dae_config.py           # 性能模式 (dae) 配置生成
 │       ├── wireguard.py            # 原生 WireGuard (密钥 / 地址池 / wg0 / NAT / 一次性链接)
 │       ├── nginx_config.py         # Nginx 配置生成 (ACME + 443 + 面板)
 │       ├── share_links.py          # 单节点链接 + 三种订阅 + 三档分流模板
@@ -80,7 +81,7 @@ zeroproxy/
 │       ├── cli.py                  # 终端快捷管理 z
 │       ├── update.py               # 面板自更新 (版本检查 / 拉起 upgrade.sh / 回读进度)
 │       └── client/                 # 路由器端制品
-│           ├── router-install.sh   # 路由器装机脚本 (~4 220 行, 面板渲染后下发)
+│           ├── router-install.sh   # 路由器装机脚本 (3 285 行, 面板渲染后下发)
 │           ├── agent/              # zpcore: Go 控制面 (源码 + dist/ 制品)
 │           └── luci/               # 路由器管理界面 (页面 + cgi; zpcore 复用同一套页面)
 ├── scripts/                        # 验证脚本 (见 §15)
@@ -104,7 +105,7 @@ zeroproxy/
                     │ Nginx                         │
                     │  :80   引导期: 初始化页(明文+ACME) / 配置后: ACME + 301 │
                     │  :443  /ws/zeroproxy → Xray    │  其余路径 → 伪装主页
-                    │  :8899 面板 (SNI 命中域名给真证书 / 否则自签) │
+                    │  :443 /panel/ 正式面板 · :8899 兼容备用入口          │
                     └───────┬───────────────┬───────┘
                             │ 反代          │
                             ▼               │
@@ -127,7 +128,8 @@ zeroproxy/
                         └───────────────────┘
 ```
 
-面板进程自身只绑回环。对外是 Nginx 的 8899 (配置完成后唯一入口, 可由安全组限制来源);
+面板进程自身只绑回环。正式入口是 Nginx 443 的 `/panel/` (只依赖 80/443, 不要求额外放行
+8899); 8899 继续作为兼容 / 自签备用入口;
 **还没初始化时**初始化页同时挂在 80 端口的明文 HTTP 上 (终端打印的主链接就是它: 打开即
 初始化页, 没有自签证书那道拦页, 也不必为用户额外放行端口 —— 80 本来就是 ACME 要开的)。
 面板一完成 setup, `apply` 就把那份引导配置整体覆盖成"80 只做 ACME + 跳 HTTPS"。
@@ -140,24 +142,25 @@ WireGuard 到期客户端回收 (60 秒检查一次; 只处理设置了到期时
 
 | 模块 | 行数 | 职责 |
 |---|---:|---|
-| `routes.py` | 4047 | 全部 API: 初始化 / 认证 / 仪表盘 / 设置 / 订阅 / 二维码 / 备份 / 诊断 / 探测 / 升级 / 链式 / 设备 / **WireGuard** / 设备侧 `/c/*`。含异步落地任务表与会话管理 |
-| `wireguard.py` | 1238 | 原生 WireGuard: 密钥派生 / 地址池 / wg0 配置 / NAT 脚本 / 内核探测与 `wireguard-go` 用户态回退 / GL.iNet 兼容模式 (`/32`) / `wg syncconf` / 握手与流量 / 一次性链接 / 到期回收 |
-| `services.py` | 1248 | 系统适配层: systemctl / certbot / 自签证书 / 流量统计 (Stats API) / 真实握手探测 / 诊断; 非 Linux 自动 dry-run |
-| `share_links.py` | 1398 | 单节点分享链接 + 三种订阅格式 + 三档分流模板 + 设备专属订阅 |
-| `router_client.py` | 854 | 路由器安装脚本渲染 (`__ZP_BASE__`/`__ZP_CODE__` 占位替换) + mihomo 内核多镜像缓存分发 |
+| `routes.py` | 4689 | 全部 API (73 条): 初始化 / 认证 / 仪表盘 / 设置 / 订阅 / 二维码 / 备份 / 诊断 / 探测 / 升级 / 链式 / 设备 / **WireGuard** / 设备侧 `/c/*`。含异步落地任务表与会话管理 |
+| `router_client.py` | 1881 | 路由器安装脚本渲染 + mihomo 内核/Geo/BTF/dae/zpcore 多镜像缓存分发 + 制品 SHA-256 校验与下发头 |
+| `share_links.py` | 1481 | 单节点分享链接 + 三种订阅格式 + 三档分流模板 + 设备专属订阅 |
+| `services.py` | 1374 | 系统适配层: systemctl / certbot(含 deploy hook) / 自签证书 / 流量统计 / 真实握手探测 / 诊断; 非 Linux dry-run |
+| `wireguard.py` | 1254 | 原生 WireGuard: 密钥 / 地址池 / wg0 / NAT / 内核探测与 `wireguard-go` 回退 / GL.iNet 兼容 / `wg syncconf` / 到期回收 |
+| `chain.py` | 1006 | 链式代理: 配对码 v1/v2/v3 / 端口分配 / 真实出口探测 / 预热 / 证书固定诊断 |
 | `geodata.py` | 800 | GeoIP/GeoSite 多镜像下载 + 体积/SHA/真实 `xray -test` 三重校验 + 原子替换 + 上游版本核对 |
-| `chain.py` | 775 | 链式代理: 配对码打包解析 / 端口分配 / 真实出口 IP 探测 / 预热 |
-| `config.py` | 679 | 状态模型 (schema v6) / `locked()` 事务 / 引导令牌 / 审计日志 / 备份还原 |
-| `chain_quic.py` | 593 | 链式内层 QUIC: hysteria 子进程托管 / 配置同步 / 看门线程 |
-| `apply.py` | 621 | 配置落地闭环 (生成 → 真实校验 → 重载 → 复查端口, 含 WireGuard); 面板与 `upgrade.sh` 共用 |
-| `xray_config.py` | 437 | Xray 配置生成 (4 个入站 + 链式入站/出站/路由 + Stats API + geo 规则) |
-| `update.py` | 381 | 面板自更新: 远端版本检查 + `systemd-run --no-block` 拉起 `upgrade.sh` + 回读进度 |
-| `devices.py` | 363 | 客户端设备注册表: 配对码 / 设备凭据 (只存 sha256) / 期望状态 / 配置版本哈希 |
+| `config.py` | 750 | 状态模型 (schema v6) / `locked()` 事务 / 引导令牌 / 审计日志 / 状态损坏维护态 |
+| `apply.py` | 740 | 配置落地闭环 (生成 → 真实校验 → 重载 → 复查端口, 含 WireGuard); 面板与 `upgrade.sh` 共用 |
+| `chain_quic.py` | 727 | 链式内层 QUIC: hysteria 子进程托管 / 配置同步 / 看门线程 / 证书指纹 |
+| `devices.py` | 500 | 客户端设备注册表: 配对码 / 设备凭据 (只存 sha256) / 期望状态 / 下载-应用版本 |
+| `xray_config.py` | 469 | Xray 配置生成 (4 个入站 + 链式入站/出站/路由 + Stats API + geo 规则) |
+| `update.py` | 411 | 面板自更新: 远端版本检查 + `systemd-run --no-block` 拉起 `upgrade.sh` + 回读进度 |
+| `nginx_config.py` | 402 | Nginx 配置生成 (ACME + 443 WS/面板 + 伪装主页 + HSTS + 日志脱敏) |
+| `main.py` | 393 | 入口: FastAPI 装配 / 安全头与 Origin 校验 / 启动端口探测 / 后台线程 / 状态损坏 503 |
 | `cli.py` | 339 | 终端快捷管理 `z` (改账号 / 在线更新 / 看状态), 与面板同一条代码路径 |
-| `main.py` | 312 | 入口: FastAPI 装配 / 安全响应头 (含按文件算的内联脚本哈希) / 启动端口探测 / 后台线程 (含 WireGuard 到期回收) |
-| `nginx_config.py` | 208 | Nginx 配置生成 (ACME + 443 WS 反代 + 面板 TLS + 伪装主页) |
+| `dae_config.py` | 211 | 性能模式 (dae) 配置渲染: 节点键净化 / DNS / 分流 / 面板直连 |
+| `hysteria_config.py` | 152 | Hysteria 2 配置生成 + 结构校验 (重启前拦截坏 YAML) |
 | `crypto.py` | 95 | VLESS UUID 确定性派生 / Reality X25519 密钥对 / PBKDF2-SHA256 |
-| `hysteria_config.py` | 82 | Hysteria 2 配置生成 (端口跳跃 + masquerade) |
 | `account.py` | 75 | 管理员凭据规则的**唯一**实现 (用户名格式 / 密码长度 / 踢下线), 面板与 `z` 共用 |
 | `__init__.py` | 6 | `__version__` —— 升级检查读的就是这一行 |
 
@@ -250,6 +253,11 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
 * 端口约定: 落地 8447/tcp (Reality)、8448/udp (QUIC 内层); 入口侧从 8446 起顺序找空位; QUIC 客户端 SOCKS 从 8470 起。
 * QUIC 内层的 hysteria 进程由**面板托管** (不是 systemd): 本地开发与生产同一条路径,
   老部署面板内升级完即能用, 由看门线程兜底。
+* **证书固定 (v2.12.15 起)**: `hysteria2` 内层在入口端固定落地端证书 DER SHA-256
+  (`insecure: true` + `pinSHA256`)。旧 v2 配对码没有指纹, 升级后**不再**以"不校验对端
+  身份"的形态运行 (fail-closed): `/api/diagnose` 给出 `chain_quic_pin` 红项, apply 跳过
+  该链路并写审计, 需要用落地端最新 v3 配对码重新配对; 落地端证书重签后入口端出现
+  `chain_quic_pin_mismatch` 告警。诊断/apply 都不阻断其它节点的落地与整体升级。
 
 ---
 
@@ -273,8 +281,12 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
 面板上的「客户端」页背后: 让路由器/手机/电脑**各自持有一份独立凭据**。
 
 * **主订阅令牌永不下发**。安装命令里带的是一次性**配对码** (30 分钟有效, 用掉即废); 设备拿它换
-  `device_id + secret`, 之后所有请求用这对凭据。secret 只在配对响应里出现一次, 服务端只存 **sha256**
+  `device_id + secret`, 之后所有请求用这对凭据。secret 只在配对响应里下发一次, 服务端只存 **sha256**
   (备份文件会离开这台机器, 明文凭据不该躺在里面)。单台设备因此可单独吊销/改名/换模板。
+  新客户端把 secret 放在 `Authorization: Bearer` 头里 (旧 `?k=` 继续兼容); nginx 访问日志
+  不记录 query string, `/c/`、`/sub/`、`/wg/one/` (含 `/panel/` 前缀) 整条不记录。
+* **下载 ≠ 已应用**: 订阅/配置下载只推进 `downloaded_rev`; 设备在配置真正落地并自检后回报
+  `applied_rev` (或 `healthy`), 面板才点亮「配置已应用」。
 * **开关是「期望状态」不是按钮动画**: 面板写 `desired`, 设备轮询 `/c/report` (约 15 秒一次) 拿到它
   并回报 `actual`; 面板显示的颜色取自 `actual`——「显示已连接」永远意味着路由器真的连上了。
 * **配置版本用内容哈希**: `config_rev()` 把影响订阅内容的字段做一次哈希 (节点启停 / 端口 / 模板 /
@@ -412,7 +424,7 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
 | 面 | 措施 |
 |---|---|
 | 初始化抢注 | 一次性引导令牌, 常量时间比对, 成功后立即删除 |
-| 暴露面 | 面板进程只绑 `127.0.0.1:9900`; 配置完成后对外只有 Nginx 的 8899 |
+| 暴露面 | 面板进程只绑 `127.0.0.1:9900`; 正式入口为 Nginx 443 `/panel/`, 8899 为兼容入口 |
 | 引导期 (未初始化) | 初始化页在 80 端口明文 HTTP 上 — 这一段是刻意的: 自签证书在 IP 上必然被浏览器拦一页, 而 80 是 ACME 必须开着的端口。此处只有 `/` `/static` 与 `/api/status` `/api/setup` (令牌门禁) 可达, 且没有管理员账号 / 会话 / 节点凭据; `apply` 一落地 (setup 完成) 这份引导配置就被覆盖成"80 只做 ACME + 跳 HTTPS" |
 | 登录爆破 | 连败 3 次起按 2^n 秒封禁 (上限 300 s), 返回 429 + `Retry-After`, 状态持久化 |
 | 会话 | HttpOnly + SameSite=Lax (HTTPS 自动加 Secure), 72 h 过期, 最多 8 个 (超出淘汰最旧), 支持全部登出 |
@@ -421,8 +433,12 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
 | 并发 | `config.locked()` = 进程内 RLock + `fcntl.flock`, 读-改-写事务化 |
 | HTTP 头 | CSP 的 `script-src` **与 `style-src` 都不放行 `unsafe-inline`**; 页面仅剩的 head 内联主题脚本用启动时按 `index.html` 实际内容算出的 sha256 白名单放行。另有 `X-Content-Type-Options` / `X-Frame-Options: DENY` / `Referrer-Policy` / `Permissions-Policy`; 不开放 CORS 通配 |
 | 数据驱动样式 | 进度条 / 延迟条 / 流量条的宽度与底色在模板里只写 `data-w` / `data-bg`, 插入文档后由 `lib/dom.js` 的 `applyWidths()` 用 **CSSOM** 赋值 (`el.style.*` 不受 `style-src` 约束) |
-| 设备凭据 | 主令牌不下发; 每台设备独立 secret, 服务端只存 sha256 |
-| 审计 | 最近 500 条 + 归档; 不可逆动作带风险标记 |
+| 设备凭据 | 主令牌不下发; 每台设备独立 secret (服务端只存 sha256); 新客户端走 `Authorization: Bearer`, 旧 `?k=` 兼容; nginx 日志不记 query, 敏感路径不记录 |
+| 状态文件损坏 | `state.json` 存在但解析失败 → 503 维护态 (不回落 DEFAULTS); setup 在没有引导令牌但已有初始化痕迹时拒绝 |
+| 供应链 | 仓库根 `SHA256SUMS` 逐文件校验 (install/upgrade 用同一 ref 的独立 raw 清单比对, 不符即中止); zpcore 带 `dist/SHA256SUMS` 与下发头 `X-ZP-Sha256` |
+| 证书续期 | certbot `--deploy-hook` (reload nginx + restart xray); install / upgrade / 面板三处写同一份 hook |
+| 备份 | `/api/backup` 仅 POST; 可选 AES-256-GCM 口令加密 (PBKDF2-SHA256 600k); 备份不含 handoff 票据与未用配对码 |
+| 审计 | 最近 500 条 + 归档 (0600); 不可逆动作带风险标记 |
 
 ---
 
@@ -435,7 +451,10 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
   `setsid` 独立会话重跑, 前台只 tail 日志 (`$ZP_HOME/data/install.log`) —— SSH 断线不再中断
   安装; 小内存机器 (< 1 GB 且无 swap) 顺带补 1 GB swap 并 `vm.swappiness=10`, 那一段**从不
   fail**。两条对应真机上的同一现象: "走到装依赖那一步会话断了, 一点报错都没有" (README 8.96)。
-  GitHub 取文件走**多前缀表** (自建反代排第一, 最后才直连; 拿到的必须是非空文件)。
+  GitHub 取文件走**多前缀表** (自建反代排第一, 最后才直连)。下载的代码包解压后按
+  **同一 ref 的 `SHA256SUMS`** 逐文件校验 (清单从原始 raw 地址独立获取, 镜像只承担传输;
+  不一致或缺清单即中止, `ZP_ALLOW_UNVERIFIED=1` 才跳过); setsid 自保取回自己时也先校验
+  脚本 hash。
   识别到 OpenWrt 会**当场停下**并说明「面板装在服务器上, 路由器端用面板生成的那一行命令」——
   在路由器上跑它以前只会留下一句 `dpkg: command not found` (真机截图)。
 * **第一跳与面板基址的 scheme**: 引导期初始化页挂在 **80 端口明文 HTTP** (主链接, 没有证书
@@ -444,10 +463,13 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
   打印链接前 install.sh 还会先等面板回话, 再**按用户那一跳** (经 nginx) 自检并把结论印出来。
   面板端口在生产上**只有 nginx 的 TLS**, 所以 `share_links.panel_base_url()` 用
   `X-Forwarded-Proto` 判 scheme: 从 80 端口的明文页初始化完之后, 那一跳是
-  `https://<域名>:<面板端口>` —— 跟着请求走会拼出 `http://<域名>:8899/`, 被 nginx 回
+  `https://<域名>/panel/` —— 跟着请求走会拼出错误 scheme / 端口, 被 nginx 回
   `400 The plain HTTP request was sent to HTTPS port` (真机截图, README 8.95)。订阅地址 /
   客户端安装命令 / "打开面板"都出自这个函数, 所以它们一起正。
-* **`upgrade.sh`**: 备份代码与 `state.json` → 换代码 → 按现有 `state.json` 重新落地配置 → 任一步失败**自动回滚**。
+* **`upgrade.sh`**: 备份代码 / `requirements.txt` / systemd 五份单元 / `upgrade.sh` 自身 / `state.json`
+  → 换代码 (同样做 `SHA256SUMS` 逐文件校验) → 落 certbot 续期 hook → 按现有 `state.json` 重新
+  落地配置 → 任一步失败**自动回滚**并 `daemon-reload` + `python -m zeroproxy.apply` + `/api/info`
+  readiness 复验; pip 依赖只记录 freeze 并提示"只前进不回退"。
   只换程序代码, 密钥 / 订阅令牌 / 节点开关原样保留, **订阅地址不变**。
   面板内升级由 `systemd-run --no-block` 放进独立 cgroup (面板自身重启不打断), 进度落在
   `data/update.json` + `data/update.log`, 面板重启后照常能读。
@@ -459,6 +481,12 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
   `backend/tests/test_python_compat.py` 用 `ast.parse(feature_version=(3,10))` 守着 ——
   开发机是 3.14, 没有这道闸门时"本机全绿"与"装到 Debian 12 上能起来"是两件事
   (v2.11.42 踩过, 见 README 8.94)。
+> **发布流程硬约束 (v2.12.15 起)**: 根 `SHA256SUMS` 必须与代码**同一个 commit** 发布
+> (改完代码跑 `bash scripts/gen_sha256sums.sh` 再提交)。`install.sh` / `upgrade.sh` 默认
+> 严格校验, 清单缺失/不一致会直接中止; 应急可用 `ZP_ALLOW_UNVERIFIED=1` 跳过。
+> 镜像只承担传输, 期望摘要来自同一 ref 的原始 raw 清单 (残余风险: 清单与代码同链路时
+> 无法抵御同时控制两条通道的攻击者, 彻底解决需要 release 签名)。
+
 * **`uninstall.sh`**: 与安装对称, 可选保留数据 / 证书。
 * **`dev.sh`**: 本地开发启动 (macOS 可跑, 无 systemd 时自动 dry-run)。`cli.py` 提供终端兜底入口 `z`。
 * systemd 单元: `zeroproxy.service` (面板, `Restart=always`) / `xray.service` / `hysteria2.service`;
@@ -478,23 +506,24 @@ GET /sub/{token}?format=singbox-next  → 同上, 1.14+ 的 http_clients 写法
 
 | 脚本 | 覆盖 |
 |---|---|
-| `backend/tests/` (pytest) | **353 通过 + 6 skip** (无真实内核二进制时跳过)。dry-run 全流程 + 安全边界 + 状态迁移 + WireGuard 密钥/配置/API/内核与用户态回退/GL.iNet 兼容模式 + 装机件端点契约 + 面板直传"一个字节都没拿到"时的让位 (8.92) |
+| `backend/tests/` (pytest) | **464 通过 + 6 skip** (无真实内核二进制时跳过)。dry-run 全流程 + 安全边界 + 状态迁移 + 备份加密/恢复校验 + 设备下载/应用版本 + 证书续期 hook + 供应链清单 + WireGuard 密钥/配置/API/内核与用户态回退 + 装机件端点契约 |
 | `scripts/verify.py` | 用真实 Xray/Hysteria/mihomo/sing-box 校验生成的配置与订阅 (含**两台机器真跑一条链**) |
-| `scripts/router_install_check.py` | **201 项**。真的用 shell 跑一遍路由器安装脚本: 七类机器 (含 OpenWrt 25.12 / apk 三态 / BTF 两种现场 / 性能模式的进-出-回退) / 本机覆盖 / revert 比对 / zpcore 真跑 / **第一跳** (面板生成的那一行命令外面顶一个 uclient-fetch 替身: 丢包重试、自签面板按证书状态跳过校验、配对码失效时读得到原因; 旧写法的"什么都没有发生"与命令长度都钉在测试里)。性能模式那一节的假 dae **照真机复刻两条硬规矩** (0644 拒 / node 键带引号拒) 并先自证一次 —— 它以前无条件 exit 0, 于是这两类事故在演练里永远是绿的; 另有"停不掉的 mihomo"(真进程)、"切换期间 agent 不许拉起标准模式"、"出口等于本机 WAN 地址时不算通"与"cgi 的 status 必须带 perf.live"。**四个现场入口的一致性矩阵** (8.90): 四档 mihomo 数据面各跑一遍, CLI `status` / `doctor` / 本地界面 (zpcore) / agent 心跳必须报同一档 mode 与同一档 covered —— 假工具按一个状态文件说话, 所以四档只起一次 zpcore、装一次机器; 外加 `zpcore state` 的 key=value 与 `--json` 两个契约 |
-| `scripts/browser_check.cjs` | **157 项**, 真 Chromium 走「初始化 → 仪表盘」全流程 + 交互 + CSP + 截图 |
+| `scripts/router_install_check.py` | 真的用 shell 跑一遍路由器安装脚本 (项数以脚本输出为准): 七类机器 (含 OpenWrt 25.12 / apk 三态 / BTF 两种现场 / 性能模式的进-出-回退) / 本机覆盖 / revert 比对 / zpcore 真跑 / **第一跳** (面板生成的那一行命令外面顶一个 uclient-fetch 替身: 丢包重试、自签面板按证书状态跳过校验、配对码失效时读得到原因; 旧写法的"什么都没有发生"与命令长度都钉在测试里)。性能模式那一节的假 dae **照真机复刻两条硬规矩** (0644 拒 / node 键带引号拒) 并先自证一次 —— 它以前无条件 exit 0, 于是这两类事故在演练里永远是绿的; 另有"停不掉的 mihomo"(真进程)、"切换期间 agent 不许拉起标准模式"、"出口等于本机 WAN 地址时不算通"与"cgi 的 status 必须带 perf.live"。**四个现场入口的一致性矩阵** (8.90): 四档 mihomo 数据面各跑一遍, CLI `status` / `doctor` / 本地界面 (zpcore) / agent 心跳必须报同一档 mode 与同一档 covered —— 假工具按一个状态文件说话, 所以四档只起一次 zpcore、装一次机器; 外加 `zpcore state` 的 key=value 与 `--json` 两个契约 |
+| `scripts/browser_check.cjs` | 真 Chromium 走「初始化 → 仪表盘」全流程 + 交互 + CSP + 截图 (缺 playwright 时 exit 1 且收掉面板子进程) |
 | `scripts/clients_check.cjs` | 真实浏览器点客户端开关 |
-| `scripts/router_ui_check.cjs` | **62 项**。路由器本地界面 (含「没有更新记录时不许凭空长出进度面板」这类判据, 以及性能模式那块**速率表**: 真实浏览器里点一次, 看刻度/切换五段/真实读数/出口/熄火)。8.86 重做表盘时这一节的断言按新契约改过, 但**这台机器上没有 playwright, 没能在这里跑** —— 只做了静态更新 (下一次在有浏览器的地方跑时要留意) |
-| `scripts/geo_slow_check.cjs` | 长任务前端行为 (默认约 3 分钟的真下载) |
-| `scripts/upgrade_sim.sh` | 真跑 `upgrade.sh` (桩掉 root/systemd), 覆盖成功与回滚两条路径 |
+| `scripts/router_ui_check.cjs` | 路由器本地界面 (含「没有更新记录时不许凭空长出进度面板」这类判据与性能模式速率表)。**这台机器上没有 playwright, 只做了静态/语法验证** —— 下一次在有浏览器的地方跑时要留意 |
+| `scripts/geo_slow_check.cjs` | 长任务前端行为 (150 s 慢速**桩**, 验证轮询/进度条复位, 不是真下载) |
+| `scripts/upgrade_sim.sh` | 真跑 `upgrade.sh` (桩掉 root/systemd), 覆盖成功、坏清单回滚、下载失败回滚；当前 43 项全绿 |
 | `scripts/build-agent.sh` | 构建 `zpcore` 并注入版本号到 `client/agent/dist/` |
 
-（各脚本的用例数以脚本自身运行输出为准; 上面标数字的是已核对的。）
+（各脚本的用例数以脚本自身运行输出为准; pytest/upgrade_sim 数字为 v2.12.15 实测。本机无 playwright,
+浏览器类脚本只做了静态/语法验证, 有 Chromium 的机器应重跑。）
 
 ---
 
 ## 16. 已知技术债 / 待办
 
-* **超长单文件**: `routes.py` (~3 320 行) / `router-install.sh` (~3 040 行, 8.89 把运行时装机件搬去了 `client/runtime/`, 从 5578 行降下来) / `scripts/browser_check.cjs` (~82 KB) / `scripts/router_install_check.py` (~2 300 行, 仍在长)。
+* **超长单文件**: `routes.py` (~4 689 行) / `router-install.sh` (3 285 行) / `scripts/browser_check.cjs` (~90 KB) / `scripts/router_install_check.py` (~2 461 行, 仍在长)。
   注释密度很高、内部有分区, 但单文件到这个体量, 后续定位成本会持续上升。
 * **文档重叠**: README (逐版日志) 与本文、`docs/` 三份之间有信息重叠; README 面向历史, 本文面向现状,
   长期需要保持本文随代码更新 (否则又会退回「过期快照」)。

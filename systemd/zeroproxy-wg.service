@@ -14,6 +14,8 @@ ExecReload=/bin/sh /opt/zeroproxy/wireguard/reload.sh
 TimeoutStartSec=30
 TimeoutStopSec=30
 Restart=no
+# 建接口 / 配地址 / 挂 NAT 规则都只需要 NET_ADMIN (P2-13)
+CapabilityBoundingSet=CAP_NET_ADMIN
 
 [Install]
 WantedBy=multi-user.target

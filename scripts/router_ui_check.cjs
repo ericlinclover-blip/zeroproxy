@@ -26,6 +26,21 @@ for (const extra of (process.env.ZP_NODE_PATH || "").split(path.delimiter)) {
   if (extra && !module.paths.includes(extra)) module.paths.push(extra);
 }
 
+// playwright 必须在起模拟路由器 (makeMock/listen) **之前** require: 本机没有这个模块时,
+// 旧写法是先把模拟服务挂上端口再抛 MODULE_NOT_FOUND, 依赖缺失时的退出路径会绕过
+// finally 里的 server.close()。先 require 再起服务: 缺依赖就干净退出 1。
+let chromium;
+try {
+  ({ chromium } = require("playwright"));
+} catch (e) {
+  console.error(
+    "缺少 playwright: 本脚本需要 node + playwright + Chromium。\n" +
+      "本机没有时请明确跳过 (不能当作\"通过\"), 不要安装到项目里来跑。\n" +
+      "原始错误: " + (e && e.message ? e.message : e)
+  );
+  process.exit(1);
+}
+
 const results = [];
 function check(name, ok, detail = "") {
   results.push({ name, ok });
@@ -239,7 +254,6 @@ async function main() {
   const server = makeMock();
   await new Promise((r) => server.listen(PORT, "127.0.0.1", r));
   const base = `http://127.0.0.1:${PORT}/cgi-bin/zeroproxy`;
-  const { chromium } = require("playwright");
   let browser;
   try {
     browser = await chromium.launch(

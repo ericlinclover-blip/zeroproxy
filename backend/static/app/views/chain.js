@@ -23,14 +23,53 @@ export function renderChain(d) {
   const ex = c.exit || {};
   const entries = c.entries || [];
   renderChainPath(d);
-  grid.innerHTML = chainExitCard(d, ex) + chainPeerCard(d, entries);
+  grid.innerHTML = chainExitCard(d, ex, c) + chainPeerCard(d, entries);
   $("#chain-entries").innerHTML = entries.length
     ? `<div class="section-title mb-0">已连接的落地端 (${entries.length})</div>` +
+      chainPinSummary(c, entries) +
       entries.map((e) => chainEntryCard(d, e)).join("")
     : "";
   bindChainExit(ex);
   bindChainPeer();
   bindChainEntries(entries);
+}
+
+/** 这条链的证书指纹 (pin) 是否需要重新配对。
+ *
+ *  字段来自后端 /api/chain: needs_repair=true 或 pin_ok=false 就是"链是通的但 TLS
+ *  指纹对不上 / 根本没固定" —— 客户端那侧只会看到 "no certificate matches the pinned
+ *  hash", 面板这里不能静默。字段缺省 (旧后端) 时当作"未知", 不误报。
+ */
+function entryNeedsRepair(e) {
+  return !!(e && (e.needs_repair === true || e.pin_ok === false));
+}
+
+/** 当前链式条目里"指纹待修复"的汇总提示 (红条, 写清怎么办)。 */
+function chainPinSummary(c, entries) {
+  const broken = entries.filter(entryNeedsRepair);
+  const mismatch = c && c.pin_mismatch === true;
+  if (!broken.length && !mismatch) return "";
+  const reasons = [];
+  if (broken.length) {
+    reasons.push(
+      `<b>${broken.length} 条链的落点证书指纹 (pin) 对不上</b> —— 配对码里没有证书指纹 (旧版配对码), ` +
+        `或者落地端重新签过证书。内层 QUIC 那条链路现在多半直接连不上, 客户端日志里是 ` +
+        `<span class="mono">no certificate matches the pinned hash</span>。`
+    );
+  }
+  if (mismatch) {
+    reasons.push(
+      `<b>本机落地端证书已重签</b> —— 已连接的入口端存的还是旧指纹 (当前 pin: ` +
+        `<span class="mono">${esc(String((c && c.exit_pin) || "").slice(0, 16))}…</span>)。`
+    );
+  }
+  return `<div class="banner bad mt-3" id="chain-pin-banner">
+      <span class="ico">!</span>
+      <span>${reasons.join("<br>")}<br>
+        <b>怎么修:</b> 在入口端点对应卡片上的「重新配对」断开这条链, 再到落地端「生成配对码 / 重新生成」
+        拿一份最新的配对码, 粘回下面「连接到落地服务器」重新连接即可 (订阅里的节点会随配对重建)。
+        落地端自己的订阅与其它节点完全不受影响。</span>
+    </div>`;
 }
 
 /* 链式代理卡片顶部的三段式拓扑: 客户端 → 本机入口 → 落地端。
@@ -44,6 +83,7 @@ function renderChainPath(d) {
   // 拓扑只画"活着"的那条链: 优先默认出口, 其次是第一条启用中的; 全停用就别画成通的
   const live = all.filter((x) => x.enabled);
   const e = live.find((x) => x.default_out) || live[0];
+  const broken = entryNeedsRepair(e);   // 证书指纹对不上: 这条内层链路实际是断的
   const probe = (e && e.last_probe) || {};
   const onCount = (d.nodes || []).filter((n) => n.enabled && !n.chain).length;
   const emptyMeta = all.length
@@ -57,14 +97,18 @@ function renderChainPath(d) {
       <span class="meta">订阅里自动多出链式节点, 不用手写 relay / detour</span></div>`;
   const entry = e
     ? `<div class="hop accent"><span class="who">入口 · 就近加速</span><span class="id">${esc(d.domain)}:${e.local_port}</span>
-        <span class="meta">${onCount} 个主力节点在这台机器上 · 客户端连它</span></div>`
+        <span class="meta">${onCount} 个主力节点在这台机器上 · 客户端连它${
+          broken ? " · <b>证书指纹待修复</b>" : ""
+        }</span></div>`
     : `<div class="hop empty"><span class="who">入口 · 就近加速</span><span class="id">${esc(d.domain)}</span>
         <span class="meta">${emptyMeta}</span></div>`;
   const exitHop = e
     ? `<div class="hop"><span class="who">落地 · ${esc(e.label || "出口")}</span><span class="id">${esc(e.host)}:${e.port}</span>
         <span class="meta">出口 IP ${esc(probe.exit_ip || "未探测")}${
           probe.tcp_ms ? " · 链路 " + Math.round(probe.tcp_ms) + "ms" : ""
-        } · 内层 ${e.transport === "hysteria2" ? "QUIC" : "Reality"}${e.default_out ? " · 已设为默认出口" : ""}</span></div>`
+        } · 内层 ${e.transport === "hysteria2" ? "QUIC" : "Reality"}${e.default_out ? " · 已设为默认出口" : ""}${
+          broken ? ' · <b>证书指纹待修复</b>' : ""
+        }</span></div>`
     : `<div class="hop empty"><span class="who">落地 · 出口</span><span class="id">—</span>
         <span class="meta">${ex.enabled ? "本机可当别人的出口, 端口 " + ex.port : "本机既没接入也没开启落地端"}</span></div>`;
 
@@ -72,7 +116,7 @@ function renderChainPath(d) {
     client +
     `<div class="wire${e ? "" : " off"}"><i></i><span>${e ? "VLESS Reality" : "未接链"}</span><span class="mono">${e ? e.local_port + "/tcp" : ""}</span></div>` +
     entry +
-    `<div class="wire${e ? "" : " off"}"><i></i><span>${
+    `<div class="wire${e && !broken ? "" : " off"}"><i></i><span>${
       e && e.transport === "hysteria2" ? "QUIC/UDP" : "专用凭据"
     }</span><span class="mono">${
       e ? (e.transport === "hysteria2" ? e.hy_port + "/udp" : e.port + "/tcp") : ""
@@ -80,14 +124,25 @@ function renderChainPath(d) {
     exitHop;
 }
 
-function chainExitCard(d, ex) {
+function chainExitCard(d, ex, c) {
+  const pin = String((c && c.exit_pin) || "");
+  const mismatch = !!(c && c.pin_mismatch === true);
+  // 证书重签不会通知入口端: 它们存的还是旧指纹, 只会安静地连不上。这里必须当面说清。
+  const pinWarn = mismatch
+    ? `<div class="banner bad mt-3" id="chain-exit-pin-warn"><span class="ico">!</span>
+        <span><b>本机证书已重签, 已连接的入口端 pin 对不上</b> —— 入口端存的还是旧指纹。
+        当前 pin: <span class="mono">${esc(pin.slice(0, 16))}${pin.length > 16 ? "…" : ""}</span><br>
+        到入口端点对应链的「重新配对」, 然后用这里的「重新生成」出的新配对码重新连接。
+        本机自己的订阅完全不受影响。</span></div>`
+    : "";
   const head = `<div class="row-between">
       <span class="name card-title">
         <span class="badge trojan">落地端</span>本机对外当出口</span>
       ${ex.enabled ? '<span class="badge vless">已开启</span>' : '<span class="badge hysteria">未开启</span>'}
+      ${mismatch ? '<span class="badge hysteria">入口端 pin 待重新配对</span>' : ""}
     </div>`;
   if (!ex.enabled) {
-    return `<div class="card" id="chain-exit-card">${head}
+    return `<div class="card" id="chain-exit-card">${head}${pinWarn}
       <div class="note mt-3 mb-3">
         开启后本机会多一个<b>专用入站</b> (独立凭据, 与订阅里那份互不影响), 供另一台机器把本机当出口用。
         客户端最终看到的出口 IP 就是这台服务器。</div>
@@ -121,7 +176,7 @@ function chainExitCard(d, ex) {
     </div>`;
   }
   const code = ex.code || "";
-  return `<div class="card" id="chain-exit-card">${head}
+  return `<div class="card" id="chain-exit-card">${head}${pinWarn}
     <div class="note mt-3 mb-3">
       把这行配对码贴到入口端服务器的「连接到落地服务器」里, 它就会把本机的出口当自己的出口。</div>
     <div class="qr-link mono" id="chain-exit-code" title="${escAttr(code)}">${esc(code)}</div>
@@ -139,6 +194,15 @@ function chainExitCard(d, ex) {
         : "未开启 (内层走 Reality/TCP)"
     }${ex.hy_enabled ? ` <button class="btn ghost small" id="btn-chain-exit-hy-off">关闭</button>` : ""}</span></div>
     <div class="kv"><span class="k">专用凭据</span><span class="mono">${esc(ex.credential || "")}… <span class="muted">与订阅凭据分开, 可单独作废</span></span></div>
+    ${
+      pin
+        ? `<div class="kv"><span class="k">证书指纹 (pin)</span><span class="mono" title="${escAttr(pin)}">${esc(
+            pin.slice(0, 24)
+          )}${pin.length > 24 ? "…" : ""}${
+            mismatch ? ' <span class="badge hysteria">入口端存的不是它</span>' : ""
+          }</span></div>`
+        : ""
+    }
     ${ex.label ? `<div class="kv"><span class="k">名称</span><span>${esc(ex.label)}</span></div>` : ""}
     <div class="kv"><span class="k">开启时间</span><span>${esc(fmtTime(ex.created_at))}</span></div>
     ${
@@ -193,6 +257,7 @@ function chainPeerCard(d, entries) {
 
 function chainEntryCard(d, e) {
   const p = e.last_probe || {};
+  const repair = entryNeedsRepair(e);
   let probe;
   if (!p.ts && !p.detail) {
     probe = `<span class="note">还没测过这条链 —— 点「测速」跑一次真实出口往返。</span>`;
@@ -216,11 +281,15 @@ function chainEntryCard(d, e) {
         p.ts ? " · " + esc(fmtTime(p.ts)) : ""
       }</span>`;
   }
-  return `<div class="card chain-entry">
+  return `<div class="card chain-entry${repair ? " pin-broken" : ""}"${
+    repair ? ' data-pin-broken="1"' : ""
+  }>
     <div class="top">
       <span class="name"><span class="badge hysteria">链式</span><span class="nm">${esc(
         e.label || e.host
-      )}</span>${e.default_out ? '<span class="badge trojan">默认出口</span>' : ""}</span>
+      )}</span>${e.default_out ? '<span class="badge trojan">默认出口</span>' : ""}${
+        repair ? '<span class="badge hysteria">证书指纹待修复</span>' : ""
+      }</span>
       <label class="switch"><input type="checkbox" data-chain-toggle="${escAttr(e.id)}" ${
         e.enabled ? "checked" : ""
       }><span class="slider"></span></label>
@@ -230,6 +299,15 @@ function chainEntryCard(d, e) {
         ? `QUIC/UDP ${e.hy_port}${e.hy_bw ? " · Brutal " + e.hy_bw + "M" : ""}`
         : "Reality/TCP"
     } · SNI ${esc(e.sni || "")}</div>
+    ${
+      repair
+        ? `<div class="banner bad mt-2" id="chain-pin-warn-${escAttr(e.id)}">
+        <span class="ico">!</span>
+        <span><b>这条链的证书指纹 (pin) 对不上</b> —— 配对码里没带落地端证书指纹 (旧版配对码),
+        或落地端重签过证书。内层 QUIC 现在多半直接连不上 (客户端日志: <span class="mono">no certificate
+        matches the pinned hash</span>)。点「重新配对」断开后, 用落地端最新的配对码重连即可。</span></div>`
+        : ""
+    }
     ${
       e.enabled && e.transport === "hysteria2" && e.hy_ready === false
         ? `<div class="note">内层 QUIC 客户端没在跑 —— 点「重新应用」或看程序日志; 这条链现在多半是断的。</div>`
@@ -244,6 +322,11 @@ function chainEntryCard(d, e) {
       <div class="ce-probe">${probe}</div>
       <div class="actions">
         <button class="btn ghost small" data-chain-probe="${escAttr(e.id)}">测速</button>
+        ${
+          repair
+            ? `<button class="btn small" data-chain-repair="${escAttr(e.id)}">重新配对</button>`
+            : ""
+        }
         ${
           e.has_quic || e.transport === "hysteria2"
             ? `<button class="btn ghost small" data-chain-transport="${escAttr(e.id)}">${
@@ -511,6 +594,29 @@ function bindChainEntries(entries) {
           从这台落地服务器出网 —— 客户端不用换节点。<br>
           分流模板里的广告 / 私有地址拦截规则优先级更高, 不受影响。</div>`,
         onOk: doIt,
+      });
+    })
+  );
+  document.querySelectorAll("[data-chain-repair]").forEach((el) =>
+    (el.onclick = () => {
+      const entry = entries.find((e) => e.id === el.dataset.chainRepair) || {};
+      openConfirm({
+        title: `重新配对「${entry.label || entry.host}」?`,
+        okLabel: "断开并重新配对",
+        html: `<div class="qr-sub">证书指纹 (pin) 对不上时这条链是<b>连不通</b>的, 面板不会替你静默放过。<br><br>
+          先把这条链断开 (本机入站 / 出站 / 路由规则一起删掉, 订阅里这个节点随之消失;
+          落地端服务器上的配置不受影响), 然后:<br>
+          ① 到落地端面板「落地端」卡片点「重新生成」(或直接复制现有配对码);<br>
+          ② 回到下面「连接到落地服务器」粘贴新配对码, 点「连接并测试」。<br><br>
+          <span class="muted">断开之后正在走这条链的客户端会断一次, 重连成功即恢复。</span></div>`,
+        onOk: () =>
+          applyAction(
+            "DELETE",
+            `/api/chain/entries/${el.dataset.chainRepair}`,
+            undefined,
+            el,
+            "断开中…"
+          ),
       });
     })
   );

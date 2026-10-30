@@ -216,6 +216,34 @@ function ago(ts) {
   return `${Math.floor(s / 86400)} 天前`;
 }
 
+/** 配置版本语义 —— 「已下载」不等于「已应用」。
+ *
+ *  面板把新配置推给路由器, 只能证明设备**下载**到了 (downloaded_rev);
+ *  只有设备自己回报"应用成功/数据面已生效"后 applied_rev 才推进。
+ *  两者不一致 (或设备还没回报) 时必须显式说"已下载未应用", 不能拿下载冒充生效 ——
+ *  真机上出现过"面板显示已应用, 而设备数据面根本没切过去"。
+ *  字段缺失 (旧后端 / 旧设备) 时不显示, 不误报。
+ */
+function versionChip(d) {
+  const downloaded = String(d.downloaded_rev || "");
+  const applied = String(d.applied_rev || "");
+  const short = (v) => esc(v.slice(0, 8));
+  if (downloaded && (!applied || downloaded !== applied)) {
+    const why = applied
+      ? `面板已让设备下载 v${short(downloaded)}, 设备上一次回报应用的是 v${short(applied)}`
+      : `面板已让设备下载 v${short(downloaded)}, 但设备还没回报「已应用」`;
+    return `<span class="badge hysteria" title="${escAttr(why)}">已下载未应用${
+      applied ? ` (上报 v${short(applied)})` : ""
+    }</span>`;
+  }
+  if (applied) {
+    return `<span class="badge trojan" title="${escAttr(
+      `设备已回报应用这一版配置 (v${short(applied)})`
+    )}">配置已应用</span>`;
+  }
+  return "";
+}
+
 function routerTab(dash, routers) {
   if (!routers.length) return installCard(dash);
   // 更新命令由面板渲染 (与"生成安装命令"同一处): 界面里手写一份迟早在改命令时漂移。
@@ -258,6 +286,7 @@ function deviceCard(d) {
         <span class="tag-chip">分流 · ${esc(tpl)}</span>
         <span class="tag-chip">${d.actual ? "内核运行中" : "内核已停止"}</span>
         ${coverageChip(d)}
+        ${versionChip(d)}
         ${d.version ? `<span class="tag-chip">客户端 v${esc(d.version)}</span>` : ""}
       </div>
       ${d.ui ? `

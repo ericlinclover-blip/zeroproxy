@@ -6,6 +6,9 @@ import errno
 import json
 import os
 import shutil
+import threading
+import time
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -26,7 +29,7 @@ def test_setup_requires_bootstrap_token(client, token):
 
 def test_setup_pipeline_all_steps_ok(configured):
     steps = configured["steps"]
-    assert [s["name"] for s in steps][:2] == ["生成密钥材料", "写入面板状态"]
+    assert [s["name"] for s in steps][:2] == ["生成密钥材料", "准备面板状态"]
     assert all(s["ok"] for s in steps), steps
     assert len(configured["nodes"]) == 5
     assert configured["subscription_url"].endswith(configured["subscription_url"].split("/")[-1])
@@ -46,6 +49,95 @@ def test_setup_validation(client, token):
     assert client.post("/api/setup", json={**base, "domain": "not a domain"}).status_code == 400
     assert client.post("/api/setup", json={**base, "domain": DOMAIN, "password": "123"}).status_code == 400
     assert client.post("/api/setup", json={**base, "domain": DOMAIN, "username": "a"}).status_code == 400
+
+
+def test_setup_certificate_wait_keeps_requests_and_bootstrap_entrypoint_alive(client, token, home, monkeypatch):
+    """证书申请期间不能持全局锁, 也不能提前把 IP 初始化入口改成 finished 配置。
+
+    certbot 在真实网络里可能等待数分钟。旧实现把整个 setup 包在 config.locked()
+    内, 同时先写入 configured=true 和完整 nginx 配置; 结果其他请求被锁住, IP
+    入口又被切到域名/8899。用户看到的就是“初始化页打不开”, 而且失败后无法重试。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from zeroproxy import config, services
+
+    cert_started = threading.Event()
+    release_cert = threading.Event()
+    lock_acquired = threading.Event()
+    cert_paths = config.paths()
+
+    def slow_install_cert(host: str, timeout: int = 300):
+        cert_started.set()
+        assert release_cert.wait(3), "测试没有释放证书等待"
+        return True, "测试证书", {
+            "type": "selfsigned",
+            "issuer": "test",
+            "cert_file": cert_paths["cert_file"],
+            "key_file": cert_paths["cert_key"],
+            "not_after": 4_000_000_000,
+        }
+
+    monkeypatch.setattr(services, "install_cert", slow_install_cert)
+    payload = {"domain": DOMAIN, "username": USERNAME, "password": PASSWORD, "token": token}
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        setup_future = pool.submit(client.post, "/api/setup", json=payload)
+        assert cert_started.wait(3), "setup 没有进入证书申请步骤"
+
+        def acquire_state_lock():
+            with config.locked():
+                lock_acquired.set()
+
+        probe = threading.Thread(target=acquire_state_lock, daemon=True)
+        probe.start()
+        try:
+            assert lock_acquired.wait(0.5), "证书申请期间 setup 仍持有全局状态锁"
+            assert config.load_state()["configured"] is False, "证书还没完成就提前提交了初始化状态"
+
+            setup_conf = (home / "nginx" / "zeroproxy.conf").read_text(encoding="utf-8")
+            assert DOMAIN in setup_conf, "初始化阶段的 nginx 配置没有接受待申请证书的域名"
+            assert "listen 443" not in setup_conf, "证书还没完成就切换成了正式 nginx 配置"
+        finally:
+            release_cert.set()
+        response = setup_future.result(timeout=10)
+
+    assert response.status_code == 200, response.text
+    assert config.load_state()["configured"] is True
+
+
+def test_setup_certificate_failure_keeps_bootstrap_token_retryable(client, token, home, monkeypatch):
+    """证书步骤异常时不能谎报初始化成功, 也不能消耗一次性引导令牌。"""
+    from zeroproxy import config, services
+
+    def failed_install_cert(host: str, timeout: int = 300):
+        return False, "模拟 certbot 失败", {
+            "type": "none", "issuer": "", "cert_file": "", "key_file": "", "not_after": 0,
+        }
+
+    monkeypatch.setattr(services, "install_cert", failed_install_cert)
+    payload = {"domain": DOMAIN, "username": USERNAME, "password": PASSWORD, "token": token}
+    response = client.post("/api/setup", json=payload)
+
+    assert response.status_code == 500, response.text
+    assert config.load_state()["configured"] is False
+    assert config.bootstrap_token() == token
+
+
+def test_external_command_timeout_kills_descendant_processes():
+    """子进程握着管道时, run() 也必须按 timeout 返回而不是永久挂住。"""
+    from zeroproxy import services
+
+    started = time.monotonic()
+    ok, detail = services.run(
+        ["/bin/sh", "-c", "sleep 5 & wait"],
+        timeout=1,
+    )
+    elapsed = time.monotonic() - started
+
+    assert ok is False
+    assert "超时" in detail
+    assert elapsed < 3, f"命令超时没有真正终止子进程组, 耗时 {elapsed:.1f}s"
 
 
 def test_setup_tells_frontend_when_domain_panel_is_not_ready(client, token, home, monkeypatch):
@@ -76,7 +168,7 @@ def test_setup_offers_handoff_when_cert_and_domain_are_ready(client, token, home
 
     calls = []
 
-    def fake_install_cert(host: str):
+    def fake_install_cert(host: str, timeout: int = 300):
         return True, "Let's Encrypt 证书已签发 (测试桩)", {
             "type": "letsencrypt",
             "issuer": "Let's Encrypt",
@@ -109,22 +201,28 @@ def test_setup_hands_off_to_https_when_the_bootstrap_page_was_plain_http(client,
     只在**从默认 HTTP 端口进来**时给: 本地 dev.sh / 回归脚本的面板自己就听在那个明文
     端口上 (Host 带 :8899), 不需要换地址, 也就不该被赶去没有人听的 https。
     """
-    from zeroproxy import services
+    from zeroproxy import apply, routes, services
 
     monkeypatch.setattr(services, "is_prod", lambda: True)
+    monkeypatch.setattr(apply, "gen_setup_nginx", lambda *a, **kw: (True, "测试引导配置"))
+    monkeypatch.setattr(apply, "gen_nginx", lambda *a, **kw: (True, "测试正式配置"))
+    monkeypatch.setattr(routes, "_reload_nginx", lambda *a, **kw: (True, "测试重载"))
     payload = {"domain": DOMAIN, "username": USERNAME, "password": PASSWORD, "token": token}
 
     # (a) 80 端口进来 (Host 不带端口): 给 HTTPS 入口
     body = client.post("/api/setup", json=payload).json()
-    assert body["redirect"]["secure_url"] == f"https://testserver:{config.PANEL_PORT}/", body["redirect"]
+    assert body["redirect"]["secure_url"] == f"https://{DOMAIN}/panel/", body["redirect"]
 
 
 def test_setup_does_not_force_https_on_the_panels_own_port(client, token, home, monkeypatch):
     """面板自己那个对外端口 (8899) 明文进来时**不该**被赶去 https —— 那是本地开发
     (dev.sh / browser_check) 的形态: 它本来就一直听着这个明文端口。"""
-    from zeroproxy import services
+    from zeroproxy import apply, routes, services
 
     monkeypatch.setattr(services, "is_prod", lambda: True)
+    monkeypatch.setattr(apply, "gen_setup_nginx", lambda *a, **kw: (True, "测试引导配置"))
+    monkeypatch.setattr(apply, "gen_nginx", lambda *a, **kw: (True, "测试正式配置"))
+    monkeypatch.setattr(routes, "_reload_nginx", lambda *a, **kw: (True, "测试重载"))
     payload = {"domain": DOMAIN, "username": USERNAME, "password": PASSWORD, "token": token}
     body = client.post(
         "/api/setup", json=payload, headers={"host": f"127.0.0.1:{config.PANEL_PORT}"}
@@ -136,24 +234,22 @@ def test_panel_url_on_the_panel_port_is_https_even_when_initialized_from_port_80
     client, token, home, monkeypatch
 ):
     """初始化是在 80 端口的**明文**页面上做的 (引导块设 `X-Forwarded-Proto: http`),
-    而"初始化完成后把人送到域名面板"要跳到 `<域名>:8899` —— 那个端口在生产上只有 nginx
-    的 TLS 在听。
-
-    所以这一跳必须是 https: 拿明文 scheme 拼出来的 `http://<域名>:8899/` 是一个**明文
-    请求打在 TLS 端口上**, nginx 只会回
-    `400 The plain HTTP request was sent to HTTPS port` —— 用户点完「一键生成」看到的
-    就是这个 400 (真机截图), 还得自己把 http 改成 https 才进得去。
+    而"初始化完成后把人送到域名面板"走标准的 443 `/panel/`: 80/443 本来就为
+    ACME 与普通 Web 打开, 不要求用户再去云安全组额外放行 8899。
 
     两个可能被前端用到的字段 (`url` / `secure_url`) 一起钉住。
     """
-    from zeroproxy import services
+    from zeroproxy import apply, routes, services
 
     monkeypatch.setattr(services, "is_prod", lambda: True)
+    monkeypatch.setattr(apply, "gen_setup_nginx", lambda *a, **kw: (True, "测试引导配置"))
+    monkeypatch.setattr(apply, "gen_nginx", lambda *a, **kw: (True, "测试正式配置"))
+    monkeypatch.setattr(routes, "_reload_nginx", lambda *a, **kw: (True, "测试重载"))
     payload = {"domain": DOMAIN, "username": USERNAME, "password": PASSWORD, "token": token}
     body = client.post("/api/setup", json=payload, headers={"x-forwarded-proto": "http"}).json()
-    assert body["redirect"]["url"] == f"https://{DOMAIN}:{config.PANEL_PORT}", body["redirect"]
+    assert body["redirect"]["url"] == f"https://{DOMAIN}/panel", body["redirect"]
     assert (
-        body["redirect"]["secure_url"] == f"https://testserver:{config.PANEL_PORT}/"
+        body["redirect"]["secure_url"] == f"https://{DOMAIN}/panel/"
     ), body["redirect"]
 
 
@@ -165,7 +261,7 @@ def test_panel_url_stays_https_when_the_page_itself_is_https(client, token, home
         json=payload,
         headers={"x-forwarded-proto": "https", "host": f"{DOMAIN}:{config.PANEL_PORT}"},
     ).json()
-    assert body["redirect"]["url"] == f"https://{DOMAIN}:{config.PANEL_PORT}", body["redirect"]
+    assert body["redirect"]["url"] == f"https://{DOMAIN}/panel", body["redirect"]
 
 
 def test_panel_url_follows_the_request_when_there_is_no_nginx(client, token, home):
@@ -178,13 +274,25 @@ def test_panel_url_follows_the_request_when_there_is_no_nginx(client, token, hom
 
 def test_subscription_links_are_https_on_the_panel_port_behind_nginx(client, configured):
     """订阅地址与"面板基址"是同一处算出来的 —— 初始化那一步修好了, 这里也要跟着对:
-    从 80 端口的明文页面打开仪表盘时给出的订阅地址必须是 `https://<域名>:8899/sub/…`,
-    否则用户把它粘进客户端只会拿到 nginx 的 400。"""
+    从 80 端口的明文页面打开仪表盘时给出的订阅地址也走标准 443 的
+    `https://<域名>/panel/sub/…`, 与面板入口共用同一条反代路径。"""
     body = client.get("/api/dashboard", headers={"x-forwarded-proto": "http"}).json()
-    assert body["panel_url"] == f"https://{DOMAIN}:{config.PANEL_PORT}", body["panel_url"]
+    assert body["panel_url"] == f"https://{DOMAIN}/panel", body["panel_url"]
     assert body["subscription_formats"]["base64"].startswith(
-        f"https://{DOMAIN}:{config.PANEL_PORT}/sub/"
+        f"https://{DOMAIN}/panel/sub/"
     ), body["subscription_formats"]
+
+
+def test_finished_nginx_exposes_panel_on_standard_https_path(client, configured):
+    """正式入口必须只用 443 `/panel/`, 不能依赖云安全组另行放行 8899。"""
+    from zeroproxy import nginx_config
+
+    text = nginx_config.build_nginx_conf(config.load_state())
+    assert "location = /panel" in text
+    assert "location ^~ /panel/" in text
+    assert "location ^~ /api/" in text
+    assert "location ^~ /static/" in text
+    assert f"https://{DOMAIN}/panel$request_uri" in text
 
 
 # ---------------------------------------------------------------- 鉴权
@@ -327,9 +435,19 @@ def test_hysteria_link_carries_password_only_and_hop_ports(client, configured):
     assert f"hysteria2://{hy_password}@" in hy               # 只写口令, 没有 admin:
     assert "admin:" not in hy
     assert f":{configured['ports']['hysteria']}" in hy
-    assert "30001,31001,32001" in hy                       # 端口跳跃写进 host
-    assert "mport=" in hy
+    assert ":30001,31001,32001" not in hy                   # authority 端口必须是单个整数
+    assert "mport=30001%2C31001%2C32001" in hy              # 跳跃列表只放在 mport
     assert "insecure=1" in hy
+
+
+def test_base64_subscription_uris_have_parseable_integer_ports(client, configured):
+    """订阅 URI 必须能被标准解析器读取; Shadowrocket 不接受逗号端口。"""
+    path = configured["subscription_url"].split("testserver")[-1]
+    text = base64.b64decode(client.get(path).text).decode()
+    for line in text.splitlines():
+        parsed = urlsplit(line)
+        assert parsed.hostname == DOMAIN
+        assert isinstance(parsed.port, int), line.split("#", 1)[0]
 
 
 def test_subscription_clash_is_valid_yaml(client, configured):
@@ -1445,15 +1563,40 @@ def test_udp_port_listening_detects_listener(home):
 
 # ---------------------------------------------------------------- 备份 / 恢复
 
+def _backup_json(client, **kwargs) -> dict:
+    """导出一次备份 (POST, 明文)。"""
+    exported = client.post("/api/backup", json={"encrypt": 0}, **kwargs)
+    assert exported.status_code == 200, exported.text
+    return exported.json()
+
+
+def _resign(payload: dict) -> dict:
+    """按面板算法重算校验和 —— 用来构造"完整性通过但字段非法"的备份。"""
+    import copy
+    import hashlib
+
+    clean = copy.deepcopy(payload["state"])
+    clean.pop("sessions", None)
+    clean.pop("login_failures", None)
+    canonical = json.dumps(clean, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    payload["checksum"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return payload
+
+
 def test_backup_and_restore_roundtrip(client, configured):
-    exported = client.get("/api/backup")
+    exported = client.post("/api/backup", json={"encrypt": 0})
     assert exported.status_code == 200
+    assert "attachment" in exported.headers["content-disposition"]
+    assert exported.headers["cache-control"] == "no-store"
     payload = exported.json()
     assert payload["format"] == "zeroproxy-backup"
     assert len(payload["checksum"]) == 64
     # 会话与登录限流属于运行时数据, 不应进备份
     assert "sessions" not in payload["state"]
     assert "login_failures" not in payload["state"]
+    # 交接票据 (能换管理员会话) 与未使用配对码 (能领设备 secret) 同样不进备份
+    assert "handoffs" not in payload["state"]
+    assert payload["state"]["devices"]["pair_codes"] == []
     # 私钥必须随备份一起走, 否则恢复后所有客户端都要重新导入
     assert payload["state"]["reality"]["private_key"]
 
@@ -1471,13 +1614,59 @@ def test_backup_and_restore_roundtrip(client, configured):
     assert any(a["action"] == "restore" for a in state["audit"])
 
 
-def test_backup_requires_auth(client, configured):
+def test_backup_rejects_get_and_requires_auth(client, configured):
+    """备份必须 POST: GET 是"有副作用的 GET", 缓存/预取都可能把它带走 (P2-5/P3-11)。"""
+    assert client.get("/api/backup").status_code == 405
     client.cookies.clear()
-    assert client.get("/api/backup").status_code == 401
+    assert client.post("/api/backup", json={"encrypt": 0}).status_code == 401
+    assert client.post("/api/backup").status_code == 401
+
+
+def test_backup_encryption_roundtrip(client, configured):
+    """encrypt=1 + X-ZP-Passphrase → AES-GCM 的 .enc; restore 自动识别并解密。"""
+    passphrase = "correct-horse-battery"
+    exported = client.post(
+        "/api/backup",
+        json={"encrypt": 1},
+        headers={"x-zp-passphrase": passphrase},
+    )
+    assert exported.status_code == 200, exported.text
+    assert exported.headers["content-type"] == "application/octet-stream"
+    assert exported.content.startswith(b"ZPBAKENC1")
+    assert exported.headers["content-disposition"].endswith('.json.enc"')
+    # 明文不能泄漏在加密文件里
+    assert b"private_key" not in exported.content
+
+    # 没口令 / 口令错都必须拒绝, 且现网不变
+    assert client.post("/api/restore", content=exported.content).status_code == 400
+    wrong = client.post(
+        "/api/restore", content=exported.content, headers={"x-zp-passphrase": "wrong-pass-123"}
+    )
+    assert wrong.status_code == 400 and "口令" in wrong.json()["error"]
+
+    client.post("/api/nodes/vless-ws/toggle")
+    assert config.load_state()["nodes"]["vless-ws"] is False
+    restored = client.post(
+        "/api/restore",
+        content=exported.content,
+        headers={"x-zp-passphrase": passphrase},
+    )
+    assert restored.status_code == 200, restored.text
+    assert config.load_state()["nodes"]["vless-ws"] is True
+
+
+def test_backup_encryption_needs_a_long_enough_passphrase(client, configured):
+    short = client.post(
+        "/api/backup", json={"encrypt": 1}, headers={"x-zp-passphrase": "short"}
+    )
+    assert short.status_code == 400 and "口令" in short.json()["error"]
+    # query 参数与 body 两种写法等价 (前端两种都带)
+    ok = client.post("/api/backup?encrypt=1", headers={"x-zp-passphrase": "long-enough-pass"})
+    assert ok.status_code == 200 and ok.content.startswith(b"ZPBAKENC1")
 
 
 def test_restore_rejects_tampered_backup(client, configured):
-    payload = client.get("/api/backup").json()
+    payload = _backup_json(client)
     payload["state"]["domain"] = "evil.example.com"
     response = client.post("/api/restore", json=payload)
     assert response.status_code == 400
@@ -1493,22 +1682,60 @@ def test_restore_rejects_foreign_file(client, configured):
 
 def test_restore_rejects_malformed_structure(client, configured):
     """备份校验和过了也不代表结构可用 —— 坏结构必须 400, 而不是 500。"""
-    import copy
-    import hashlib
-
-    payload = client.get("/api/backup").json()
+    payload = _backup_json(client)
     payload["state"]["reality"] = None
-    clean = copy.deepcopy(payload["state"])
-    clean.pop("sessions", None)
-    clean.pop("login_failures", None)
-    canonical = json.dumps(clean, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-    payload["checksum"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-    response = client.post("/api/restore", json=payload)
+    response = client.post("/api/restore", json=_resign(payload))
     assert response.status_code == 400, response.text
     assert "结构" in response.json()["error"]
     # 现网不能被动过
     assert config.load_state()["reality"]["private_key"]
+
+
+def test_restore_revalidates_fields_before_apply(client, configured):
+    """恢复路径上的字段要和手工改设置走同一套门槛 (P2-3)。"""
+    before = config.load_state()["domain"]
+
+    bad_domain = _backup_json(client)
+    bad_domain["state"]["domain"] = "not a domain"
+    res = client.post("/api/restore", json=_resign(bad_domain))
+    assert res.status_code == 400 and "domain" in res.json()["error"]
+
+    bad_port = _backup_json(client)
+    bad_port["state"]["ports"]["trojan"] = 70000
+    res = client.post("/api/restore", json=_resign(bad_port))
+    assert res.status_code == 400 and "端口" in res.json()["error"]
+
+    bad_pass = _backup_json(client)
+    bad_pass["state"]["hysteria_password"] = 'x"\nsystemctl restart evil'
+    res = client.post("/api/restore", json=_resign(bad_pass))
+    assert res.status_code == 400 and "hysteria_password" in res.json()["error"]
+
+    bad_cert = _backup_json(client)
+    bad_cert["state"]["cert"]["cert_file"] = "/etc/shadow"
+    res = client.post("/api/restore", json=_resign(bad_cert))
+    assert res.status_code == 400 and "证书路径" in res.json()["error"]
+
+    # 全部被拒之后现网一个字都没动
+    assert config.load_state()["domain"] == before
+
+
+def test_restore_rolls_back_when_reapply_explodes(client, configured, monkeypatch):
+    """恢复后重新应用失败 → 回到恢复前的状态, 而不是把用户丢在半坏的状态里。"""
+    from zeroproxy import routes
+
+    payload = _backup_json(client)
+    payload["state"]["domain"] = "restored.example.com"
+    payload = _resign(payload)
+    before = config.load_state()["domain"]
+
+    def boom(*_args, **_kwargs):
+        raise OSError("systemctl exploded")
+
+    monkeypatch.setattr(routes, "_reapply", boom)
+    res = client.post("/api/restore", json=payload)
+    assert res.status_code == 500, res.text
+    assert "回滚" in res.json()["error"]
+    assert config.load_state()["domain"] == before
 
 
 def test_state_load_ignores_broken_nested_types(client, configured, home):
@@ -4007,3 +4234,400 @@ def test_clash_reality_and_chain_flow_and_opts(configured):
     hy = share_links._clash_proxy(state, "hysteria2")
     assert hy["fingerprint"] == "chrome"
 
+
+
+# ---------------------------------------------------------------- 安全头 / 状态门禁 / 凭据
+
+def test_hsts_and_no_store_only_where_they_belong(client):
+    """/api/* 一律 no-store; HSTS 只在 https 上下发; /api/info 不再泄露 home 路径。"""
+    plain = client.get("/api/info")
+    assert plain.status_code == 200
+    assert "home" not in plain.json(), plain.json()
+    # 明文响应不发 HSTS (浏览器会忽略, 但也不该出现)
+    assert "strict-transport-security" not in {k.lower() for k in plain.headers}
+    assert plain.headers.get("cache-control") == "no-store"
+
+    secure = client.get("/api/info", headers={"x-forwarded-proto": "https"})
+    hsts = secure.headers.get("strict-transport-security", "")
+    assert "max-age=31536000" in hsts and "includeSubDomains" in hsts
+    assert secure.headers.get("cache-control") == "no-store"
+
+
+def test_cross_origin_writes_are_rejected(client, configured):
+    """写接口的 Origin 校验 (P3-11): 浏览器跨源写请求 403, 无 Origin 照旧放行。"""
+    bad = client.post(
+        "/api/nodes/trojan/toggle", headers={"origin": "https://evil.example.com"}
+    )
+    assert bad.status_code == 403
+    # 同源 (TestClient 的 base_url) 放行
+    good = client.post("/api/nodes/trojan/toggle", headers={"origin": "http://testserver"})
+    assert good.status_code == 200
+    # 只读接口不受影响
+    assert client.get("/api/status", headers={"origin": "https://evil.example.com"}).status_code == 200
+
+
+def test_corrupt_state_stops_the_panel_instead_of_reinitialising(client, configured):
+    """state.json 损坏 → 明确 503 维护态, 不回落 DEFAULTS (P2-4)。"""
+    path = config.paths()["state"]
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write('{"configured": true, "domain": "proxy.exa')   # 截断的 JSON
+
+    with pytest.raises(config.StateError):
+        config.load_state()
+
+    response = client.get("/api/dashboard")
+    assert response.status_code == 503
+    body = response.json()
+    assert body["maintenance"] is True and "状态文件" in body["error"]
+    # 也不能趁"读不出来"重新初始化
+    setup = client.post(
+        "/api/setup",
+        json={"domain": DOMAIN, "username": USERNAME, "password": PASSWORD, "token": ""},
+    )
+    assert setup.status_code in (403, 503)
+
+
+def test_setup_refuses_without_token_when_initialization_traces_exist(client, configured):
+    """令牌为空 + 已有初始化痕迹 → 拒绝 (防止删掉 state.json 后抢注管理员)。"""
+    os.remove(config.paths()["state"])          # 模拟"状态文件被删"
+    response = client.post(
+        "/api/setup",
+        json={"domain": DOMAIN, "username": USERNAME, "password": PASSWORD, "token": ""},
+    )
+    assert response.status_code == 403
+    assert "初始化痕迹" in response.json()["error"]
+
+
+def test_setup_still_works_without_token_on_a_clean_machine(client):
+    """本地开发 (dev.sh) 没有引导令牌也能初始化 —— 干净机器不该被门禁误伤。"""
+    response = client.post(
+        "/api/setup", json={"domain": DOMAIN, "username": USERNAME, "password": PASSWORD}
+    )
+    assert response.status_code == 200, response.text
+
+
+def test_login_runs_pbkdf2_even_for_unknown_username(client, configured, monkeypatch):
+    """用户名错也要跑一次 PBKDF2 —— 否则响应耗时能枚举用户名 (P3-12)。"""
+    from zeroproxy import crypto
+
+    calls: list[str] = []
+    real = crypto.verify_password
+
+    def counting(password, stored):
+        calls.append(password)
+        return real(password, stored)
+
+    monkeypatch.setattr(crypto, "verify_password", counting)
+    response = client.post("/api/login", json={"username": "nobody", "password": PASSWORD})
+    assert response.status_code == 401, response.text
+    assert calls, "用户名错误时也必须执行一次口令校验"
+
+
+def test_login_rate_limit_ignores_spoofed_real_ip_from_loopback(monkeypatch):
+    """回环连接伪造 X-Real-IP 换不到新的限流桶 (P3-12)。"""
+    from starlette.requests import Request
+
+    from zeroproxy import routes
+
+    def make(peer: str) -> Request:
+        return Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/login",
+                "scheme": "http",
+                "query_string": b"",
+                "server": ("127.0.0.1", config.PANEL_BIND_PORT),
+                "client": (peer, 45678),
+                "headers": [(b"x-real-ip", b"9.9.9.9")],
+            }
+        )
+
+    assert routes._login_rate_limit_key(make("127.0.0.1")) == "loopback"
+    assert routes._login_rate_limit_key(make("::1")) == "loopback"
+    # 非回环连接照旧按真实来源分桶
+    assert routes._login_rate_limit_key(make("203.0.113.7")) == "9.9.9.9"
+
+
+def test_handoff_token_is_bound_to_the_issuing_ip(client, configured):
+    """交接票据只对签发时的来源 IP 有效 (P3-13)。"""
+    with config.locked():
+        state = config.load_state()
+        state["handoffs"] = {
+            "zph_wrong_ip": {"expires": int(time.time()) + 600, "ip": "203.0.113.9"},
+            "zph_good_ip": {"expires": int(time.time()) + 600, "ip": "testclient"},
+        }
+        config.save_state(state)
+
+    bad = client.post("/api/session/handoff", json={"token": "zph_wrong_ip"})
+    assert bad.status_code == 401 and "IP" in bad.json()["error"]
+
+    good = client.post("/api/session/handoff", json={"token": "zph_good_ip"})
+    assert good.status_code == 200, good.text
+
+
+def test_audit_log_is_written_0600(home):
+    """审计日志含 actor / 失败用户名, 不能是默认 0644 (P3-8)。"""
+    from zeroproxy import config as zp_config
+
+    zp_config._archive_audit([{"ts": 1, "action": "login_failed", "actor": "9.9.9.9"}])
+    path = zp_config.audit_log_path()
+    assert os.path.exists(path)
+    assert (os.stat(path).st_mode & 0o777) == 0o600
+
+
+def test_update_status_write_is_atomic_private_and_locked(home):
+    """update.json: 原子写 + flock + 0600 —— CLI 与面板并发升级不能互相覆盖 (P3-7)。"""
+    import threading
+
+    from zeroproxy import update
+
+    errors: list[BaseException] = []
+
+    def writer(n: int) -> None:
+        try:
+            for i in range(5):
+                update._write_status({"state": "running", "trigger": f"w{n}", "i": i})
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer, args=(n,)) for n in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, errors
+    path = update.paths()["update_status"]
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    assert data["state"] == "running" and data["trigger"].startswith("w")
+    assert (os.stat(path).st_mode & 0o777) == 0o600
+    assert os.path.exists(path + ".lock"), "并发写必须有锁文件"
+
+
+def test_renew_hook_reloads_nginx_and_restarts_xray(home):
+    """certbot deploy hook: 续期后 reload nginx + restart xray (P2-1)。"""
+    from zeroproxy import services
+
+    ok, path, detail = services.ensure_renew_hook()
+    assert ok, detail
+    assert path.startswith(config.home())
+    assert "非生产" in detail
+    text = open(path, encoding="utf-8").read()
+    assert "systemctl reload nginx" in text
+    assert "systemctl restart xray" in text
+    assert (os.stat(path).st_mode & 0o777) == 0o755
+
+
+def test_install_cert_passes_the_deploy_hook_to_certbot(home, monkeypatch):
+    """install_cert 申请证书时必须把 hook 交给 certbot (否则续期没人 reload)。"""
+    from zeroproxy import services
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(services, "is_prod", lambda: True)
+    monkeypatch.setattr(services, "renew_hook_dir", lambda: str(home / "renew-hooks"))
+    monkeypatch.setattr(
+        services.shutil, "which", lambda name: "/usr/bin/certbot" if name == "certbot" else None
+    )
+
+    def fake_run(cmd, timeout=120, env=None):
+        calls.append(list(cmd))
+        return False, ""          # certbot 没签成 → 回退自签
+
+    monkeypatch.setattr(services, "run", fake_run)
+    ok, _detail, cert_state = services.install_cert("proxy.example.com")
+    assert ok and cert_state["type"] == "selfsigned"
+    certbot = [cmd for cmd in calls if cmd and cmd[0] == "certbot"][0]
+    assert "--deploy-hook" in certbot
+    hook_path = certbot[certbot.index("--deploy-hook") + 1]
+    assert "systemctl reload nginx" in open(hook_path, encoding="utf-8").read()
+
+
+# ---------------------------------------------------------------- 诊断 / 链式证书固定视图
+
+def test_diagnose_merges_chain_quic_items(client, configured, monkeypatch):
+    """chain.diagnose_items 的项被并入 /api/diagnose (schema 与现有项一致)。"""
+    from zeroproxy import chain
+
+    def fake_items(state):
+        return [
+            {
+                "id": "chain_quic_pin",
+                "name": "链式 QUIC 证书固定",
+                "title": "链式 QUIC 证书固定",
+                "ok": False,
+                "detail": "1 条内层 QUIC 链路来自旧配对码",
+                "hint": "重新配对",
+                "fixable": True,
+            }
+        ]
+
+    monkeypatch.setattr(chain, "diagnose_items", fake_items, raising=False)
+    body = client.get("/api/diagnose").json()
+    item = {c["name"]: c for c in body["checks"]}["链式 QUIC 证书固定"]
+    assert item["id"] == "chain_quic_pin"
+    assert item["ok"] is False and item["fixable"] is True
+    assert item["detail"] and item["hint"]
+    assert body["ok"] is False, "有失败项时总览必须跟着红"
+
+
+def test_diagnose_survives_a_broken_chain_diagnoser(client, configured, monkeypatch):
+    from zeroproxy import chain
+
+    def boom(state):
+        raise RuntimeError("diagnoser exploded")
+
+    monkeypatch.setattr(chain, "diagnose_items", boom, raising=False)
+    body = client.get("/api/diagnose")
+    # 不能被一个坏掉的自检项打成 500; 它自己作为一条失败项出现在列表里
+    assert body.status_code == 200
+    item = {c["name"]: c for c in body.json()["checks"]}["链式 QUIC 证书固定"]
+    assert item["ok"] is False and "diagnoser exploded" in item["detail"]
+
+
+def test_chain_view_exposes_pin_fields(client, configured, monkeypatch):
+    """链式视图的 pin_ok / needs_repair / exit_pin / pin_mismatch (字段名是前端契约)。"""
+    from zeroproxy import chain
+
+    base_entry = {
+        "id": "e1",
+        "label": "旧落地",
+        "host": "exit.example.com",
+        "port": 8447,
+        "local_port": 23001,
+        "sni": "exit.example.com",
+        "transport": "hysteria2",
+        "hy_port": 8448,
+        "hy_pw": "pw",
+        "hy_sni": "exit.example.com",
+        "enabled": True,
+        "created_at": 0,
+        "last_probe": {},
+    }
+    with config.locked():
+        state = config.load_state()
+        state["chain"]["entries"] = [
+            {**base_entry, "hy_cert_sha256": ""},                       # 旧 v2: 无 pin
+            {**base_entry, "id": "e2", "label": "已固定",
+             "hy_cert_sha256": "a" * 64},
+            {**base_entry, "id": "e3", "label": "Reality 内层",
+             "transport": "reality", "hy_cert_sha256": ""},
+        ]
+        state["chain"]["exit"] = {
+            **state["chain"]["exit"], "enabled": True, "uuid": "u-1",
+            "hy_enabled": True, "hy_port": 8448, "hy_password": "pw",
+        }
+        config.save_state(state)
+    monkeypatch.setattr(chain, "current_exit_pin", lambda state: "a" * 64, raising=False)
+
+    view = client.get("/api/dashboard").json()["chain"]
+    assert view["exit_pin"] == "a" * 64
+    assert view["pin_mismatch"] is False
+    entries = {e["id"]: e for e in view["entries"]}
+    assert entries["e1"]["pin_ok"] is False and entries["e1"]["needs_repair"] is True
+    assert entries["e2"]["pin_ok"] is True and entries["e2"]["needs_repair"] is False
+    # Reality 内层不涉及证书固定, 不产生误报
+    assert entries["e3"]["pin_ok"] is True and entries["e3"]["needs_repair"] is False
+
+    # 落地端重签后: 已固定的条目指纹过期 → mismatch
+    monkeypatch.setattr(chain, "current_exit_pin", lambda state: "b" * 64, raising=False)
+    view = client.get("/api/dashboard").json()["chain"]
+    assert view["exit_pin"] == "b" * 64
+    assert view["pin_mismatch"] is True
+    entries = {e["id"]: e for e in view["entries"]}
+    assert entries["e2"]["pin_ok"] is False and entries["e2"]["needs_repair"] is True
+
+
+def test_reenabling_an_unpinned_quic_entry_is_rejected(client, configured):
+    """重新启用旧 v2 QUIC 条目时 API 层直接说清楚, 而不是让人点完看红灯。"""
+    with config.locked():
+        state = config.load_state()
+        state["chain"]["entries"] = [
+            {
+                "id": "old", "label": "旧落地", "host": "exit.example.com",
+                "port": 8447, "local_port": 23001, "sni": "exit.example.com",
+                "transport": "hysteria2", "hy_port": 8448, "hy_pw": "pw",
+                "hy_sni": "exit.example.com", "hy_cert_sha256": "",
+                "enabled": False, "created_at": 0, "last_probe": {},
+            }
+        ]
+        config.save_state(state)
+    res = client.post("/api/chain/entries/old", json={"enabled": True})
+    assert res.status_code == 400, res.text
+    assert "证书指纹" in res.json()["error"]
+    assert config.load_state()["chain"]["entries"][0]["enabled"] is False
+
+
+def test_chain_view_survives_missing_chain_helpers(client, configured, monkeypatch):
+    """旧代码/降级部署没有 current_exit_pin/diagnose_items 时, 视图与诊断照常工作。"""
+    from zeroproxy import chain
+
+    monkeypatch.setattr(chain, "current_exit_pin", None, raising=False)
+    monkeypatch.setattr(chain, "diagnose_items", None, raising=False)
+    view = client.get("/api/dashboard").json()["chain"]
+    assert view["exit_pin"] == "" and view["pin_mismatch"] is False
+    assert client.get("/api/diagnose").status_code == 200
+
+
+# ---------------------------------------------------------------- 并发 / 任务表
+
+def test_job_table_only_trims_finished_jobs(client, configured):
+    """并发任务超过上限时只裁 done/failed, 不能把还在跑的记录删掉 (P3-21)。"""
+    from zeroproxy import routes
+
+    routes._APPLY_JOBS.clear()
+    try:
+        running = [routes._new_job(None, 7, "x")[0] for _ in range(12)]
+        # 结束最老的几个, 再触发一次裁剪
+        for job_id in running[:4]:
+            routes._finish_job(job_id, [], "")
+        routes._finish_job(running[4], [], "")
+        assert set(running[5:]) <= set(routes._APPLY_JOBS), "运行中的任务被裁掉了"
+    finally:
+        routes._APPLY_JOBS.clear()
+
+
+def test_background_apply_does_not_hold_the_config_lock(client, configured, monkeypatch):
+    """后台闭环只持锁读副本, apply 本身在锁外跑 (P2-2)。"""
+    from zeroproxy import apply as zp_apply
+    from zeroproxy import routes
+
+    monkeypatch.setenv("ZP_APPLY_ASYNC", "1")
+    seen: dict = {}
+
+    def fake_reapply(state, progress=None):
+        # 这里如果能拿到 config.LOCK, 说明长耗时的 apply 已经不在锁内
+        acquired = config.LOCK.acquire(blocking=False)
+        seen["free"] = acquired
+        if acquired:
+            config.LOCK.release()
+        return [{"name": "stub", "ok": True, "detail": "", "ms": 0}]
+
+    monkeypatch.setattr(zp_apply, "reapply", fake_reapply)
+    try:
+        body = client.post("/api/nodes/trojan/toggle").json()
+        snap = _wait_job(client, body["job"]["id"])
+        assert snap["state"] == "done", snap
+        assert seen.get("free") is True
+    finally:
+        routes._APPLY_JOBS.clear()
+
+
+def test_dashboard_fingerprint_tracks_geodata_changes(client, configured):
+    """指纹要读真实的 geodata 键 (P3-18): 数据/开关/更新时间变化必须让指纹变。"""
+    first = client.get("/api/dashboard").json()["fingerprint"]
+    assert client.get("/api/dashboard").json()["fingerprint"] == first, "无变化时指纹必须稳定"
+
+    with config.locked():
+        state = config.load_state()
+        state["geodata"]["updated_at"] = int(time.time())
+        state["geodata"]["files"] = {"geoip.dat": {"size": 123, "sha256": "a" * 64}}
+        config.save_state(state)
+    changed_data = client.get("/api/dashboard").json()["fingerprint"]
+    assert changed_data != first, "geo 数据变化后指纹没变"
+
+    with config.locked():
+        state = config.load_state()
+        state["geodata"]["enabled"] = True
+        config.save_state(state)
+    assert client.get("/api/dashboard").json()["fingerprint"] != changed_data, "geo 开关没进指纹"
