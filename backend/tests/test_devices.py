@@ -3257,6 +3257,57 @@ def test_luci_cgi_reports_cli_failure_honestly():
     assert '{"ok":false,"error":"%s"}' in cgi_src, "退出码非 0 时必须返回 ok:false 和 error"
 
 
+def test_pair_in_update_mode_recognizes_servers_directory_and_migrated_credentials(tmp_path):
+    """当 device.json 被 agent 迁移或多服务器管理至 servers/*.json 时，更新模式安装脚本仍能正确复用凭据。"""
+    import subprocess
+    from zeroproxy import router_client
+
+    text = router_client.render_script("https://us.i3.pub:8899", "")
+    zp_dir = tmp_path / "zp"
+    servers_dir = zp_dir / "servers"
+    servers_dir.mkdir(parents=True)
+    server_file = servers_dir / "us_i3_pub_8899.json"
+    server_file.write_text(
+        '{"base":"https://us.i3.pub:8899","id":"dvb6af355302855636","secret":"sec123","name":"US"}\n'
+    )
+
+    harness = f"""
+ZP_DIR="{zp_dir}"
+ZP_DEV="$ZP_DIR/device.json"
+ZP_BASE="https://us.i3.pub:8899"
+ZP_CODE=""
+step() {{ echo "==> $1"; }}
+ok() {{ echo "  ✓ $1"; }}
+warn() {{ echo "  ! $1"; }}
+die() {{ echo "  ✕ $1"; exit 1; }}
+"""
+    srv_key_def = text.split("srv_key() {")[1].split("\n# 取一个扁平 JSON 字段")[0].rstrip().rstrip("}")
+    pair_def = text.split("pair() {")[1].split("\n# 用本次命令里的配对码")[0].rstrip().rstrip("}")
+
+    full_script = f"""{harness}
+srv_key() {{
+{srv_key_def}
+}}
+pair() {{
+{pair_def}
+}}
+pair
+"""
+    res = subprocess.run(["sh", "-c", full_script], capture_output=True, text=True)
+    assert res.returncode == 0, f"pair() 应当成功识别 servers/ 下的凭据: {res.stderr}\n{res.stdout}"
+    assert "已接入过 (设备 dvb6af355302855636)" in res.stdout
+
+    # 情况 2: servers/ 下无文件，但存在 device.json.migrated
+    server_file.unlink()
+    migrated_file = zp_dir / "device.json.migrated"
+    migrated_file.write_text(
+        '{"base":"https://us.i3.pub:8899","id":"dvmigrated123","secret":"sec456","name":"US"}\n'
+    )
+    res2 = subprocess.run(["sh", "-c", full_script], capture_output=True, text=True)
+    assert res2.returncode == 0, f"pair() 应当成功识别 device.json.migrated 下的凭据: {res2.stderr}\n{res2.stdout}"
+    assert "已接入过 (设备 dvmigrated123)" in res2.stdout
+
+
 
 
 # ---------------------------------------------------------------- 凭据不进 URL / 已下载≠已应用

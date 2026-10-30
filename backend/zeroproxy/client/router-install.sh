@@ -660,25 +660,95 @@ preflight() {
 # ---------------------------------------------------------------- 配对
 pair() {
     step "接入账号"
-    if [ -f "$ZP_DEV" ] && grep -q '"id"' "$ZP_DEV" 2>/dev/null; then
-        _old_base="$(sed -n 's/.*"base"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ZP_DEV" | head -n1)"
-        DEV_ID="$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ZP_DEV" | head -n1)"
-        DEV_SECRET="$(sed -n 's/.*"secret"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ZP_DEV" | head -n1)"
+    _found_cred=0
+    _old_base=""
+    DEV_ID=""
+    DEV_SECRET=""
+    DEV_NAME=""
+    _my_key="$(srv_key "$ZP_BASE")"
+    _fb_base=""
+    _fb_id=""
+    _fb_sec=""
+    _fb_name=""
+
+    # 1. 优先从 servers/ 下查找匹配当前面板的凭据 (支持多服务器架构)
+    if [ -f "$ZP_DIR/servers/$_my_key.json" ]; then
+        _old_base="$(sed -n 's/.*"base"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ZP_DIR/servers/$_my_key.json" | head -n1)"
+        DEV_ID="$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ZP_DIR/servers/$_my_key.json" | head -n1)"
+        DEV_SECRET="$(sed -n 's/.*"secret"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ZP_DIR/servers/$_my_key.json" | head -n1)"
+        DEV_NAME="$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ZP_DIR/servers/$_my_key.json" | head -n1)"
         if [ -n "$DEV_ID" ] && [ -n "$DEV_SECRET" ]; then
-            if [ -n "$_old_base" ] && [ "$_old_base" != "$ZP_BASE" ]; then
-                # 换了面板: 这台路由器之前接的是别人。凭据在这里一定不认, 直接重新配对。
-                warn "这台路由器原来接的是 $_old_base, 本次改用 $ZP_BASE"
-            else
-                ok "已接入过 (设备 $DEV_ID), 先沿用原有凭据"
-                return 0
+            _found_cred=1
+        fi
+    fi
+
+    # 2. 遍历 servers/ 目录 (兼容地址格式变体或单服务器更新模式)
+    if [ "$_found_cred" = "0" ] && [ -d "$ZP_DIR/servers" ]; then
+        for _sf in "$ZP_DIR"/servers/*.json; do
+            [ -f "$_sf" ] || continue
+            _sb="$(sed -n 's/.*"base"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$_sf" | head -n1)"
+            _sid="$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$_sf" | head -n1)"
+            _ssec="$(sed -n 's/.*"secret"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$_sf" | head -n1)"
+            _sname="$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$_sf" | head -n1)"
+            if [ -n "$_sid" ] && [ -n "$_ssec" ]; then
+                if [ -n "$_sb" ] && [ "$(srv_key "$_sb")" = "$_my_key" ]; then
+                    _old_base="$_sb"; DEV_ID="$_sid"; DEV_SECRET="$_ssec"; DEV_NAME="$_sname"
+                    _found_cred=1
+                    break
+                elif [ -z "$_fb_id" ]; then
+                    _fb_base="$_sb"; _fb_id="$_sid"; _fb_sec="$_ssec"; _fb_name="$_sname"
+                fi
             fi
+        done
+        if [ "$_found_cred" = "0" ] && [ -z "$ZP_CODE" ] && [ -n "$_fb_id" ]; then
+            _old_base="$_fb_base"; DEV_ID="$_fb_id"; DEV_SECRET="$_fb_sec"; DEV_NAME="$_fb_name"
+            _found_cred=1
+        fi
+    fi
+
+    # 3. 兼容旧版单个 device.json 或被 agent.sh 迁移归档的 device.json.migrated
+    if [ "$_found_cred" = "0" ]; then
+        for _df in "$ZP_DEV" "$ZP_DIR/device.json.migrated"; do
+            if [ -f "$_df" ] && grep -q '"id"' "$_df" 2>/dev/null; then
+                _old_base="$(sed -n 's/.*"base"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$_df" | head -n1)"
+                DEV_ID="$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$_df" | head -n1)"
+                DEV_SECRET="$(sed -n 's/.*"secret"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$_df" | head -n1)"
+                DEV_NAME="$(sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$_df" | head -n1)"
+                if [ -n "$DEV_ID" ] && [ -n "$DEV_SECRET" ]; then
+                    _found_cred=1
+                    break
+                fi
+            fi
+        done
+    fi
+
+    if [ "$_found_cred" = "1" ]; then
+        if [ -n "$ZP_CODE" ] && [ -n "$_old_base" ] && [ "$(srv_key "$_old_base")" != "$_my_key" ]; then
+            # 换了面板且带新配对码: 这台路由器之前接的是别人。凭据在这里一定不认, 直接重新配对。
+            warn "这台路由器原来接的是 $_old_base, 本次改用 $ZP_BASE"
+        else
+            ok "已接入过 (设备 $DEV_ID), 先沿用原有凭据"
+            # 补齐 servers/ 下当前面板的条目, 避免被其他模块视作未接入
+            mkdir -p "$ZP_DIR/servers"
+            if [ ! -f "$ZP_DIR/servers/$_my_key.json" ]; then
+                cat > "$ZP_DIR/servers/$_my_key.json" <<EOF
+{
+  "base": "$ZP_BASE",
+  "id": "$DEV_ID",
+  "secret": "$DEV_SECRET",
+  "name": "${DEV_NAME:-$ZP_BASE}"
+}
+EOF
+                chmod 600 "$ZP_DIR/servers/$_my_key.json"
+            fi
+            return 0
         fi
     fi
 
     # 更新模式 (`/c/install.sh`, 不带配对码): 已经装过的机器只是来升级客户端的,
     # 绝不能再配一次 —— 每次配对都会在面板上多出一台设备, 用户就得反复清设备。
     if [ -z "$ZP_CODE" ]; then
-        if [ -f "$ZP_DEV" ]; then
+        if [ -f "$ZP_DEV" ] || [ -f "$ZP_DIR/device.json.migrated" ] || ls "$ZP_DIR/servers"/*.json >/dev/null 2>&1; then
             die "本机上的设备凭据不完整, 更新命令无法自救。
   请到面板「客户端」重新生成一条**带配对码**的安装命令 (首次安装那种)。"
         fi
