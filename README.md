@@ -5817,3 +5817,16 @@ PublicKey = ...
   时默认非 0 退出（`--allow-skip` 放行）；浏览器脚本先 `require` 再起服务、异常时
   收掉子进程，修正 `.banner` / `.mini-card` 选择器；全量 pytest、Go test/vet、
   upgrade_sim 全部跑通。
+
+
+### 8.111 v2.12.16: 修复沙箱白名单在缺目录机器上导致面板起不来 (502)
+- **根因**: v2.12.15 给 `zeroproxy.service` 加了 `ProtectSystem=strict` + `ReadWritePaths`
+  白名单。systemd 对 `ReadWritePaths` 里**不存在**的路径会让单元启动失败（必须加 `-`
+  前缀才是"缺失则忽略"）。没装 ufw 的机器没有 `/etc/ufw`、`/var/lib/ufw`，升级后
+  面板进程起不来，nginx 8899 于是返回 **502 Bad Gateway**。
+- **修复**: 白名单里所有**可选**系统目录加 `-` 前缀（`-/etc/nginx`、nginx 运行目录、
+  Let's Encrypt、ufw、`-/run`）；`/opt/zeroproxy` 保持必需（不存在应显式失败）。
+- **已升级到 2.12.15 的机器**: 重新跑一次 `upgrade.sh` 即可；或先用 drop-in 临时恢复
+  （见下），再升级到本版。
+- **回归**: 单元字段由 `upgrade_sim.sh` 断言；systemd 的"缺失路径"行为以真机为准
+  （本次真机踩到，已补注释说明为什么必须写 `-`）。
