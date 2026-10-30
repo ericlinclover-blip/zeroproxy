@@ -307,3 +307,47 @@ def test_stale_queued_task_does_not_lock_the_panel(home):
     )
     assert update.is_running() is True
     assert update.stale_queued() is False
+
+
+def test_sha256sums_manifest_matches_the_tree(home):
+    """仓库根的 SHA256SUMS 必须与工作树一致 —— 发布流程的机械卡口。
+
+    install.sh / upgrade.sh 下载代码包之后, 会用**同一 ref 的 raw 地址**独立取一份
+    SHA256SUMS 逐文件比对 (镜像只承担传输)。所以清单落后于代码 = 升级必然在
+    "代码包 SHA256SUMS 校验失败"处中止并回滚。
+
+    真机上就是这么卡住的: v2.12.18/19/20 改了 19 个文件, 却一次都没重跑
+    `scripts/gen_sha256sums.sh` —— 代码本身没问题, 校验清单对不上, 升级一步都走不了。
+    这条测试让"忘了更新清单"在本地就红, 而不是等用户点升级。
+    """
+    import subprocess
+    import tempfile
+
+    from zeroproxy import router_client
+
+    root = os.path.dirname(  # <root>/backend/zeroproxy/router_client.py → 三层
+        os.path.dirname(os.path.dirname(os.path.abspath(router_client.__file__)))
+    )
+    generator = os.path.join(root, "scripts", "gen_sha256sums.sh")
+    manifest = os.path.join(root, "SHA256SUMS")
+    assert os.path.isfile(generator) and os.path.isfile(manifest)
+
+    fd, fresh = tempfile.mkstemp()
+    os.close(fd)
+    try:
+        subprocess.run(["bash", generator, root, fresh], check=True, capture_output=True)
+        with open(fresh, encoding="utf-8") as fh:
+            expected = fh.read()
+    finally:
+        os.unlink(fresh)
+    with open(manifest, encoding="utf-8") as fh:
+        committed = fh.read()
+
+    if expected != committed:
+        want = dict(reversed(line.split("  ", 1)) for line in expected.splitlines() if "  " in line)
+        have = dict(reversed(line.split("  ", 1)) for line in committed.splitlines() if "  " in line)
+        stale = sorted(p for p in set(want) | set(have) if want.get(p) != have.get(p))
+        raise AssertionError(
+            "SHA256SUMS 与代码不同步, 这些文件的摘要对不上: " + ", ".join(stale[:10])
+            + " —— 发布前跑 `bash scripts/gen_sha256sums.sh` 并一起提交"
+        )
