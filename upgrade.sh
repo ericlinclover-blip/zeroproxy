@@ -300,7 +300,8 @@ parse_version() { # 输出 "002 003 000" 便于字符串比较
 cleanup_self_dir() {
   [ -n "${ZP_SELF_DIR:-}" ] || return 0
   case "$ZP_SELF_DIR" in
-    /tmp/zeroproxy-update-*|"${TMPDIR:-/tmp}"/zeroproxy-update-*) rm -rf "$ZP_SELF_DIR" 2>/dev/null || true ;;
+    /tmp/zeroproxy-update-*|"${TMPDIR:-/tmp}"/zeroproxy-update-*|*/data/update-run/run-*) \
+      rm -rf "$ZP_SELF_DIR" 2>/dev/null || true ;;
   esac
   return 0
 }
@@ -420,6 +421,12 @@ FROM_VERSION="${FROM_VERSION:-unknown}"
 TO_VERSION="$FROM_VERSION"
 mkdir -p "$ZP_HOME/data" "$BACKUP_DIR"
 : > "$LOG_FILE"
+# 先把状态落成 running 再说: 面板下一轮轮询就能看到"真的开始了", 而不是一直停在
+# "升级任务已排队"。这一步也顺带把"脚本根本没起来"和"起来了但某步失败"区分开 ——
+# 后者由 trap on_exit 写成 failed, 前者连这一行都写不出来。
+STATUS_MSG="升级已开始"
+CURRENT="准备中"
+write_status
 
 if [ -n "${ZP_REF_OVERRIDE:-}" ]; then ZP_REF="$ZP_REF_OVERRIDE"; fi
 

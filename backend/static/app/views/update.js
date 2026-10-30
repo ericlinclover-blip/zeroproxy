@@ -154,6 +154,16 @@ function updateResultHtml(u, last) {
   const elapsed = last.started_at && last.finished_at
     ? `用时 ${fmtDuration(Math.max(0, last.finished_at - last.started_at))} · ` : "";
   const trigger = `触发方式: ${last.trigger === "panel" ? "面板按钮" : "命令行"}`;
+  // "排队"超过 2 分钟 = 那个 systemd 单元根本没跑起来 (脚本连一行都没执行, 所以它
+  // 自己写不了失败状态)。这时别再转圈让人干等: 直接给出唯一有效的自救动作。
+  if (state === "queued" && u.stale_queued) {
+    return `<div class="banner bad"><span class="ico">✗</span><span><b>升级没能启动</b>
+      <br><span class="muted">任务已排队超过 2 分钟却没有任何进度 —— 升级脚本没有被执行起来。
+      到服务器上手动跑一次即可 (它会自动拉取最新代码并重启面板):</span>
+      <br><code>cd /opt/zeroproxy && bash upgrade.sh</code>
+      <br><span class="muted">常见原因是面板的 systemd 单元带 PrivateTmp, 而升级脚本曾被放在 /tmp
+      (v2.12.20 起改为放在 $ZP_HOME/data/update-run, 面板内升级恢复正常)。</span></span></div>`;
+  }
   if (state === "running" || state === "queued") {
     const title = state === "queued" ? "升级任务已排队, 正在准备…" : `正在升级: v${esc(last.from || "")} → v${esc(last.to || "…")}`;
     return `<div class="banner info"><span class="ico">⟳</span><span><b>${title}</b>

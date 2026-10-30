@@ -176,8 +176,24 @@ def upgrade_script() -> str:
     return ""
 
 
+def staged_root() -> str:
+    """升级脚本的暂存根目录 —— **必须在 $ZP_HOME 里, 不能是 /tmp**。
+
+    面板的 systemd 单元带 `PrivateTmp=yes` (v2.12.15 起): 面板进程看到的是自己的私有
+    /tmp。而升级是靠 `systemd-run` 起一个**独立单元**, 那是另一个 mount namespace ——
+    它看不到面板私有 /tmp 里那份暂存脚本, `bash /tmp/zeroproxy-update-xxx/upgrade.sh`
+    直接 "No such file or directory" (退出码 127)。
+
+    这个失败还特别隐蔽: 脚本一行都没跑, 所以它自己写不了失败状态, 面板上的进度就永远
+    停在"升级任务已排队"; 而 `is_running()` 又按 1 小时算它"还在跑", 于是按钮也点不动
+    (真机 v2.12.17 → v2.12.19 复现)。$ZP_HOME 同时满足三个条件: 面板可写
+    (ReadWritePaths 里有)、独立单元可见、不会被 PrivateTmp 隔离。
+    """
+    return os.path.join(paths()["data_dir"], "update-run")
+
+
 def stage_script(script: str) -> str:
-    """把 upgrade.sh 复制到一个私有临时目录, 返回副本路径 (面板执行的是副本)。
+    """把 upgrade.sh 复制到一个私有暂存目录, 返回副本路径 (面板执行的是副本)。
 
     bash 是**按文件偏移增量读取**脚本的, 而 upgrade.sh 会在「安装新代码」那步把自己
     就地覆盖成新版本 (同一个 inode) —— 覆盖之后 bash 从"新文件"的同一偏移继续读, 读到的
@@ -189,7 +205,11 @@ def stage_script(script: str) -> str:
     注: `bash -s < 原文件` 不算数, 那个 fd 指向的还是同一个 inode。新版本脚本自己也做了
     一份「先整份读进内存」的兜底 (命令行就地执行时靠它), 见仓库里的 upgrade.sh。
     """
-    staged_dir = tempfile.mkdtemp(prefix="zeroproxy-update-")
+    root = staged_root()
+    os.makedirs(root, exist_ok=True)
+    with contextlib.suppress(OSError):
+        os.chmod(root, 0o700)
+    staged_dir = tempfile.mkdtemp(prefix="run-", dir=root)
     staged = os.path.join(staged_dir, "upgrade.sh")
     shutil.copyfile(script, staged)
     os.chmod(staged, 0o755)
@@ -197,30 +217,56 @@ def stage_script(script: str) -> str:
 
 
 def prune_staged(max_age: float = 86400.0) -> None:
-    """清掉过期的暂存目录 (老脚本不会自己删, 正常路径由新脚本的 ZP_SELF_DIR 收尾)。"""
-    root = tempfile.gettempdir()
-    try:
-        entries = os.listdir(root)
-    except OSError:
-        return
+    """清掉过期的暂存目录 (老脚本不会自己删, 正常路径由新脚本的 ZP_SELF_DIR 收尾)。
+
+    两个位置都看: `$ZP_HOME/data/update-run/run-*` (现在) 与 `/tmp/zeroproxy-update-*`
+    (v2.12.19 及更早留在面板私有 tmp 里的遗留 —— 那一份其实谁也跑不到)。
+    """
     now = time.time()
-    for name in entries:
-        if not name.startswith("zeroproxy-update-"):
-            continue
-        path = os.path.join(root, name)
+    for root, prefixes in (
+        (staged_root(), ("run-",)),
+        (tempfile.gettempdir(), ("zeroproxy-update-",)),
+    ):
         try:
-            if now - os.path.getmtime(path) > max_age:
-                shutil.rmtree(path, ignore_errors=True)
+            entries = os.listdir(root)
         except OSError:
             continue
+        for name in entries:
+            if not name.startswith(prefixes):
+                continue
+            path = os.path.join(root, name)
+            try:
+                if now - os.path.getmtime(path) > max_age:
+                    shutil.rmtree(path, ignore_errors=True)
+            except OSError:
+                continue
+
+
+#: "已排队"最多算它活这么久。排队表示"刚交给 systemd-run", 正常情况下几秒内脚本就会
+#: 把状态改成 running; 一直停在 queued 只有一个解释: 那个单元根本没跑起来 (脚本连一行
+#: 都没执行, 所以它自己写不了失败状态)。以前这里跟 running 一样按 1 小时算, 于是界面
+#: 会锁死一小时、按钮点不动。
+QUEUED_GRACE = 120
 
 
 def is_running() -> bool:
     status = _read_status()
-    if status.get("state") not in ("queued", "running"):
+    state = status.get("state")
+    if state not in ("queued", "running"):
         return False
     started = int(status.get("started_at") or 0)
-    return (time.time() - started) < UPDATE_STALE_SECONDS
+    age = time.time() - started
+    if state == "queued":
+        return age < QUEUED_GRACE
+    return age < UPDATE_STALE_SECONDS
+
+
+def stale_queued() -> bool:
+    """排队太久 = 那个单元没起来。给面板一句人话, 并允许重新发起。"""
+    status = _read_status()
+    if status.get("state") != "queued":
+        return False
+    return (time.time() - int(status.get("started_at") or 0)) >= QUEUED_GRACE
 
 
 def status(force: bool = False, timeout: int = 8) -> dict:
@@ -263,6 +309,7 @@ def status(force: bool = False, timeout: int = 8) -> dict:
         "prod": services.is_prod(),
         "cache_hit": hit_cache,  # 命中缓存 = 刚检查过, 前端可显示"上次检查时间"
         "running": is_running(),
+        "stale_queued": stale_queued(),
         "last": _read_status(),
         "log_tail": _log_tail(),
     }

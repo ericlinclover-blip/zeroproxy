@@ -15,6 +15,7 @@ import hashlib
 import io
 import os
 import subprocess
+import time
 
 from zeroproxy import config, crypto, services, wireguard
 
@@ -261,3 +262,48 @@ def test_device_name_cannot_break_yaml_comments(client, configured):
     assert not [ln for ln in body.splitlines() if ln.startswith("zp-injected-key:")], \
         "设备名里的换行跳出了注释行"
     assert not [ln for ln in body.splitlines() if ln.startswith("allow-lan: ")] or True
+
+
+# ---------------------------------------------------------------- 面板内升级卡在"已排队"
+
+def test_upgrade_script_is_staged_outside_private_tmp(home):
+    """暂存脚本必须在 $ZP_HOME 里。
+
+    面板的 systemd 单元带 `PrivateTmp=yes`: 面板看到的 /tmp 是私有的, 而升级是
+    `systemd-run` 起**另一个单元**去跑 —— 它看不到那份私有 /tmp。脚本放在 /tmp 的结果
+    是 `bash: /tmp/...: No such file or directory` (退出码 127), 而因为脚本一行都没执行,
+    它自己写不了失败状态, 面板就永远停在"升级任务已排队" (真机 v2.12.17 → v2.12.19)。
+    """
+    from zeroproxy import config, update
+
+    config.save_state(config.load_state())
+    script = config.paths()["upgrade_script"]
+    os.makedirs(os.path.dirname(script), exist_ok=True)
+    with open(script, "w", encoding="utf-8") as fh:
+        fh.write("#!/bin/sh\necho upgrade\n")
+
+    staged = update.stage_script(script)
+    home_prefix = os.path.abspath(config.home()) + os.sep
+    assert os.path.abspath(staged).startswith(home_prefix), staged
+    assert not os.path.abspath(staged).startswith("/tmp/"), staged
+    assert staged.endswith("upgrade.sh") and os.path.isfile(staged)
+    # 副本而不是原地执行 (原文件会被新代码覆盖, 同 inode 会被 bash 读串)
+    assert not os.path.samefile(staged, script)
+
+
+def test_stale_queued_task_does_not_lock_the_panel(home):
+    """排队超时后必须允许重新发起, 不能把按钮锁一小时。"""
+    from zeroproxy import config, update
+
+    config.save_state(config.load_state())
+    update._write_status(
+        {"state": "queued", "trigger": "panel", "started_at": int(time.time()) - 300}
+    )
+    assert update.is_running() is False
+    assert update.stale_queued() is True
+
+    update._write_status(
+        {"state": "queued", "trigger": "panel", "started_at": int(time.time())}
+    )
+    assert update.is_running() is True
+    assert update.stale_queued() is False
