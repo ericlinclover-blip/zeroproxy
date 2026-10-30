@@ -95,14 +95,25 @@ G_DIRECT = "🎯 全球直连"
 #:   * DOMAIN-SUFFIX: 显式域名, 不依赖数据库 —— 对"必须能通"的服务用这种兜底。
 G_LANDING = "🌍 落地节点"
 
-#: AI 服务: 地域限制最硬的一类, 用显式域名 (不依赖 geo 数据库的收录情况)
+#: 严格限制地区或纯净度的服务 (AI / 流媒体 / 验证风控 / 纯净度检测 / 国际支付)
 LANDING_DOMAINS = (
+    # ---- AI 核心服务 ----
     "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
-    "anthropic.com", "claude.ai",
+    "anthropic.com", "claude.ai", "claude.com",
     "gemini.google.com", "bard.google.com", "aistudio.google.com",
     "generativelanguage.googleapis.com",
     "perplexity.ai", "x.ai", "grok.com", "midjourney.com",
     "poe.com", "character.ai", "sora.com",
+    # ---- 人机验证 / 边缘风控 (Cloudflare Turnstile, Arkose 等) ----
+    "challenges.cloudflare.com", "turnstile.cloudflare.com",
+    "arkoselabs.com", "hcaptcha.com",
+    # ---- IP 纯净度 / 欺诈分 / 泄漏检测平台 ----
+    "scamalytics.com", "iphey.com", "browserleaks.com", "whoer.net",
+    "ipinfo.io", "ipdata.co", "ipqualityscore.com", "maxmind.com",
+    "ip-api.com", "ipapi.co", "ip.sb",
+    # ---- 国际支付与风控 ----
+    "stripe.com", "paypal.com", "paypalobjects.com",
+    # ---- 流媒体服务 ----
     "primevideo.com", "hulu.com", "max.com", "hbomax.com",
     "disneyplus.com", "spotify.com", "soundcloud.com", "deezer.com",
     "pandora.com", "crunchyroll.com", "paramountplus.com", "peacocktv.com",
@@ -307,11 +318,10 @@ ROUTER_FAKE_IP_FILTER = [
     "*.pool.ntp.org",
     "*.ntp.org.cn",
     "+.market.xiaomi.com",
-    "*.stun.*",
-    "stun.*",
-    "*.*.stun.*",
-    "*.turn.*",
-    "*.webrtc.*",
+    # 注意: STUN / WebRTC (*.stun.*, *.webrtc.*) 绝不能写进 fake-ip-filter!
+    # 之前放进 filter 会导致浏览器向国内 DNS 直查 STUN 服务器真实 IP,
+    # 并在 WebRTC 建联中泄漏真实国内公网 IP, 导致严格风控检测平台 (Scamalytics /
+    # BrowserLeaks / Turnstile) 判定为 WebRTC 泄漏而拒绝连接。
 ]
 
 #: 路由器端 `dns` 段。国内域名走国内 DNS (快、拿到就近 CDN), 国外域名走 DoH 且经代理
@@ -840,16 +850,13 @@ def clash_profile(
             # 带面板域名前缀, 但"链式"这个标记保留)。filter 匹配不到任何节点时,
             # 兜底成员"节点选择"保证这个组永远可用。
             #
-            # 用 url-test 而不是 select: 多服务器模式正是"同一个落地挂了两台入口"的
-            # 样子, 哪一台能通必须由内核自己判 —— 一台入口被按比例丢包时, 人不会去
-            # 手点一下, 而 url-test 会切过去。(组里套组 mihomo 接受, 已用真内核 -t 验过。)
+            # 用 select 代替 url-test: 当用户挂载的节点中没有"链式"节点时,
+            # url-test 会因为 filter 结果为空且仅含 G_SELECT (策略组而非直连节点)
+            # 而在真机上测活失败, 导致落地组被判定为不可用, 访问 OpenAI/Claude 等落地域名
+            # 出现"无法连接"。用 select 组则能在无链式节点时无缝 fallback 到 G_SELECT。
             {
                 "name": G_LANDING,
-                "type": "url-test",
-                "url": HEALTH_URL,
-                "interval": 60,
-                "lazy": False,
-                "tolerance": 50,
+                "type": "select",
                 "use": [],
                 "filter": "(?i)链式",
                 "proxies": [G_SELECT],
@@ -880,7 +887,13 @@ def clash_profile(
         # GEOIP,LAN 是内建判断 (私有地址), 不需要数据库 —— 降级时也留着
         rules.append(f"GEOIP,LAN,{G_DIRECT},no-resolve")
         if geo:
-            rules.append(f"GEOIP,CN,{G_DIRECT}")
+            # 必须加 no-resolve: 在 fake-ip 模式下, 若缺少 no-resolve, 未命中前置规则的境外域名
+            # 会被 mihomo 暂停匹配并调用 nameserver (国内阿里/腾讯 DNS) 解析真实 IP 来匹配 GEOIP。
+            # 这会导致:
+            #   1. 境外域名向国内 DNS 发生 DNS 泄漏与被污染;
+            #   2. 污染返回国内 IP 时被错误路由到直连, 导致目标网站连接超时失败;
+            #   3. 落地机与 DNS 出口 ASN 不一致被 Cloudflare 等高纯净度风控拦截。
+            rules.append(f"GEOIP,CN,{G_DIRECT},no-resolve")
         rules.append(f"MATCH,{G_FINAL}")
     elif tpl == "global":
         rules = []

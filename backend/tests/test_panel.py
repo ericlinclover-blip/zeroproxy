@@ -598,6 +598,58 @@ def test_singbox_templates_download_rule_set_directly(client, configured):
     assert direct["route"]["rules"][-1]["outbound"] == "🎯 全球直连"
 
 
+def test_ip_purity_routing_and_outbound_strategy(client, configured):
+    """防 IP 纯净度检测失败与高纯净度服务断连。
+
+    核心保障:
+      1. GEOIP,CN 必须带 no-resolve, 避免境外域名在 fake-ip 下触发国内 DNS 泄漏与污染
+      2. 严格风控、高纯净度检测及人机验证域名显式走落地
+      3. fake-ip-filter 移除 STUN/WebRTC, 杜绝浏览器通过 WebRTC 暴露国内真实 IP
+      4. Xray freedom 出站强制 domainStrategy: UseIPv4, 避免 VPS 机房 IPv6 导致连接超时或风控拦截
+      5. 多服务器模式 (skeleton) 落地组用 select 兜底, 避免 url-test 在无链式节点时测活失败
+    """
+    from zeroproxy import config, share_links, xray_config
+
+    yaml = pytest.importorskip("yaml")
+    smart = yaml.safe_load(_sub(client, configured).text)
+    rules = smart["rules"]
+
+    # 1. GEOIP,CN 必须带 no-resolve
+    assert "GEOIP,CN,🎯 全球直连,no-resolve" in rules
+
+    # 2. 关键高纯净度与人机验证域名在 LANDING_DOMAINS 中且走落地
+    purity_domains = (
+        "challenges.cloudflare.com",
+        "turnstile.cloudflare.com",
+        "scamalytics.com",
+        "iphey.com",
+        "browserleaks.com",
+        "whoer.net",
+        "ipinfo.io",
+        "stripe.com",
+    )
+    for d in purity_domains:
+        assert d in share_links.LANDING_DOMAINS
+        assert f"DOMAIN-SUFFIX,{d},🌍 落地节点" in rules
+
+    # 3. fake-ip-filter 中不得含有 stun / webrtc 旁路
+    for f in share_links.ROUTER_FAKE_IP_FILTER:
+        assert "stun" not in f and "webrtc" not in f
+
+    # 4. xray 出站 freedom 强制 UseIPv4
+    state = config.load_state()
+    xray_cfg = xray_config.build_xray_config(state)
+    direct_out = next(o for o in xray_cfg["outbounds"] if o.get("tag") == "direct")
+    assert direct_out["protocol"] == "freedom"
+    assert direct_out.get("settings", {}).get("domainStrategy") == "UseIPv4"
+
+    # 5. skeleton 模式下 G_LANDING 为 select 类型
+    skel = yaml.safe_load(share_links.router_skeleton(state, "smart"))
+    landing_grp = next(g for g in skel["proxy-groups"] if g["name"] == share_links.G_LANDING)
+    assert landing_grp["type"] == "select"
+    assert share_links.G_SELECT in landing_grp["proxies"]
+
+
 def test_singbox_next_format_uses_http_client(client, configured):
     """`?format=singbox-next` 面向 sing-box ≥1.14 (download_detour 已废弃)。"""
     from zeroproxy import share_links

@@ -367,7 +367,18 @@ def build_xray_config(state: dict) -> dict:
             },
         },
         "inbounds": [],
-        "outbounds": [{"protocol": "freedom", "tag": "direct"}],
+        # 强制出站使用 IPv4 解析与建联:
+        # 大多数云厂商 VPS 默认分配了数据中心机房的 IPv6 (ASN 与 IPv4 往往不同甚至不可路由),
+        # 且 Linux 系统的 getaddrinfo 默认优先走 IPv6。若不强制 UseIPv4, 目标网站 (如 OpenAI/Claude/金融风控)
+        # 会收到来自机房 IPv6 的请求, 识别为机房低纯净度 IP 拦截或直接因 IPv6 缺网关超时。
+        # 显式指定 domainStrategy: UseIPv4 保证始终使用服务器配置的高纯净度 IPv4 出网。
+        "outbounds": [
+            {
+                "protocol": "freedom",
+                "tag": "direct",
+                "settings": {"domainStrategy": "UseIPv4"},
+            }
+        ],
         "routing": {
             "domainStrategy": "AsIs",
             # API 入站的流量必须交给 tag=api 的内置处理器 (而不是 direct),
