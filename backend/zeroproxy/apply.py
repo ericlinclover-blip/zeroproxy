@@ -173,6 +173,12 @@ def ensure_reality_settings(state: dict, timeout: int = 0) -> tuple[bool, str]:
     reality = state["reality"]
     notes: list[str] = []
 
+    # 尽力保证系统时间对齐 (生产环境): REALITY 依赖时间戳防重放 (误差必须在 120 秒内),
+    # 宿主机时钟漂移会导致握手全部回落到伪装站 (测速有延迟但实际无法出网)。
+    if services.is_prod():
+        with contextlib.suppress(Exception):
+            services.run(["timedatectl", "set-ntp", "true"], timeout=3)
+
     if not crypto.reality_key_valid(reality.get("private_key", ""), reality.get("public_key", "")):
         private_key, public_key, short_id = crypto.new_reality_keys()
         reality["private_key"] = private_key

@@ -5970,3 +5970,14 @@ PublicKey = ...
 - **发布清单与回归测试**:
   - 重新生成 `SHA256SUMS` 清单。
   - 新增 `test_warm_one_retries_and_succeeds_when_port_listener_delayed` 与 `test_warm_one_fails_after_timeout_when_port_never_listens` 单元测试。
+
+
+### 8.118 v2.12.23: 修复 Xray 顶层 DNS 顺序导致的出网解析假死与时间对齐强化
+- **DNS 解析优化与防假死**:
+  - 故障现象：客户端测速显示正常延迟（195ms / 193ms），但切换到 VLESS Reality / XHTTP 节点后国外网络无法访问（超时转圈），而国内网络（因直连规则）正常。
+  - 根因：Xray 顶层 `dns.servers` 原先将 `1.1.1.1` 与 `8.8.8.8` 置于 `localhost` 之前。在部分海外云服务商或安全组下，对外公网 UDP 53 请求被机房静默丢弃，导致内置 DNS 模块逐级等待超时（每级 5s），浏览器端直接触发 ERR_CONNECTION_TIMED_OUT。
+  - 解决方案：将 `localhost` 系统解析器（通过 `/etc/resolv.conf` 走云主机内网 DNS）提升为第一优先级，配合 `queryStrategy: UseIPv4` 达成 0.1ms 级极速出站解析，保留公共 DNS 作为备选。
+- **Reality 时钟对齐强化**:
+  - 生产环境配置落地阶段自动尝试启用 `timedatectl set-ntp true`，杜绝宿主机时间漂移超过 120 秒触发 Reality 强制回落至伪装网站（Fallback）。
+- **发布清单**:
+  - 重新生成 `SHA256SUMS` 清单并完成测试回归。

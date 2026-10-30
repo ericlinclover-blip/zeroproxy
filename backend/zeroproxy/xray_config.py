@@ -377,12 +377,12 @@ def build_xray_config(state: dict) -> dict:
         },
         "dns": {
             # 显式配置 IPv4 优先的上游 DNS:
-            # 当 freedom 出站开启 UseIPv4 时, Xray 切换至内置 DNS 模块解析目标域名。
-            # 若缺失顶层 dns 配置, 在 systemd-resolved 或受限 DNS 环境下会导致域名解析失败或测速超时。
+            # 优先使用本机系统解析器 (localhost), 避免部分 VPS 机房阻断向 1.1.1.1/8.8.8.8 发起 UDP 53 请求
+            # 导致所有目标网站解析超时卡死; 同时保留公共 DNS 兜底。
             "servers": [
+                "localhost",
                 "1.1.1.1",
                 "8.8.8.8",
-                "localhost",
             ],
             "queryStrategy": "UseIPv4",
         },
