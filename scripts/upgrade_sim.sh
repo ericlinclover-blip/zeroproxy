@@ -337,6 +337,13 @@ _assert_unit_has() { # _assert_unit_has <文件> <模式> <说明>
     bad "$3 (缺字段: $2 · $1)"
   fi
 }
+_assert_unit_lacks() { # _assert_unit_lacks <文件> <模式> <说明>
+  if grep -qE "$2" "$UNIT_DIR/$1" 2>/dev/null; then
+    bad "$3 (不该出现的字段: $2 · $1)"
+  else
+    ok "$3"
+  fi
+}
 _assert_unit_has zeroproxy.service 'NoNewPrivileges=yes' "面板单元带 NoNewPrivileges=yes"
 _assert_unit_has zeroproxy.service 'ProtectSystem=strict' "面板单元带 ProtectSystem=strict"
 _assert_unit_has zeroproxy.service 'ReadWritePaths=.*/etc/nginx.*/etc/letsencrypt.*/run' "面板单元写了 ReadWritePaths 白名单"
@@ -344,9 +351,14 @@ _assert_unit_has zeroproxy.service 'MemoryMax=' "面板单元带 MemoryMax (资�
 _assert_unit_has zeroproxy.service 'PrivateTmp=yes' "面板单元带 PrivateTmp=yes"
 _assert_unit_has xray.service 'NoNewPrivileges=yes' "Xray 单元带 NoNewPrivileges=yes"
 _assert_unit_has xray.service 'ProtectSystem=strict' "Xray 单元带 ProtectSystem=strict"
-_assert_unit_has xray.service 'CapabilityBoundingSet=' "Xray 单元限制 CapabilityBoundingSet"
 _assert_unit_has hysteria2.service 'NoNewPrivileges=yes' "Hysteria 单元带 NoNewPrivileges=yes"
-_assert_unit_has zeroproxy-wg.service 'CapabilityBoundingSet=CAP_NET_ADMIN' "WireGuard 单元只保留 CAP_NET_ADMIN"
+_assert_unit_has hysteria2.service 'ReadWritePaths=.*run' "Hysteria 单元允许写 /run (iptables 回退需要)"
+# 能力收窄回归: Hysteria 端口跳跃要写 nftables/iptables (CAP_NET_ADMIN), Xray/ wg-quick
+# 同样会碰内核网络能力。v2.12.15 收窄后 hysteria 起来就退出 -> 30001/udp 不监听 ->
+# 升级在端口校验处回滚 (2026-10-30 三台真机)。这里钉住"不要再加回去"。
+_assert_unit_lacks hysteria2.service '^CapabilityBoundingSet=' "Hysteria 单元不做能力收窄 (端口跳跃需要 NET_ADMIN)"
+_assert_unit_lacks xray.service '^CapabilityBoundingSet=' "Xray 单元不做能力收窄"
+_assert_unit_lacks zeroproxy-wg.service '^CapabilityBoundingSet=' "WireGuard 单元不做能力收窄 (wg-quick 要写 NAT)"
 if grep -q '^User=' "$UNIT_DIR/zeroproxy.service" 2>/dev/null; then
   bad "面板单元不应降 User (会破坏既有部署的文件属主/权限)"
 else

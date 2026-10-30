@@ -5830,3 +5830,21 @@ PublicKey = ...
   （见下），再升级到本版。
 - **回归**: 单元字段由 `upgrade_sim.sh` 断言；systemd 的"缺失路径"行为以真机为准
   （本次真机踩到，已补注释说明为什么必须写 `-`）。
+
+
+### 8.112 v2.12.17: 修复 Hysteria 2 端口跳跃被能力收窄中断 (升级在端口校验处回滚)
+- **根因**: v2.12.15 给 `hysteria2.service` 加了
+  `CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW`。Hysteria 2 的端口跳跃
+  （`listen` 逗号多端口）需要自己写 nftables/iptables 的 UDP REDIRECT 规则
+  （`CAP_NET_ADMIN`）。能力被收掉后 hysteria 启动即退出，30001/udp 不监听；apply 的
+  端口复查判红，`upgrade.sh` 于是回滚整次升级（2026-10-30 三台真机复现，
+  `验证端口监听 | 以下端口未监听: Hysteria 2 30001/udp`）。
+- **修复**: 去掉 `hysteria2` / `xray` / `zeroproxy-wg*` 的 `CapabilityBoundingSet`；
+  `hysteria2` 的 `ReadWritePaths` 补上 `/run`（端口跳跃在没装 `nft` 的机器上会退回
+  `iptables -w`，需要写 `/run/xtables.lock`）。文件系统沙箱（`ProtectSystem=strict` +
+  `ReadWritePaths`、`PrivateTmp`、`ProtectHome`）与 `NoNewPrivileges=yes` 全部保留；
+  内核网络能力不再收窄——这类依赖随上游版本演化，收窄的风险大于收益。
+- **可观测性**: apply 端口校验失败时，结论里直接附 `journalctl -u xray/hysteria2`
+  排查入口，不再只给"端口未监听"。
+- **回归**: `upgrade_sim.sh` 把断言改成"这些单元不得做能力收窄"，防止再被加回来；
+  全量 pytest、Go test、upgrade_sim 全绿。

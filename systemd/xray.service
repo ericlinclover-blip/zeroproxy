@@ -19,16 +19,16 @@ Restart=always
 RestartSec=3
 LimitNOFILE=1048576
 
-# ---- 沙箱 (P2-13): 不降 User (既有部署的文件属主不变), 只收窄能力与文件系统 ----
+# ---- 沙箱 (P2-13): 不降 User (既有部署的文件属主不变), 只收窄文件系统 ----
 # ExecStartPre 的 geodata guard 会重写 /opt/zeroproxy 下的配置, 所以 ZP_HOME 必须可写。
+# **不要加 CapabilityBoundingSet**: Xray 的 sockopt / 传输特性会随版本演化用到
+# 内核网络能力 (NET_ADMIN 等); 能力收窄的风险大于收益 (v2.12.15 的 Hysteria 就是
+# 被同一类收窄弄挂的)。文件系统沙箱与 NoNewPrivileges 仍然保留。
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/opt/zeroproxy
 PrivateTmp=yes
 ProtectHome=read-only
-# Xray 监听的都是 8443+ 高端口; 保留 NET_BIND_SERVICE 是给自定义低端口配置兜底,
-# NET_RAW 给部分传输/探测路径兜底 (其余能力 —— SYS_ADMIN/DAC_OVERRIDE/… —— 全部丢弃)。
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
 
 [Install]
 WantedBy=multi-user.target

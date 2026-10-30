@@ -16,7 +16,9 @@ RestartSec=3
 TimeoutStartSec=30
 TimeoutStopSec=20
 # wireguard-go 建 TUN 设备 / 配地址 / NAT 都只需要 NET_ADMIN (P2-13)
-CapabilityBoundingSet=CAP_NET_ADMIN
+
+# 不做 CapabilityBoundingSet 收窄: wg-quick 的 PostUp/PostDown 会调
+# iptables/nft 写 NAT 规则 (需要 NET_ADMIN, 部分实现还要 NET_RAW)。
 
 [Install]
 WantedBy=multi-user.target

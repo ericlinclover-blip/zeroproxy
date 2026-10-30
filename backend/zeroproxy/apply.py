@@ -614,6 +614,15 @@ def verify_listeners(state: dict, timeout: int = 0) -> tuple[bool, str]:
     problems: list[str] = []
     if missing:
         problems.append("以下端口未监听: " + ", ".join(missing))
+        # 服务显示 active 但端口不在, 通常意味着核心进程启动后立刻退出 (能力/配置/
+        # 端口冲突)。把排查入口直接写进结论, 免得用户只看到"端口未监听"。
+        units = []
+        if any("Hysteria" in item for item in missing):
+            units.append("hysteria2")
+        if any("Hysteria" not in item for item in missing):
+            units.append("xray")
+        if units:
+            problems.append("排查: journalctl -u " + " -u ".join(units) + " -n 30")
     if still_open:
         problems.append(
             "以下端口已停用却仍在监听 (内核没按新配置重启, 或被其它进程占用): "

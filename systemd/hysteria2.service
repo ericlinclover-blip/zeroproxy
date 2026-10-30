@@ -10,14 +10,18 @@ Restart=always
 RestartSec=3
 LimitNOFILE=1048576
 
-# ---- 沙箱 (P2-13): 不降 User (既有部署的文件属主不变), 只收窄能力与文件系统 ----
+# ---- 沙箱 (P2-13): 不降 User (既有部署的文件属主不变), 只收窄文件系统 ----
+# **不要加 CapabilityBoundingSet**: Hysteria 2 的端口跳跃 (listen 逗号多端口)
+# 需要自己写 nftables / iptables 的 UDP REDIRECT 规则 (CAP_NET_ADMIN)。
+# v2.12.15 曾把能力收窄到 NET_BIND_SERVICE+NET_RAW, 结果 hysteria 起来就退出、
+# 30001/udp 不监听 -> apply 端口校验失败 -> 整次升级回滚 (2026-10-30 三台真机踩到)。
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/opt/zeroproxy
+# /run 必须可写: 端口跳跃在缺少 nft 的机器上会退回 `iptables -w`, 需要写
+# /run/xtables.lock (否则内核转发规则装不上, hysteria 起来就退出)。
+ReadWritePaths=/opt/zeroproxy /run
 PrivateTmp=yes
 ProtectHome=read-only
-# 监听 30001+ 高端口; 保留 NET_BIND_SERVICE 给自定义低端口兜底, NET_RAW 给 QUIC/探测兜底。
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
 
 [Install]
 WantedBy=multi-user.target
