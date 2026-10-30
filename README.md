@@ -5960,3 +5960,13 @@ PublicKey = ...
 - **发布清单与测试**:
   - 重新生成根 `SHA256SUMS`，保持发布清单与代码提交一致。
   - 全量回归测试通过，新增 deep_links、unlock_probe、reality_candidates 与 auto_dest 对应单元测试用例。
+
+
+### 8.117 v2.12.22: 修复配置重载时后台预热的时序竞争 (Race Condition)
+- **时序竞争问题修复**:
+  - 故障现象：在升级或保存配置重载服务时，操作记录中偶发记录一条红色报错 `链路预热失败 chain_warmup_failed 8443 ↶ 0.0s (入口没在监听 (ConnectionRefusedError: [Errno 111] Connection refused))`，但几百毫秒后核心服务其实完全正常。
+  - 根因：`systemctl restart xray` 是 systemd Simple 服务且前置了 `geodata guard` 自愈脚本，在端口正式调 `listen()` 之前进程还在初始化。紧随其后的后台预热线程连接回环 `127.0.0.1:8443` 时，因缺少端口就绪等待直接撞上 Linux 内核网络栈的瞬间 RST（0.0s 触发 ConnectionRefused），导致误判失败并提前中断预热。
+  - 解决方案：在 `chain.py` 的 `_warm_one()` 中引入端口就绪等待机制（在总预算内提供最多 6 秒、步长 0.2 秒的自适应重试轮询），彻底消除服务启动初期回环 RST 引起的假阳性误报，同时保证 Reality 冷启动预热真正生效。
+- **发布清单与回归测试**:
+  - 重新生成 `SHA256SUMS` 清单。
+  - 新增 `test_warm_one_retries_and_succeeds_when_port_listener_delayed` 与 `test_warm_one_fails_after_timeout_when_port_never_listens` 单元测试。

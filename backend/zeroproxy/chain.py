@@ -912,7 +912,19 @@ def _warm_one(binary: str, target: dict, timeout: float, state: dict | None = No
     F04: 接受 state 以传递给 client_config。
     """
     started = time.perf_counter()
-    reachable, _ms, detail = services.tcp_connect_ms(target["host"], target["port"], 1.0)
+    # 等待入口就绪: Xray 刚重启时 (包含 ExecStartPre 脚本耗时与配置加载) 端口可能要
+    # 几百毫秒才 bind() 成功。在预算内给它短暂重试等待 (最多 6 秒, 步长 0.2 秒),
+    # 避免因回环瞬间 RST (0.0s ConnectionRefused) 误判为"入口没在监听"。
+    wait_limit = min(6.0, max(0.5, float(timeout)))
+    wait_deadline = time.monotonic() + wait_limit
+    reachable = False
+    detail = ""
+    while True:
+        reachable, _ms, detail = services.tcp_connect_ms(target["host"], target["port"], 0.5)
+        if reachable or time.monotonic() >= wait_deadline:
+            break
+        time.sleep(min(0.2, max(0.0, wait_deadline - time.monotonic())))
+
     if not reachable:
         return False, f"入口没在监听 ({detail})", time.perf_counter() - started
 
@@ -931,7 +943,8 @@ def _warm_one(binary: str, target: dict, timeout: float, state: dict | None = No
         wait_err = _wait_socks(proc, socks_port)
         if wait_err:
             return False, wait_err, time.perf_counter() - started
-        ip, read_detail = read_exit_ip(socks_port, timeout)
+        remain = max(1.0, float(timeout) - (time.perf_counter() - started))
+        ip, read_detail = read_exit_ip(socks_port, remain)
         # 没读到出口 IP 也算"穿过一次" —— 预热只要握手真的走完一遍就达到目的,
         # 回显服务偶发读不到不该被当成失败。
         return bool(ip), (f"读到出口 IP {ip}" if ip else read_detail), time.perf_counter() - started

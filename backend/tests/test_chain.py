@@ -714,6 +714,71 @@ def test_warmup_records_result_in_audit(client, configured, monkeypatch):
     assert "8443" in rows[-1]["detail"]
 
 
+def test_warm_one_retries_and_succeeds_when_port_listener_delayed(monkeypatch):
+    """Xray 重启后前几百毫秒内核会直接报 ConnectionRefused, _warm_one 必须重试等待。"""
+    from zeroproxy import chain as chain_mod
+    from zeroproxy import services
+
+    attempts = 0
+
+    def mock_tcp(host, port, timeout=0.5):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            return False, -1.0, "ConnectionRefusedError: [Errno 111] Connection refused"
+        return True, 0.5, "TCP 握手成功"
+
+    monkeypatch.setattr(services, "tcp_connect_ms", mock_tcp)
+    monkeypatch.setattr(chain_mod, "_wait_socks", lambda proc, port: "")
+    monkeypatch.setattr(chain_mod, "read_exit_ip", lambda port, timeout: ("1.2.3.4", "HTTP 往返成功"))
+
+    class FakeProc:
+        def terminate(self): pass
+        def wait(self, timeout=None): pass
+        def kill(self): pass
+
+    monkeypatch.setattr(chain_mod.subprocess, "Popen", lambda *args, **kwargs: FakeProc())
+
+    target = {
+        "host": "127.0.0.1",
+        "port": 8443,
+        "uuid": "00000000-0000-0000-0000-000000000001",
+        "pbk": "fake_pbk",
+        "sid": "fake_sid",
+        "sni": "fake.com",
+        "flow": "xtls-rprx-vision",
+    }
+    ok, detail, cost = chain_mod._warm_one("/fake/xray", target, timeout=3.0)
+    assert ok is True
+    assert attempts >= 3
+    assert "读到出口 IP 1.2.3.4" in detail
+
+
+def test_warm_one_fails_after_timeout_when_port_never_listens(monkeypatch):
+    """端口真正未监听时, 重试至预算耗尽返回失败。"""
+    from zeroproxy import chain as chain_mod
+    from zeroproxy import services
+
+    monkeypatch.setattr(
+        services,
+        "tcp_connect_ms",
+        lambda host, port, timeout=0.5: (False, -1.0, "ConnectionRefusedError: [Errno 111] Connection refused"),
+    )
+
+    target = {
+        "host": "127.0.0.1",
+        "port": 8443,
+        "uuid": "00000000-0000-0000-0000-000000000001",
+        "pbk": "fake_pbk",
+        "sid": "fake_sid",
+        "sni": "fake.com",
+        "flow": "xtls-rprx-vision",
+    }
+    ok, detail, cost = chain_mod._warm_one("/fake/xray", target, timeout=0.5)
+    assert ok is False
+    assert "入口没在监听" in detail
+
+
 # ---------------------------------------------------------------- 内层 QUIC (Hysteria 2)
 
 def _v2_code(state: dict, host: str = "203.0.113.9", **over) -> str:
