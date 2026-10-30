@@ -81,3 +81,49 @@ $("#btn-apply").onclick = async () => {
   } catch (e) { toast("应用失败: " + e.message); }
   btn.disabled = false; btn.textContent = "重新应用配置";
 };
+
+/* ---------------- AI / 流媒体解锁与出口纯净度检测 ---------------- */
+const unlockBtn = $("#btn-unlock-probe");
+if (unlockBtn) {
+  unlockBtn.onclick = async () => {
+    unlockBtn.disabled = true;
+    unlockBtn.textContent = "检测中…";
+    $("#unlock-summary").textContent = "正在探测出口对主流 AI 服务与流媒体的可用性…";
+    try {
+      const res = await api("/api/probe/unlock?force=1");
+      renderUnlock(res);
+      toast(res.summary || "检测完成");
+    } catch (e) {
+      toast("检测失败: " + e.message);
+      $("#unlock-summary").textContent = "检测失败: " + e.message;
+    } finally {
+      unlockBtn.disabled = false;
+      unlockBtn.textContent = "刷新检测";
+    }
+  };
+}
+
+export function renderUnlock(res) {
+  if (!res) return;
+  const summaryEl = $("#unlock-summary");
+  if (summaryEl) {
+    summaryEl.textContent = `${res.summary || "检测完成"} · 出口 IP: ${res.ip || "—"}`;
+  }
+  const grid = $("#unlock-grid");
+  if (!grid) return;
+  const items = res.items || [];
+  grid.innerHTML = items
+    .map(
+      (item) => `
+        <div style="background: var(--bg-soft); border: 1px solid var(--border-soft); border-radius: var(--radius); padding: 10px 14px;">
+          <div class="row-between mb-1">
+            <span class="fs-sm fw-bold">${esc(item.name)}</span>
+            <span class="pill ${item.ok ? "ok" : "bad"}">${item.ok ? "✓ 解锁" : "✗ 受限"}</span>
+          </div>
+          <div class="muted fs-xs">${esc(item.detail)}</div>
+        </div>
+      `
+    )
+    .join("");
+}
+

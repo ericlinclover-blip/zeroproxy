@@ -1121,6 +1121,7 @@ def _dashboard_body(state: dict, request: Request, traffic: dict | None = None) 
             "clash": f"{sub}?format=clash",
             "singbox": f"{sub}?format=singbox",
         },
+        "deep_links": share_links.deep_links(sub),
         "cert": _cert_view(state),
         "nodes": _node_view(state, traffic),
         "routing": {
@@ -2361,6 +2362,67 @@ def probe(request: Request, force: int = 0, deep: int = 0):
     with _PROBE_LOCK:
         _PROBE_CACHE[key] = {"at": time.time(), "body": body}
     return body
+
+
+@router.get("/api/probe/unlock")
+def probe_unlock(request: Request, force: int = 0):
+    """AI / 流媒体解锁状态与出口 IP 纯净度检测。"""
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+    return services.unlock_probe(force=bool(force))
+
+
+@router.get("/api/reality/candidates")
+def reality_candidates(request: Request):
+    """探测候选 Reality 伪装目标池的连通性、延迟与证书体积 (<=8KB 为安全)。"""
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+    return {"candidates": services.candidate_reality_targets()}
+
+
+class RealityAutoDestIn(BaseModel):
+    server_name: str | None = None
+    dest: str | None = None
+
+
+@router.post("/api/reality/auto-dest")
+def reality_auto_dest(payload: RealityAutoDestIn, request: Request):
+    """自动优选或切换 Reality 伪装目标, 并自动触发配置重载与自愈。"""
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+
+        if payload.server_name and payload.dest:
+            server_name = payload.server_name.strip().lower()
+            dest = payload.dest.strip()
+        else:
+            candidates = services.candidate_reality_targets()
+            avail = [c for c in candidates if c.get("ok") and c.get("cert_safe")]
+            if not avail:
+                return _err("未能找到符合安全要求 (证书<=8KB 且连通) 的可用候选伪装目标", 502)
+            best = avail[0]
+            server_name = best["server_name"]
+            dest = best["dest"]
+
+        state["reality"]["server_name"] = server_name
+        state["reality"]["dest"] = dest
+        save_state(state)
+        config.audit(state, "settings", f"优选伪装: {server_name} ({dest})", actor=_client_ip(request))
+
+    from . import apply
+    steps = apply.reapply(state)
+    return {
+        "ok": True,
+        "server_name": server_name,
+        "dest": dest,
+        "steps": steps,
+    }
+
 
 
 # ---------------------------------------------------------------- 备份 / 恢复

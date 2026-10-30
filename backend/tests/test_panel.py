@@ -4631,3 +4631,61 @@ def test_dashboard_fingerprint_tracks_geodata_changes(client, configured):
         state["geodata"]["enabled"] = True
         config.save_state(state)
     assert client.get("/api/dashboard").json()["fingerprint"] != changed_data, "geo 开关没进指纹"
+
+
+def test_dashboard_exposes_deep_links(client, configured):
+    """仪表盘返回主流客户端 Universal Deep Link 一键导入链接。"""
+    dash = client.get("/api/dashboard").json()
+    assert "deep_links" in dash, "缺少 deep_links"
+    dl = dash["deep_links"]
+    assert "clash" in dl and dl["clash"].startswith("clash://install-config?")
+    assert "singbox" in dl and dl["singbox"].startswith("sing-box://import-remote-profile?")
+    assert "shadowrocket" in dl and dl["shadowrocket"].startswith("shadowrocket://add/sub://")
+    assert "surge" in dl and dl["surge"].startswith("surge:///install-config?")
+    assert "quantumultx" in dl and dl["quantumultx"].startswith("quantumult-x:///add-resource?")
+
+
+def test_unlock_probe_endpoint(client, configured):
+    """AI 与流媒体解锁及出口纯净度探针接口在离线模式下正常返回结构化数据。"""
+    res = client.get("/api/probe/unlock").json()
+    assert "items" in res
+    assert "summary" in res
+    assert len(res["items"]) >= 5
+    names = [item["name"] for item in res["items"]]
+    assert "OpenAI / ChatGPT" in names
+    assert "Netflix" in names
+
+
+def test_reality_candidates_and_auto_dest(client, configured, monkeypatch):
+    """Reality 伪装目标候选池探测与智能切换。"""
+    from zeroproxy import services
+
+    # 1. 查询候选池
+    monkeypatch.setattr(
+        services,
+        "candidate_reality_targets",
+        lambda timeout=3.5: [
+            {"server_name": "gateway.icloud.com", "dest": "gateway.icloud.com:443", "ok": True, "ms": 12.5, "cert_bytes": 1420, "cert_safe": True, "detail": "test"},
+            {"server_name": "www.yahoo.com", "dest": "www.yahoo.com:443", "ok": True, "ms": 25.0, "cert_bytes": 2200, "cert_safe": True, "detail": "test"},
+        ],
+    )
+    candidates = client.get("/api/reality/candidates").json()
+    assert "candidates" in candidates
+    assert len(candidates["candidates"]) == 2
+    assert candidates["candidates"][0]["server_name"] == "gateway.icloud.com"
+
+    # 2. 自动切换到最优伪装目标
+    res = client.post("/api/reality/auto-dest", json={}).json()
+    assert res["ok"] is True
+    assert res["server_name"] == "gateway.icloud.com"
+    assert res["dest"] == "gateway.icloud.com:443"
+
+    # 3. 指定切换伪装目标
+    res2 = client.post(
+        "/api/reality/auto-dest",
+        json={"server_name": "www.yahoo.com", "dest": "www.yahoo.com:443"},
+    ).json()
+    assert res2["ok"] is True
+    assert res2["server_name"] == "www.yahoo.com"
+    assert res2["dest"] == "www.yahoo.com:443"
+

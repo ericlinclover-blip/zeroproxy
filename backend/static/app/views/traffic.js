@@ -182,6 +182,8 @@ export function renderAdvanced(d) {
       : "关闭后只监听主端口 (同一端口被反复封锁时再打开)";
   }
   $("#btn-save-adv").onclick = saveAdvanced;
+  const autoDestBtn = $("#btn-reality-auto-dest");
+  if (autoDestBtn) autoDestBtn.onclick = autoRealityDest;
   renderRouting(d);
   renderGeo(d);
 }
@@ -417,6 +419,30 @@ async function saveAdvanced() {
   }
   btn.disabled = false;
   btn.textContent = "保存并应用";
+}
+
+async function autoRealityDest() {
+  const btn = $("#btn-reality-auto-dest");
+  btn.disabled = true;
+  btn.textContent = "测速优选中…";
+  try {
+    const res = await api("/api/reality/auto-dest", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    if (res.ok) {
+      toast(`已切换至最优伪装: ${res.server_name} (${res.dest})`);
+      clearDraft("#adv-sni");
+      $("#adv-sni").value = res.server_name;
+      reloadDash(true);
+    }
+  } catch (e) {
+    toast("优选失败: " + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "✨ 智能寻优伪装 (Auto-Hunter)";
+  }
 }
 
 export function renderSystem(d) {

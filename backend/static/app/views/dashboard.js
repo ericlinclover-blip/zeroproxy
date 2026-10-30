@@ -62,6 +62,19 @@ export function renderDash(quiet) {
   document.querySelectorAll("[data-copy-fmt]").forEach((el) =>
     (el.onclick = () => copyText(S.dash.subscription_formats[el.dataset.copyFmt]))
   );
+  document.querySelectorAll("[data-import-app]").forEach((el) =>
+    (el.onclick = () => {
+      const app = el.dataset.importApp;
+      const links = S.dash.deep_links || {};
+      const url = links[app];
+      if (!url) {
+        toast("未生成该客户端的导入链接");
+        return;
+      }
+      toast(`正在唤起 ${app} 客户端…`);
+      window.location.href = url;
+    })
+  );
   document.querySelectorAll("[data-qr-fmt]").forEach((el) =>
     (el.onclick = () => {
       const fmt = el.dataset.qrFmt;

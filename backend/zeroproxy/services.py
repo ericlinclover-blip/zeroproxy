@@ -1376,3 +1376,391 @@ def probe_all(state: dict, timeout: float = 4.0, deep: bool = False) -> dict:
             "detail": dest_detail,
         },
     }
+
+
+# ---------------------------------------------------------------- Reality 伪装目标自愈与优选
+
+REALITY_DEST_POOL: tuple[dict[str, str], ...] = (
+    {"server_name": "gateway.icloud.com", "dest": "gateway.icloud.com:443", "tag": "Apple iCloud (极紧凑证书)"},
+    {"server_name": "swdist.apple.com", "dest": "swdist.apple.com:443", "tag": "Apple CDN"},
+    {"server_name": "itunes.apple.com", "dest": "itunes.apple.com:443", "tag": "Apple iTunes"},
+    {"server_name": "www.yahoo.com", "dest": "www.yahoo.com:443", "tag": "Yahoo (国际骨干)"},
+    {"server_name": "cdn.cloudflare.net", "dest": "cdn.cloudflare.net:443", "tag": "Cloudflare Anycast"},
+    {"server_name": "dl.google.com", "dest": "dl.google.com:443", "tag": "Google CDN"},
+)
+
+
+def probe_reality_target(server_name: str, dest: str, timeout: float = 3.5) -> dict:
+    """探测单个 Reality 伪装目标: 连通性、RTT 以及证书链体积 (REALITY 要求 <= 8192 字节)。"""
+    if not dest:
+        return {
+            "server_name": server_name,
+            "dest": dest,
+            "ok": False,
+            "ms": None,
+            "cert_bytes": 0,
+            "cert_safe": False,
+            "detail": "目标为空",
+        }
+
+    parts = dest.rsplit(":", 1)
+    host = parts[0]
+    port = int(parts[1]) if len(parts) > 1 else 443
+    sni = server_name or host
+
+    start = time.perf_counter()
+    sock = None
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+        sock.settimeout(timeout)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with ctx.wrap_socket(sock, server_hostname=sni) as ssock:
+            der = ssock.getpeercert(binary_form=True) or b""
+            rtt_ms = round((time.perf_counter() - start) * 1000, 1)
+            cert_len = len(der)
+            cert_safe = cert_len <= 8192
+            status_desc = "正常" if cert_safe else "溢出 (>8KB)"
+            return {
+                "server_name": sni,
+                "dest": f"{host}:{port}",
+                "ok": True,
+                "ms": rtt_ms,
+                "cert_bytes": cert_len,
+                "cert_safe": cert_safe,
+                "detail": f"RTT {rtt_ms}ms · 证书 {cert_len}B ({status_desc})",
+            }
+    except Exception as exc:
+        return {
+            "server_name": sni,
+            "dest": f"{host}:{port}",
+            "ok": False,
+            "ms": None,
+            "cert_bytes": 0,
+            "cert_safe": False,
+            "detail": f"连接失败: {exc}",
+        }
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def candidate_reality_targets(timeout: float = 3.5) -> list[dict]:
+    """探测候选池中全部 Reality 伪装目标并排序 (证书安全 > 可用性 > RTT)。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    results: list[dict] = []
+    with ThreadPoolExecutor(max_workers=min(len(REALITY_DEST_POOL), 6)) as pool:
+        futures = [
+            pool.submit(probe_reality_target, c["server_name"], c["dest"], timeout)
+            for c in REALITY_DEST_POOL
+        ]
+        for item, fut in zip(REALITY_DEST_POOL, futures):
+            try:
+                res = fut.result()
+                res["tag"] = item.get("tag", "")
+                results.append(res)
+            except Exception as exc:
+                results.append(
+                    {
+                        "server_name": item["server_name"],
+                        "dest": item["dest"],
+                        "tag": item.get("tag", ""),
+                        "ok": False,
+                        "ms": None,
+                        "cert_bytes": 0,
+                        "cert_safe": False,
+                        "detail": f"探测异常: {exc}",
+                    }
+                )
+
+    def _rank(r: dict) -> tuple[int, int, float]:
+        safe_score = 0 if r.get("cert_safe") else 1
+        ok_score = 0 if r.get("ok") else 1
+        ms = float(r.get("ms") or 99999.0)
+        return (safe_score, ok_score, ms)
+
+    results.sort(key=_rank)
+    return results
+
+
+# ---------------------------------------------------------------- AI / 流媒体解锁与出口纯净度探针
+
+_UNLOCK_CACHE: dict = {"data": None, "at": 0.0}
+_UNLOCK_LOCK = threading.Lock()
+
+
+def unlock_probe(timeout: float = 4.0, force: bool = False) -> dict:
+    """探测服务器出口对主流 AI 服务 (OpenAI / Claude / Gemini) 与流媒体 (Netflix / YouTube / Google) 的解锁状态及纯净度。
+
+    离线测试环境 (ZP_PUBLIC_IP=0) 自动返回模拟测试结果，杜绝拖出外网。
+    """
+    now = time.time()
+    with _UNLOCK_LOCK:
+        if not force and _UNLOCK_CACHE["data"] and (now - _UNLOCK_CACHE["at"] < 60.0):
+            return dict(_UNLOCK_CACHE["data"])
+
+    if not public_ip_enabled():
+        mock_result = {
+            "checked_at": int(now),
+            "ip": "198.51.100.1",
+            "region": "US · United States",
+            "items": [
+                {"name": "OpenAI / ChatGPT", "category": "ai", "ok": True, "detail": "可用 (未限制)"},
+                {"name": "Claude (Anthropic)", "category": "ai", "ok": True, "detail": "可用"},
+                {"name": "Google Gemini", "category": "ai", "ok": True, "detail": "可用"},
+                {"name": "Netflix", "category": "media", "ok": True, "detail": "原生完整片库解锁"},
+                {"name": "YouTube Premium", "category": "media", "ok": True, "detail": "支持购买 (US)"},
+                {"name": "Google 服务", "category": "ip", "ok": True, "detail": "原生国际 IP (未送中)"},
+            ],
+            "summary": "全部 AI 与流媒体测试通过",
+        }
+        with _UNLOCK_LOCK:
+            _UNLOCK_CACHE["data"] = mock_result
+            _UNLOCK_CACHE["at"] = now
+        return mock_result
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _test_openai() -> dict:
+        try:
+            req = urllib.request.Request(
+                "https://api.openai.com/v1/models",
+                headers={"User-Agent": "ZeroProxy-Probe/1.0", "Accept": "*/*"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                status = resp.getcode()
+                return {
+                    "name": "OpenAI / ChatGPT",
+                    "category": "ai",
+                    "ok": True,
+                    "detail": f"可用 (HTTP {status})",
+                }
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                return {
+                    "name": "OpenAI / ChatGPT",
+                    "category": "ai",
+                    "ok": True,
+                    "detail": "可用 (端点开放, 需密钥)",
+                }
+            if exc.code == 403:
+                return {
+                    "name": "OpenAI / ChatGPT",
+                    "category": "ai",
+                    "ok": False,
+                    "detail": "地区受限 (403 阻断)",
+                }
+            return {
+                "name": "OpenAI / ChatGPT",
+                "category": "ai",
+                "ok": False,
+                "detail": f"HTTP {exc.code}",
+            }
+        except Exception as exc:
+            return {
+                "name": "OpenAI / ChatGPT",
+                "category": "ai",
+                "ok": False,
+                "detail": f"连接超时: {exc.__class__.__name__}",
+            }
+
+    def _test_claude() -> dict:
+        try:
+            req = urllib.request.Request(
+                "https://api.anthropic.com",
+                headers={"User-Agent": "Mozilla/5.0 ZeroProxy/2.0", "Accept": "*/*"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return {"name": "Claude (Anthropic)", "category": "ai", "ok": True, "detail": "可用"}
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 404, 405):
+                return {
+                    "name": "Claude (Anthropic)",
+                    "category": "ai",
+                    "ok": True,
+                    "detail": "可用 (开放访问)",
+                }
+            if exc.code == 403:
+                return {
+                    "name": "Claude (Anthropic)",
+                    "category": "ai",
+                    "ok": False,
+                    "detail": "Cloudflare / 地区拦截 (403)",
+                }
+            return {
+                "name": "Claude (Anthropic)",
+                "category": "ai",
+                "ok": False,
+                "detail": f"HTTP {exc.code}",
+            }
+        except Exception as exc:
+            return {
+                "name": "Claude (Anthropic)",
+                "category": "ai",
+                "ok": False,
+                "detail": f"连接失败: {exc.__class__.__name__}",
+            }
+
+    def _test_gemini() -> dict:
+        try:
+            req = urllib.request.Request(
+                "https://generativelanguage.googleapis.com",
+                headers={"User-Agent": "ZeroProxy-Probe/1.0", "Accept": "*/*"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return {"name": "Google Gemini", "category": "ai", "ok": True, "detail": "可用"}
+        except urllib.error.HTTPError as exc:
+            if exc.code in (400, 404, 403):
+                return {
+                    "name": "Google Gemini",
+                    "category": "ai",
+                    "ok": exc.code != 403,
+                    "detail": "可用" if exc.code != 403 else "受限 (403)",
+                }
+            return {
+                "name": "Google Gemini",
+                "category": "ai",
+                "ok": False,
+                "detail": f"HTTP {exc.code}",
+            }
+        except Exception as exc:
+            return {
+                "name": "Google Gemini",
+                "category": "ai",
+                "ok": False,
+                "detail": f"连接失败: {exc.__class__.__name__}",
+            }
+
+    def _test_netflix() -> dict:
+        try:
+            req = urllib.request.Request(
+                "https://www.netflix.com/title/70143836",
+                headers={"User-Agent": "Mozilla/5.0 ZeroProxy/2.0"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                code = resp.getcode()
+                if code == 200:
+                    return {
+                        "name": "Netflix",
+                        "category": "media",
+                        "ok": True,
+                        "detail": "完整片库解锁 (原生支持)",
+                    }
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                try:
+                    req_orig = urllib.request.Request(
+                        "https://www.netflix.com/title/80018499",
+                        headers={"User-Agent": "Mozilla/5.0"},
+                    )
+                    with urllib.request.urlopen(req_orig, timeout=timeout) as r2:
+                        if r2.getcode() == 200:
+                            return {
+                                "name": "Netflix",
+                                "category": "media",
+                                "ok": True,
+                                "detail": "仅支持自制剧 (Originals Only)",
+                            }
+                except Exception:
+                    pass
+                return {
+                    "name": "Netflix",
+                    "category": "media",
+                    "ok": False,
+                    "detail": "仅自制剧或地区受限",
+                }
+            return {
+                "name": "Netflix",
+                "category": "media",
+                "ok": False,
+                "detail": f"受限 (HTTP {exc.code})",
+            }
+        except Exception as exc:
+            return {
+                "name": "Netflix",
+                "category": "media",
+                "ok": False,
+                "detail": f"检测超时: {exc.__class__.__name__}",
+            }
+
+    def _test_google_ncr() -> dict:
+        try:
+            req = urllib.request.Request(
+                "https://www.google.com/ncr",
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                final_url = resp.geturl()
+                if "google.com.hk" in final_url or "google.cn" in final_url:
+                    return {
+                        "name": "Google 服务",
+                        "category": "ip",
+                        "ok": False,
+                        "detail": "被重定向至香港 (被送中)",
+                    }
+                return {
+                    "name": "Google 服务",
+                    "category": "ip",
+                    "ok": True,
+                    "detail": "原生国际 IP (未送中)",
+                }
+        except Exception as exc:
+            return {
+                "name": "Google 服务",
+                "category": "ip",
+                "ok": False,
+                "detail": f"检测失败: {exc.__class__.__name__}",
+            }
+
+    def _test_yt_premium() -> dict:
+        try:
+            req = urllib.request.Request(
+                "https://www.youtube.com/premium",
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                body = resp.read(8192).decode("utf-8", "replace")
+                m = re.search(r'"countryCode":\s*"([A-Z]{2})"', body)
+                loc = f" [{m.group(1)}]" if m else ""
+                return {
+                    "name": "YouTube Premium",
+                    "category": "media",
+                    "ok": True,
+                    "detail": f"支持购买{loc}",
+                }
+        except Exception as exc:
+            return {
+                "name": "YouTube Premium",
+                "category": "media",
+                "ok": False,
+                "detail": f"检测失败: {exc.__class__.__name__}",
+            }
+
+    tasks = [_test_openai, _test_claude, _test_gemini, _test_netflix, _test_yt_premium, _test_google_ncr]
+    items = []
+    with ThreadPoolExecutor(max_workers=min(len(tasks), 6)) as pool:
+        futures = [pool.submit(t) for t in tasks]
+        for f in futures:
+            try:
+                items.append(f.result())
+            except Exception as exc:
+                items.append({"name": "未知测试", "category": "other", "ok": False, "detail": str(exc)})
+
+    pip = public_ip().get("ip") or "未知"
+    ok_count = sum(1 for item in items if item.get("ok"))
+    res = {
+        "checked_at": int(time.time()),
+        "ip": pip,
+        "items": items,
+        "summary": f"{ok_count}/{len(items)} 项服务检测通过",
+    }
+    with _UNLOCK_LOCK:
+        _UNLOCK_CACHE["data"] = res
+        _UNLOCK_CACHE["at"] = time.time()
+    return res
+

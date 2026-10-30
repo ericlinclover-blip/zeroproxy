@@ -1491,3 +1491,25 @@ def panel_base_url(request, state: dict) -> str:
 
 def subscription_url(request, state: dict) -> str:
     return f"{panel_base_url(request, state)}/sub/{state['subscription_token']}"
+
+
+def deep_links(sub_url: str) -> dict[str, str]:
+    """生成主流客户端的一键导入深度链接 (Deep Link / Scheme)。
+
+    - clash: Clash Verge / Clash Nyanpasu / Flclash / Clash Meta for Android
+    - singbox: sing-box (iOS/macOS/Android/GUI)
+    - shadowrocket: Shadowrocket (iOS)
+    - surge: Surge (iOS/macOS)
+    - quantumultx: Quantumult X (iOS)
+    """
+    clash_url = f"{sub_url}?format=clash"
+    singbox_url = f"{sub_url}?format=singbox"
+    sr_payload = base64.urlsafe_b64encode(sub_url.encode("utf-8")).decode("ascii").rstrip("=")
+    return {
+        "clash": f"clash://install-config?url={quote(clash_url, safe='')}&name=ZeroProxy",
+        "singbox": f"sing-box://import-remote-profile?url={quote(singbox_url, safe='')}#ZeroProxy",
+        "shadowrocket": f"shadowrocket://add/sub://{sr_payload}?title=ZeroProxy",
+        "surge": f"surge:///install-config?url={quote(clash_url, safe='')}&name=ZeroProxy",
+        "quantumultx": f"quantumult-x:///add-resource?remote-resource={quote(sub_url, safe='')}",
+    }
+

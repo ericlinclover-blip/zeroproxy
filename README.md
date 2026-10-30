@@ -5944,3 +5944,19 @@ PublicKey = ...
   失败, 而不是等用户点升级。
 - **回归**: 全量 pytest 495 项通过; 新增用例: 暂存脚本必须落在 `$ZP_HOME` 内且不是原地
   执行、`queued` 超时后 `is_running()` 必须为假(界面不再被锁死)、`SHA256SUMS` 与代码同步。
+
+
+### 8.116 v2.12.21: Universal Deep Link 一键唤醒导入 + AI/流媒体解锁与出口纯净度探针 + Reality 伪装智能寻优 (Auto-Hunter)
+- **Universal Deep Link 一键唤醒导入**:
+  - 针对主流科学上网客户端深度集成官方 URL Scheme (Clash Verge/Nyanpasu 的 `clash://`、sing-box 的 `sing-box://`、Shadowrocket 小火箭的 `shadowrocket://`、Surge 与 Quantumult X 等)。
+  - 面板订阅卡片新增「一键导入」按钮，点击直接唤起本地对应客户端 App 并完成配置填充与更新，从原先复制链接、打开软件、粘贴、保存的 5 步交互压缩至 1 步秒级导入。
+- **AI / 流媒体解锁 & 出口纯净度实时探针**:
+  - 新增 `/api/probe/unlock` 接口与面板「出口质量与解锁诊断」卡片，以非阻塞协程池实时测试当前服务器出口对主流大模型 (OpenAI/ChatGPT、Claude、Google Gemini) 以及流媒体平台 (Netflix 原生完整片库 vs 仅自制剧、YouTube Premium、Google NCR 未送中判定) 的连通性与解锁状态。
+  - 自动抓取出口公网 IP 与归属信息，配合 60 秒内存防刷缓存与离线测试模式保护。
+- **Reality 伪装目标智能寻优与自愈 (Auto-Hunter)**:
+  - 针对 REALITY 服务端 8KB 证书链缓冲上限设计了证书体积与 TLS 1.3 握手实时探测引擎。
+  - 内置精选高可用紧凑证书池 (Apple iCloud、Apple CDN、iTunes、Yahoo、Cloudflare Anycast 等)，新增 `/api/reality/candidates` 与 `/api/reality/auto-dest` 接口。
+  - 面板高级设置提供「✨ 智能寻优伪装 (Auto-Hunter)」按钮，一键测速并自动原子切换至最低延迟且证书安全 (<=8KB) 的最佳伪装目标并热重载生效。
+- **发布清单与测试**:
+  - 重新生成根 `SHA256SUMS`，保持发布清单与代码提交一致。
+  - 全量回归测试通过，新增 deep_links、unlock_probe、reality_candidates 与 auto_dest 对应单元测试用例。

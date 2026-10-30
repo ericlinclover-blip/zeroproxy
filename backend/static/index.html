@@ -88,6 +88,7 @@
           <a href="#chain-intro"><span class="ic">⇄</span>链式代理<span class="cnt" id="nav-chain">—</span></a>
           <a href="#sec-adv"><span class="ic">⑃</span>高级 / 分流</a>
           <a href="#diag-card"><span class="ic">✓</span>诊断<span class="cnt" id="nav-diag">—</span></a>
+          <a href="#unlock-card"><span class="ic">🌍</span>解锁检测</a>
           <a href="#sec-sys"><span class="ic">⚙</span>系统</a>
           <a href="#sec-panel"><span class="ic">⚿</span>面板设置</a>
           <a href="#sec-audit"><span class="ic">≡</span>操作记录<span class="cnt" id="nav-audit"></span></a>
@@ -163,18 +164,21 @@
         <code class="inline mono val" id="sub-base64">—</code>
         <button class="btn ghost small" data-copy-fmt="base64">复制</button>
         <button class="btn ghost small" data-qr-fmt="base64">二维码</button>
+        <button class="btn ghost small" data-import-app="shadowrocket" title="一键导入到 Shadowrocket">一键导入</button>
       </div>
       <div class="fmt-row">
         <span class="tag">Clash</span>
         <code class="inline mono val" id="sub-clash">—</code>
         <button class="btn ghost small" data-copy-fmt="clash">复制</button>
         <button class="btn ghost small" data-qr-fmt="clash">二维码</button>
+        <button class="btn ghost small" data-import-app="clash" title="一键导入到 Clash Verge / Nyanpasu">一键导入</button>
       </div>
       <div class="fmt-row">
         <span class="tag">sing-box</span>
         <code class="inline mono val" id="sub-singbox">—</code>
         <button class="btn ghost small" data-copy-fmt="singbox">复制</button>
         <button class="btn ghost small" data-qr-fmt="singbox">二维码</button>
+        <button class="btn ghost small" data-import-app="singbox" title="一键导入到 sing-box">一键导入</button>
       </div>
       <div class="note mt-2">
         三个地址指向同一份订阅内容; 节点启停 / 端口变更 / 伪装设置都会自动同步, 客户端无需重新导入。
@@ -276,6 +280,9 @@
         <div class="field">
           <label>Reality 伪装 SNI</label>
           <input id="adv-sni" placeholder="www.cloudflare.com" spellcheck="false">
+          <div class="row mt-2">
+            <button class="btn ghost small" id="btn-reality-auto-dest" title="从高可用池中探测并切换最佳伪装目标">✨ 智能寻优伪装 (Auto-Hunter)</button>
+          </div>
           <div class="note mt-1">目标站点证书链必须 ≤ 8KB (Reality 服务端缓冲上限), 超了握手必然失败; 改完点「节点测速」验证。</div></div>
         <div class="field">
           <label>Hysteria 2 伪装站点 (留空关闭)</label>
@@ -329,6 +336,17 @@
       <div class="row hidden mt-4" id="diag-actions">
         <button class="btn small" id="btn-repair">一键修复 (重新生成 + 重启)</button>
       </div>
+    </section>
+
+    <section class="card reveal" id="unlock-card">
+      <div class="tile-head">
+        <h2>出口质量与解锁诊断</h2>
+        <span class="hint">实时探测 AI 与流媒体服务可用性</span>
+        <span class="grow"></span>
+        <button class="btn ghost small" id="btn-unlock-probe">刷新检测</button>
+      </div>
+      <div class="muted fs-sm mb-3" id="unlock-summary">点击「刷新检测」检查服务器出口对主流 AI 服务与流媒体的解锁能力。</div>
+      <div class="grid" id="unlock-grid" style="grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px;"></div>
     </section>
 
     <section class="card reveal" id="sec-sys">
