@@ -1390,6 +1390,10 @@ install_deps() {
         # 少一次索引往返在慢线路上是实打实的时间。
         pkg_update || true
     fi
+    # 确保 TLS CA 根证书就绪 (防止极简固件中 curl/wget 因缺少根证书报错)
+    if [ ! -f /etc/ssl/certs/ca-certificates.crt ] && [ ! -f /etc/ssl/cert.pem ]; then
+        pkg_install ca-bundle >/dev/null 2>&1 || pkg_install ca-certificates >/dev/null 2>&1 || true
+    fi
     # 装包失败先记在手边, **等探测完了再决定要不要报** —— 模块本来就在 (或已编进内核) 时,
     # "apk add 没成功"是无关紧要的 (源离线 / 架构的 kmod 不在源里都可能), 说出来只会吓人。
     if pkg_install kmod-tun; then _tun_why=""; else _tun_why="$DEPS_WHY"; fi

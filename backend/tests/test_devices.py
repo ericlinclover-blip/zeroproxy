@@ -3093,3 +3093,148 @@ def test_skeleton_landing_group_filters_chain_nodes(client, configured):
     assert landing["use"] == [], "use 要留给路由器填 provider"
     assert "链式" in landing["filter"]
     assert landing["proxies"] == ["🚀 节点选择"]
+
+
+def test_remove_device_records_revoked_history(client, configured):
+    """移除设备不仅从当前设备列表剔除，还应在 revoked 列表中留存审计追踪。"""
+    from zeroproxy import devices, config
+
+    _login(client)
+    device = _register(client, _pair_code(client)["code"])
+    res = client.delete(f"/api/devices/{device['id']}")
+    assert res.status_code == 200
+    data = res.json()
+    assert "notice" in data
+    assert "重置节点密码" in data["notice"]
+
+    # 验证底层 state 中的 revoked 记录
+    state = config.load_state()
+    revoked = state.get("devices", {}).get("revoked", [])
+    assert any(r["id"] == device["id"] for r in revoked)
+
+
+def test_cli_drop_single_and_multi_server(tmp_path):
+    """验证 zeroproxy drop 命令在只剩1台服务器和多台服务器时的正确性。
+    
+    1. 单服务器 drop: 移除后 servers 目录为空，清理 config.yaml, device.json, 停用服务，且绝对不回滚。
+    2. 多服务器 drop: 移除指定服务器，保留其余服务器并更新配置。
+    """
+    import subprocess
+    from zeroproxy import router_client
+
+    zp_dir = tmp_path / "zeroproxy"
+    servers_dir = zp_dir / "servers"
+    providers_dir = zp_dir / "providers"
+    init_dir = tmp_path / "init.d"
+    zp_dir.mkdir(parents=True)
+    servers_dir.mkdir(parents=True)
+    providers_dir.mkdir(parents=True)
+    init_dir.mkdir(parents=True)
+
+    # 准备假的环境与依赖脚本
+    fake_init = init_dir / "zeroproxy"
+    fake_init.write_text("#!/bin/sh\nexit 0\n")
+    fake_init.chmod(0o755)
+
+    fake_agent = zp_dir / "agent.sh"
+    fake_agent.write_text("#!/bin/sh\ncase \"$1\" in config) echo 'proxy-groups: []'; exit 0 ;; refresh_state) exit 0 ;; esac\n")
+    fake_agent.chmod(0o755)
+
+    fake_mihomo = zp_dir / "mihomo"
+    fake_mihomo.write_text("#!/bin/sh\nexit 0\n")
+    fake_mihomo.chmod(0o755)
+
+    # 读取并定制 cli 脚本中的路径为 tmp_path
+    cli_src = _runtime_file("cli")
+    cli_src = cli_src.replace("ZP_DIR=/etc/zeroproxy", f"ZP_DIR={zp_dir}")
+    cli_src = cli_src.replace("/etc/init.d/zeroproxy", str(fake_init))
+    cli_src = cli_src.replace("/etc/init.d/dnsmasq", str(fake_init))
+    cli_file = tmp_path / "zeroproxy_cli"
+    cli_file.write_text(cli_src)
+    cli_file.chmod(0o755)
+
+    # 1. 测试单服务器 drop
+    srv1 = servers_dir / "hk_main.json"
+    srv1.write_text('{"base":"https://hk.example.com","id":"dev1","secret":"sec1"}\n')
+    dev_json = zp_dir / "device.json"
+    dev_json.write_text('{"base":"https://hk.example.com","id":"dev1","secret":"sec1"}\n')
+    conf_yaml = zp_dir / "config.yaml"
+    conf_yaml.write_text("port: 7890\n")
+    prov_file = providers_dir / "hk_main.yaml"
+    prov_file.write_text("proxies: []\n")
+
+    res = subprocess.run(["sh", str(cli_file), "drop", "hk_main"], capture_output=True, text=True)
+    assert res.returncode == 0, f"drop 失败: {res.stderr}\n{res.stdout}"
+    assert "已移除 hk_main" in res.stdout
+    assert not srv1.exists(), "单服务器 drop 后 servers/hk_main.json 必须已被移除"
+    assert not (servers_dir / "hk_main.json.removed").exists(), "不能遗留 .removed 文件"
+    assert not dev_json.exists(), "对应此服务器的 device.json 必须被清理，防止僵尸复活"
+    assert not conf_yaml.exists(), "已无服务器时 config.yaml 必须被清理"
+    assert not prov_file.exists(), "对应的 provider 缓存必须被清理"
+
+    # 2. 测试多服务器 drop
+    srv_a = servers_dir / "srv_a.json"
+    srv_a.write_text('{"base":"https://a.example.com","id":"deva","secret":"seca"}\n')
+    srv_b = servers_dir / "srv_b.json"
+    srv_b.write_text('{"base":"https://b.example.com","id":"devb","secret":"secb"}\n')
+
+    res_multi = subprocess.run(["sh", str(cli_file), "drop", "srv_a"], capture_output=True, text=True)
+    assert res_multi.returncode == 0, f"多服务器 drop 失败: {res_multi.stderr}\n{res_multi.stdout}"
+    assert "已移除 srv_a" in res_multi.stdout
+    assert "剩余 1 台服务器" in res_multi.stdout
+    assert not srv_a.exists(), "srv_a 必须被移除"
+    assert srv_b.exists(), "srv_b 必须保留"
+
+
+def test_agent_migrate_servers_never_resurrects_dropped_servers(tmp_path):
+    """agent.sh 在迁移 device.json 之后，若 servers 目录被清空，绝对不能重新从 device.json 复活僵尸。"""
+    import subprocess
+
+    zp_dir = tmp_path / "zeroproxy"
+    servers_dir = zp_dir / "servers"
+    zp_dir.mkdir(parents=True)
+    servers_dir.mkdir(parents=True)
+
+    agent_src = _runtime_file("agent.sh")
+    agent_src = agent_src.replace("ZP_DIR=/etc/zeroproxy", f"ZP_DIR={zp_dir}")
+
+    # 写入 device.json
+    dev_json = zp_dir / "device.json"
+    dev_json.write_text('{"base":"https://hk.example.com","id":"dev1","secret":"sec1","name":"HK"}\n')
+
+    agent_file = tmp_path / "agent.sh"
+    agent_file.write_text(agent_src)
+    agent_file.chmod(0o755)
+
+    # 首次执行 agent.sh migrate
+    res = subprocess.run(["sh", str(agent_file), "migrate"], capture_output=True, text=True)
+    assert res.returncode == 0, f"agent.sh migrate 失败: {res.stderr}\n{res.stdout}"
+    # 迁移后 device.json 应变成 device.json.migrated
+    assert not dev_json.exists(), "device.json 迁移后不应作为原文件残留"
+    assert (zp_dir / "device.json.migrated").exists(), "应重命名为 device.json.migrated"
+    migrated_srvs = list(servers_dir.glob("*.json"))
+    assert len(migrated_srvs) == 1, "应迁移至 servers/"
+
+    # 用户手动或通过 cli 删除了所有服务器
+    for f in migrated_srvs:
+        f.unlink()
+
+    # 再次调用 agent.sh migrate，验证绝不复活已删除的服务器
+    res2 = subprocess.run(["sh", str(agent_file), "migrate"], capture_output=True, text=True)
+    assert res2.returncode == 0
+    assert len(list(servers_dir.glob("*.json"))) == 0, "servers 目录为空时不应从已迁移的文件复活"
+
+
+def test_luci_cgi_reports_cli_failure_honestly():
+    """LuCI cgi 的 run_cli 在 CLI 遇到非 0 退出码时必须返回 {"ok":false,"error":...}，绝不能伪装成 ok:true。"""
+    import os
+    from zeroproxy import router_client
+
+    client_dir = os.path.dirname(router_client.script_path())
+    cgi_src = open(os.path.join(client_dir, "luci", "cgi"), encoding="utf-8").read()
+
+    # 验证 run_cli 包含退出码检查
+    assert "_rc=$?" in cgi_src, "run_cli 必须捕获命令退出码"
+    assert '{"ok":false,"error":"%s"}' in cgi_src, "退出码非 0 时必须返回 ok:false 和 error"
+
+

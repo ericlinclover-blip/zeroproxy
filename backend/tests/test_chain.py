@@ -980,3 +980,27 @@ def test_diagnose_reports_a_dead_inner_quic(client, configured, monkeypatch):
     assert "链式内层 QUIC" in checks, "要求跑内层 QUIC 却没起进程时, 诊断必须报出来"
     assert checks["链式内层 QUIC"]["ok"] is False
     assert checks["链式内层 QUIC"]["fixable"] is True
+
+
+def test_quic_already_running_elsewhere_requires_matching_cmdline(monkeypatch, tmp_path):
+    """跨进程认领必须严格核对 PID 命令行属于自身 key.yaml，拒绝无关系统进程。"""
+    from zeroproxy import chain_quic
+
+    monkeypatch.setattr(chain_quic, "work_dir", lambda: str(tmp_path))
+    # 写一个假 pid
+    key = "entry-test"
+    with open(tmp_path / f"{key}.pid", "w") as fh:
+        fh.write("99999\nfake-fingerprint\n")
+
+    # 模拟系统存在 PID 99999，但其 cmdline 是无关进程 (如 systemd 或 python)
+    monkeypatch.setattr(chain_quic, "_cmdline", lambda pid: "systemd --user")
+    monkeypatch.setattr(chain_quic, "_port_in_use", lambda k: True)
+
+    assert chain_quic._already_running_elsewhere(key, "fake-fingerprint") is False
+    assert chain_quic._already_running_elsewhere(key, "other-fingerprint") is False
+
+    # 匹配自身工作目录与 key.yaml 时方可认领
+    our_cmd = f"/usr/local/bin/hysteria server -c {tmp_path}/{key}.yaml"
+    monkeypatch.setattr(chain_quic, "_cmdline", lambda pid: our_cmd)
+    assert chain_quic._already_running_elsewhere(key, "fake-fingerprint") is True
+

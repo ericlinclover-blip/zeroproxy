@@ -744,23 +744,68 @@ EOF
         fi
         ;;
     drop)
-        _key="${2:-}"
+        _key="$(basename "${2:-}" .json)"
+        [ -n "$_key" ] || { echo "用法: zeroproxy drop <服务器键>"; exit 2; }
         _file="$SERVERS/$_key.json"
         [ -f "$_file" ] || { echo "没有这台服务器: $_key (用 zeroproxy servers 看清单)"; exit 2; }
-        mv "$_file" "$_file.removed"
-        echo "已移除 $_key, 正在重建配置…"
-        if "$ZP_DIR/agent.sh" config > "$ZP_DIR/config.yaml.new" 2>/dev/null \
-            && "$ZP_DIR/mihomo" -t -d "$ZP_DIR" -f "$ZP_DIR/config.yaml.new" >/dev/null 2>&1; then
-            mv "$ZP_DIR/config.yaml.new" "$ZP_DIR/config.yaml"
-            /etc/init.d/zeroproxy restart >/dev/null 2>&1
-            rm -f "$_file.removed"
-            echo "完成 (剩余 $(servers | wc -l | tr -d ' ') 台服务器)"
+
+        # 计算排除这台之后剩余的服务器数量
+        _rem=0
+        for _sf in "$SERVERS"/*.json; do
+            [ -f "$_sf" ] || continue
+            [ "$_sf" = "$_file" ] && continue
+            _rem=$((_rem + 1))
+        done
+
+        # 彻底移除该服务器的凭据与关联缓存
+        rm -f "$_file" "$_file.removed"
+        rm -f "$ZP_DIR/providers/$_key.yaml"
+
+        # 若 device.json 对应的是这台被删掉的服务器, 一并移除以防 agent 迁移逻辑产生僵尸复活
+        if [ -f "$ZP_DIR/device.json" ]; then
+            _dev_base="$(sed -n 's/.*"base"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ZP_DIR/device.json" 2>/dev/null | head -n1)"
+            if [ -n "$_dev_base" ]; then
+                _dev_key="$(printf '%s' "$_dev_base" | sed -e 's#^https*://##' -e 's/[^A-Za-z0-9]/_/g' | cut -c1-32)"
+                [ "$_dev_key" = "$_key" ] && rm -f "$ZP_DIR/device.json" "$ZP_DIR/device.json.migrated"
+            fi
+        fi
+        [ "$_rem" -eq 0 ] && rm -f "$ZP_DIR/device.json" "$ZP_DIR/device.json.migrated"
+
+        if [ "$_rem" -eq 0 ]; then
+            # 没有剩余服务器: 停掉代理并清理配置与放行规则, 彻底恢复直连
+            rm -f "$ZP_DIR/config.yaml" "$ZP_DIR/config.yaml.new"
+            rm -rf "$ZP_DIR/providers"/* 2>/dev/null || true
+            /etc/init.d/zeroproxy stop >/dev/null 2>&1 || true
+            if [ -f "$ZP_DIR/perf.sh" ]; then
+                . "$ZP_DIR/perf.sh"
+                zp_perf_off >/dev/null 2>&1 || true
+            fi
+            nft delete table inet zp_router 2>/dev/null || true
+            if [ -f "$ZP_DIR/redirect.sh" ]; then
+                . "$ZP_DIR/redirect.sh"
+                zp_redirect_clear >/dev/null 2>&1 || true
+            fi
+            if [ -f "$ZP_DIR/tunfw.sh" ]; then
+                . "$ZP_DIR/tunfw.sh"
+                zp_tunfw_clear >/dev/null 2>&1 || true
+            fi
+            killall -HUP dnsmasq 2>/dev/null || /etc/init.d/dnsmasq reload >/dev/null 2>&1 || true
+            "$ZP_DIR/agent.sh" refresh_state >/dev/null 2>&1 || true
+            echo "已移除 $_key (已无接入的服务器，代理已停止，恢复普通上网)"
         else
-            mv "$_file.removed" "$_file"
-            rm -f "$ZP_DIR/config.yaml.new"
-            echo "重建失败, 已回滚 —— 这台服务器还在用"
+            # 还有其它服务器: 重建配置
+            if "$ZP_DIR/agent.sh" config > "$ZP_DIR/config.yaml.new" 2>/dev/null \
+                && "$ZP_DIR/mihomo" -t -d "$ZP_DIR" -f "$ZP_DIR/config.yaml.new" >/dev/null 2>&1; then
+                mv "$ZP_DIR/config.yaml.new" "$ZP_DIR/config.yaml"
+                /etc/init.d/zeroproxy restart >/dev/null 2>&1 || true
+                echo "已移除 $_key (剩余 $_rem 台服务器，配置已更新)"
+            else
+                rm -f "$ZP_DIR/config.yaml.new"
+                echo "已移除 $_key (剩余 $_rem 台服务器；新配置将在网络通畅后自动同步)"
+            fi
         fi
         echo "提示: 面板上的设备记录不会自动删除, 需要的话在那边一并移除。"
+        exit 0
         ;;
     refresh)
         echo "重新拉取全部服务器的节点…"

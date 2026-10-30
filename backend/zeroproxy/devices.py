@@ -271,18 +271,32 @@ def touch(state: dict, device: dict, info: dict) -> bool:
 
 
 def remove(state: dict, device_id: str) -> bool:
-    """移除设备 (等价于吊销它手里的 secret)。
+    """移除设备 (等价于吊销它手里的 secret, 并在已吊销列表中留痕)。
 
-    标记设备为 deleted, 以便数据面 (Xray / Nginx) 重新生成时撤销其入站/出站条目。
+    标记设备为 deleted, 留存审计信息, 便于排查与确认数据面状态。
     """
     bucket = _bucket(state)
-    before = len(bucket["items"])
+    target = None
     for d in bucket["items"]:
         if isinstance(d, dict) and d.get("id") == device_id:
-            d["deleted"] = True
+            target = d
             break
-    bucket["items"] = [d for d in bucket["items"] if not (isinstance(d, dict) and d.get("id") == device_id)]
-    return len(bucket["items"]) != before
+    if target is not None:
+        target["deleted"] = True
+        now = _now()
+        revoked = bucket.setdefault("revoked", [])
+        revoked.append({
+            "id": target.get("id", ""),
+            "name": target.get("name", ""),
+            "kind": target.get("kind", ""),
+            "ip": target.get("ip", ""),
+            "deleted_at": now,
+        })
+        if len(revoked) > 100:
+            bucket["revoked"] = revoked[-100:]
+        bucket["items"] = [d for d in bucket["items"] if not (isinstance(d, dict) and d.get("id") == device_id)]
+        return True
+    return False
 
 
 def online(device: dict, now: int | None = None) -> bool:

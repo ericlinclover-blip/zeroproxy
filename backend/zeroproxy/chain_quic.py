@@ -264,40 +264,49 @@ def _already_running_elsewhere(key: str, fingerprint: str) -> bool:
     避免重复绑定同一端口导致失败。
     """
     pid, recorded = _read_pid(key)
-    if pid <= 1 or recorded != fingerprint:
-        # F12: 指纹不匹配但端口在监听 → 也是我们在跑的 (可能配置变了但端口没变)
-        if pid > 1 and _port_in_use(key):
-            return True
+    if pid <= 1:
         return False
     cmdline = _cmdline(pid)
     base = work_dir()
-    return bool(cmdline) and base in cmdline and f"{key}.yaml" in cmdline
+    is_our_proc = bool(cmdline) and base in cmdline and f"{key}.yaml" in cmdline
+    if not is_our_proc:
+        return False
+    if recorded == fingerprint:
+        return True
+    # F12: 指纹不匹配但确定是我们进程且目标端口仍在监听 -> 认领避免端口冲突
+    return _port_in_use(key)
 
 
 def _port_in_use(key: str) -> bool:
     """检查 key 对应的 hysteria 端口是否正在监听 (用于 F12 跨进程认领)。"""
-    from .config import paths
-
     base = work_dir()
     cfg_path = os.path.join(base, f"{key}.yaml")
     try:
-        with open(cfg_path, "r") as fh:
+        with open(cfg_path, "r", encoding="utf-8") as fh:
             cfg = fh.read()
     except OSError:
         return False
-    # server 模式: listen :PORT
+    # server 模式: listen :PORT (UDP)
     for line in cfg.splitlines():
         if line.strip().startswith("listen:"):
             port_str = line.strip().split(":")[-1].strip()
             if port_str and port_str.isdigit():
                 return services.udp_port_listening(int(port_str)) or False
-    # client 模式: server HOST:PORT
+    # client 模式: socks5 listen: 127.0.0.1:PORT (TCP 本地 SOCKS 监听)
+    in_socks5 = False
     for line in cfg.splitlines():
-        if line.strip().startswith("server:"):
-            port_str = line.strip().split(":")[-1].strip()
-            if port_str and port_str.isdigit():
-                # client 连接的是远端端口, 检查远端是否可达
-                return True  # 只要能读到配置就认为"可能在跑"
+        trimmed = line.strip()
+        if trimmed == "socks5:":
+            in_socks5 = True
+            continue
+        if in_socks5:
+            if trimmed.startswith("listen:"):
+                port_str = trimmed.split(":")[-1].strip()
+                if port_str and port_str.isdigit():
+                    ok, _, _ = services.tcp_connect_ms("127.0.0.1", int(port_str), timeout=0.3)
+                    return ok
+            elif not line.startswith(" ") and not line.startswith("\t"):
+                in_socks5 = False
     return False
 
 

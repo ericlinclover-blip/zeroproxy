@@ -104,14 +104,39 @@ function render(state) {
     btn.onclick = async () => {
       const key = btn.dataset.drop;
       if (!confirm(`移除 ${key}？\n这台路由器将不再使用它上面的节点；面板上的设备记录需要你到面板里一并删除。`)) return;
+      const srvEl = btn.closest('.srv');
       btn.disabled = true;
+      const oldText = btn.textContent;
+      btn.textContent = '正在移除…';
+      if (srvEl) {
+        srvEl.style.transition = 'opacity .24s var(--ease), transform .24s var(--ease)';
+        srvEl.style.opacity = '0.5';
+        srvEl.style.pointerEvents = 'none';
+      }
       try {
         const r = await call('drop', { key });
-        toast((r.message || '已移除').split('\n')[0]);
+        if (srvEl) {
+          srvEl.style.transition = 'all .32s var(--ease)';
+          srvEl.style.opacity = '0';
+          srvEl.style.transform = 'scale(0.96)';
+          srvEl.style.maxHeight = '0';
+          srvEl.style.paddingTop = '0';
+          srvEl.style.paddingBottom = '0';
+          srvEl.style.marginTop = '0';
+          srvEl.style.marginBottom = '0';
+          srvEl.style.overflow = 'hidden';
+          await new Promise((res) => setTimeout(res, 280));
+        }
+        toast(unesc(r.message || '已移除').split('\n')[0]);
         await load();
       } catch (e) {
         toast(e.message);
         btn.disabled = false;
+        btn.textContent = oldText;
+        if (srvEl) {
+          srvEl.style.opacity = '1';
+          srvEl.style.pointerEvents = '';
+        }
       }
     };
   });

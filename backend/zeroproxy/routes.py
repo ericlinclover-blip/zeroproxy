@@ -3461,7 +3461,7 @@ def device_update(device_id: str, payload: DevicePatchIn, request: Request):
 
 @router.delete("/api/devices/{device_id}")
 def device_delete(device_id: str, request: Request):
-    """移除设备 = 立刻吊销它手里的 secret (那台机器上的代理随即失效)。"""
+    """移除设备 = 立刻吊销它手里的 secret (那台机器无法再同步配置与心跳)。"""
     with config.locked():
         state = load_state()
         if not _require_auth(state, request):
@@ -3473,7 +3473,11 @@ def device_delete(device_id: str, request: Request):
         devices.remove(state, device_id)
         config.audit(state, "device_remove", f"{name} ({device_id})")
         save_state(state)
-        return {"removed": device_id, "devices": devices.view(state)}
+        return {
+            "removed": device_id,
+            "devices": devices.view(state),
+            "notice": "设备凭据已吊销。若该设备非受控或疑似泄露，建议在「设置」中重置节点密码/UUID以彻底切断其已缓存的数据面代理访问。",
+        }
 
 
 # ---------------------------------------------------------------- 设备侧接口

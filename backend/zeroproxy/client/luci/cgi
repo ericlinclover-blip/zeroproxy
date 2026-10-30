@@ -132,8 +132,13 @@ fi
 run_cli() {
     if [ -x "$CLI" ]; then
         out="$("$CLI" "$@" 2>&1)"
+        _rc=$?
         header
-        printf '{"ok":true,"message":"%s"}\n' "$(jstr "$out")"
+        if [ "$_rc" -eq 0 ]; then
+            printf '{"ok":true,"message":"%s"}\n' "$(jstr "$out")"
+        else
+            printf '{"ok":false,"error":"%s"}\n' "$(jstr "$out")"
+        fi
     else
         fail "路由器上找不到 zeroproxy 命令, 请重跑一次安装命令"
     fi

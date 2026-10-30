@@ -95,6 +95,7 @@ migrate_servers() {
 }
 EOF
     chmod 600 "$SERVERS/$(key_of "$_b").json"
+    mv "$DEV" "$DEV.migrated" 2>/dev/null || true
     log "已把原来的单服务器凭据迁移到 servers/"
 }
 
@@ -229,7 +230,12 @@ http_post() {
         if command -v curl >/dev/null 2>&1; then
             if curl -fsS -m 20 -H 'Content-Type: application/json' --data "$_body" "$_url" 2>/dev/null; then
                 _rc=0
-            else _rc=$?; fi
+            else
+                _rc=$?
+                if [ "$_rc" = "60" ] && curl -fsSk -m 20 -H 'Content-Type: application/json' --data "$_body" "$_url" 2>/dev/null; then
+                    _rc=0
+                fi
+            fi
         elif uclient-fetch -q --no-check-certificate -O - --post-data "$_body" "$_url" 2>/dev/null; then
             _rc=0
         elif wget -q --no-check-certificate -O - --post-data "$_body" "$_url" 2>/dev/null; then
@@ -257,7 +263,14 @@ http_get() {
         _rc=1
         _out=""
         if command -v curl >/dev/null 2>&1; then
-            if _out="$(curl -fsS -m 10 "$1" 2>/dev/null)"; then _rc=0; else _rc=$?; fi
+            if _out="$(curl -fsS -m 10 "$1" 2>/dev/null)"; then
+                _rc=0
+            else
+                _rc=$?
+                if [ "$_rc" = "60" ] && _out="$(curl -fsSk -m 10 "$1" 2>/dev/null)"; then
+                    _rc=0
+                fi
+            fi
         elif command -v uclient-fetch >/dev/null 2>&1; then
             if _out="$(uclient-fetch -q --no-check-certificate -O - "$1" 2>/dev/null)"; then _rc=0; fi
         else
@@ -291,7 +304,8 @@ http_get() {
 # 不是"装不上"。
 http_get_file() {
     _tmo="${2:-600}"
-    if command -v curl >/dev/null 2>&1; then curl -fsS -m "$_tmo" "$1" 2>/dev/null
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsS -m "$_tmo" "$1" 2>/dev/null || curl -fsSk -m "$_tmo" "$1" 2>/dev/null
     else uclient-fetch -q --no-check-certificate -T "$_tmo" -O - "$1" 2>/dev/null \
         || wget -q --no-check-certificate -T "$_tmo" -O - "$1" 2>/dev/null
     fi
@@ -587,14 +601,24 @@ SWITCH_PENDING=""
 # agent.sh geo 只拉取/更新指定分流数据库;
 # agent.sh once 只跑一轮心跳 (排查用)。默认无参数 = 常驻循环。
 case "${1:-}" in
-    config) migrate_servers; refresh_state; build_config; exit $? ;;
-    geo)    migrate_servers; ensure_geo "${2:-}"; exit $? ;;
-    once)   RUN_ONCE=1 ;;
+    config)  migrate_servers; refresh_state; build_config; exit $? ;;
+    geo)     migrate_servers; ensure_geo "${2:-}"; exit $? ;;
+    migrate) migrate_servers; exit $? ;;
+    once)    RUN_ONCE=1 ;;
 esac
 
 while true; do
     migrate_servers
     refresh_state
+    if [ "$(count_servers)" -eq 0 ]; then
+        if proxy_up; then
+            switch_core off
+        fi
+        refresh_state
+        [ -n "${RUN_ONCE:-}" ] && exit 0
+        sleep "$SLEEP_STABLE"
+        continue
+    fi
     # 性能模式 (eBPF / dae) 的看门狗 —— **必须在算心跳之前**: 那一档下 mihomo 是停着的,
     # dae 一死家里就断网, 而用户不会知道去关掉它。连续 3 轮看不到进程就自动退回标准模式,
     # 于是这一轮上报出去的 mode/covered 已经是从现场读到的真实状态。
