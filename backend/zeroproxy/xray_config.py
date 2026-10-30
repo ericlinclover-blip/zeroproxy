@@ -30,20 +30,42 @@ def _sniffing() -> dict:
     return {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": False}
 
 
-def _sockopt() -> dict:
-    """TCP 层调优 (入站与出站共用)。
+def _inbound_sockopt() -> dict:
+    """公网入站 TCP 调优。
 
-    - `tcpFastOpen`: 有 TFO cookie 时把三次握手压掉一个 RTT。链式代理要连两跳,
-      每条新连接省下的这一个 RTT 就是实打实的体感 (香港→美国那一跳约 170ms);
-      服务端也已由 install.sh 打开 `net.ipv4.tcp_fastopen = 3`。
-    - `tcpNoDelay`: 关掉 Nagle, 小包立刻发 (面板/网页这类请求-响应最受益)。
-    - `tcpKeepAliveInterval`: 长连接定期探活, 运营商悄悄断流时能自己恢复。
+    注意: 绝不开启 tcpFastOpen！
+    中国大陆各省运营商、校园网及移动蜂窝网络对公网入站的 SYN 包携带数据 (TFO)
+    极易出现丢包、阻断或超时，导致客户端连接超时卡死；入站 listener 必须禁用 TFO。
+    - `tcpNoDelay`: 关掉 Nagle, 小包立刻发。
+    - `tcpKeepAliveInterval`: 长连接定期探活。
+    """
+    return {"tcpNoDelay": True, "tcpKeepAliveInterval": 15}
+
+
+def _outbound_sockopt() -> dict:
+    """跨 VPS 出站 TCP 调优 (如中转端至落地端)。
+
+    在受控 Linux 数据中心机房之间保持 tcpFastOpen (服务端已开启 net.ipv4.tcp_fastopen = 3),
+    省去跨洋连接握手的 1 个 RTT。
     """
     return {"tcpFastOpen": True, "tcpNoDelay": True, "tcpKeepAliveInterval": 15}
 
 
-def _reality_inbound(state: dict) -> dict:
+def _reality_settings(state: dict) -> dict:
     r = state["reality"]
+    sids = [r["short_id"], ""] if r.get("short_id") else [""]
+    return {
+        "show": False,
+        "xver": 0,
+        "dest": r["dest"],
+        "serverNames": [r["server_name"]],
+        "privateKey": r["private_key"],
+        "minClientVer": "",
+        "shortIds": sids,
+    }
+
+
+def _reality_inbound(state: dict) -> dict:
     return {
         "tag": "vless-reality",
         "listen": "0.0.0.0",
@@ -57,16 +79,9 @@ def _reality_inbound(state: dict) -> dict:
         "streamSettings": {
             "network": "tcp",
             "security": "reality",
-            "sockopt": _sockopt(),
+            "sockopt": _inbound_sockopt(),
             "tcpSettings": {"header": {"type": "none"}},
-            "realitySettings": {
-                "show": False,
-                "xver": 0,
-                "dest": r["dest"],
-                "serverNames": [r["server_name"]],
-                "privateKey": r["private_key"],
-                "shortIds": [r["short_id"]],
-            },
+            "realitySettings": _reality_settings(state),
         },
         "sniffing": _sniffing(),
     }
@@ -93,20 +108,13 @@ def _xhttp_inbound(state: dict) -> dict:
         "streamSettings": {
             "network": "xhttp",
             "security": "reality",
-            "sockopt": _sockopt(),
+            "sockopt": _inbound_sockopt(),
             "xhttpSettings": {
                 "host": host,
                 "path": x.get("path") or XHTTP_PATH,
                 "mode": x.get("mode") or "auto",
             },
-            "realitySettings": {
-                "show": False,
-                "xver": 0,
-                "dest": r["dest"],
-                "serverNames": [r["server_name"]],
-                "privateKey": r["private_key"],
-                "shortIds": [r["short_id"]],
-            },
+            "realitySettings": _reality_settings(state),
         },
         "sniffing": _sniffing(),
     }
@@ -125,7 +133,7 @@ def _ws_inbound(state: dict) -> dict:
         "streamSettings": {
             "network": "websocket",
             "security": "none",  # TLS 由 nginx (443 + Let's Encrypt) 终结
-            "sockopt": _sockopt(),
+            "sockopt": _inbound_sockopt(),
             "wsSettings": {"path": WS_PATH},
         },
         "sniffing": _sniffing(),
@@ -147,7 +155,7 @@ def _trojan_inbound(state: dict) -> dict:
         "streamSettings": {
             "network": "tcp",
             "security": "tls",
-            "sockopt": _sockopt(),
+            "sockopt": _inbound_sockopt(),
             "tlsSettings": {
                 "serverName": state["domain"] if _is_domain(state["domain"]) else "",
                 # Xray 25+ 的 TLSCertConfig 里 `certificate`/`key` 已改为 []string
@@ -221,28 +229,21 @@ def chain_node_id(entry: dict) -> str:
 
 def _reality_stream(state: dict) -> dict:
     """本机 Reality 入站的 streamSettings (与主力节点共用同一套密钥与伪装目标)。"""
-    r = state["reality"]
     return {
         "network": "tcp",
         "security": "reality",
-        "sockopt": _sockopt(),
+        "sockopt": _inbound_sockopt(),
         "tcpSettings": {"header": {"type": "none"}},
-        "realitySettings": {
-            "show": False,
-            "xver": 0,
-            "dest": r["dest"],
-            "serverNames": [r["server_name"]],
-            "privateKey": r["private_key"],
-            "shortIds": [r["short_id"]],
-        },
+        "realitySettings": _reality_settings(state),
     }
 
 
 def _chain_exit_inbound(state: dict) -> dict:
-    """落地端入站: 给"别人的中转服务器"用的专用凭据 (独立 UUID / 独立端口)。
+    """落地端入站: 给中转服务器用的专用凭据 (独立 UUID / 独立端口)。
 
-    与主力 Reality 节点同样的协议组合 —— 免证书, 且中转服务器的出站正好是
-    VLESS Reality 客户端, 两端参数一一对应。
+    两端对齐 flow: "" (标准 VLESS + Reality 隧道):
+    链式中转场景为二级代理转发, 绝不能开启 Vision 流控, 否则内核态 splice
+    会向代理套接字二次争夺 TLS 帧导致客户端超时卡死。
     """
     exit_cfg = state["chain"]["exit"]
     return {
@@ -251,10 +252,11 @@ def _chain_exit_inbound(state: dict) -> dict:
         "port": int(exit_cfg["port"]),
         "protocol": "vless",
         "settings": {
-            "clients": [{"id": exit_cfg["uuid"], "flow": "xtls-rprx-vision"}],
+            "clients": [{"id": exit_cfg["uuid"], "flow": ""}],
             "decryption": "none",
         },
         "streamSettings": _reality_stream(state),
+        "sniffing": _sniffing(),
     }
 
 
@@ -277,6 +279,7 @@ def _chain_entry_inbound(state: dict, entry: dict) -> dict:
             "decryption": "none",
         },
         "streamSettings": _reality_stream(state),
+        "sniffing": _sniffing(),
     }
 
 
@@ -299,7 +302,7 @@ def chain_entry_outbound(entry: dict) -> dict:
                     {"address": "127.0.0.1", "port": int(entry.get("hy_socks_port") or 0)}
                 ]
             },
-            "streamSettings": {"network": "tcp", "sockopt": _sockopt()},
+            "streamSettings": {"network": "tcp", "sockopt": _outbound_sockopt()},
         }
     return {
         "tag": f"chain-out-{entry['id']}",
@@ -313,7 +316,7 @@ def chain_entry_outbound(entry: dict) -> dict:
                         {
                             "id": entry["uuid"],
                             "encryption": "none",
-                            "flow": entry.get("flow") or "xtls-rprx-vision",
+                            "flow": "",
                         }
                     ],
                 }
@@ -322,8 +325,8 @@ def chain_entry_outbound(entry: dict) -> dict:
         "streamSettings": {
             "network": "tcp",
             "security": "reality",
-            # 内层这一跳是整条链的瓶颈所在: TFO 省掉新连接的一个 RTT (跨洋约 170ms)
-            "sockopt": _sockopt(),
+            # 内层这一跳是受控数据中心直连: TFO 省掉新连接的一个 RTT (跨洋约 170ms)
+            "sockopt": _outbound_sockopt(),
             "tcpSettings": {"header": {"type": "none"}},
             "realitySettings": {
                 "serverName": entry["sni"],
@@ -395,9 +398,6 @@ def build_xray_config(state: dict) -> dict:
                 "protocol": "freedom",
                 "tag": "direct",
                 "settings": {"domainStrategy": "UseIPv4"},
-                "streamSettings": {
-                    "sockopt": {"domainStrategy": "UseIPv4"},
-                },
             }
         ],
         "routing": {

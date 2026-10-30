@@ -625,7 +625,6 @@ def _clash_proxy(state: dict, node_id: str) -> dict | None:
             "reality-opts": {
                 "public-key": _pbk(r["public_key"]),
                 "short-id": r["short_id"],
-                "support-x25519mlkem768": True,
             },
         }
     if node_id == "vless-reality":
@@ -646,7 +645,6 @@ def _clash_proxy(state: dict, node_id: str) -> dict | None:
             "reality-opts": {
                 "public-key": _pbk(r["public_key"]),
                 "short-id": r["short_id"],
-                "support-x25519mlkem768": True,
             },
         }
     if node_id == "vless-xhttp":
@@ -673,7 +671,6 @@ def _clash_proxy(state: dict, node_id: str) -> dict | None:
             "reality-opts": {
                 "public-key": _pbk(r["public_key"]),
                 "short-id": r["short_id"],
-                "support-x25519mlkem768": True,
             },
         }
     if node_id == "vless-ws":

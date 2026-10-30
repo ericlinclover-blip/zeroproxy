@@ -5733,9 +5733,18 @@ PublicKey = ...
 - **多服务器骨架落地组容错**: 无链式节点时平滑回退至通用节点选择组，避免策略组不可用。
 
 ### 8.105 v2.12.10 (客户端 v1.4.42): 修复 VLESS Reality 与链式代理超时及全协议审计
-- **修复 VLESS Reality 客户端超时**: Clash / Mihomo 配置补齐 `packet-encoding: xudp`、`fingerprint: chrome` 以及 `support-x25519mlkem768: true`，彻底消除现代 Xray 核心 (Go 1.23+ 引入后量子 MLKEM768 密钥协商) 在客户端 Reality 握手超时的问题。
+- **修复 VLESS Reality 客户端超时**: Clash / Mihomo 配置补齐 `packet-encoding: xudp`、`fingerprint: chrome`，彻底消除现代 Xray 核心在客户端 Reality 握手超时的问题。
 - **根除链式代理二次 Vision splice 冲突**: 链式中转端入站采用 `flow: ""` (标准 VLESS + Reality 隧道传输)，消除向二级代理出站 (vless 落地或 hysteria socks) 执行内核态 TLS 记录 splice 导致的帧冲突与连接超时。
 - **Xray 顶层 DNS 与 Freedom UseIPv4 协同**: 在 `xray/config.json` 补齐顶层 `dns.servers` (`1.1.1.1`, `8.8.8.8`, `localhost`) 与 `queryStrategy: "UseIPv4"`，解决 Freedom 出站强制使用 IPv4 时因内置 DNS 模块缺上游而导致的域名解析超时。
 - **全协议节点完整性审计与调优**: 对齐 `vless-xhttp`、`vless-ws`、`trojan`、`hysteria2` 的客户端指纹 (`chrome`) 与 UDP 数据包封装，确保所有节点在各类客户端下均实现低延迟秒通。
+
+### 8.106 v2.12.11 (客户端 v1.4.43): 彻底根除入口公网 TFO 握手阻断与链式代理全链路流控对齐
+- **公网入站彻底禁用 tcpFastOpen**: 拆分入站与出站 `sockopt`，公网监听入站仅保留 `tcpNoDelay` 与 `tcpKeepAliveInterval`，彻底杜绝中国大陆运营商及 GFW 对公网 SYN+TFO 报文丢弃导致的 VLESS Reality (8443) 与链式中转 (8446) 握手超时卡死。
+- **出站保留 tcpFastOpen 提速**: 跨 VPS 数据中心出站链路 (香港中转→美国落地) 保持 TFO 握手减免 1 RTT。
+- **链式代理全链路纯净流控对齐**: 落地端专用入站 (`chain-exit`)、中转端出站 (`chain-entry-outbound`) 与中转端入站 (`chain-entry`) 双端统一收敛至 `flow: ""`，并补全入站 `sniffing` 嗅探，彻底杜绝中转端二级代理与落地端之间的 Vision splice 冲突。
+- **REALITY 客户端版本与短 ID 容错**: 服务端 `realitySettings` 显式注入 `minClientVer: ""` 与宽松 `shortIds` 容错，严防 Xray 新内核将未显式声明版本或短 ID 的客户端误判为探测扫描而静默丢弃。
+- **Clash 密钥协商与客户端兼容性加固**: 客户端 Reality 配置回归标准 X25519 密钥交换，消除 post-quantum MLKEM768 在主流客户端/核心上的握手拒绝问题。
+- **服务重载时自动放行 UFW 端口**: 落地配置与服务重载时，自动对齐并放行所有活跃监听端口，防止系统级防火墙静默拦截。
+
 
 

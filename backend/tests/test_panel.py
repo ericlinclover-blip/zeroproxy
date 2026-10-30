@@ -3934,13 +3934,12 @@ def test_xray_config_dns_and_freedom_use_ipv4(configured):
 
     direct_out = next(o for o in cfg["outbounds"] if o["tag"] == "direct")
     assert direct_out["settings"]["domainStrategy"] == "UseIPv4"
-    assert direct_out["streamSettings"]["sockopt"]["domainStrategy"] == "UseIPv4"
 
 
 def test_clash_reality_and_chain_flow_and_opts(configured):
     """Clash / Mihomo 客户端订阅字段全面审计:
 
-    1. VLESS Reality: 包含 xtls-rprx-vision, packet-encoding: xudp, support-x25519mlkem768, fingerprint
+    1. VLESS Reality: 包含 xtls-rprx-vision, packet-encoding: xudp, fingerprint
     2. 链式中转节点: 入站与客户端必须使用 flow: "" (无 Vision), 避免向二级代理出站二次 splice 导致握手冲突超时
     3. 全协议指纹与编码对齐: vless-xhttp, vless-ws, trojan, hysteria2
     """
@@ -3950,7 +3949,8 @@ def test_clash_reality_and_chain_flow_and_opts(configured):
     assert vr["packet-encoding"] == "xudp"
     assert vr["client-fingerprint"] == "chrome"
     assert vr["fingerprint"] == "chrome"
-    assert vr["reality-opts"]["support-x25519mlkem768"] is True
+    assert "public-key" in vr["reality-opts"]
+    assert "short-id" in vr["reality-opts"]
 
     # 链式条目测试
     entry = {
@@ -3972,18 +3972,30 @@ def test_clash_reality_and_chain_flow_and_opts(configured):
     assert cp["packet-encoding"] == "xudp"
     assert cp["client-fingerprint"] == "chrome"
     assert cp["fingerprint"] == "chrome"
-    assert cp["reality-opts"]["support-x25519mlkem768"] is True
+    assert "public-key" in cp["reality-opts"]
 
-    # 服务端链式中转入站流控必须为空
+    # 服务端链式中转入站流控必须为空, 且必须配置 sniffing
     cfg = xray_config.build_xray_config(state)
     chain_in = next(i for i in cfg["inbounds"] if i["tag"] == f"chain-{entry['id']}")
     assert chain_in["settings"]["clients"][0]["flow"] == ""
+    assert chain_in["sniffing"]["enabled"] is True
+
+    # 入站 sockopt 绝不能带 tcpFastOpen
+    assert "tcpFastOpen" not in chain_in["streamSettings"]["sockopt"]
+    vr_in = next(i for i in cfg["inbounds"] if i["tag"] == "vless-reality")
+    assert "tcpFastOpen" not in vr_in["streamSettings"]["sockopt"]
+    assert vr_in["streamSettings"]["realitySettings"]["minClientVer"] == ""
+
+    # 出站必须带嗅探对齐与出站 sockopt (TFO 仅保留在出站)
+    chain_out = next(o for o in cfg["outbounds"] if o["tag"] == f"chain-out-{entry['id']}")
+    assert chain_out["settings"]["vnext"][0]["users"][0]["flow"] == ""
+    assert chain_out["streamSettings"]["sockopt"]["tcpFastOpen"] is True
 
     # 其他协议审计
     vx = share_links._clash_proxy(state, "vless-xhttp")
     assert vx["packet-encoding"] == "xudp"
     assert vx["fingerprint"] == "chrome"
-    assert vx["reality-opts"]["support-x25519mlkem768"] is True
+    assert "public-key" in vx["reality-opts"]
 
     ws = share_links._clash_proxy(state, "vless-ws")
     assert ws["packet-encoding"] == "xudp"

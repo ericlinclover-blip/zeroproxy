@@ -93,7 +93,7 @@ def test_code_roundtrip():
     assert parsed["host"] == "us.example.com" and parsed["port"] == 8447
     assert parsed["pbk"] == public_key and parsed["sid"] == short_id
     assert parsed["sni"] == "www.cloudflare.com" and parsed["label"] == "美国落地"
-    assert parsed["flow"] == "xtls-rprx-vision"
+    assert parsed["flow"] == ""
     # 复制粘贴最常见的"带空格 / 换行"要能自愈
     assert chain.parse_code(f"  {code[:20]}\n{code[20:]}  ")["port"] == 8447
 
@@ -648,7 +648,7 @@ def test_inbound_and_outbound_carry_tcp_sockopt(client, configured, monkeypatch)
     cfg = xray_config.build_xray_config(config.load_state())
     inbound = next(i for i in cfg["inbounds"] if i["tag"] == "vless-reality")
     sockopt = inbound["streamSettings"]["sockopt"]
-    assert sockopt["tcpFastOpen"] is True
+    assert "tcpFastOpen" not in sockopt
     assert sockopt["tcpNoDelay"] is True
     assert sockopt["tcpKeepAliveInterval"] == 15
     outbound = next(o for o in cfg["outbounds"] if str(o["tag"]).startswith("chain-out-"))

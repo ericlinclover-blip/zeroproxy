@@ -329,6 +329,17 @@ def restart_services(
         with contextlib.suppress(Exception):
             chain.warmup_in_background(state)
 
+    # 尽力同步放行所有预期监听的端口 (在生产环境 UFW 启用时生效, 避免节点/链路开了解析对却被防火墙阻断)
+    if services.is_prod():
+        with contextlib.suppress(Exception):
+            want = _wanted_ports(state)
+            tcp_p = [p for p, proto, _ in want if proto == "tcp"]
+            udp_p = [p for p, proto, _ in want if proto == "udp"]
+            if tcp_p:
+                services.open_firewall_ports(tcp_p, "tcp")
+            if udp_p:
+                services.open_firewall_ports(udp_p, "udp")
+
     ordered = [results.get(name, f"{name} ✗ 没有结果") for name, _, _ in jobs]
     # 这一步的成败只看核心服务 (nginx / xray / hysteria2) —— 内层 QUIC 是可选链路,
     # 它起不来不该把整步判红。判红的代价很重: `python -m zeroproxy.apply` 以退出码 1

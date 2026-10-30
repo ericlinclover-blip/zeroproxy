@@ -157,7 +157,7 @@ from .config import paths
 #: 1.4.40: 修复单服务器 drop 回滚死锁与 device.json 僵尸复活; CGI 如实汇报退出码; 路由页面动效与防重优化。
 #: 1.4.41: 修复高纯净度网站连接失败: GEOIP,CN 增加 no-resolve 杜绝国内 DNS 污染; 扩展落地风控域名; fake-ip-filter 移除 STUN 杜绝 WebRTC 泄漏。
 #: 1.4.42: 修复 VLESS Reality 与链式代理在 Clash Verge 等客户端超时: 补齐 packet-encoding: xudp, support-x25519mlkem768, fingerprint: chrome; 修复 Xray 顶层 DNS 与 UseIPv4 出站协同; 根除链式中转入站二次 Vision splice 冲突。
-SCRIPT_VERSION = "1.4.42"
+SCRIPT_VERSION = "1.4.43"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"

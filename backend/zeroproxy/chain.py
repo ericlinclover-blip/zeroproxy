@@ -154,7 +154,7 @@ def make_code(
     pbk: str,
     sid: str = "",
     sni: str,
-    flow: str = "xtls-rprx-vision",
+    flow: str = "",
     label: str = "",
     hy_port: int | None = None,
     hy_password: str = "",
@@ -302,7 +302,7 @@ def exit_code(state: dict) -> str:
         pbk=str(reality.get("public_key") or ""),
         sid=str(reality.get("short_id") or ""),
         sni=str(reality.get("server_name") or ""),
-        flow="xtls-rprx-vision",
+        flow="",
         label=str(exit_cfg.get("label") or "") or (state.get("domain") or ""),
         hy_port=int(exit_cfg.get("hy_port") or 0) if hy_on else None,
         hy_password=str(exit_cfg.get("hy_password") or "") if hy_on else "",
@@ -385,7 +385,7 @@ def client_config(target: dict, socks_port: int, state: dict | None = None) -> d
                                 {
                                     "id": target["uuid"],
                                     "encryption": "none",
-                                    "flow": target.get("flow") or "xtls-rprx-vision",
+                                    "flow": target.get("flow") or "",
                                 }
                             ],
                         }
