@@ -5848,3 +5848,35 @@ PublicKey = ...
   排查入口，不再只给"端口未监听"。
 - **回归**: `upgrade_sim.sh` 把断言改成"这些单元不得做能力收窄"，防止再被加回来；
   全量 pytest、Go test、upgrade_sim 全绿。
+
+
+### 8.113 v2.12.18: 三轮代码审计与修复 (竞态 / 注入 / 供应链 / 数据降级 / 锁)
+- **竞态与数据一致性**: 后台落地闭环的收尾不再整份回写旧快照 —— 逐层只合并本次真正改过的
+  叶子字段, 落地那 2-4 秒里用户在面板上点的开关不会再被静默覆盖 (`write_xray_config` 也
+  不再顺手 `save_state`); WireGuard 回执改为合并式落盘 (锁外 `ufw` 最长 25 秒的窗口)。
+- **注入 / 凭据边界**: WireGuard 客户端**改名**不再绕过名字净化 —— 名字会进 `wg0.conf` 的
+  注释行, 换行能在 `[Interface]` 段注入 `PostUp`, 而 `wg-quick up` 以 root 执行它;
+  VLESS UUID 改为**随机生成**, 不再由管理员口令做单轮 SHA-256 派生 (UUID 随每条订阅链接
+  发给每个客户端, 等于把口令的快速哈希交出去, PBKDF2 那 12 万次迭代被完全绕过);
+  口令哈希串改为记录迭代次数 (`pbkdf2$<iters>$<salt>$<digest>`), 老格式继续可验证。
+- **崩溃面**: `/sub/<非 ASCII>`、`/c/<非 ASCII 配对码>` 不再 500; `restore` 校验
+  `chain.entries` 的每个元素 (混进空 dict 会让仪表盘/诊断永久 500), 且**失败回滚真的会触发**
+  (此前 `apply.reapply` 用 `add_step` 吞掉每步异常、自己从不抛, 那段回滚是死代码);
+  未知节点 id 不再让仪表盘 500; state.json 字段类型被外部改坏时退化为默认值, 而不是每个
+  已登录请求 500 (`"sessions": "abc"` 以前就是全站 500); 超深嵌套 state 不会让面板再也存不了盘。
+- **配置落盘原子性**: `config.json` / hysteria YAML / nginx 配置改为 tmp + fsync + rename ——
+  写一半崩溃不再留下半份配置 (那会让 Xray / Hysteria 2 起不来, 而这台机器往往就是用户唯一出口)。
+- **锁**: 同一线程嵌套 `config.locked()` 不再自死锁 (flock 按**打开文件描述符**上锁,
+  RLock 可重入不代表 flock 可重入) —— `python -m zeroproxy.apply` 这类"持锁跑完整闭环"的
+  路径不再有卡死风险。
+- **WireGuard 脚本**: `reload.sh` / `userspace-up.sh` 在 IPv6 关闭 (默认) 时生成的是字面量
+  `{INTERFACE}` —— "关闭 IPv6 后清理旧 v6 地址"从来没有生效过, 每次 reload 还会往 journal
+  丢一条 `Device "{INTERFACE}" does not exist`; 已修并加 `sh -n` 回归。
+- **数据面降级**: dae 的 `geo=0` 降级配置不再引用 `geoip:private` (dae 读不到 geoip.dat 时是
+  **整份配置校验失败**, 而"面板还没准备好数据文件"正是降级分支唯一的场景), 私有地址改用
+  显式 CIDR; 分流数据下载必须收满 `Content-Length`, 半个 `geosite.dat` 不再被当成新鲜缓存
+  用满 7 天 (mihomo 读不了数据文件 = 整份配置起不来); dae 缓存按架构**整段**匹配 (请求
+  `mips` 不再拿到 `mipsle` 二进制) 且改为原子写。
+- **回归**: 全量 pytest 486 项通过; 新增 20 条针对性用例 (坏 state 韧性 / 嵌套锁 / 原子写 /
+  落地并发语义 / WG 脚本占位符与注入 / UUID 随机性 / 口令哈希版本化 / dae 降级)。
+  三轮审计的完整记录见 `docs/BUG_REPORT.md`、`docs/FIX_REPORT.md`、`docs/SECOND_PASS_REPORT.md`。

@@ -189,7 +189,16 @@ def render(
     add("    pname(NetworkManager) -> direct")
     add("    # 组播 / 广播不该进代理")
     add("    dip(224.0.0.0/3, 'ff00::/8') -> direct")
-    add("    dip(geoip:private) -> direct")
+    # 私有/回环地址直连。有分流数据就用 geoip:private; 降级 (geo=False) 时必须换成
+    # 显式 CIDR —— dae 读不到 geoip.dat 时**整份配置校验失败**, 不是跳过这条规则,
+    # 而这个降级分支存在的唯一场景恰恰就是"面板还没准备好数据文件"。
+    if geo:
+        add("    dip(geoip:private) -> direct")
+    else:
+        add(
+            "    dip(10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, "
+            "169.254.0.0/16, 'fc00::/7', 'fe80::/10') -> direct"
+        )
     for rule in panel_direct_rules(base):
         add(f"    {rule}")
     if tpl == "direct":

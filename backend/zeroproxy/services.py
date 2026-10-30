@@ -839,9 +839,11 @@ def udp_port_listening(port: int) -> bool | None:
     Linux 读 /proc/net/udp*, 其他平台退回 lsof; 都不可用时返回 None (未知)。
     """
     hexed = f"{int(port):04X}"
+    scanned = False
     for proc_file in ("/proc/net/udp", "/proc/net/udp6"):
         if not os.path.exists(proc_file):
             continue
+        scanned = True
         try:
             with open(proc_file, "r", encoding="utf-8") as fh:
                 next(fh, None)  # 跳过表头
@@ -849,15 +851,17 @@ def udp_port_listening(port: int) -> bool | None:
                     parts = line.split()
                     if len(parts) > 1 and parts[1].rsplit(":", 1)[-1].upper() == hexed:
                         return True
-            return False
         except OSError:
-            break
+            continue
+        # 注意: 这里**不能** return False —— 看完 /proc/net/udp 还要看 udp6。
+        # 以前一读完第一张表就下结论, 于是只监听 IPv6 的进程会被判成"没在监听"。
     if shutil.which("lsof"):
         ok, out = run(["lsof", "-nP", f"-iUDP:{int(port)}"], timeout=10)
         if ok and out.strip():
             return True
         return False
-    return None
+    # 两张表都看过了(确实没有) → False; 一张都没读到(非 Linux) → None(未知)
+    return False if scanned else None
 
 
 def _probe_target(state: dict, node_id: str) -> tuple[str, str, int, str]:

@@ -47,6 +47,15 @@ PANEL_BIND_HOST = os.environ.get("ZP_BIND_HOST", "127.0.0.1")
 PANEL_BIND_PORT = int(os.environ.get("ZP_BIND_PORT", "9900"))
 
 LOCK = threading.RLock()
+#: 当前线程已持有的 flock 嵌套层数。
+#:
+#: 为什么需要它: `threading.RLock` 是可重入的, 但 `flock` 是**按打开文件描述符**
+#: 上锁的 —— 同一个线程再次 `os.open()` 同一个锁文件并 `flock(LOCK_EX)` 会把自己
+#: 阻塞住 (fcntl 记录锁在进程内是可重入的, flock 不是)。而确实存在这条路径:
+#: apply 的命令行入口 `with config.locked(): reapply(...)`, reapply 收尾落盘时还要
+#: 再进一次 `locked()` 去合并最新 state。没有这层计数就是**永久死锁**。
+#: 同一个线程嵌套时直接复用外层已经拿到的锁, 语义与可重入锁一致。
+_LOCK_DEPTH = threading.local()
 
 #: 会话默认有效期 (72h) / 允许同时在线的会话数上限
 SESSION_TTL = 72 * 3600
@@ -320,19 +329,67 @@ def _ensure_dirs() -> None:
         os.makedirs(p[key], exist_ok=True)
 
 
-def _merge(base: dict, extra: dict) -> None:
-    """把 extra 递归合并进 base。
+#: `_merge` 允许的最大嵌套层数。DEFAULTS 只有 4 层, 这里给足余量; 设上限是为了
+#: 让"递归"这一步永远不会变成无限深 —— 坏掉的 state.json / 备份文件不该能把
+#: 面板进程推进 RecursionError。
+_MERGE_MAX_DEPTH = 16
 
-    `base` 里已经是对象的字段只接受同样是对象的值: state.json 或备份文件被外部
-    改坏时 (例如 `"reality": null`), 直接赋值会让之后每一处 `.get()` 都变成 500
-    ("'NoneType' object has no attribute 'get'")。这里保留默认值, 让坏数据退化成
-    "该字段缺失" (由各接口给出 400 / 自愈), 而不是把整个面板打挂。
+
+def _kind(value: object) -> str:
+    """值的"种类" (bool 必须排在 int 前面, 否则 True 会被当成数字)。"""
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, dict):
+        return "dict"
+    if isinstance(value, list):
+        return "list"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "str"
+    return type(value).__name__
+
+
+def _too_deep(value: object, budget: int = _MERGE_MAX_DEPTH) -> bool:
+    """这个值是否嵌套过深 (深到 json.dump 自己会 RecursionError)。
+
+    坏文件里塞一个 8000 层的 `{"a":{"a":…}}`, `_merge` 会把它当成"未知字段"整段
+    收进 state —— 之后每次 save_state 都在 json.dump 里炸掉, 面板从此**一次都存
+    不了盘**。所以在收下任何值之前先量一下深度, 过深就当它不存在。
     """
+    if budget <= 0:
+        return isinstance(value, (dict, list))
+    if isinstance(value, dict):
+        return any(_too_deep(item, budget - 1) for item in value.values())
+    if isinstance(value, list):
+        return any(_too_deep(item, budget - 1) for item in value)
+    return False
+
+
+def _merge(base: dict, extra: dict, depth: int = 0) -> None:
+    """把 extra 递归合并进 base, **只接受与默认值同种类**的值。
+
+    state.json 或备份文件被外部改坏时, 直接赋值会让之后每一处 `.get()` 都 500:
+      * `"reality": null`      → `None.get(...)`            (NoneType 无 get)
+      * `"sessions": "abc"`    → `str.get(...)`             (**每个**已登录请求 500)
+      * `"ports": [1,2,3]`     → `list["reality"]`          (TypeError)
+      * `"configured": "no"`   → 字符串在布尔判断里恒为真   (门禁失效)
+    这里改成"种类不匹配就保留默认值", 坏数据退化成"该字段缺失", 由各接口给出
+    400 / 自愈, 而不是把整个面板打挂。
+    """
+    if depth > _MERGE_MAX_DEPTH:
+        return
     for key, value in extra.items():
-        if key in base and isinstance(base[key], dict):
-            if isinstance(value, dict):
-                _merge(base[key], value)
-            continue
+        if key in base:
+            default = base[key]
+            if isinstance(default, dict):
+                if isinstance(value, dict):
+                    _merge(default, value, depth + 1)
+                continue   # null / 字符串 / 列表 → 保留默认结构
+            if _kind(default) != _kind(value):
+                continue   # 类型被改坏 → 保留默认值
+        if _too_deep(value):
+            continue       # 深到存不下盘的嵌套 → 直接丢掉
         base[key] = value
 
 
@@ -412,21 +469,40 @@ def locked():
     进程内 threading.RLock (可重入, 允许嵌套), 进程间 fcntl.flock。
     锁文件独立于 state.json, 避免 rename 让锁失效。「读 → 改 → 写」应整体
     包在 `with locked():` 内。
+
+    嵌套调用 (同一线程第二次进入) 只复用外层的锁: flock 不能重入, 见 _LOCK_DEPTH。
     """
     with LOCK:
-        if fcntl is None:
-            yield
+        depth = int(getattr(_LOCK_DEPTH, "depth", 0) or 0)
+        if fcntl is None or depth > 0:
+            _LOCK_DEPTH.depth = depth + 1
+            try:
+                yield
+            finally:
+                _LOCK_DEPTH.depth = depth
             return
         _ensure_dirs()
         fd = os.open(paths()["lock"], os.O_CREAT | os.O_RDWR, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
+            _LOCK_DEPTH.depth = depth + 1
             yield
         finally:
+            _LOCK_DEPTH.depth = depth
             try:
                 fcntl.flock(fd, fcntl.LOCK_UN)
             finally:
                 os.close(fd)
+
+
+def lock_held_here() -> bool:
+    """当前线程是否已经持有配置锁 (即正处在一次 `with locked():` 里)。
+
+    给"收尾落盘"这类逻辑用: 持锁期间**不可能**有别的写入者 (其它线程/进程都卡在
+    同一把 flock 上), 所以此刻内存里的 state 就是权威的; 反之 (锁外跑了几秒的
+    后台任务) 就必须只合并自己改过的字段, 免得覆盖别人在这期间写的东西。
+    """
+    return int(getattr(_LOCK_DEPTH, "depth", 0) or 0) > 0
 
 
 def load_state() -> dict:
@@ -444,7 +520,10 @@ def load_state() -> dict:
             try:
                 with open(path, "r", encoding="utf-8") as fh:
                     data = json.load(fh)
-            except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError, RecursionError) as exc:
+                # RecursionError: 上万个 `{"a":{"a":{…` 的嵌套会让 json 自己的递归
+                # 先炸掉。它和"JSON 语法坏了"一样属于"这个文件不能信", 必须走
+                # StateError → 503 维护态, 而不是让异常直穿到每个请求变 500。
                 raise StateError(
                     f"状态文件 {path} 无法读取 ({type(exc).__name__}: {exc})。"
                     "面板已进入维护态: 请先备份/修复该文件再重启面板, 不要删掉它重新初始化 "
@@ -497,6 +576,41 @@ def save_state(state: dict) -> None:
             os.chmod(path, 0o600)
         except OSError:
             pass
+
+
+def atomic_write_text(path: str, text: str, mode: int = 0o600) -> None:
+    """原子写一个文本文件 (临时文件 + fsync + rename)。
+
+    为什么不能 `open(path, "w").write(...)`: 写一半崩溃 / 断电 / 磁盘满, 留下的
+    就是**半个配置** —— Xray 与 Hysteria 2 读到半截 JSON/YAML 会直接拒绝启动,
+    下次开机整台机器就没节点了, 而这台机器往往是用户唯一能连出去的路。rename
+    在同一文件系统内是原子的, 读方看到的永远是完整的旧版或完整的新版。
+
+    临时文件建在**目标目录里** (而不是 /tmp): 跨文件系统的 rename 会
+    `OSError: [Errno 18] Invalid cross-device link` (见 geodata.atomic_install)。
+    """
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".zp-", suffix=".tmp", dir=directory)
+    try:
+        # mkstemp 建出来就是 0600; 需要更宽权限 (nginx 配置) 由调用方显式声明。
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        try:
+            os.chmod(tmp, mode)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(tmp)
+
+
+def atomic_write_json(path: str, data: object, mode: int = 0o600) -> None:
+    """原子写一份 JSON (缩进 2, 不转义非 ASCII) —— 供各配置生成器共用。"""
+    atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False) + "\n", mode)
 
 
 # ---------------------------------------------------------------- 审计日志

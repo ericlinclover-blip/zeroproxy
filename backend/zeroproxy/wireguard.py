@@ -108,9 +108,19 @@ def key_valid(value: str) -> bool:
         return False
 
 
-def _clean_name(value: str, fallback: str = "设备") -> str:
+def clean_name(value: str, fallback: str = "设备") -> str:
+    """设备名净化: 去掉控制字符 (含换行) 并限长。
+
+    设备名会原样写进 `wg0.conf` 的注释行 (`# <名字>`)。名字里带 `\n` 时, 后面那串
+    内容就成了**配置文件的一行** —— 落在 `[Interface]` 段里就是 `PostUp = …`, 而
+    `wg-quick up` 以 root 执行 PostUp。所以这条净化不是"好看", 是注入边界:
+    新增 peer 时已经走了它, 但**改名**那条路以前漏了 (routes.wireguard_peer_update)。
+    """
     name = _NAME_RE.sub("", str(value or "")).strip()
     return (name or fallback)[:40]
+
+
+_clean_name = clean_name   # 内部旧名, 保持向后兼容
 
 
 def _new_id() -> str:
@@ -642,9 +652,13 @@ def reload_script(state: dict) -> str:
             "fi",
         ]
     else:
-        # F12: IPv6 被禁用时, 清理旧 v6 地址防止残留
+        # F12: IPv6 被禁用时, 清理旧 v6 地址防止残留。
+        # 注意这两行必须是 f-string: 以前漏了 f 前缀, 生成出来的脚本里是字面量
+        # `{INTERFACE}` 与 `{{print $2; exit}}`。管道末尾是 awk, 退出码仍是 0,
+        # 所以脚本"看起来没坏", 但 **"清理旧 v6 地址"从来没生效过**, 而且每次
+        # reload 都往 journal 丢一条 `Device "{INTERFACE}" does not exist`。
         lines += [
-            'cur6="$(ip -6 addr show dev {INTERFACE} | awk \'/inet6 /{{print $2; exit}}\')"',
+            f'cur6="$(ip -6 addr show dev {INTERFACE} | awk \'/inet6 /{{print $2; exit}}\')"',
             'if [ -n "$cur6" ]; then',
             f'  ip -6 addr flush dev {INTERFACE} scope global || true',
             "fi",
@@ -694,7 +708,7 @@ def userspace_up_script(state: dict) -> str:
     else:
         # F12: IPv6 被禁用时, 清理旧 v6 地址防止残留
         lines += [
-            'cur6="$(ip -6 addr show dev {INTERFACE} | awk \'/inet6 /{{print $2; exit}}\')"',
+            f'cur6="$(ip -6 addr show dev {INTERFACE} | awk \'/inet6 /{{print $2; exit}}\')"',
             'if [ -n "$cur6" ]; then',
             f'  ip -6 addr flush dev {INTERFACE} scope global || true',
             "fi",

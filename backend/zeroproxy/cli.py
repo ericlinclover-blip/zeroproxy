@@ -39,12 +39,18 @@ def _out(msg: str = "") -> None:
     print(msg)
 
 
+#: `_ask` 在 EOF / Ctrl-C 时的返回值。菜单靠它区分"用户敲了空回车"与"输入已经没了" ——
+#: 以前两者都被吞成空串, 于是 `z </dev/null`(或管道调用)会在菜单里**无限重画**,
+#: 每圈还要跑一次 load_state + systemctl is-active。
+_EOF = "\x00__eof__"
+
+
 def _ask(prompt: str) -> str:
     try:
         return input(prompt)
     except (EOFError, KeyboardInterrupt):
         _out("")
-        return ""
+        return _EOF
 
 
 def _ask_password(prompt: str) -> str:
@@ -201,7 +207,11 @@ def _print_menu() -> None:
 def menu() -> int:
     while True:
         _print_menu()
-        choice = _ask("请选择 [0-2]: ").strip().lower()
+        raw = _ask("请选择 [0-2]: ")
+        if raw == _EOF:
+            _out("")
+            return 0 if not sys.stdin.isatty() else 1
+        choice = raw.strip().lower()
         if choice in ("0", "q", "quit", "exit"):
             _out("再见。")
             return 0
@@ -310,20 +320,37 @@ def install_shortcut(bin_dir: str | None = None) -> int:
     return 0
 
 
+def _guarded(fn) -> int:
+    """把 state.json 损坏翻成一句人话。
+
+    面板那边 `StateError` 会变成 503 维护态; 而 `z` 是"最后的兜底通道", 以前它直接把
+    traceback 打给用户 —— 恰恰是这个通道最该说清楚"状态文件坏了, 先备份再修"。
+    """
+    try:
+        return fn()
+    except config.StateError as exc:
+        _out(f"× {exc}")
+        _out("  修复后重试; 也可以先备份 data/state.json 再手工修正 JSON 语法。")
+        return 1
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     cmd = args[0].strip().lower() if args else ""
     if cmd in ("", "menu", "m"):
-        return menu()
+        return _guarded(menu)
     if cmd in ("passwd", "password", "pw", "1"):
-        return _menu_passwd()
+        return _guarded(_menu_passwd)
     if cmd in ("update", "upgrade", "2"):
-        return run_update()
+        return _guarded(run_update)
     if cmd in ("status", "show", "info", "3"):
-        _out("ZeroProxy 终端管理")
-        for line in status_lines():
-            _out(line)
-        return 0
+        def _status() -> int:
+            _out("ZeroProxy 终端管理")
+            for line in status_lines():
+                _out(line)
+            return 0
+
+        return _guarded(_status)
     if cmd == "install-shortcut":
         # 安装脚本用: cli install-shortcut [bin_dir]
         return install_shortcut(args[1] if len(args) > 1 else None)

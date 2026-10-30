@@ -13,7 +13,6 @@
 """
 from __future__ import annotations
 
-import json
 import os
 
 from . import config, geodata
@@ -462,8 +461,13 @@ def build_xray_config(state: dict) -> dict:
 
 
 def write_xray_config(state: dict) -> None:
+    """原子落盘 Xray 配置。
+
+    **不在这里保存 state**: 落盘由调用方 (apply.reapply 的收尾步骤) 统一负责,
+    它会把本次真正改过的字段合并进最新 state。以前这里顺手 `save_state(state)`,
+    等于把一份几秒前的旧快照写回磁盘 —— 落地期间用户在面板上改的开关会被
+    悄悄覆盖 (lost update)。
+    """
     p = paths()
     os.makedirs(p["xray_dir"], exist_ok=True)
-    with open(p["xray_config"], "w", encoding="utf-8") as fh:
-        json.dump(build_xray_config(state), fh, indent=2)
-    config.save_state(state)
+    config.atomic_write_json(p["xray_config"], build_xray_config(state), mode=0o600)

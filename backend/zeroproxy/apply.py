@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import json
 import os
@@ -679,6 +680,71 @@ def _config_digests() -> dict[str, str | None]:
     }
 
 
+_MISSING = object()
+
+
+def _merge_audit(fresh: list, mine: list) -> list:
+    """审计记录按 id 求并集 (两边都可能在这几秒里追加过记录)。
+
+    直接拿自己那份整列覆盖, 会把并发的设备心跳 / 登录记录抹掉 —— 操作记录是
+    事后追责用的, 少一条就说不清了。
+    """
+    seen = {e.get("id") for e in fresh if isinstance(e, dict)}
+    merged = list(fresh)
+    for entry in mine:
+        if isinstance(entry, dict) and entry.get("id") not in seen:
+            merged.append(entry)
+    merged.sort(key=lambda e: (e.get("id") if isinstance(e, dict) else 0) or 0)
+    return merged
+
+
+def _apply_changes(target: dict, baseline: dict, current: dict) -> None:
+    """把 `current` 相对 `baseline` 的变化**逐层**覆盖到 `target` 上。
+
+    只覆盖真正变化的叶子, 是为了守住粒度: 用户先后点了两张节点卡片的开关,
+    改的都是 `state["nodes"]` 这**一个**字典里不同的键 —— 按顶层整块覆盖的话,
+    后落盘的那一次会把另一次一并抹掉。`audit` 单独按 id 合并 (见 _merge_audit)。
+    """
+    for key, value in current.items():
+        if key in ("version", "updated_at"):
+            continue
+        base = baseline.get(key, _MISSING)
+        if key in target:
+            slot = target[key]
+            if isinstance(slot, dict) and isinstance(value, dict) and isinstance(base, dict):
+                _apply_changes(slot, base, value)
+                continue
+        if base is _MISSING or base != value:
+            if key == "audit" and isinstance(target.get(key), list) and isinstance(value, list):
+                target[key] = _merge_audit(target[key], value)
+            else:
+                target[key] = value
+
+
+def _save_merged(state: dict, baseline: dict) -> None:
+    """把这次闭环的结果落盘, 但不覆盖这期间别人写进去的改动。
+
+    两条路径的语义不一样:
+
+    * **同步路径** (面板同步落地 / `apply.py` 命令行): 调用方从头到尾持有配置锁,
+      期间不可能有别的写入者 —— 此刻内存里的 state 就是权威的, 整份写回。注意
+      调用方在调用 reapply **之前**就可能改过 state (例如「生成配对码」先改
+      chain.exit 再触发落地), 所以不能只写回 reapply 自己改的那几个字段。
+    * **后台任务路径** (`_run_apply_job`): 闭环在锁外跑 2-4 秒 (systemctl restart +
+      端口验证), 这段时间用户在面板上点别的开关是正常的, 那些请求各自持锁落了盘。
+      收尾时若整份写回几秒前的旧快照, 就把它们**静默覆盖**了 (lost update) ——
+      所以这里只把 reapply 对比前后快照真正改过的叶子字段盖上去。
+    """
+    authoritative = config.lock_held_here()
+    with config.locked():
+        fresh = load_state()
+        if authoritative:
+            _apply_changes(fresh, {}, state)
+        else:
+            _apply_changes(fresh, baseline, state)
+        save_state(fresh)
+
+
 def reapply(state: dict, timeout: int = 0, progress=None) -> list[dict]:
     """完整闭环: 重新生成配置 → 校验 → 重载服务 → 验证端口。
 
@@ -686,6 +752,8 @@ def reapply(state: dict, timeout: int = 0, progress=None) -> list[dict]:
     面板把整条闭环放到后台跑, 就靠它给用户画实时进度。
     """
     steps = steps_recorder()
+    # 收尾落盘要跟这份快照对比才知道"这次改了什么" (见 _save_merged)
+    baseline = copy.deepcopy(state)
     before = _config_digests()
     # 证书文件兜底要放在生成 Xray / Nginx 之前: 证书不可用时 Trojan 入站会被直接
     # 跳过, nginx 配置也会指向一个不存在的文件 (见 ensure_cert_files)。
@@ -720,7 +788,7 @@ def reapply(state: dict, timeout: int = 0, progress=None) -> list[dict]:
             steps[-1]["abort"] = True
             break
     state["steps"] = steps
-    save_state(state)
+    _save_merged(state, baseline)
     return steps
 
 

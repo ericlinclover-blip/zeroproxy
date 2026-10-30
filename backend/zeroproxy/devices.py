@@ -131,7 +131,11 @@ def pair_code_live(state: dict, code: str) -> dict | None:
     for entry in _bucket(state)["pair_codes"]:
         if not isinstance(entry, dict):
             continue
-        if hmac.compare_digest(str(entry.get("code") or ""), code):
+        # 字节比较: 非 ASCII 的 code (URL 路径里可控) 会让 compare_digest 抛 TypeError
+        if hmac.compare_digest(
+            str(entry.get("code") or "").encode("utf-8", "replace"),
+            str(code or "").encode("utf-8", "replace"),
+        ):
             if entry.get("used_at") or int(entry.get("expires_at") or 0) <= now:
                 return None
             return entry

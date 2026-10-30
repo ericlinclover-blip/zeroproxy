@@ -391,7 +391,12 @@ def _cmdline(pid: int) -> str:
 
 
 def _ppid(pid: int) -> int:
-    """读一个 pid 的父进程 ID。"""
+    """读一个 pid 的父进程 ID (读不到返回 0 = "不知道", 调用方据此放过)。
+
+    `/proc/<pid>/status` 只有 Linux 有; macOS / BSD 上要退回 `ps`。以前没有这条
+    回退, 非 Linux 环境的 `_ppid` 恒为 0, 于是 `_reap_stale` 永远认不出孤儿进程
+    —— 面板崩溃后残留的 hysteria 会一直占着 UDP 端口, 新的起不来。
+    """
     try:
         with open(f"/proc/{pid}/status", "r") as fh:
             for line in fh:
@@ -399,7 +404,14 @@ def _ppid(pid: int) -> int:
                     return int(line.split()[1])
     except (OSError, ValueError, IndexError):
         pass
-    return 0
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "ppid=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        return int(out.stdout.strip() or 0)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 0
 
 
 def _reap_stale() -> None:
@@ -491,10 +503,21 @@ def _stop(key: str) -> None:
 
 
 def running(key: str) -> bool:
-    """这个 key 的进程现在是不是活着 (面板据此显示状态)。"""
+    """这个 key 的进程现在是不是活着 (面板据此显示状态)。
+
+    面板内存里没有它, 不代表它没在跑: apply 由 upgrade.sh 拉起时是**另一个进程**,
+    由它起的内层 QUIC 只会留下 pid 文件 (见 _already_running_elsewhere)。以前这里
+    只看 `_PROCS`, 于是升级完的那一刻「一键诊断」会把一条其实健康的链报成
+    "未运行", 用户点了「一键修复」又去抢同一个 UDP 端口。这里补上 pid 文件的认领。
+    """
     with _LOCK:
         item = _PROCS.get(key)
-    return bool(item and item[0].poll() is None)
+    if item is not None:
+        return item[0].poll() is None
+    pid, fingerprint = _read_pid(key)
+    if pid <= 1:
+        return False
+    return _already_running_elsewhere(key, fingerprint)
 
 
 def desired(state: dict) -> list[dict]:

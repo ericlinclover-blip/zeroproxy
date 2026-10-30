@@ -230,11 +230,14 @@ def _session_of(state: dict, request: Request) -> str | None:
     token = request.cookies.get(SESSION_COOKIE)
     if not token:
         return None
-    session = state.get("sessions", {}).get(token)
-    if not session:
+    sessions = state.get("sessions")
+    if not isinstance(sessions, dict):   # state.json 被改坏时不让它变成每请求 500
         return None
-    if session.get("expires", 0) < time.time():
-        state["sessions"].pop(token, None)
+    session = sessions.get(token)
+    if not isinstance(session, dict):
+        return None
+    if float(session.get("expires") or 0) < time.time():
+        sessions.pop(token, None)
         return None
     return token
 
@@ -611,7 +614,9 @@ def setup(payload: SetupIn, request: Request):
             reality = current["reality"]
             if not crypto.reality_key_valid(reality["private_key"], reality["public_key"]):
                 reality["private_key"], reality["public_key"], reality["short_id"] = crypto.new_reality_keys()
-            current["uuid"] = crypto.derive_uuid(username, password)
+            # 随机 UUID: 与管理员口令**无关** (口令不能进任何会发给客户端的字段,
+            # 以前这里是 derive_uuid(username, password) —— UUID 会随每条订阅链接外发)
+            current["uuid"] = current["uuid"] or crypto.new_vless_uuid()
             current["subscription_token"] = current["subscription_token"] or crypto.new_token()
             current["admin"] = {"username": username, "password_hash": crypto.hash_password(password)}
             return True, "UUID / Reality 密钥对 / 订阅令牌 就绪"
@@ -809,13 +814,28 @@ def logout_all(request: Request):
 # ---------------------------------------------------------------- 仪表盘
 
 def _port_for(state: dict, node_id: str) -> int:
-    """节点对外端口: vless-ws 固定走 nginx 443, 其余取配置端口。"""
+    """节点对外端口: vless-ws 固定走 nginx 443, 其余取配置端口。
+
+    取不到就返回 0 而不是抛 KeyError: 这个函数给仪表盘画卡片用, 一个未知的
+    节点 id (前端缓存了旧 id / state.json 被外部改坏) 不该让整个
+    `/api/dashboard` 变成 500 —— 面板上少一个端口号, 胜过整页打不开。
+    """
     entry = share_links.chain_entry_of(state, node_id)
     if entry is not None:
-        return int(entry.get("local_port") or 0)
+        try:
+            return int(entry.get("local_port") or 0)
+        except (TypeError, ValueError):
+            return 0
     if node_id == "vless-ws":
         return 443
-    return state["ports"][NODE_BY_ID[node_id]["port_key"]]
+    meta = NODE_BY_ID.get(node_id)
+    ports = state.get("ports") or {}
+    if not isinstance(meta, dict):
+        return 0
+    try:
+        return int(ports.get(meta.get("port_key") or "", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _node_view(state: dict, traffic: dict | None) -> dict:
@@ -1050,7 +1070,10 @@ def _dash_fingerprint(state: dict) -> str:
 
     chain_cfg = state.get("chain") or {}
     entries = chain_cfg.get("entries") or []
-    chain_states = [f"{e['id']}:{bool(e.get('enabled', True))}" for e in entries]
+    chain_states = [
+        f"{e.get('id', '?')}:{bool(e.get('enabled', True))}"
+        for e in entries if isinstance(e, dict)
+    ]
 
     exit_cfg = chain_cfg.get("exit") or {}
     exit_state = f"exit:{exit_cfg.get('uuid', '')}:{bool(exit_cfg.get('enabled', True))}"
@@ -2567,6 +2590,17 @@ def restore(request: Request, raw: bytes = Depends(_raw_request_body)):
     for key in ("admin", "reality", "cert", "nodes", "ports", "chain"):
         if key in data and not isinstance(data[key], dict):
             return _err(f"备份结构不合法: {key} 应为对象")
+    # `chain` 是对象不代表它的成员是对象: entries 里混进一个字符串/空 dict, 落盘之后
+    # 仪表盘 (_dash_fingerprint 取 e['id']) 与诊断都会 500, 而那时配置已经写过盘了。
+    entries = ((data.get("chain") or {}).get("entries"))
+    if entries is not None:
+        if not isinstance(entries, list):
+            return _err("备份结构不合法: chain.entries 应为列表")
+        for index, entry in enumerate(entries):
+            if not isinstance(entry, dict) or not str(entry.get("id") or "").strip():
+                return _err(f"备份结构不合法: chain.entries[{index}] 缺少 id")
+            if not isinstance(entry.get("local_port", 0), int):
+                return _err(f"备份结构不合法: chain.entries[{index}].local_port 不是整数")
 
     expected = payload.get("checksum", "")
     candidate = copy.deepcopy(data)
@@ -2622,6 +2656,22 @@ def restore(request: Request, raw: bytes = Depends(_raw_request_body)):
             save_state(original)
         return _err(
             f"恢复后重新应用配置失败 ({type(exc).__name__}: {exc}), 已回滚到恢复前状态", 500
+        )
+    # apply.reapply 内部用 add_step 把每一步的异常都吞成了"这一步 ok=False", 它自己
+    # **不会抛** —— 所以上面那个 except 实际上抓不到"配置生成失败", 回滚从来没触发过。
+    # 这里按步骤结果补上: 生成/校验类步骤失败 = 这份备份的配置在这台机器上起不来,
+    # 必须回滚; "重载服务 / 验证端口"失败只如实报红 (与「重新应用」的语义一致, 免得
+    # 一次端口抖动就把用户的恢复操作撤销掉)。
+    hard = [
+        step for step in apply.failures(steps)
+        if step.get("abort") or step.get("name") in apply.STEP_NAMES[:5]
+    ]
+    if hard:
+        detail = "; ".join(f"{s['name']}: {s['detail']}" for s in hard)[:400]
+        with config.locked():
+            save_state(original)
+        return _err(
+            f"恢复后的配置校验未通过 ({detail}), 已回滚到恢复前状态", 500
         )
 
     with config.locked():
@@ -3212,8 +3262,11 @@ def geodata_force_check(request: Request):
 @router.get("/sub/{token}")
 def subscribe(token: str, request: Request, format: str = "base64", rules: str = ""):
     state = load_state()
+    # 先按字节比: hmac.compare_digest 对**非 ASCII 的 str** 会抛 TypeError
+    # (`/sub/中文` 就是一个 500)。encode 之后长度不同也不会漏出异常。
     if not state["configured"] or not hmac.compare_digest(
-        token, state.get("subscription_token", "")
+        token.encode("utf-8", "replace"),
+        str(state.get("subscription_token") or "").encode("utf-8", "replace"),
     ):
         return _err("无效订阅", 404)
     # rules 参数可对单个客户端覆盖分流模板 (?rules=smart|global|direct)
@@ -3346,9 +3399,21 @@ def _wg_text_response(text: str, filename: str, inline: bool = False) -> Respons
 
 
 def _wg_reply(state: dict, request: Request, steps: list[dict]) -> dict:
-    state["steps"] = steps
-    save_state(state)
-    body = _dashboard_body(state, request)
+    """回执 + 落盘。**只并回真正改过的东西**, 不整份覆盖。
+
+    `state` 可能是几秒前的快照: 调用方在锁外跑过 `systemctl`/`wg syncconf`, 有的分支
+    后面还跟一次 `ufw`(最长 25 秒)。这段时间里登录会话、设备心跳、配对码都在正常写
+    state.json —— 直接 `save_state(state)` 会把它们**静默覆盖**掉。所以这里重新读一份
+    最新的, 只把"步骤记录"与 WireGuard 段盖上去。
+    """
+    with config.locked():
+        fresh = load_state()
+        fresh["steps"] = steps
+        wireguard_state = state.get("wireguard")
+        if isinstance(wireguard_state, dict):
+            fresh["wireguard"] = wireguard_state
+        save_state(fresh)
+    body = _dashboard_body(fresh, request)
     body["steps"] = steps
     return body
 
@@ -3570,7 +3635,9 @@ def wireguard_peer_update(peer_id: str, payload: WireGuardPeerPatch, request: Re
             return _err("客户端不存在", 404)
         changed: list[str] = []
         if payload.name is not None:
-            name = str(payload.name).strip()[:40] or "设备"
+            # 必须走 clean_name: 名字会进 wg0.conf 的注释行, 换行 = 注入一行配置
+            # ([Interface] 段里的 PostUp 由 wg-quick 以 root 执行)
+            name = wireguard.clean_name(payload.name, "设备")
             if name != peer.get("name"):
                 peer["name"] = name
                 changed.append(f"name={name}")

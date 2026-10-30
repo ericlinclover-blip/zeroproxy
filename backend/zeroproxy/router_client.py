@@ -962,6 +962,14 @@ def fetch_geo(
                         continue
                     size = 0
                     started = time.time()
+                    # 声明了长度就必须收满: 中途断流留下的"半个 geosite.dat"体积仍可能
+                    # 过 minimum 闸门 (真实 4 MB, 闸门 2 MB), 一旦落盘就会被当成新鲜
+                    # 缓存用满 GEO_TTL(7 天) —— 而 mihomo 读不了数据文件是**整份配置
+                    # 起不来**, 不是跳过规则。
+                    try:
+                        expect_len = int(resp.headers.get("content-length") or 0)
+                    except (TypeError, ValueError):
+                        expect_len = 0
                     with open(tmp, "wb") as fh:
                         while True:
                             if time.time() > deadline:
@@ -986,6 +994,9 @@ def fetch_geo(
                                     )
                 if size < minimum:
                     errors.append(f"{source} 体积异常 ({size} 字节)")
+                    continue
+                if expect_len and size != expect_len:
+                    errors.append(f"{source} 传输不完整 ({size}/{expect_len} 字节)")
                     continue
                 os.replace(tmp, dst)
                 return True, f"已下载 {size // 1024} KB", dst
@@ -1403,6 +1414,17 @@ def perf_file(arch: str) -> str:
     return os.path.join(perf_dir(), f"dae-{arch}-{PERF_VERSION}.gz")
 
 
+def _perf_candidates(names: list[str], arch: str) -> list[str]:
+    """手工兜底文件的候选: 架构必须**整段**命中。
+
+    以前是子串判断 (`arch in name`), 于是请求 `mips` 会命中 `dae-mipsle-v2.1.1.gz` ——
+    `perf_ready` 因此永远为真, `ensure_perf_async` 再也不会去下正确的那一份, 路由器
+    拿到的是小端二进制, 执行时报 Illegal instruction (本文件 ARCHES 的注释正是讲这个)。
+    """
+    pattern = re.compile(rf"^dae-{re.escape(arch)}-[^/]+\.gz$")
+    return [name for name in sorted(names) if pattern.match(name)]
+
+
 def perf_ready(arch: str) -> bool:
     """缓存里有没有一份能用的 dae (.gz)。
 
@@ -1419,9 +1441,7 @@ def perf_ready(arch: str) -> bool:
         names = os.listdir(perf_dir())
     except OSError:
         return False
-    for name in names:
-        if not name.endswith(".gz") or "dae" not in name or arch not in name:
-            continue
+    for name in _perf_candidates(names, arch):
         try:
             if os.path.getsize(os.path.join(perf_dir(), name)) >= (PERF_MIN_BYTES // 4):
                 return True
@@ -1439,9 +1459,8 @@ def perf_cached_file(arch: str) -> str:
         names = sorted(os.listdir(perf_dir()))
     except OSError:
         return path
-    for name in names:
-        if name.endswith(".gz") and "dae" in name and arch in name:
-            return os.path.join(perf_dir(), name)
+    for name in _perf_candidates(names, arch):
+        return os.path.join(perf_dir(), name)
     return path
 
 
@@ -1569,14 +1588,26 @@ def fetch_perf(arch: str, *, deadline: float | None = None) -> tuple[bool, str, 
         if not ok:
             return False, detail, ""
         # 重新压成 .gz: 路由器上只有 busybox, gzip 一定有而 xz 不保证。
+        # 落盘必须是 tmp + rename: 直接写 dst 时, 中断/ENOSPC 留下的半个 .gz 体积
+        # 仍高于 perf_ready 的门槛 (PERF_MIN_BYTES//4 = 1.5 MB, 真实约 8 MB),
+        # 于是它被当成"已缓存", fetch_perf 永远返回"已缓存", 路由器再也拿不到好内核。
         import gzip
 
-        with open(bin_path, "rb") as src, gzip.open(dst, "wb") as out:
-            while True:
-                chunk = src.read(1 << 20)
-                if not chunk:
-                    break
-                out.write(chunk)
+        part = dst + ".part"
+        try:
+            with open(bin_path, "rb") as src, gzip.open(part, "wb") as out:
+                while True:
+                    chunk = src.read(1 << 20)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+            os.replace(part, dst)
+        finally:
+            if os.path.exists(part):
+                try:
+                    os.remove(part)
+                except OSError:
+                    pass
         return True, f"已就绪 ({detail})", dst
     finally:
         for leftover in (tar_path, bin_path):

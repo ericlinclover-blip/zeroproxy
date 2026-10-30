@@ -17,8 +17,24 @@ import uuid as _uuid
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 
 
+def new_vless_uuid() -> str:
+    """生成 VLESS UUID —— **随机**、与管理员口令无关。
+
+    以前这里是 `derive_uuid(username, password)`(对"用户名:口令"做单轮 SHA-256):
+    UUID 会随每一条 vless:// 订阅链接发到**每个客户端**手上, 而它是口令的单轮快速
+    哈希 —— 任何拿到订阅的人都能按 SHA-256 速率离线爆破, PBKDF2 那 12 万次迭代
+    等于白做 (口令下限还只有 6 位)。随机 UUID 照样持久化在 state.json 里,
+    "重新生成配置时不变"这个诉求完全不受影响。
+    """
+    return str(_uuid.uuid4())
+
+
 def derive_uuid(username: str, password: str) -> str:
-    """确定性派生 VLESS UUID (16 bytes, UUID 格式)。"""
+    """[已废弃] 由口令确定性派生 UUID —— **不要再用**。
+
+    保留函数只是为了老的单元测试/外部脚本还能 import; 面板初始化已经改用
+    `new_vless_uuid()`。新代码若再调用它, 等于把管理员口令的快速哈希重新发出去。
+    """
     digest = hashlib.sha256(f"zeroproxy:vless:{username}:{password}".encode()).digest()
     return str(_uuid.UUID(bytes=digest[:16]))
 
@@ -77,19 +93,57 @@ def new_token(nbytes: int = 24) -> str:
     return secrets.token_urlsafe(nbytes)
 
 
-def hash_password(password: str, salt: bytes | None = None) -> str:
+#: 口令哈希的当前参数 (PBKDF2-SHA256 迭代次数)。存储格式里**记录**了它, 所以以后
+#: 调高时老哈希仍能验证 (按它自己那份参数), 不会把所有存量用户锁在门外。
+PBKDF2_ITERATIONS = 120_000
+PBKDF2_DIGEST = "sha256"
+
+
+def hash_password(password: str, salt: bytes | None = None, iterations: int | None = None) -> str:
+    """口令哈希, 格式 `pbkdf2$<iters>$<salt_hex>$<digest_hex>` (老格式 3 段也认)。
+
+    为什么要把迭代次数写进串里: 以前是 `pbkdf2$<salt>$<digest>`, verify 永远用当前
+    硬编码的 120000 重算 —— 一旦有人把次数调高或换算法, **所有存量口令立刻验证失败**,
+    面板登录全挂 (只能靠 `z passwd` 绕过口令重置)。参数随哈希走才是可持续的写法。
+    """
+    rounds = int(iterations or PBKDF2_ITERATIONS)
     if salt is None:
         salt = secrets.token_bytes(16)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 120_000)
-    return f"pbkdf2${salt.hex()}${digest.hex()}"
+    digest = hashlib.pbkdf2_hmac(PBKDF2_DIGEST, password.encode(), salt, rounds)
+    return f"pbkdf2${rounds}${salt.hex()}${digest.hex()}"
+
+
+def password_needs_rehash(stored: str) -> bool:
+    """这条哈希是不是用更弱的参数算的 (登录成功后可以顺手重算)。"""
+    parts = str(stored or "").split("$")
+    if len(parts) < 3 or parts[0] != "pbkdf2":
+        return True
+    if len(parts) == 3:            # 老格式: 没有迭代次数
+        return True
+    try:
+        return int(parts[1]) < PBKDF2_ITERATIONS
+    except ValueError:
+        return True
 
 
 def verify_password(password: str, stored: str) -> bool:
-    parts = stored.split("$")
-    if len(parts) != 3 or parts[0] != "pbkdf2":
+    parts = str(stored or "").split("$")
+    if len(parts) == 4 and parts[0] == "pbkdf2":
+        try:
+            rounds = int(parts[1])
+        except ValueError:
+            return False
+        salt_hex, digest_hex = parts[2], parts[3]
+    elif len(parts) == 3 and parts[0] == "pbkdf2":
+        rounds, salt_hex, digest_hex = PBKDF2_ITERATIONS, parts[1], parts[2]
+    else:
         return False
     try:
-        salt = bytes.fromhex(parts[1])
+        salt = bytes.fromhex(salt_hex)
+        expected = bytes.fromhex(digest_hex)
     except ValueError:
         return False
-    return hmac.compare_digest(hash_password(password, salt), stored)
+    # 比的是**摘要本身**, 不是整串: 整串比对会让老格式 (3 段) 永远失败, 因为
+    # hash_password 现在输出 4 段 —— 那正好是"以后改参数就把所有人锁在外面"的同一个坑。
+    actual = hashlib.pbkdf2_hmac(PBKDF2_DIGEST, password.encode(), salt, rounds)
+    return hmac.compare_digest(actual, expected)

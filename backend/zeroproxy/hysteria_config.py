@@ -15,6 +15,7 @@ import re
 
 import yaml
 
+from . import config
 from .config import paths
 
 #: `listen` 的合法形态: `[地址]:端口[,端口...]` (端口跳跃是逗号分隔的多端口)。
@@ -146,7 +147,7 @@ def validate(config_text: str) -> list[str]:
 
 
 def write_hysteria_config(state: dict) -> None:
+    """原子落盘 Hysteria 2 配置 (写一半的 YAML 会让 hysteria2 起不来)。"""
     p = paths()
     os.makedirs(p["hysteria_dir"], exist_ok=True)
-    with open(p["hysteria_config"], "w", encoding="utf-8") as fh:
-        fh.write(build_hysteria_config(state))
+    config.atomic_write_text(p["hysteria_config"], build_hysteria_config(state), mode=0o600)

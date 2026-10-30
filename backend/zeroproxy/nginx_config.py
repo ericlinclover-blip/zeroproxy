@@ -354,14 +354,12 @@ def write_setup_nginx_conf(
     p = paths()
     conf = build_setup_nginx_conf(state, hosts)
     os.makedirs(p["nginx_dir"], exist_ok=True)
-    with open(p["nginx_home"], "w", encoding="utf-8") as fh:
-        fh.write(conf)
+    config.atomic_write_text(p["nginx_home"], conf, mode=0o644)
     if not services.is_prod():
         return False, p["nginx_home"]
     try:
         os.makedirs(os.path.dirname(p["nginx_etc"]), exist_ok=True)
-        with open(p["nginx_etc"], "w", encoding="utf-8") as fh:
-            fh.write(conf)
+        config.atomic_write_text(p["nginx_etc"], conf, mode=0o644)
         return True, p["nginx_etc"]
     except (PermissionError, OSError):
         return False, p["nginx_home"]
@@ -385,18 +383,18 @@ def write_nginx_conf(state: dict) -> tuple[bool, str]:
     p = paths()
     conf = build_nginx_conf(state)
     os.makedirs(p["nginx_dir"], exist_ok=True)
-    with open(p["nginx_home"], "w", encoding="utf-8") as fh:
-        fh.write(conf)
+    # 原子写: nginx -t / reload 可能正撞上写入, 半个配置会让这次 reload 失败
+    config.atomic_write_text(p["nginx_home"], conf, mode=0o644)
     # 伪造主页 (443 非代理路径返回, 技术文档 §3.3 模块四)
     os.makedirs(p["www"], exist_ok=True)
-    with open(os.path.join(p["www"], "index.html"), "w", encoding="utf-8") as fh:
-        fh.write(build_fake_index(state))
+    config.atomic_write_text(
+        os.path.join(p["www"], "index.html"), build_fake_index(state), mode=0o644
+    )
     if not services.is_prod():
         return False, p["nginx_home"]
     try:
         os.makedirs(os.path.dirname(p["nginx_etc"]), exist_ok=True)
-        with open(p["nginx_etc"], "w", encoding="utf-8") as fh:
-            fh.write(conf)
+        config.atomic_write_text(p["nginx_etc"], conf, mode=0o644)
         return True, p["nginx_etc"]
     except (PermissionError, OSError):
         return False, p["nginx_home"]

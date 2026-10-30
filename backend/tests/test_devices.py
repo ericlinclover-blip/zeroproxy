@@ -758,7 +758,10 @@ def test_dae_config_speaks_daes_language_and_skips_what_it_cannot_dial(client, c
     # geo=0 是降级: 引用分流数据的规则**整条去掉** (dae 读不到数据文件是起不来, 不是跳过规则)
     degraded = client.get(f"{base}&geo=0").text
     assert "geosite:" not in degraded and "geoip:cn" not in degraded
-    assert "geoip:private" in degraded, "私有地址那条不依赖数据文件, 要留着"
+    # 降级分支里**不能**出现 geoip: —— dae 读不到 geoip.dat 时整份配置校验失败,
+    # 而 geo=0 存在的唯一场景就是"面板还没准备好数据文件"。私有地址改用显式 CIDR。
+    assert "geoip:" not in degraded, "降级分支不能引用需要数据文件的规则"
+    assert "192.168.0.0/16" in degraded, "私有地址要靠显式 CIDR 兜住"
 
     # 设备专属配置: 凭据不对就是 403
     assert client.get("/c/perf/config?id=x&k=y").status_code == 403
