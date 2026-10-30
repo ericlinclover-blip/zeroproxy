@@ -4240,7 +4240,7 @@ def test_clash_reality_and_chain_flow_and_opts(configured):
     assert "tcpFastOpen" not in chain_in["streamSettings"]["sockopt"]
     vr_in = next(i for i in cfg["inbounds"] if i["tag"] == "vless-reality")
     assert "tcpFastOpen" not in vr_in["streamSettings"]["sockopt"]
-    assert vr_in["streamSettings"]["realitySettings"]["minClientVer"] == ""
+    assert vr_in["streamSettings"]["realitySettings"]["minClientVer"] == "0.0.0"
 
     # 出站必须带嗅探对齐与出站 sockopt (TFO 仅保留在出站)
     chain_out = next(o for o in cfg["outbounds"] if o["tag"] == f"chain-out-{entry['id']}")

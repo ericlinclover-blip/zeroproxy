@@ -5743,7 +5743,7 @@ PublicKey = ...
 - **公网入站彻底禁用 tcpFastOpen**: 拆分入站与出站 `sockopt`，公网监听入站仅保留 `tcpNoDelay` 与 `tcpKeepAliveInterval`，彻底杜绝中国大陆运营商及 GFW 对公网 SYN+TFO 报文丢弃导致的 VLESS Reality (8443) 与链式中转 (8446) 握手超时卡死。
 - **出站保留 tcpFastOpen 提速**: 跨 VPS 数据中心出站链路 (香港中转→美国落地) 保持 TFO 握手减免 1 RTT。
 - **链式代理全链路纯净流控对齐**: 落地端专用入站 (`chain-exit`)、中转端出站 (`chain-entry-outbound`) 与中转端入站 (`chain-entry`) 双端统一收敛至 `flow: ""`，并补全入站 `sniffing` 嗅探，彻底杜绝中转端二级代理与落地端之间的 Vision splice 冲突。
-- **REALITY 客户端版本与短 ID 容错**: 服务端 `realitySettings` 显式注入 `minClientVer: ""` 与宽松 `shortIds` 容错，严防 Xray 新内核将未显式声明版本或短 ID 的客户端误判为探测扫描而静默丢弃。
+- **REALITY 客户端版本与短 ID 容错**: 服务端 `realitySettings` 显式注入 `minClientVer: "0.0.0"` 与宽松 `shortIds` 容错，严防 Xray 新内核 (26.x) 将未显式声明高版本的 Shadowrocket / 移动端客户端误判并静默回落到伪装站。
 - **Clash 密钥协商与客户端兼容性加固**: 客户端 Reality 配置回归标准 X25519 密钥交换，消除 post-quantum MLKEM768 在主流客户端/核心上的握手拒绝问题。
 - **服务重载时自动放行 UFW 端口**: 落地配置与服务重载时，自动对齐并放行所有活跃监听端口，防止系统级防火墙静默拦截。
 
@@ -6011,3 +6011,11 @@ PublicKey = ...
   - 部署架构特性：面板内升级由启动前暂存的旧脚本负责拉取与替换新代码。因 v2.12.23 升至 v2.12.24 阶段执行的仍是 v2.12.23 的旧脚本进程，现升级至 v2.12.25 可直接由已安装就位的 v2.12.24 全新修复脚本执行，完整闭环内核升级。
 - **发布清单**:
   - 重新生成 `SHA256SUMS` 清单。
+
+
+### 8.121 v2.12.26: 修复 Xray 26+ Reality 客户端版本门禁导致节点无法出网
+- **修复 Reality 节点静默回落与外网无法连接故障**:
+  - **根本成因**: Xray-core 26.x (如 26.7.11 ~ 26.10.29+) 强化了 REALITY 握手版本门禁逻辑。若服务端 `realitySettings` 中 `minClientVer` 留空 `""`，服务端将默认按自身高版本 (>= 26.10.29) 强制判定；Shadowrocket 或未上报新版特征的移动端客户端在握手阶段被判定为不匹配，连接被静默回落 (fallback) 至 `dest` 伪装站点。因此在客户端测速时能收到伪装目标返回的 TLS 延迟响应 (如 195ms)，但传输真实代理流量时被伪装站掐断重置，表现为节点外网无法访问、国内走直连规则正常。
+  - **解决方案**: 在服务端 `xray_config._reality_settings` 中显式指定 `"minClientVer": "0.0.0"`，彻底禁用高版本强校验门禁，允许 Shadowrocket 及各客户端平滑完成 REALITY 握手与外网代理。
+- **发布清单与测试回归**:
+  - 同步更新测试用例断言与发布完整性校验清单 `SHA256SUMS`。

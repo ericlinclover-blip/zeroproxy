@@ -59,7 +59,13 @@ def _reality_settings(state: dict) -> dict:
         "dest": r["dest"],
         "serverNames": [r["server_name"]],
         "privateKey": r["private_key"],
-        "minClientVer": "",
+        # minClientVer 必须显式声明 "0.0.0" 而不能留空 "":
+        # Xray-core 26.x (如 26.7.11 ~ 26.10.29+) 引入了严格的客户端版本门禁校验;
+        # 若留空 "", 服务端默认会要求客户端内核版本 >= 服务端版本 (>= 26.10.29)。
+        # Shadowrocket / 部分移动端客户端因未上报该高版本，会被判定为不匹配而静默
+        # 回落 (fallback) 到 dest 伪装目标 —— 表现为延迟测试有数据 (伪装站响应 TLS),
+        # 但实际代理流量被伪装站掐断无法上网。显式设为 "0.0.0" 彻底放开客户端版本校验。
+        "minClientVer": "0.0.0",
         "shortIds": sids,
     }
 
