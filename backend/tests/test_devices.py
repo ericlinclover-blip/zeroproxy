@@ -2068,7 +2068,7 @@ def test_one_click_update_is_wired_everywhere():
     page, _m, _n = router_client.ui_file("index.html")
     assert 'id="update"' in page and "更新客户端" in page
     js, _m2, _n2 = router_client.ui_file("app.js")
-    assert "$('update').onclick" in js and "call('update')" in js
+    assert "$('update').onclick" in js and "call('update', {})" in js
     serve = open(os.path.join(os.path.dirname(os.path.abspath(router_client.__file__)),
                               "client", "agent", "serve.go"), encoding="utf-8").read()
     assert '"update"' in serve and '"update-log"' in serve

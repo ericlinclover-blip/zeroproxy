@@ -98,6 +98,11 @@ function makeMock() {
         res.end(fs.readFileSync(path.join(LUCi_DIR, "index.html"))); return;
       }
       if (!authed) return json(res, { ok: false, error: "未登录 LuCI" });
+      const mutating = ["add", "drop", "toggle", "refresh", "update", "perf-on", "perf-off"].includes(action);
+      if (mutating && req.method !== "POST") {
+        res.writeHead(405, { "Content-Type": "application/json; charset=utf-8" });
+        return res.end(JSON.stringify({ ok: false, error: "这个操作必须使用 POST" }));
+      }
       let body = "";
       req.on("data", (c) => (body += c));
       req.on("end", () => {

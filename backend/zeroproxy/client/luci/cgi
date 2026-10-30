@@ -129,6 +129,18 @@ if [ -z "$action" ]; then
     action="$(printf '%s' "${REQUEST_URI:-}" | sed -e 's/[?].*$//' -e 's#/*$##' -e 's#.*/##')"
 fi
 
+case "$action" in
+    status|log|update-log) ;;
+    *)
+        if [ "${REQUEST_METHOD:-GET}" != "POST" ]; then
+            printf 'Status: 405 Method Not Allowed\r\n'
+            header
+            printf '{"ok":false,"error":"这个操作必须使用 POST"}\n'
+            exit 0
+        fi
+        ;;
+esac
+
 run_cli() {
     if [ -x "$CLI" ]; then
         out="$("$CLI" "$@" 2>&1)"

@@ -15,6 +15,7 @@ import contextlib
 import copy
 import json
 import os
+import tempfile
 import threading
 import time
 
@@ -425,12 +426,19 @@ def save_state(state: dict) -> None:
         state["version"] = STATE_VERSION
         state["updated_at"] = int(time.time())
         path = paths()["state"]
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(state, fh, ensure_ascii=False, indent=2)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
+        fd, tmp = tempfile.mkstemp(
+            prefix=".state.", suffix=".tmp", dir=os.path.dirname(path)
+        )
+        try:
+            # mkstemp 从创建瞬间就是 0600，避免 rename 后再 chmod 的可见窗口。
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(state, fh, ensure_ascii=False, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(tmp)
         try:
             os.chmod(path, 0o600)
         except OSError:

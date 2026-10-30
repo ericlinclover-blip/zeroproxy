@@ -108,19 +108,20 @@ def ensure_exit_cert(state: dict) -> tuple[bool, str]:
     return ok, detail
 
 
-def _cert_hash(state: dict) -> str:
-    """读落地端自签证书的 SHA256 指纹, 用于 QUIC 客户端 TLS 校验 (F04)。
+def cert_sha256() -> str:
+    """落地端自签证书 DER 的 SHA-256 指纹, 用于 Hysteria 2 证书固定。
 
-    如果证书文件不存在或读取出错, 退回 `insecure: true` 避免阻断流量。
+    读不出来时返回空串; 新配对码不会在没有指纹的情况下把 QUIC 条目落地。
     """
     try:
-        import hashlib as _hashlib
         from cryptography import x509
+        from cryptography.hazmat.primitives.serialization import Encoding
+
         with open(paths()["chain_quic_cert"], "rb") as fh:
             cert = x509.load_pem_x509_certificate(fh.read())
-        return _hashlib.sha256(cert.public_bytes(encoding=x509.Encoding.DER)).hexdigest()
+        return hashlib.sha256(cert.public_bytes(encoding=Encoding.DER)).hexdigest()
     except Exception:  # noqa: BLE001
-        return ""  # 空串 → caller 用 insecure 兜底
+        return ""
 
 
 def _cert_paths() -> tuple[str, str]:
@@ -176,7 +177,8 @@ def server_config(state: dict) -> str:
 def client_config(entry: dict, state: dict | None = None) -> str:
     """入口端的本地 hysteria 客户端 (SOCKS5 只监听 127.0.0.1, 给 Xray 当出站用)。
 
-    F04 修复: 原 `insecure: true` 改为落地端证书的 SHA256 指纹校验。
+    Hysteria 2 用 `insecure: true` + `pinSHA256` 固定对端证书。`state` 保留在签名里
+    兼容旧调用方, 证书身份必须来自配对码并保存在 entry 上, 不能读入口端自己的证书。
     """
     lines: list[str] = [
         "# 由 ZeroProxy 面板自动生成 — 链式代理的内层 QUIC 客户端",
@@ -186,12 +188,12 @@ def client_config(entry: dict, state: dict | None = None) -> str:
         "tls:",
         f"  sni: {entry.get('hy_sni') or ''}",
     ]
-    # F04: 用落地端自签证书 SHA256 替代 insecure=true
-    if state is not None:
-        cert_hash = _cert_hash(state)
-        lines.append(f'  cert: {{"sha256_cert": "{cert_hash}"}}')
-    else:
-        lines.append('  insecure: true')  # fallback for callers without state
+    lines.append("  insecure: true")
+    # 新版配对码携带落地端证书指纹。旧条目没有指纹时只能保持原行为; 新 QUIC
+    # 条目在 API 层会拒绝这种旧配对码, 避免继续新增无身份校验的连接。
+    pin = str(entry.get("hy_cert_sha256") or "")
+    if pin:
+        lines.append(f'  pinSHA256: "{pin}"')
     lines.extend([
         "socks5:",
         f"  listen: 127.0.0.1:{int(entry.get('hy_socks_port') or 0)}",

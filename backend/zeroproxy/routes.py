@@ -1405,6 +1405,11 @@ def chain_entry_add(payload: ChainEntryIn, request: Request):
                     "这份配对码里没有 QUIC 凭据 (落地端还没开「内层 QUIC」); "
                     "请让落地端打开后再复制一次配对码, 或者这次先用 Reality 内层"
                 )
+            if not target.get("hy_cert_sha256"):
+                return _err(
+                    "这份配对码来自旧版落地端, 没有 QUIC 证书指纹; "
+                    "请先升级落地端, 再重新生成配对码"
+                )
             if not chain_quic.binary():
                 return _err("本机没有 hysteria 二进制, 用不了 QUIC 内层 (重跑 install.sh 可装上)")
         target["transport"] = transport
@@ -1480,6 +1485,7 @@ def chain_entry_add(payload: ChainEntryIn, request: Request):
             "hy_port": int(target.get("hy_port") or 0),
             "hy_pw": target.get("hy_pw") or "",
             "hy_sni": target.get("hy_sni") or "",
+            "hy_cert_sha256": target.get("hy_cert_sha256") or "",
             "hy_socks_port": int(hy_socks_port or 0),
             "hy_bw": 0,
             "local_port": local_port,
@@ -1595,6 +1601,11 @@ def chain_entry_update(entry_id: str, payload: ChainEntryPatch, request: Request
                         return _err(
                             "这条链的配对码里没有 QUIC 凭据 (落地端当时没开内层 QUIC); "
                             "请让落地端打开后用新配对码重新接一次"
+                        )
+                    if not entry.get("hy_cert_sha256"):
+                        return _err(
+                            "这条链来自旧版 QUIC 配对码, 缺少证书指纹; "
+                            "请让落地端升级并重新生成配对码后再接一次"
                         )
                     if not chain_quic.binary():
                         return _err("本机没有 hysteria 二进制, 用不了 QUIC 内层")

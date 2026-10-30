@@ -159,12 +159,15 @@ def make_code(
     hy_port: int | None = None,
     hy_password: str = "",
     hy_sni: str = "",
+    hy_cert_sha256: str = "",
 ) -> str:
     """把落地端的连接参数打包成一行配对码 (字段名压到 1 个字母, 码更短)。
 
     版本 1: 只有 Reality 内层 (老版本生成的码, 新版本照样认);
     版本 2: 落地端同时开了 QUIC (Hysteria 2) 内层 —— Reality 那组参数挪进 `r`,
     QUIC 那组放进 `y`; 入口端可以逐条选走哪一层。
+    版本 3: 在版本 2 基础上加入落地端证书 DER SHA-256 (`y.c`), 客户端据此固定
+    Hysteria 2 的对端证书。
     """
     reality = {
         "p": int(port),
@@ -174,13 +177,17 @@ def make_code(
         "f": flow,
     }
     if hy_port and hy_password:
+        version = 3 if hy_cert_sha256 else 2
+        hy = {"p": int(hy_port), "w": hy_password, "n": hy_sni or sni}
+        if hy_cert_sha256:
+            hy["c"] = hy_cert_sha256
         payload = {
-            "v": 2,
+            "v": version,
             "h": host,
             "n": sni,
             "l": label or "",
             "r": reality,
-            "y": {"p": int(hy_port), "w": hy_password, "n": hy_sni or sni},
+            "y": hy,
         }
     else:
         payload = {"v": 1, "h": host, "n": sni, "l": label or "", **reality}
@@ -214,13 +221,13 @@ def parse_code(text: str) -> dict:
     if not isinstance(payload, dict):
         raise CodeError("配对码内容损坏 (不是一份参数), 请重新复制")
     version = int(payload.get("v") or 0)
-    if version not in (1, 2):
+    if version not in (1, 2, 3):
         raise CodeError("配对码版本不认识 (可能来自更新版本的面板), 请升级本机程序后重试")
 
     host = str(payload.get("h") or "").strip()
     sni = str(payload.get("n") or "").strip().lower()
-    # v1: Reality 参数平铺在顶层; v2: 挪进 `r`, QUIC 参数在 `y`
-    reality = payload.get("r") if version == 2 else payload
+    # v1: Reality 参数平铺在顶层; v2/v3: 挪进 `r`, QUIC 参数在 `y`
+    reality = payload.get("r") if version in (2, 3) else payload
     if not isinstance(reality, dict):
         raise CodeError("配对码内容损坏 (缺少落地参数), 请重新复制")
     uid = str(reality.get("u") or "").strip().lower()
@@ -265,12 +272,14 @@ def parse_code(text: str) -> dict:
         "hy_port": 0,
         "hy_pw": "",
         "hy_sni": "",
+        "hy_cert_sha256": "",
     }
 
-    hy = payload.get("y") if version == 2 else None
+    hy = payload.get("y") if version in (2, 3) else None
     if isinstance(hy, dict) and hy:
         hy_pw = str(hy.get("w") or "")
         hy_sni = str(hy.get("n") or sni).strip().lower()
+        hy_cert_sha256 = str(hy.get("c") or "").strip().lower()
         try:
             hy_port = int(hy.get("p"))
         except (TypeError, ValueError):
@@ -282,7 +291,16 @@ def parse_code(text: str) -> dict:
         # SNI 会原样写进客户端的 TLS 配置, 这里挡一下明显不合法的值
         if not _SNI_RE.match(hy_sni):
             raise CodeError(f"配对码里的 QUIC SNI 不合法: {hy_sni or '(空)'}")
-        target.update({"hy_port": hy_port, "hy_pw": hy_pw, "hy_sni": hy_sni})
+        if version == 3 and not re.fullmatch(r"[0-9a-f]{64}", hy_cert_sha256):
+            raise CodeError("配对码里的 QUIC 证书指纹不合法 (需要 64 位十六进制 SHA-256)")
+        target.update(
+            {
+                "hy_port": hy_port,
+                "hy_pw": hy_pw,
+                "hy_sni": hy_sni,
+                "hy_cert_sha256": hy_cert_sha256,
+            }
+        )
     return target
 
 
@@ -293,8 +311,15 @@ def exit_code(state: dict) -> str:
     if not uid or not exit_cfg.get("enabled"):
         return ""
     reality = state.get("reality") or {}
-    # 开了 QUIC 内层就把那组参数一并写进配对码 (v2): 入口端可以逐条选走哪一层
-    hy_on = bool(exit_cfg.get("hy_enabled")) and bool(exit_cfg.get("hy_password"))
+    # 开了 QUIC 内层就把那组参数一并写进 v3 配对码。证书读不出来时退回 v1,
+    # 不生成看似支持 QUIC、实际却无法固定对端身份的 v2 码。
+    hy_requested = bool(exit_cfg.get("hy_enabled")) and bool(exit_cfg.get("hy_password"))
+    hy_pin = ""
+    if hy_requested:
+        from . import chain_quic
+
+        hy_pin = chain_quic.cert_sha256()
+    hy_on = hy_requested and bool(hy_pin)
     return make_code(
         host=state.get("domain") or "",
         port=int(exit_cfg.get("port") or DEFAULT_EXIT_PORT),
@@ -307,6 +332,7 @@ def exit_code(state: dict) -> str:
         hy_port=int(exit_cfg.get("hy_port") or 0) if hy_on else None,
         hy_password=str(exit_cfg.get("hy_password") or "") if hy_on else "",
         hy_sni=str(exit_cfg.get("hy_sni") or "") if hy_on else "",
+        hy_cert_sha256=hy_pin,
     )
 
 
@@ -629,6 +655,7 @@ def as_target(entry: dict, state: dict | None = None) -> dict:
         "hy_port": int(entry.get("hy_port") or 0),
         "hy_pw": entry.get("hy_pw") or "",
         "hy_sni": entry.get("hy_sni") or "",
+        "hy_cert_sha256": entry.get("hy_cert_sha256") or "",
         "hy_socks_port": int(entry.get("hy_socks_port") or 0),
         "hy_bw": int(entry.get("hy_bw") or 0),
     }

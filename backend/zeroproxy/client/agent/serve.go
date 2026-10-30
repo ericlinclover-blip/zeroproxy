@@ -185,16 +185,16 @@ func luciSession(r *http.Request) bool {
 		if !ok || out == "" || strings.Contains(out, "Command failed") {
 			continue
 		}
-		// 解析 JSON, 验证返回的 session id 与请求一致 (F03 修复: 不只看文本, 还看退出码)
+		// 解析 JSON 并确认不是错误对象。OpenWrt 的有效响应通常是
+		// `{"values":{}}`, 不会把请求的 session id 再抄回来。
 		var resp map[string]any
 		if json.Unmarshal([]byte(out), &resp) != nil {
 			continue
 		}
-		if sessID, hasSession := resp["session"]; hasSession && sessID != nil {
-			if sessStr, isStr := sessID.(string); isStr && sessStr == sid {
-				return true
-			}
+		if _, hasErr := resp["error"]; hasErr {
+			continue
 		}
+		return true
 	}
 	return false
 }
@@ -234,6 +234,11 @@ func serveStatic(w http.ResponseWriter, cfg serveConfig, name string) {
 }
 
 func handleAction(w http.ResponseWriter, r *http.Request, cfg serveConfig, action string) {
+	readOnly := action == "status" || action == "log" || action == "update-log"
+	if !readOnly && r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, simpleResp{Error: "这个操作必须使用 POST"})
+		return
+	}
 	switch action {
 	case "status":
 		writeJSON(w, http.StatusOK, currentStatus(cfg))

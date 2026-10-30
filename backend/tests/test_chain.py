@@ -734,6 +734,31 @@ def _v2_code(state: dict, host: str = "203.0.113.9", **over) -> str:
     return chain.make_code(**fields)
 
 
+def _v3_code(
+    state: dict,
+    host: str = "203.0.113.9",
+    pin: str = "ab" * 32,
+    **over,
+) -> str:
+    reality = state["reality"]
+    fields = {
+        "host": host,
+        "port": 8447,
+        "uuid": str(uuid_mod.uuid4()),
+        "pbk": reality["public_key"],
+        "sid": reality["short_id"],
+        "sni": reality["server_name"],
+        "flow": "xtls-rprx-vision",
+        "label": "美国落地",
+        "hy_port": 8448,
+        "hy_password": "quic-secret-1234",
+        "hy_sni": "us.example.com",
+        "hy_cert_sha256": pin,
+    }
+    fields.update(over)
+    return chain.make_code(**fields)
+
+
 def test_code_v2_carries_quic_credentials(client, configured):
     code = _v2_code(config.load_state())
     parsed = chain.parse_code(code)
@@ -746,6 +771,42 @@ def test_code_v2_carries_quic_credentials(client, configured):
     # v1 (老版本生成的码) 照样认, QUIC 字段为空 —— 面板据此把选项置灰
     v1 = chain.parse_code(_fake_code(config.load_state()))
     assert v1["hy_port"] == 0 and v1["hy_pw"] == "" and v1["hy_sni"] == ""
+
+
+def test_code_v3_carries_the_exit_certificate_pin(client, configured):
+    """A new QUIC pair code must carry the remote certificate identity."""
+    pin = "0123456789abcdef" * 4
+    code = _v3_code(config.load_state(), pin=pin)
+    parsed = chain.parse_code(code)
+    assert parsed["hy_cert_sha256"] == pin
+    payload = json.loads(base64.urlsafe_b64decode(code.split("~")[1] + "=="))
+    assert payload["v"] == 3 and payload["y"]["c"] == pin
+
+
+def test_quic_pair_code_rejects_a_malformed_certificate_pin(client, configured):
+    pin = "not-a-sha256"
+    code = _v3_code(config.load_state(), pin=pin)
+    with pytest.raises(chain.CodeError, match="证书指纹"):
+        chain.parse_code(code)
+
+
+def test_quic_client_uses_hysteria_certificate_pin_syntax():
+    """Hysteria's pin is `insecure: true` + top-level `pinSHA256`, not a cert mapping."""
+    from zeroproxy import chain_quic
+
+    pin = "fedcba9876543210" * 4
+    entry = {
+        "host": "203.0.113.9",
+        "hy_port": 8448,
+        "hy_pw": "quic-secret",
+        "hy_sni": "us.example.com",
+        "hy_socks_port": 18470,
+        "hy_cert_sha256": pin,
+    }
+    text = chain_quic.client_config(entry, {})
+    assert "  insecure: true" in text
+    assert f'  pinSHA256: "{pin}"' in text
+    assert "sha256_cert" not in text
 
 
 @pytest.mark.parametrize(
@@ -794,6 +855,14 @@ def test_exit_quic_toggle(client, configured):
     assert ex["hy_available"] is (chain_quic.binary() is not None)
     first = chain.parse_code(ex["code"])
     assert first["hy_port"] == 8667 and first["hy_pw"]
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+
+    with open(paths_of()["chain_quic_cert"], "rb") as fh:
+        cert = x509.load_pem_x509_certificate(fh.read())
+    expected_pin = cert.fingerprint(hashes.SHA256()).hex()
+    assert first["hy_cert_sha256"] == expected_pin
+    assert json.loads(base64.urlsafe_b64decode(ex["code"].split("~")[1] + "=="))["v"] == 3
     # 证书按配对码里的 SNI 现签: 两端对不上时 hysteria 服务端会直接 TLS 告警
     assert first["hy_sni"] == chain_quic.exit_sni(config.load_state())
     assert os.path.exists(paths_of()["chain_quic_cert"])
@@ -822,12 +891,16 @@ def test_entry_quic_transport_wiring(client, configured, monkeypatch):
     monkeypatch.setattr(chain, "probe_target", _ok_probe("203.0.113.9"))
     response = client.post(
         "/api/chain/entries",
-        json={"code": _v2_code(config.load_state()), "transport": "hysteria2"},
+        json={"code": _v3_code(config.load_state()), "transport": "hysteria2"},
     )
     assert response.status_code == 200, response.text
     entry = response.json()["chain"]["entries"][-1]
     assert entry["transport"] == "hysteria2" and entry["hy_socks_port"] > 0
-
+    saved = next(
+        row for row in config.load_state()["chain"]["entries"]
+        if row["id"] == entry["id"]
+    )
+    assert saved["hy_cert_sha256"] == "ab" * 32
     cfg = xray_config.build_xray_config(config.load_state())
     outbound = next(o for o in cfg["outbounds"] if o["tag"] == f"chain-out-{entry['id']}")
     assert outbound["protocol"] == "socks"
@@ -850,6 +923,19 @@ def test_entry_quic_transport_wiring(client, configured, monkeypatch):
     assert outbound["protocol"] == "vless"
 
 
+def test_entry_quic_rejects_a_legacy_code_without_certificate_pin(client, configured, monkeypatch):
+    from zeroproxy import chain_quic
+
+    monkeypatch.setattr(chain_quic, "binary", lambda: "/usr/local/bin/hysteria")
+    monkeypatch.setattr(chain, "probe_target", _ok_probe("203.0.113.9"))
+    response = client.post(
+        "/api/chain/entries",
+        json={"code": _v2_code(config.load_state()), "transport": "hysteria2"},
+    )
+    assert response.status_code == 400
+    assert "证书指纹" in response.json()["error"]
+
+
 def test_entry_quic_needs_credentials_and_binary(client, configured, monkeypatch):
     from zeroproxy import chain_quic
 
@@ -864,7 +950,7 @@ def test_entry_quic_needs_credentials_and_binary(client, configured, monkeypatch
     monkeypatch.setattr(chain_quic, "binary", lambda: None)
     no_binary = client.post(
         "/api/chain/entries",
-        json={"code": _v2_code(config.load_state(), host="203.0.113.21"), "transport": "hysteria2"},
+        json={"code": _v3_code(config.load_state(), host="203.0.113.21"), "transport": "hysteria2"},
     )
     assert no_binary.status_code == 400 and "hysteria" in no_binary.json()["error"]
 
@@ -879,9 +965,11 @@ def test_quic_processes_start_and_stop(client, configured, monkeypatch):
 
     monkeypatch.setattr(chain, "probe_target", _ok_probe("203.0.113.9"))
     client.post("/api/chain/exit", json={"action": "generate", "port": 8666, "hy_enabled": True, "hy_port": 8667})
+    pin = chain_quic.cert_sha256()
+    assert len(pin) == 64
     entry = client.post(
         "/api/chain/entries",
-        json={"code": _v2_code(config.load_state()), "transport": "hysteria2"},
+        json={"code": _v3_code(config.load_state(), pin=pin), "transport": "hysteria2"},
     ).json()["chain"]["entries"][-1]
     try:
         ok, note = chain_quic.sync(config.load_state())
@@ -972,7 +1060,10 @@ def test_restart_step_survives_a_broken_inner_quic(configured, monkeypatch):
 
 def test_diagnose_reports_a_dead_inner_quic(client, configured, monkeypatch):
     """既然「重载服务」不再因内层 QUIC 判红, 它的故障就必须在诊断里有独立一项。"""
+    from zeroproxy import chain_quic
+
     monkeypatch.setattr(chain, "probe_target", _ok_probe("203.0.113.9"))
+    monkeypatch.setattr(chain_quic, "status", lambda state: {"exit": False})
     client.post("/api/chain/exit",
                 json={"action": "generate", "port": 8666, "hy_enabled": True, "hy_port": 8667})
 

@@ -66,6 +66,40 @@ printf 'rc=%s\\n' "$?"
     assert old_config.read_text(encoding="utf-8") == "proxy-groups:\n  - name: old\n"
 
 
+def test_luci_cgi_rejects_get_for_state_changing_actions(tmp_path):
+    """A prefetched or cross-site GET must not be able to turn the proxy off."""
+    source = open(
+        os.path.join(ROOT, "backend", "zeroproxy", "client", "luci", "cgi"),
+        encoding="utf-8",
+    ).read()
+    zdir = tmp_path / "zp"
+    zdir.mkdir()
+    (zdir / "ui.token").write_text("test-token\n", encoding="utf-8")
+    called = tmp_path / "called"
+    cli = tmp_path / "cli"
+    cli.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{called}"\n', encoding="utf-8")
+    cli.chmod(0o755)
+    source = source.replace("ZP_DIR=/etc/zeroproxy", f"ZP_DIR={zdir}")
+    source = source.replace("CLI=/usr/bin/zeroproxy", f"CLI={cli}")
+    source = source.replace("TOKFILE=/etc/zeroproxy/ui.token", f"TOKFILE={zdir / 'ui.token'}")
+    script = tmp_path / "cgi"
+    script.write_text(source, encoding="utf-8")
+    proc = subprocess.run(
+        ["/bin/sh", str(script)],
+        capture_output=True,
+        text=True,
+        env={
+            **os.environ,
+            "REQUEST_METHOD": "GET",
+            "QUERY_STRING": "a=toggle&k=test-token",
+            "HTTP_COOKIE": "",
+        },
+        timeout=10,
+    )
+    assert "Status: 405" in proc.stdout
+    assert not called.exists()
+
+
 def test_report_fields_use_device_capabilities_and_measured_bench(tmp_path):
     """Heartbeat telemetry must come from caps and the saved bench result."""
     source = open(AGENT, encoding="utf-8").read()

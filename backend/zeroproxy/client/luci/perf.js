@@ -280,7 +280,7 @@
     setTimeout(() => btn.classList.remove('firing'), 460);
     btn.disabled = true;
     try {
-      const r = await window.call(on ? 'perf-on' : 'perf-off');
+      const r = await window.call(on ? 'perf-on' : 'perf-off', {});
       if (window.toast) window.toast(String((r && r.message) || '已提交').split('\n')[0]);
       if (on) {
         // 点火: 立刻把五段亮起来 (切换进度就归它说), 读数与弧照旧是真实速率 —— 不假装在飙。

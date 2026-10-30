@@ -217,7 +217,7 @@ $('refresh').onclick = async () => {
   const btn = $('refresh');
   btn.disabled = true;
   try {
-    const r = await call('refresh');
+    const r = await call('refresh', {});
     toast(unesc(r.message).split('\n')[0] || '已重新拉取');
     await load();
   } catch (e) {
@@ -439,7 +439,7 @@ async function runUpdate() {
   updStarting();
   updStart();
   try {
-    const msg = unesc((await call('update')).message || '');
+    const msg = unesc((await call('update', {})).message || '');
     if (/^\s*面板版本 v/.test(msg)) {
       // 后端确认"已经开始"了 —— 从这一刻起日志就是这个进程的: CLI 一动手就会先清空
       // 日志再落一行, 所以此刻那份旧内容已经被覆盖, 可以放心认了。

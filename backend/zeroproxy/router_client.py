@@ -157,7 +157,9 @@ from .config import paths
 #: 1.4.40: 修复单服务器 drop 回滚死锁与 device.json 僵尸复活; CGI 如实汇报退出码; 路由页面动效与防重优化。
 #: 1.4.41: 修复高纯净度网站连接失败: GEOIP,CN 增加 no-resolve 杜绝国内 DNS 污染; 扩展落地风控域名; fake-ip-filter 移除 STUN 杜绝 WebRTC 泄漏。
 #: 1.4.42: 修复 VLESS Reality 与链式代理在 Clash Verge 等客户端超时: 补齐 packet-encoding: xudp, support-x25519mlkem768, fingerprint: chrome; 修复 Xray 顶层 DNS 与 UseIPv4 出站协同; 根除链式中转入站二次 Vision splice 冲突。
-SCRIPT_VERSION = "1.4.43"
+#: 1.4.43: 公网入站禁用 TFO, 出站保留 TFO; 链式 Reality 全链路统一 flow=""。
+#: 1.4.44: 路由器有副作用动作只允许 POST, 页面同步改为 POST。
+SCRIPT_VERSION = "1.4.44"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"
@@ -1572,7 +1574,8 @@ def summary() -> dict:
 #:        一处算覆盖, 本地界面与 shell (live.sh / agent.sh) 都从它取 —— 以前这份状态被
 #:        四处各拼一遍, 真机上漂过 (8.88)。新增 `state [--json]` 子命令与 --dir/--cli/--init
 #:        通用选项; `serve` 的 status 与 `state` 由同一份 snapshot 组装 (8.91)。
-AGENT_VERSION = os.environ.get("ZP_AGENT_VERSION", "1.3.0")
+#: 1.3.1: 接受真实 ubus 的有效会话响应 `{"values":{}}`; 修改动作拒绝 GET。
+AGENT_VERSION = os.environ.get("ZP_AGENT_VERSION", "1.3.1")
 
 #: 小于这个大小的一律不当二进制 (一份正常的 zpcore.gz 约 2.5 MB)。演练里可以用
 #: ZP_AGENT_MIN_BYTES 调低。

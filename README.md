@@ -82,7 +82,7 @@ curl -fsSL https://github.i3.pub/https://raw.githubusercontent.com/ericlinclover
 | **安全默认值** | 登录限流、会话上限与过期清理、PBKDF2-SHA256(12 万轮)、`state.json` 0600 原子写、CSP 等安全响应头、无 CORS 通配 |
 | **一键卸载** | `uninstall.sh`, 与安装对称 (可保留数据或证书) |
 | **启动期自愈** | systemd `ExecStartPre` 跑 `geodata guard`: geo 数据丢失或配置自检不过时, 按当前状态重新生成配置, 保证 Xray 一定能起来 (证书丢失同一路径兜底) |
-| **可回归验证** | `pytest` **364 项通过 + 6 skip** (带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (105 项, 含**两台机器真跑一条链** 与**四档数据面 × IPv6 的路由器配置过真 mihomo**) + `scripts/router_install_check.py` (**201 项**, 真的用 shell 跑一遍路由器安装脚本, 内含四类机器 / 本机覆盖 / revert 比对 / zpcore 真跑 / **四档数据面下四个现场入口的一致性矩阵**) + `scripts/browser_check.cjs` (157 项) + `scripts/clients_check.cjs` (26 项, 真实浏览器点开关) + `scripts/router_ui_check.cjs` (18 项) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
+| **可回归验证** | `pytest` **378 项通过 + 6 skip** (带 `ZP_XRAY_BIN` + `ZP_HYSTERIA2_BIN` 时全通过) + `scripts/verify.py` (105 项, 含**两台机器真跑一条链** 与**四档数据面 × IPv6 的路由器配置过真 mihomo**) + `scripts/router_install_check.py` (**201 项**, 真的用 shell 跑一遍路由器安装脚本, 内含四类机器 / 本机覆盖 / revert 比对 / zpcore 真跑 / **四档数据面下四个现场入口的一致性矩阵**) + `scripts/browser_check.cjs` (157 项) + `scripts/clients_check.cjs` (26 项, 真实浏览器点开关) + `scripts/router_ui_check.cjs` (18 项) + `scripts/geo_slow_check.cjs` (长任务 6 项, 150 秒的真下载) + `scripts/upgrade_sim.sh` (23 项), 全部用真实二进制 / 真实浏览器 / 真实升级脚本 |
 | **看得见的升级** | 面板内升级是一条完整闭环: 版本对比 → 确认弹窗 (逐条列出会做什么 / 不动什么) → 逐步进度 (待执行 ○ / 进行中 ⟳ / 已完成 ✓ + 进度条 + 已用时间) → 完成或失败结论卡 (失败标出断在第几步 + 日志 + 自动回滚说明) → 一键重新加载面板; 步骤清单由 `upgrade.sh` 自己写进 `update.json`, 前端不猜 |
 | **看得懂的界面 (v2.6.0)** | 控制台布局: 左侧锚点导航 (带计数角标 + 滚动高亮) + 顶部指标条 (健康节点 / 落地出口 IP / 平均延迟 + 迷你折线 / 运行时长) + 节点密集表格 (名称 / 地址状态 / **握手延迟条** / **上下行双轨** / 开关与复制) + **流量卡 (双弧圆环 + 实时速率曲线 + 逐节点双色流量条)** + 链式链路拓扑 (你的设备 → 本机入口 → 落地端) + 程序更新闭环; 动效全部走 `transform`/自绘 rAF 并受 `prefers-reduced-motion` 约束 |
 
@@ -5745,6 +5745,13 @@ PublicKey = ...
 - **REALITY 客户端版本与短 ID 容错**: 服务端 `realitySettings` 显式注入 `minClientVer: ""` 与宽松 `shortIds` 容错，严防 Xray 新内核将未显式声明版本或短 ID 的客户端误判为探测扫描而静默丢弃。
 - **Clash 密钥协商与客户端兼容性加固**: 客户端 Reality 配置回归标准 X25519 密钥交换，消除 post-quantum MLKEM768 在主流客户端/核心上的握手拒绝问题。
 - **服务重载时自动放行 UFW 端口**: 落地配置与服务重载时，自动对齐并放行所有活跃监听端口，防止系统级防火墙静默拦截。
+
+### 8.107 v2.12.12 (客户端 v1.4.44 · zpcore 1.3.1): 修复链式 QUIC 证书固定与路由器鉴权回归
+- **链式 QUIC 恢复可用**: 使用 Hysteria 2 实际支持的 `insecure: true` + `pinSHA256`，从落地端证书推导 DER SHA-256，并通过 v3 配对码传到入口端；旧版 QUIC 配对码会给出明确升级提示，不再生成注定 TLS 失败的节点。
+- **修复 LuCI 会话误判**: zpcore 接受 OpenWrt 实际返回的 `{"values":{}}`，同时继续拒绝命令失败、非 JSON 和错误对象。
+- **有副作用动作强制 POST**: 路由器 cgi 与 zpcore 的切换、刷新、更新、移除和性能模式动作不再允许 GET；页面调用同步改为 POST。
+- **状态临时文件从创建起即为 0600**: 改用独占临时文件，消除 rename 后 chmod 前其他本地用户可读的窗口。
+- **新增真实回归**: Go 测试覆盖 ubus 响应与方法边界，Python 测试覆盖 v3 配对码、证书指纹与 CGI 拒绝 GET，真实 Hysteria 2 进程测试覆盖服务端/客户端证书固定。
 
 
 
