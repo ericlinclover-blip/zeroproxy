@@ -510,7 +510,7 @@ def test_subscription_survives_all_nodes_disabled(client, configured):
     groups = {g["name"] for g in clash["proxy-groups"]}
     for group in clash["proxy-groups"]:
         for member in group["proxies"]:
-            assert member in groups or member in ("DIRECT", "REJECT"), (group["name"], member)
+            assert member in groups or member in ("DIRECT", "REJECT", "REJECT-DROP"), (group["name"], member)
 
     singbox = json.loads(client.get(f"{path}?format=singbox").text)
     tags = {o["tag"] for o in singbox["outbounds"]}

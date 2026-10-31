@@ -449,12 +449,44 @@ body.zp-leaving { opacity: 0; pointer-events: none; }
 .device-table td { padding: 10px; border-bottom: 1px solid var(--border-soft); }
 .device-table tr:hover td { background: var(--card-sub); }
 
-/* 服务器列表 */
-.srv { display: flex; gap: 12px; align-items: center; padding: 12px 0; border-top: 1px solid var(--border-soft); }
-.srv:first-of-type { border-top: 0; }
-.srv .info { flex: 1; min-width: 0; }
-.srv .nm { font-weight: 650; font-size: 13.5px; }
+/* 服务器列表与卡片设计 */
+#servers { display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }
+.srv {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  background: var(--card-sub);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  transition: all 0.2s var(--ease);
+}
+.srv:hover {
+  background: var(--card-hover);
+  border-color: rgba(10, 132, 255, 0.25);
+  box-shadow: var(--shadow-sm);
+}
+.srv .info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.srv .srv-header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.srv .nm { font-weight: 650; font-size: 14px; color: var(--text); }
 .srv .bs { font-family: var(--mono); font-size: 12px; color: var(--sub); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.srv .srv-meta { display: flex; align-items: center; gap: 12px; font-size: 11.5px; color: var(--muted); flex-wrap: wrap; }
+.srv .srv-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.url-input-wrap { display: flex; gap: 8px; align-items: center; }
+.url-preview {
+  margin-top: 8px;
+  padding: 8px 12px;
+  background: var(--accent-soft);
+  border: 1px solid rgba(10, 132, 255, 0.2);
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.url-preview.hidden { display: none; }
 
 /* 性能模式仪表盘 (保持 perf.js 兼容性) */
 .perf { --boost: #22d3ee; }
@@ -762,14 +794,53 @@ pre {
       </div>
     </div>
 
-    <!-- 服务器订阅与管理 -->
+    <!-- 节点订阅源 (面板服务) -->
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-title-row">
+        <h2>
+          <svg viewBox="0 0 24 24"><path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM19 18H6c-2.21 0-4-1.79-4-4 0-2.05 1.53-3.76 3.56-3.97l1.07-.11.5-.95C8.08 7.14 9.94 6 12 6c2.62 0 4.88 1.86 5.39 4.43l.3 1.5 1.53.11c1.56.1 2.78 1.41 2.78 2.96 0 1.65-1.35 3-3 3z"/></svg>
+          节点订阅源 (面板服务器)
+        </h2>
+        <div class="head-actions">
+          <button class="btn small" id="btn-sync-servers" title="向所有已接入的面板同步最新代理节点与规则">同步订阅节点</button>
+        </div>
+      </div>
+      <div class="fs-xs muted" style="margin-bottom:10px">
+        管理本路由器连接的控制面板。支持单主控面板管理，亦支持多源聚合订阅。
+      </div>
+
+      <!-- 服务器卡片列表 -->
+      <div id="servers"><div class="empty">正在读取服务器…</div></div>
+
+      <!-- 添加/更换面板表单 -->
+      <div style="margin-top:18px;padding-top:14px;border-top:1px dashed var(--border)">
+        <h3 style="margin:0 0 6px;font-size:13px;font-weight:700">添加订阅面板 / 更换主控面板</h3>
+        <div class="fs-xs muted" style="margin-bottom:10px">
+          支持直接粘贴面板复制的完整 <span class="mono">curl / wget</span> 命令或 <span class="mono">https://…/c/…</span> 配对链接，系统会自动智能提取。
+        </div>
+        <div class="url-input-wrap">
+          <input type="text" id="url" placeholder="粘贴 curl 安装命令或 https://面板域名/c/配对码" autocomplete="off" spellcheck="false" style="flex:1">
+          <button class="btn" id="btn-paste-url" type="button" title="从剪贴板粘贴并自动提取配对链接">📋 粘贴</button>
+          <button class="btn primary" id="add">接入</button>
+        </div>
+        <div id="url-preview" class="url-preview hidden"></div>
+        <div style="margin-top:8px;display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;color:var(--sub)">
+            <input type="checkbox" id="chk-replace"> 设为新的主控制面板 (覆盖当前主控)
+          </label>
+        </div>
+        <div class="fs-xs muted" id="add-hint" style="margin-top:8px"></div>
+      </div>
+    </div>
+
+    <!-- 客户端核心与软件更新维护 (保持全部 update 元素 ID 与文本 '更新客户端' 满足断言) -->
     <div class="card">
       <div class="card-title-row">
         <h2>
-          <svg viewBox="0 0 24 24"><path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H8V4h12v12z"/></svg>
-          接入的面板服务器
+          <svg viewBox="0 0 24 24"><path d="M12 16.5l4-4h-3v-7h-2v7H8l4 4zm9-13H3c-1.1 0-2 .9-2 2v13c0 1.1.9 2 2 2h18c1.1 0 2-.9 2-2V5.5c0-1.1-.9-2-2-2zm0 15H3V5.5h18v13z"/></svg>
+          客户端软件维护与升级
         </h2>
-        <button class="btn small" id="update" title="从面板拉最新客户端并重跑一次安装 (后台进行, 约一分钟; 配置与凭据保留)">更新客户端</button>
+        <button class="btn small" id="update" title="从主面板拉最新客户端并重跑一次安装 (后台进行, 约一分钟; 配置与凭据保留)">更新客户端</button>
       </div>
       <div class="fs-xs muted" id="update-hint" style="margin-bottom:8px"></div>
 
@@ -791,19 +862,8 @@ pre {
           <button class="btn small" id="upd-more">看完整日志</button>
         </div>
       </div>
-
-      <div id="servers"><div class="empty">正在读取服务器…</div></div>
-
-      <div style="margin-top:18px;padding-top:14px;border-top:1px dashed var(--border)">
-        <h3 style="margin:0 0 8px;font-size:13px;font-weight:700">添加新服务器 / 更换面板</h3>
-        <div class="fs-sm muted" style="margin-bottom:10px">
-          在目标面板「客户端」页复制安装命令中的 <span class="mono">https://…/c/…</span> 链接粘入即可。
-        </div>
-        <div class="row">
-          <input type="text" id="url" placeholder="https://你的面板域名:8899/c/xxxxxxxx" autocomplete="off" spellcheck="false" style="flex:1">
-          <button class="btn primary" id="add">添加</button>
-        </div>
-        <div class="fs-xs muted" id="add-hint" style="margin-top:8px"></div>
+      <div class="fs-xs muted">
+        客户端程序包括透明网关路由策略、内核守护进程 (zpcore) 及 LuCI 控制台。升级由主控制面板静默下发并热切换，现有节点凭据、局域网设备策略不会受到影响。
       </div>
     </div>
   </main>

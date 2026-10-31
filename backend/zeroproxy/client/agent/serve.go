@@ -16,9 +16,10 @@ import (
 
 // serverEntry 是服务器清单里的一条 (与安装脚本 / CLI 写的 servers/*.json 对应)。
 type serverEntry struct {
-	Key  string `json:"key"`
-	Base string `json:"base"`
-	ID   string `json:"id"`
+	Key     string `json:"key"`
+	Base    string `json:"base"`
+	ID      string `json:"id"`
+	Primary bool   `json:"primary,omitempty"`
 }
 
 // statusResp 与原来的 cgi 契约**逐字段一致** —— 界面页 (index.html + app.js) 因此

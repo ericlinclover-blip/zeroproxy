@@ -147,27 +147,86 @@ function render(state) {
   renderServers(state.servers || []);
 }
 
+function extractPairUrl(raw) {
+  if (!raw) return '';
+  const trimmed = String(raw).trim();
+  // 智能从 curl / wget 等命令中提取短链配对 URL，如 https://domain:port/c/shortcode
+  const match = trimmed.match(/(https?:\/\/[^\s"'`<>|]+?\/c\/[a-zA-Z0-9_-]+)/i);
+  if (match) return match[1];
+  // 兜底提取普通 http/https URL
+  const urlMatch = trimmed.match(/(https?:\/\/[^\s"'`<>|]+)/i);
+  if (urlMatch) return urlMatch[1];
+  return trimmed;
+}
+
 function renderServers(servers) {
   const container = $('servers');
   if (!container) return;
   if (!servers.length) {
-    container.innerHTML = '<div class="empty">还没有接入任何服务器 — 请在下方添加一台。</div>';
+    container.innerHTML = '<div class="empty">还没有接入任何面板订阅源 — 请在下方添加一台。</div>';
     return;
   }
-  container.innerHTML = servers.map((s) => `
+  container.innerHTML = servers.map((s) => {
+    let host = s.base;
+    try {
+      const u = new URL(s.base);
+      host = u.host + (u.pathname !== '/' ? u.pathname : '');
+    } catch {}
+    const isPrimary = !!s.primary;
+    const badge = isPrimary
+      ? '<span class="pill ok">主控制面板</span>'
+      : '<span class="pill">聚合订阅源</span>';
+    return `
     <div class="srv" data-key="${esc(s.key)}">
       <div class="info">
-        <div class="nm">${esc(s.key)}</div>
+        <div class="srv-header">
+          <span class="nm">${esc(host)}</span>
+          ${badge}
+        </div>
         <div class="bs" title="${esc(s.base)}">${esc(s.base)}</div>
-        <div class="fs-xs muted">设备 ${esc(s.id)}</div>
+        <div class="srv-meta">
+          <span>设备 ID: <code class="mono">${esc(s.id)}</code></span>
+          <span>存储标识: ${esc(s.key)}</span>
+        </div>
       </div>
-      <button class="btn small danger" data-drop="${esc(s.key)}">移除</button>
-    </div>`).join('');
+      <div class="srv-actions">
+        <button class="btn small" data-sync="${esc(s.key)}" title="重新从该面板拉取最新节点与规则">同步</button>
+        <button class="btn small danger" data-drop="${esc(s.key)}" data-primary="${isPrimary}">移除</button>
+      </div>
+    </div>`;
+  }).join('');
+
+  container.querySelectorAll('[data-sync]').forEach((btn) => {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      const oldText = btn.textContent;
+      btn.textContent = '同步中…';
+      try {
+        const r = await call('refresh', {});
+        toast(unesc(r.message).split('\n')[0] || '已同步节点');
+        await load();
+      } catch (e) {
+        toast(e.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = oldText;
+      }
+    };
+  });
 
   container.querySelectorAll('[data-drop]').forEach((btn) => {
     btn.onclick = async () => {
       const key = btn.dataset.drop;
-      if (!confirm(`移除 ${key}？\n这台路由器将不再使用它上面的节点；面板上的设备记录需要你到面板里一并删除。`)) return;
+      const isPrimary = btn.dataset.primary === 'true';
+      const allSrvs = container.querySelectorAll('.srv');
+      let promptMsg = `确定移除订阅面板「${key}」？\n这台路由器将不再使用它上面的节点。`;
+      if (allSrvs.length <= 1) {
+        promptMsg = `⚠️ 警告：这是当前接入的【唯一】订阅源！\n\n移除后全屋代理将失去节点订阅并恢复普通上网。\n确定要移除「${key}」吗？`;
+      } else if (isPrimary) {
+        promptMsg = `⚠️ 提示：「${key}」是当前的主控制面板！\n\n移除后客户端更新将暂停，直到设置新的主面板。\n确定要移除吗？`;
+      }
+      if (!confirm(promptMsg)) return;
+
       const srvEl = btn.closest('.srv');
       btn.disabled = true;
       const oldText = btn.textContent;
@@ -508,18 +567,29 @@ $('toggle').onchange = async (ev) => {
 };
 
 $('add').onclick = async () => {
-  const url = $('url').value.trim();
-  if (!url) return;
+  let url = $('url').value.trim();
+  if (!url) {
+    toast('请输入或粘贴面板配对链接');
+    return;
+  }
+  url = extractPairUrl(url);
   const btn = $('add');
   btn.disabled = true;
-  $('add-hint').textContent = '正在配对并重建配置…(大约 10 秒)';
+  const replaceChecked = $('chk-replace') && $('chk-replace').checked;
+  $('add-hint').textContent = '正在连接面板并拉取节点订阅…(约 10 秒)';
+  $('add-hint').style.color = 'var(--sub)';
   try {
     let r;
     try {
-      r = await call('add', { url });
+      r = await call('add', { url, replace: replaceChecked });
     } catch (err) {
       if (err.message && err.message.includes('--replace')) {
-        if (confirm('这台路由器已接入过面板。是否确认新增此面板（或更换接入面板）？')) {
+        const wantReplace = confirm(
+          '检测到该路由器已接入其他主面板。\n\n' +
+          '【确定】更换主控制面板（以新面板为主控并拉取最新配置）\n' +
+          '【取消】取消接入操作'
+        );
+        if (wantReplace) {
           r = await call('add', { url, replace: true });
         } else {
           throw err;
@@ -530,6 +600,8 @@ $('add').onclick = async () => {
     }
     toast(unesc(r.message).split('\n')[0]);
     $('url').value = '';
+    if ($('chk-replace')) $('chk-replace').checked = false;
+    if ($('url-preview')) $('url-preview').classList.add('hidden');
     $('add-hint').textContent = '';
     await load();
   } catch (e) {
@@ -785,8 +857,69 @@ if ($('upd-more')) {
   } catch (e) {}
 })();
 
+function initUrlInputHelpers() {
+  const input = $('url');
+  const preview = $('url-preview');
+  if (!input) return;
+
+  const updatePreview = () => {
+    const raw = input.value;
+    const extracted = extractPairUrl(raw);
+    if (!preview) return;
+    if (extracted && extracted.includes('/c/')) {
+      try {
+        const u = new URL(extracted);
+        preview.innerHTML = `<span>✓ 识别到配对链接：</span><b class="mono">${esc(u.origin + u.pathname)}</b>`;
+        preview.classList.remove('hidden');
+      } catch {
+        preview.classList.add('hidden');
+      }
+    } else {
+      preview.classList.add('hidden');
+    }
+  };
+
+  input.addEventListener('input', updatePreview);
+  input.addEventListener('paste', () => setTimeout(updatePreview, 10));
+
+  if ($('btn-paste-url')) {
+    $('btn-paste-url').onclick = async () => {
+      try {
+        const text = await navigator.clipboard.readText();
+        if (!text) { toast('剪贴板为空'); return; }
+        const extracted = extractPairUrl(text);
+        input.value = extracted || text.trim();
+        updatePreview();
+        toast('已粘贴并自动提取配对链接');
+      } catch {
+        input.focus();
+        toast('无法读取剪贴板，请长按输入框粘贴');
+      }
+    };
+  }
+
+  if ($('btn-sync-servers')) {
+    $('btn-sync-servers').onclick = async () => {
+      const btn = $('btn-sync-servers');
+      btn.disabled = true;
+      btn.textContent = '正在同步…';
+      try {
+        const r = await call('refresh', {});
+        toast(unesc(r.message).split('\n')[0] || '已重新拉取全部订阅节点');
+        await load();
+      } catch (e) {
+        toast(e.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '同步订阅节点';
+      }
+    };
+  }
+}
+
 // 初始化应用
 initTabs();
+initUrlInputHelpers();
 load();
 // 周期性轮询基本状态
 setInterval(load, 5000);

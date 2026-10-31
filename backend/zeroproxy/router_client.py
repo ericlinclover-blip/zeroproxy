@@ -172,7 +172,7 @@ from .config import paths
 #:         ④ 实时上下行带宽速率监控、数据包计数与总吞吐看板;
 #:         ⑤ 局域网在线设备透视 (DHCP + ARP);
 #:         ⑥ ZeroProxy Doctor 真机体检、基准测速 (Bench) 与快照还原比对 (Revert) Web 化集成。
-SCRIPT_VERSION = "1.4.48"
+SCRIPT_VERSION = "1.4.49"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"

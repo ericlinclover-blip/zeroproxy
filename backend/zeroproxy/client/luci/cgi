@@ -273,12 +273,15 @@ case "$action" in
             [ -n "$_m_got" ] && rmode="$_m_got"
         fi
         items=""
+        _primary="$(cat "$ZP_DIR/panel.base" 2>/dev/null | tr -d '\r\n')"
         for f in "$ZP_DIR"/servers/*.json; do
             [ -f "$f" ] || continue
             base="$(sed -n 's/.*"base"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n1)"
             did="$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n1)"
             key="$(basename "$f" .json)"
-            items="${items:+$items,}{\"key\":\"$(jval_s "$key")\",\"base\":\"$(jval_s "$base")\",\"id\":\"$(jval_s "$did")\"}"
+            is_prim="false"
+            [ -n "$_primary" ] && [ "$_primary" = "$base" ] && is_prim="true"
+            items="${items:+$items,}{\"key\":\"$(jval_s "$key")\",\"base\":\"$(jval_s "$base")\",\"id\":\"$(jval_s "$did")\",\"primary\":$is_prim}"
         done
         header
         printf '{"ok":true,"core":"%s","mode":"%s","covered":"%s","why":"%s","ipv6":"%s","client":"%s","wan":"%s","packets":%s,"routing_mode":"%s","servers":[%s],' \

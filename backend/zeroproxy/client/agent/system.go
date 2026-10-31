@@ -248,6 +248,7 @@ func readServers(dir string) []serverEntry {
 	if err != nil {
 		return nil
 	}
+	primaryBase := readTrimmed(filepath.Join(dir, "panel.base"))
 	var out []serverEntry
 	for _, dirent := range entries {
 		name := dirent.Name()
@@ -270,6 +271,7 @@ func readServers(dir string) []serverEntry {
 			}
 		}
 		if entry.Base != "" {
+			entry.Primary = primaryBase != "" && entry.Base == primaryBase
 			out = append(out, entry)
 		}
 	}
