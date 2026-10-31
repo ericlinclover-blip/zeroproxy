@@ -166,7 +166,13 @@ from .config import paths
 #:         ⑤ zpcore 1.3.2: LuCI 会话校验 username=root (或 ACL)、安全响应头、PATH_INFO 动作。
 #: 1.4.46: 修复路由器端更新客户端时无法识别 servers/ 目录凭据导致接入账号失败的问题 (兼容 servers/*.json 与 device.json.migrated)。
 #: 1.4.47: 修复 Mihomo (Clash) 订阅节点中误传 fingerprint: chrome 导致配置校验失败 (proxy: fingerprint is used for TLS certificate pinning) 故障。
-SCRIPT_VERSION = "1.4.47"
+#: 1.4.48: 路由器管理终端大版本重构升级 —— ① 全新现代 Apple HIG 玻璃拟态设计与 5 大模块化选项卡 (控制概览 / 节点路线 / 设备监控 / 网络体检 / 系统日志);
+#:         ② 节点透视、一键全节点测速与免重启动态路线切换 (proxies / select-node / test-delay);
+#:         ③ 智能分流 (Rule) / 全局代理 (Global) / 全局直连 (Direct) 三档策略实时下发;
+#:         ④ 实时上下行带宽速率监控、数据包计数与总吞吐看板;
+#:         ⑤ 局域网在线设备透视 (DHCP + ARP);
+#:         ⑥ ZeroProxy Doctor 真机体检、基准测速 (Bench) 与快照还原比对 (Revert) Web 化集成。
+SCRIPT_VERSION = "1.4.48"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"

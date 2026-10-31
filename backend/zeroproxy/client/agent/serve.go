@@ -38,6 +38,8 @@ type statusResp struct {
 	//: 与原 cgi 同一个字段名, 老页面拿到它也不会用坏 (它只读自己认识的键)。
 	WAN    int64  `json:"wan"`
 	Client string `json:"client"`
+	//: 当前分流模式: rule / global / direct
+	RoutingMode string `json:"routing_mode,omitempty"`
 	//: 性能模式 (内核态 eBPF / dae) 那几个值 —— 表盘按它们画。与原 cgi 逐字段一致。
 	Perf    perfResp      `json:"perf"`
 	Servers []serverEntry `json:"servers"`
@@ -302,7 +304,7 @@ func serveStatic(w http.ResponseWriter, cfg serveConfig, name string) {
 }
 
 func handleAction(w http.ResponseWriter, r *http.Request, cfg serveConfig, action string) {
-	readOnly := action == "status" || action == "log" || action == "update-log"
+	readOnly := action == "status" || action == "log" || action == "update-log" || action == "proxies" || action == "clients" || action == "doctor" || action == "mode"
 	if !readOnly && r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, simpleResp{Error: "这个操作必须使用 POST"})
 		return
@@ -317,9 +319,76 @@ func handleAction(w http.ResponseWriter, r *http.Request, cfg serveConfig, actio
 			return
 		}
 		writeJSON(w, http.StatusOK, simpleResp{OK: true, Log: tailLines(out, 60)})
-	// update / update-log 也走 CLI: 一处实现、两个入口 (SSH 与网页)。
-	// perf-on / perf-off 是页面上那块性能模式表盘的两个动作 —— 同样转发给 CLI (切数据面
-	// 的规矩全在 perf.sh 里: 校验配置 → 换 → 验证出口 → 失败退回)。
+	case "proxies":
+		out, _ := run(probeTimeout, cfg.cli, "proxies")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		if trimSpace(out) == "" {
+			_, _ = w.Write([]byte(`{"proxies":{}}`))
+		} else {
+			_, _ = w.Write([]byte(out))
+		}
+	case "select-node":
+		payload, err := readBody(r)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, simpleResp{Error: err.Error()})
+			return
+		}
+		grp := strings.TrimSpace(asString(payload["group"]))
+		if grp == "" {
+			grp = "GLOBAL"
+		}
+		node := strings.TrimSpace(asString(payload["name"]))
+		if node == "" {
+			writeJSON(w, http.StatusBadRequest, simpleResp{Error: "未指定节点"})
+			return
+		}
+		out, good := run(probeTimeout, cfg.cli, "select-node", grp, node)
+		writeJSON(w, http.StatusOK, simpleResp{OK: good, Message: out})
+	case "test-delay":
+		payload, err := readBody(r)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, simpleResp{Error: err.Error()})
+			return
+		}
+		node := strings.TrimSpace(asString(payload["name"]))
+		if node == "" {
+			writeJSON(w, http.StatusBadRequest, simpleResp{Error: "未指定节点"})
+			return
+		}
+		out, _ := run(probeTimeout, cfg.cli, "test-delay", node)
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		if trimSpace(out) == "" {
+			_, _ = w.Write([]byte(`{"delay":0}`))
+		} else {
+			_, _ = w.Write([]byte(out))
+		}
+	case "mode":
+		payload, _ := readBody(r)
+		m := strings.TrimSpace(asString(payload["mode"]))
+		if m != "" {
+			out, good := run(probeTimeout, cfg.cli, "mode", m)
+			writeJSON(w, http.StatusOK, simpleResp{OK: good, Message: out})
+		} else {
+			out, _ := run(probeTimeout, cfg.cli, "mode")
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "mode": strings.TrimSpace(out)})
+		}
+	case "clients":
+		out, _ := run(probeTimeout, cfg.cli, "clients")
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		if trimSpace(out) == "" {
+			_, _ = w.Write([]byte(`{"ok":true,"clients":[]}`))
+		} else {
+			_, _ = fmt.Fprintf(w, `{"ok":true,"clients":%s}`, out)
+		}
+	case "doctor":
+		out, _ := run(actionTimeout, cfg.cli, "doctor")
+		writeJSON(w, http.StatusOK, simpleResp{OK: true, Message: out})
+	case "bench":
+		out, _ := run(actionTimeout, cfg.cli, "bench")
+		writeJSON(w, http.StatusOK, simpleResp{OK: true, Message: out})
+	case "revert":
+		out, _ := run(probeTimeout, cfg.cli, "revert")
+		writeJSON(w, http.StatusOK, simpleResp{OK: true, Message: out})
 	case "add", "drop", "toggle", "refresh", "update", "update-log", "perf-on", "perf-off":
 		payload, err := readBody(r)
 		if err != nil {
@@ -402,19 +471,26 @@ func currentStatus(cfg serveConfig) statusResp {
 	// 与 `zpcore state`、agent 心跳、CLI 用的是同一个 snapshot —— 界面上不会再出现
 	// "命令行说未生效、界面说已连接"这种同一台机器两个说法 (8.88 / 8.90)。
 	s := snapshotAt(cfg.commonConfig)
+	rmode := "rule"
+	if s.Core == "running" {
+		if out, good := run(time.Second, cfg.cli, "mode"); good && strings.TrimSpace(out) != "" {
+			rmode = strings.TrimSpace(out)
+		}
+	}
 	return statusResp{
-		OK:      true,
-		Core:    s.Core,
-		Mode:    s.Mode,
-		Covered: s.Covered,
-		Why:     s.Why,
+		OK:          true,
+		Core:        s.Core,
+		Mode:        s.Mode,
+		Covered:     s.Covered,
+		Why:         s.Why,
 		// IPv6 是泄漏面: 探不到就必须显示出来 (目标网站会看到真实的 v6 地址)
-		IPv6:    s.Caps.get("ipv6"),
-		Packets: s.Packets,
-		WAN:     s.WAN,
-		Client:  s.Version,
-		Perf:    s.Perf,
-		Servers: s.Servers,
+		IPv6:        s.Caps.get("ipv6"),
+		Packets:     s.Packets,
+		WAN:         s.WAN,
+		Client:      s.Version,
+		RoutingMode: rmode,
+		Perf:        s.Perf,
+		Servers:     s.Servers,
 	}
 }
 

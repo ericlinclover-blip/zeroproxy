@@ -1240,6 +1240,106 @@ EOF
         echo "(打开一次即可; 之后同一浏览器不用再带令牌)"
         ;;
     log)        logread -e zeroproxy | tail -n "${2:-40}" ;;
+    proxies)
+        _res=""
+        if command -v curl >/dev/null 2>&1; then
+            _res="$(curl -s -m 2 http://127.0.0.1:9090/proxies 2>/dev/null)"
+        elif command -v wget >/dev/null 2>&1; then
+            _res="$(wget -q -O - -T 2 http://127.0.0.1:9090/proxies 2>/dev/null)"
+        fi
+        if [ -n "$_res" ] && printf '%s' "$_res" | grep -q '"proxies"'; then
+            printf '%s\n' "$_res"
+        else
+            printf '{"proxies":{}}\n'
+        fi
+        ;;
+    select-node)
+        _grp="${2:-GLOBAL}"
+        _node="$3"
+        [ -n "$_node" ] || { echo "用法: zeroproxy select-node <策略组> <节点名>"; exit 2; }
+        _enc="$(printf '%s' "$_grp" | tr ' ' '+')"
+        _body="{\"name\":\"$(printf '%s' "$_node" | sed 's/"/\\"/g')\"}"
+        _rc=1
+        if command -v curl >/dev/null 2>&1; then
+            _code="$(curl -s -m 3 -o /dev/null -w "%{http_code}" -X PUT -H "Content-Type: application/json" -d "$_body" "http://127.0.0.1:9090/proxies/$_enc" 2>/dev/null)"
+            if [ "$_code" = "204" ] || [ "$_code" = "200" ]; then
+                _rc=0
+            elif [ "$_grp" != "GLOBAL" ]; then
+                _code2="$(curl -s -m 3 -o /dev/null -w "%{http_code}" -X PUT -H "Content-Type: application/json" -d "$_body" "http://127.0.0.1:9090/proxies/GLOBAL" 2>/dev/null)"
+                [ "$_code2" = "204" ] || [ "$_code2" = "200" ] && _rc=0
+            fi
+        fi
+        if [ "$_rc" = "0" ]; then
+            echo "已切换节点为: $_node"
+        else
+            echo "切换节点失败 (请确认内核正在运行且节点存在)"
+            exit 1
+        fi
+        ;;
+    test-delay)
+        _node="$2"
+        [ -n "$_node" ] || { echo "用法: zeroproxy test-delay <节点名>"; exit 2; }
+        _enc="$(printf '%s' "$_node" | tr ' ' '+')"
+        _res=""
+        if command -v curl >/dev/null 2>&1; then
+            _res="$(curl -s -m 4 "http://127.0.0.1:9090/proxies/$_enc/delay?timeout=2500&url=http://www.gstatic.com/generate_204" 2>/dev/null)"
+        fi
+        if [ -n "$_res" ] && printf '%s' "$_res" | grep -q '"delay"'; then
+            printf '%s\n' "$_res"
+        else
+            printf '{"delay":0}\n'
+        fi
+        ;;
+    mode)
+        _m="${2:-}"
+        if [ -z "$_m" ]; then
+            _cm=""
+            if command -v curl >/dev/null 2>&1; then
+                _cm="$(curl -s -m 2 http://127.0.0.1:9090/configs 2>/dev/null | sed -n 's/.*"mode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+            fi
+            echo "${_cm:-rule}"
+            exit 0
+        fi
+        case "$_m" in
+            rule|global|direct) ;;
+            *) echo "不支持的分流模式: $_m (仅支持 rule / global / direct)"; exit 2 ;;
+        esac
+        _body="{\"mode\":\"$_m\"}"
+        _rc=1
+        if command -v curl >/dev/null 2>&1; then
+            curl -s -m 2 -X PATCH -H "Content-Type: application/json" -d "$_body" http://127.0.0.1:9090/configs >/dev/null 2>&1
+            _rc=$?
+        fi
+        if [ "$_rc" = "0" ]; then
+            echo "分流模式已切换为: $_m"
+        else
+            echo "切换分流模式失败 (请确认内核正在运行)"
+            exit 1
+        fi
+        ;;
+    clients)
+        _leases="/tmp/dhcp.leases"
+        [ -f "$_leases" ] || _leases="/var/dhcp.leases"
+        [ -f "$_leases" ] || _leases="/tmp/dnsmasq.leases"
+        printf '[\n'
+        _first=1
+        if [ -f "$_leases" ]; then
+            while read -r _ts _mac _ip _host _id; do
+                [ -n "$_ip" ] || continue
+                [ "$_first" = "1" ] && _first=0 || printf ',\n'
+                _h="$_host"
+                [ -z "$_h" ] || [ "$_h" = "*" ] && _h="设备-$(echo "$_mac" | cut -d: -f5-6 | tr -d ':')"
+                printf '  {"ip":"%s","mac":"%s","name":"%s","online":true}' "$_ip" "$_mac" "$_h"
+            done < "$_leases"
+        elif [ -r /proc/net/arp ]; then
+            awk 'NR>1 && $4 != "00:00:00:00:00:00" {print $1, $4}' /proc/net/arp | while read -r _ip _mac; do
+                [ -n "$_ip" ] || continue
+                [ "$_first" = "1" ] && _first=0 || printf ',\n'
+                printf '  {"ip":"%s","mac":"%s","name":"%s","online":true}' "$_ip" "$_mac" "局域网设备"
+            done
+        fi
+        printf '\n]\n'
+        ;;
     geo)
         # 重新取分流数据库 (面板换了 / 数据更新了, 不用重跑安装)
         "$ZP_DIR/agent.sh" geo force && echo "分流数据库已更新" \
@@ -1433,5 +1533,5 @@ EOF
         rm -rf "$ZP_DIR" /etc/init.d/zeroproxy /etc/init.d/zeroproxy-agent /etc/init.d/zeroproxy-ui /usr/bin/zeroproxy
         echo "已卸载。这台设备在面板上仍然存在, 请在面板「客户端」里一并移除。"
         ;;
-    *) echo "用法: zeroproxy [doctor|status|ui|servers|add <链接>|drop <键>|refresh|geo|on|off|local-auto|revert|bench|update|update-log|log|uninstall]" ;;
+    *) echo "用法: zeroproxy [doctor|status|ui|servers|add <链接>|drop <键>|refresh|geo|on|off|mode [模式]|proxies|select-node <组> <节点>|test-delay <节点>|clients|local-auto|revert|bench|update|update-log|log|uninstall]" ;;
 esac

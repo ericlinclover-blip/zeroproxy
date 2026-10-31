@@ -164,7 +164,7 @@ if [ -z "$action" ]; then
 fi
 
 case "$action" in
-    status|log|update-log) ;;
+    status|log|update-log|proxies|clients|doctor|mode) ;;
     *)
         if [ "${REQUEST_METHOD:-GET}" != "POST" ]; then
             printf 'Status: 405 Method Not Allowed\r\n'
@@ -267,6 +267,11 @@ case "$action" in
                     | awk 'NR>2 {s+=$1} END{print s+0}')" ;;
         esac
         case "$packets" in ''|*[!0-9]*) packets=0 ;; esac
+        rmode="rule"
+        if [ "$core" = "running" ] && command -v curl >/dev/null 2>&1; then
+            _m_got="$(curl -s -m 1 http://127.0.0.1:9090/configs 2>/dev/null | sed -n 's/.*"mode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+            [ -n "$_m_got" ] && rmode="$_m_got"
+        fi
         items=""
         for f in "$ZP_DIR"/servers/*.json; do
             [ -f "$f" ] || continue
@@ -276,8 +281,8 @@ case "$action" in
             items="${items:+$items,}{\"key\":\"$(jval_s "$key")\",\"base\":\"$(jval_s "$base")\",\"id\":\"$(jval_s "$did")\"}"
         done
         header
-        printf '{"ok":true,"core":"%s","mode":"%s","covered":"%s","why":"%s","ipv6":"%s","client":"%s","wan":"%s","packets":%s,"servers":[%s],' \
-            "$core" "$mode" "$covered" "$(jstr "$why")" "$ipv6" "$(jval_s "$ver")" "$wan" "$packets" "$items"
+        printf '{"ok":true,"core":"%s","mode":"%s","covered":"%s","why":"%s","ipv6":"%s","client":"%s","wan":"%s","packets":%s,"routing_mode":"%s","servers":[%s],' \
+            "$core" "$mode" "$covered" "$(jstr "$why")" "$ipv6" "$(jval_s "$ver")" "$wan" "$packets" "$(jval_s "$rmode")" "$items"
         printf '"perf":{"cap":"%s","state":"%s","live":"%s","why":"%s","exit_ip":"%s","wan_ip":"%s","busy":"%s","progress":"%s"}}\n' \
             "$perf_cap" "$perf_state" "$perf_live" "$(jstr "$perf_why")" "$(jval_s "$perf_exit")" \
             "$(jval_s "$perf_wan_ip")" "$perf_busy" "$(jstr "$perf_prog")"
@@ -325,6 +330,64 @@ case "$action" in
         lines="$(logread -e zeroproxy 2>/dev/null | tail -n 60)"
         header
         printf '{"ok":true,"log":"%s"}\n' "$(jstr "$lines")"
+        ;;
+    proxies)
+        header
+        if [ -x "$CLI" ]; then
+            "$CLI" proxies 2>/dev/null || printf '{"proxies":{}}\n'
+        else
+            printf '{"proxies":{}}\n'
+        fi
+        ;;
+    select-node)
+        grp="$(jval group)"
+        node="$(jval name)"
+        [ -n "$grp" ] || grp="GLOBAL"
+        [ -n "$node" ] || fail "未指定节点"
+        run_cli select-node "$grp" "$node"
+        ;;
+    test-delay)
+        node="$(jval name)"
+        [ -n "$node" ] || fail "未指定节点"
+        header
+        if [ -x "$CLI" ]; then
+            "$CLI" test-delay "$node" 2>/dev/null || printf '{"delay":0}\n'
+        else
+            printf '{"delay":0}\n'
+        fi
+        ;;
+    mode)
+        req_mode="$(jval mode)"
+        if [ -n "$req_mode" ]; then
+            run_cli mode "$req_mode"
+        else
+            cur_mode="$("$CLI" mode 2>/dev/null || echo rule)"
+            header
+            printf '{"ok":true,"mode":"%s"}\n' "$(jval_s "$cur_mode")"
+        fi
+        ;;
+    clients)
+        header
+        if [ -x "$CLI" ]; then
+            printf '{"ok":true,"clients":%s}\n' "$("$CLI" clients 2>/dev/null || echo '[]')"
+        else
+            printf '{"ok":true,"clients":[]}\n'
+        fi
+        ;;
+    doctor)
+        out="$("$CLI" doctor 2>&1)"
+        header
+        printf '{"ok":true,"report":"%s"}\n' "$(jstr "$out")"
+        ;;
+    bench)
+        out="$("$CLI" bench 2>&1)"
+        header
+        printf '{"ok":true,"message":"%s"}\n' "$(jstr "$out")"
+        ;;
+    revert)
+        out="$("$CLI" revert 2>&1)"
+        header
+        printf '{"ok":true,"message":"%s"}\n' "$(jstr "$out")"
         ;;
     *)
         # 动作名来自 PATH_INFO / REQUEST_URI / a= —— 必须转义后再回显, 否则一个带引号的
