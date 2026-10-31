@@ -293,26 +293,6 @@ function peerCard(p, wg) {
     </div>
   </div>`;
 }
-      <span>↑ <b>${fmtBytes(p.rx)}</b></span>
-      <span>↓ <b>${fmtBytes(p.tx)}</b></span>
-    </div>
-    <div class="wg-peer-meta">
-      <span class="tag-chip" title="客户端侧 AllowedIPs">${esc(p.allowed_ips)}</span>
-      ${p.compat ? `<span class="tag-chip" title="GL.iNet 兼容模式：服务端/客户端都不使用 PSK，单 DNS、无 MTU">路由器兼容</span>` : ""}
-      ${expiry}
-      ${p.endpoint ? `<span class="tag-chip mono">${esc(p.endpoint)}</span>` : ""}
-    </div>
-    <div class="wg-peer-actions">
-      <button class="btn small" data-wg-qr="${escAttr(p.id)}">二维码</button>
-      <button class="btn ghost small" data-wg-download="${escAttr(p.id)}">下载 .conf</button>
-      <button class="btn ghost small" data-wg-link="${escAttr(p.id)}">一次性链接</button>
-      <button class="btn ghost small" data-wg-edit="${escAttr(p.id)}">编辑</button>
-      <button class="btn ghost small" data-wg-toggle="${escAttr(p.id)}">${p.enabled ? "停用" : "启用"}</button>
-      <button class="btn ghost small" data-wg-rotate="${escAttr(p.id)}">轮换密钥</button>
-      <button class="btn ghost small danger" data-wg-remove="${escAttr(p.id)}">删除</button>
-    </div>
-  </div>`;
-}
 
 /* ---------------- 事件 ---------------- */
 

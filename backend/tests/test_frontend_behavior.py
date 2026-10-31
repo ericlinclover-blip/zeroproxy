@@ -275,11 +275,13 @@ def test_browser_scripts_scope_selectors_to_result_containers():
 
 def test_changed_frontend_modules_parse_as_es_modules():
     """零构建的 ES 模块语法必须能直接进浏览器 (node --check 兜底)。"""
-    for rel in (
-        ("views", "chain.js"),
-        ("views", "clients.js"),
-        ("views", "update.js"),
-        ("views", "traffic.js"),
-    ):
-        ok, err = _es_module_ok(os.path.join(APP, *rel))
-        assert ok, f"{rel[-1]} 语法错误: {err[:400]}"
+    checked = 0
+    for base, _dirs, files in os.walk(APP):
+        for name in files:
+            if not name.endswith(".js"):
+                continue
+            path = os.path.join(base, name)
+            ok, err = _es_module_ok(path)
+            assert ok, f"{os.path.relpath(path, APP)} 语法错误: {err[:400]}"
+            checked += 1
+    assert checked >= 15, f"预期检查至少 15 个前端 JS 模块，实际检查了 {checked} 个"

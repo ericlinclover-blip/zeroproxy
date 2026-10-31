@@ -115,7 +115,7 @@ export function renderUnlock(res) {
   grid.innerHTML = items
     .map(
       (item) => `
-        <div style="background: var(--bg-soft); border: 1px solid var(--border-soft); border-radius: var(--radius); padding: 10px 14px;">
+        <div class="mini-card">
           <div class="row-between mb-1">
             <span class="fs-sm fw-bold">${esc(item.name)}</span>
             <span class="pill ${item.ok ? "ok" : "bad"}">${item.ok ? "✓ 解锁" : "✗ 受限"}</span>
