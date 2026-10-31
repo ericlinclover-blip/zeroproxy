@@ -195,7 +195,10 @@ DEFAULTS: dict = {
     "geodata": {
         "enabled": False,       # 是否下发 geo 分流规则 (需要数据文件齐备)
         "block_private": True,  # 阻止客户端访问服务器内网/私有地址
-        "block_ads": True,      # 按 geosite:category-ads-all 屏蔽广告域名
+        "block_ads": True,      # 商业广告域名拦截 (按 geosite:category-ads-all 与高频商业广告 SDK)
+        "block_tracking": True, # 隐私遥测与数据防追踪 (友盟/极光/Adjust/Appsflyer/OS遥测等)
+        "block_malicious": True,# 恶意挖矿与钓鱼威胁拦截 (Coinhive/恶意挖矿/C2威胁)
+        "ad_allowlist": [],     # 广告放行白名单 (防误杀域名列表, 优先于广告拦截放行)
         "user_set": False,      # 用户是否手动调整过分流开关 (为真则不再自动启用)
         "updated_at": 0,        # 上次成功更新时间
         "source": "",           # 实际生效的数据源

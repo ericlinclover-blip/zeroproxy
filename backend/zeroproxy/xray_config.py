@@ -202,15 +202,33 @@ def geo_rules(state: dict) -> list[dict]:
     """
     if not geodata.usable(state):
         return []
+    from . import share_links
+
     geo = state.get("geodata", {})
     rules: list[dict] = []
+
+    # 广告防误杀白名单优先直连放行 (早于任何广告与黑洞拦截)
+    allowlist = share_links.ad_allowlist_of(state)
+    if allowlist:
+        rules.append({"type": "field", "outboundTag": "direct", "domain": [f"domain:{d}" for d in allowlist]})
+
     if geo.get("block_private", True):
         # 阻止客户端借道服务器访问其内网 / 私有网段 (SSRF 面收窄)
         rules.append({"type": "field", "outboundTag": "block", "ip": ["geoip:private"]})
+
     if geo.get("block_ads", True):
-        rules.append(
-            {"type": "field", "outboundTag": "block", "domain": ["geosite:category-ads-all"]}
-        )
+        # 商业广告与开屏广告拦截
+        ad_domains = ["geosite:category-ads-all"] + [f"domain:{d}" for d in share_links.COMMERCIAL_ADS_DOMAINS]
+        rules.append({"type": "field", "outboundTag": "block", "domain": ad_domains})
+
+    if geo.get("block_tracking", True):
+        # 隐私遥测与数据防追踪
+        rules.append({"type": "field", "outboundTag": "block", "domain": [f"domain:{d}" for d in share_links.TRACKING_DOMAINS]})
+
+    if geo.get("block_malicious", True):
+        # 恶意挖矿与钓鱼威胁拦截
+        rules.append({"type": "field", "outboundTag": "block", "domain": [f"domain:{d}" for d in share_links.MALICIOUS_DOMAINS]})
+
     return rules
 
 

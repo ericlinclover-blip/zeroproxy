@@ -370,6 +370,50 @@ function renderGeo(d) {
   const ready = Object.values(files).filter((f) => f.exists).length;
   $("#geo-private").checked = g.block_private !== false;
   $("#geo-ads").checked = g.block_ads !== false;
+  const trackingEl = $("#geo-tracking");
+  if (trackingEl) {
+    trackingEl.checked = g.block_tracking !== false;
+    trackingEl.onchange = () =>
+      save(withEnable({ block_tracking: trackingEl.checked }), () => renderGeo(S.dash));
+  }
+  const malEl = $("#geo-malicious");
+  if (malEl) {
+    malEl.checked = g.block_malicious !== false;
+    malEl.onchange = () =>
+      save(withEnable({ block_malicious: malEl.checked }), () => renderGeo(S.dash));
+  }
+
+  const allowEl = $("#geo-allowlist");
+  if (allowEl && document.activeElement !== allowEl) {
+    allowEl.value = (g.ad_allowlist || []).join("\n");
+  }
+
+  const addPreset = (domain) => {
+    if (!allowEl) return;
+    const lines = allowEl.value.split("\n").map((s) => s.trim()).filter(Boolean);
+    if (!lines.includes(domain)) {
+      lines.push(domain);
+      allowEl.value = lines.join("\n");
+      toast(`已填入白名单: ${domain}，请点击保存`);
+    }
+  };
+
+  const pGoogle = $("#btn-preset-google");
+  if (pGoogle) pGoogle.onclick = () => addPreset("googleadservices.com");
+  const pApple = $("#btn-preset-apple");
+  if (pApple) pApple.onclick = () => addPreset("metrics.apple.com");
+  const pMs = $("#btn-preset-ms");
+  if (pMs) pMs.onclick = () => addPreset("vortex.data.microsoft.com");
+  const pRebate = $("#btn-preset-rebate");
+  if (pRebate) pRebate.onclick = () => addPreset("alimama.com");
+
+  const btnSaveAllow = $("#btn-save-allowlist");
+  if (btnSaveAllow) {
+    btnSaveAllow.onclick = () => {
+      const list = allowEl ? allowEl.value.split("\n").map((s) => s.trim()).filter(Boolean) : [];
+      save({ ad_allowlist: list }, () => renderGeo(S.dash));
+    };
+  }
   let text;
   if (!ready) text = "数据未下载 (分流暂不生效)";
   else if (g.active) text = `${g.age_days >= 0 ? g.age_days + " 天前更新" : "已就绪"} · 分流已启用`;

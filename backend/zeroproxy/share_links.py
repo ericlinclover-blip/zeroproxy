@@ -126,6 +126,72 @@ PURITY_LANDING_DOMAINS = (
 LANDING_DOMAINS = AI_DOMAINS + PURITY_LANDING_DOMAINS + STREAMING_DOMAINS
 LANDING_GEOSITES = STREAMING_GEOSITES
 
+#: 商业广告与开屏广告核心域名 (国内主流 App 商业广告 SDK 及知名广告网络)
+COMMERCIAL_ADS_DOMAINS = (
+    # 字节跳动 / 穿山甲独立商业化域名
+    "pangolin-sdk.com", "tobabt.com", "bytegoofy.com", "pangle.io",
+    # 阿里广告联盟
+    "atanx.alicdn.com", "strip.alicdn.com",
+    # 百度移动联盟
+    "cpro.baidustatic.com",
+    # 快手快手联盟
+    "adkwai.com", "kuaishouzt.com",
+    # 谷歌与海外主流广告网络
+    "pagead2.googlesyndication.com", "admob.com", "googleads.g.doubleclick.net",
+    "doubleclick.net", "googlesyndication.com", "unityads.unity3d.com",
+    "applovin.com", "vungle.com", "ironsrc.com",
+)
+
+#: 隐私遥测与行为追踪域名 (保护设备指纹、用户轨迹与减少后台电量/流量消耗)
+TRACKING_DOMAINS = (
+    # 国内主流统计追踪 SDK
+    "umeng.com", "umengcloud.com", "umsns.com",
+    "jiguang.cn", "jpush.cn",
+    "sensorsdata.cn",
+    "talkingdata.com", "tendcloud.com",
+    # 国际主流移动归因与埋点追踪
+    "adjust.com", "adjust.net",
+    "appsflyer.com", "appsflyersdk.com",
+    "branch.io", "app.link",
+    "kochava.com", "singular.net",
+    # 操作系统级遥测收集
+    "telemetry.microsoft.com", "vortex.data.microsoft.com", "watson.telemetry.microsoft.com",
+    "metrics.apple.com", "notes-analytics-events.apple.com",
+    # 网站与应用分析统计
+    "google-analytics.com", "app-measurement.com", "firebaseinstallations.googleapis.com",
+)
+
+#: 恶意软件、挖矿脚本与高风险钓鱼域名
+MALICIOUS_DOMAINS = (
+    "coinhive.com", "coin-hive.com", "crypto-loot.com",
+    "jsecoin.com", "authedmine.com", "webminepool.com",
+    "minr.pw", "coin-have.com",
+)
+
+
+def ad_allowlist_of(state: dict | None) -> list[str]:
+    """读取并清洗广告放行白名单 (防误杀域名列表)。"""
+    if not isinstance(state, dict):
+        return []
+    raw = (state.get("geodata") or {}).get("ad_allowlist") or []
+    cleaned: list[str] = []
+    for x in raw:
+        n = normalize_target(x)
+        if n and n not in cleaned:
+            cleaned.append(n)
+    return cleaned
+
+
+def ad_settings_of(state: dict | None) -> dict:
+    """读取广告拦截三维防护配置。"""
+    geo = (state.get("geodata") or {}) if isinstance(state, dict) else {}
+    return {
+        "block_ads": bool(geo.get("block_ads", True)),
+        "block_tracking": bool(geo.get("block_tracking", True)),
+        "block_malicious": bool(geo.get("block_malicious", True)),
+        "ad_allowlist": ad_allowlist_of(state),
+    }
+
 
 def _landing_rules(geo: bool = True) -> list[str]:
     """"必须走落地"的规则 (兼容旧接口, 包含 AI + 流媒体 + 纯净度/风控)。"""
@@ -302,7 +368,72 @@ def simulate_match(target: str, state: dict, override_template: str | None = Non
             "reason": "全部直连模板：除自定义规则外全部直连",
         }
 
-    # 3. 全局代理模式
+    # 3. 广告放行白名单 (优先级高于任何广告/追踪/威胁拦截规则，防误杀放行)
+    allowlist = ad_allowlist_of(state)
+    if not is_ip:
+        for w in allowlist:
+            if norm == w or norm.endswith("." + w):
+                return {
+                    "target": target,
+                    "normalized": norm,
+                    "template": tpl,
+                    "group": G_DIRECT,
+                    "action": "direct",
+                    "matched_rule": f"DOMAIN-SUFFIX,{w}",
+                    "reason": "广告拦截放行白名单 (防误杀放行)",
+                }
+
+    # 4. 商业广告、隐私遥测与恶意威胁防护 (早于常规业务分流)
+    ad_cfg = ad_settings_of(state)
+    if not is_ip:
+        if ad_cfg["block_ads"]:
+            for d in COMMERCIAL_ADS_DOMAINS:
+                if norm == d or norm.endswith("." + d):
+                    return {
+                        "target": target,
+                        "normalized": norm,
+                        "template": tpl,
+                        "group": G_ADS,
+                        "action": "reject",
+                        "matched_rule": f"DOMAIN-SUFFIX,{d}",
+                        "reason": "商业广告与推广服务拦截 (屏蔽开屏/SDK/弹窗广告)",
+                    }
+            if any(k in norm for k in ("adservice.google", "pagead2", "admob")):
+                return {
+                    "target": target,
+                    "normalized": norm,
+                    "template": tpl,
+                    "group": G_ADS,
+                    "action": "reject",
+                    "matched_rule": "GEOSITE,category-ads-all",
+                    "reason": "商业广告与推广服务拦截 (屏蔽开屏/SDK/弹窗广告)",
+                }
+        if ad_cfg["block_tracking"]:
+            for d in TRACKING_DOMAINS:
+                if norm == d or norm.endswith("." + d):
+                    return {
+                        "target": target,
+                        "normalized": norm,
+                        "template": tpl,
+                        "group": G_ADS,
+                        "action": "reject",
+                        "matched_rule": f"DOMAIN-SUFFIX,{d}",
+                        "reason": "隐私与行为遥测防追踪 (保护设备指纹与隐私)",
+                    }
+        if ad_cfg["block_malicious"]:
+            for d in MALICIOUS_DOMAINS:
+                if norm == d or norm.endswith("." + d):
+                    return {
+                        "target": target,
+                        "normalized": norm,
+                        "template": tpl,
+                        "group": G_ADS,
+                        "action": "reject",
+                        "matched_rule": f"DOMAIN-SUFFIX,{d}",
+                        "reason": "恶意软件与挖矿脚本拦截 (阻止恶意威胁)",
+                    }
+
+    # 5. 全局代理模式
     if tpl == "global":
         if is_ip:
             try:
@@ -1080,7 +1211,7 @@ def _groups_for(names: list[str], tpl: str) -> list[dict]:
         streaming_group,
         landing_group,
         {"name": G_DIRECT, "type": "select", "proxies": ["DIRECT", G_SELECT]},
-        {"name": G_ADS, "type": "select", "proxies": ["REJECT", "DIRECT"]},
+        {"name": G_ADS, "type": "select", "proxies": ["REJECT", "REJECT-DROP", "DIRECT"]},
         {
             "name": G_FINAL,
             "type": "select",
@@ -1119,6 +1250,27 @@ def management_direct_rules(base: str) -> list[str]:
     if host.replace(".", "").isdigit():
         return [f"IP-CIDR,{host}/32,DIRECT,no-resolve"]
     return [f"DOMAIN-SUFFIX,{host},DIRECT"]
+
+
+def _clash_ad_rules(state: dict, geo: bool = True) -> list[str]:
+    """生成 Clash 格式的广告拦截与防误杀白名单规则。"""
+    rules: list[str] = []
+    allowlist = ad_allowlist_of(state)
+    for d in allowlist:
+        rules.append(f"DOMAIN-SUFFIX,{d},{G_DIRECT}")
+    ad_cfg = ad_settings_of(state)
+    if ad_cfg["block_ads"]:
+        if geo:
+            rules.append(f"GEOSITE,category-ads-all,{G_ADS}")
+        for d in COMMERCIAL_ADS_DOMAINS:
+            rules.append(f"DOMAIN-SUFFIX,{d},{G_ADS}")
+    if ad_cfg["block_tracking"]:
+        for d in TRACKING_DOMAINS:
+            rules.append(f"DOMAIN-SUFFIX,{d},{G_ADS}")
+    if ad_cfg["block_malicious"]:
+        for d in MALICIOUS_DOMAINS:
+            rules.append(f"DOMAIN-SUFFIX,{d},{G_ADS}")
+    return rules
 
 
 def clash_profile(
@@ -1210,7 +1362,7 @@ def clash_profile(
                 "proxies": [G_SELECT],
             },
             {"name": G_DIRECT, "type": "select", "proxies": ["DIRECT", G_SELECT]},
-            {"name": G_ADS, "type": "select", "proxies": ["REJECT", "DIRECT"]},
+            {"name": G_ADS, "type": "select", "proxies": ["REJECT", "REJECT-DROP", "DIRECT"]},
             {
                 "name": G_FINAL,
                 "type": "select",
@@ -1230,8 +1382,7 @@ def clash_profile(
         # 唯一的国内直连来源 (见 CN_DIRECT_DOMAINS 的说明)。
         rules = []
         rules += custom_rules_clash
-        if geo:
-            rules.append(f"GEOSITE,category-ads-all,{G_ADS}")
+        rules += _clash_ad_rules(state, geo)
         # AI 核心服务走 AI 专线
         for d in AI_DOMAINS:
             rules.append(f"DOMAIN-SUFFIX,{d},{G_AI}")
@@ -1255,8 +1406,7 @@ def clash_profile(
     elif tpl == "global":
         rules = []
         rules += custom_rules_clash
-        if geo:
-            rules.append(f"GEOSITE,category-ads-all,{G_ADS}")
+        rules += _clash_ad_rules(state, geo)
         for d in AI_DOMAINS:
             rules.append(f"DOMAIN-SUFFIX,{d},{G_AI}")
         for d in STREAMING_DOMAINS:
@@ -1628,8 +1778,22 @@ def singbox_profile(state: dict, template: str | None = None, next_gen: bool = F
     rules += custom_rules_sb
 
     if tpl in ("smart", "precision"):
-        rule_set = [_singbox_rule_set(tag, name, next_gen) for tag, name in smart_rule_sets()]
-        rules.append({"rule_set": ["ads"], "action": "reject"})
+        ad_cfg = ad_settings_of(state)
+        rule_sets = [_singbox_rule_set(tag, name, next_gen) for tag, name in smart_rule_sets()]
+        if not ad_cfg["block_ads"]:
+            rule_sets = [rs for rs in rule_sets if rs.get("tag") != "ads"]
+        rule_set = rule_sets
+
+        allowlist = ad_allowlist_of(state)
+        if allowlist:
+            rules.append({"domain_suffix": allowlist, "action": "route", "outbound": G_DIRECT})
+        if ad_cfg["block_ads"]:
+            rules.append({"rule_set": ["ads"], "action": "reject"})
+            rules.append({"domain_suffix": list(COMMERCIAL_ADS_DOMAINS), "action": "reject"})
+        if ad_cfg["block_tracking"]:
+            rules.append({"domain_suffix": list(TRACKING_DOMAINS), "action": "reject"})
+        if ad_cfg["block_malicious"]:
+            rules.append({"domain_suffix": list(MALICIOUS_DOMAINS), "action": "reject"})
         # 业务分流: AI 专线
         rules.append(
             {"domain_suffix": list(AI_DOMAINS), "action": "route", "outbound": G_AI}
@@ -1662,8 +1826,18 @@ def singbox_profile(state: dict, template: str | None = None, next_gen: bool = F
         )
         final = G_SELECT
     elif tpl == "global":
-        rule_set = [_singbox_rule_set(*ADS_RULE_SET, next_gen)]
-        rules.append({"rule_set": ["ads"], "action": "reject"})
+        ad_cfg = ad_settings_of(state)
+        allowlist = ad_allowlist_of(state)
+        if allowlist:
+            rules.append({"domain_suffix": allowlist, "action": "route", "outbound": G_DIRECT})
+        if ad_cfg["block_ads"]:
+            rule_set = [_singbox_rule_set(*ADS_RULE_SET, next_gen)]
+            rules.append({"rule_set": ["ads"], "action": "reject"})
+            rules.append({"domain_suffix": list(COMMERCIAL_ADS_DOMAINS), "action": "reject"})
+        if ad_cfg["block_tracking"]:
+            rules.append({"domain_suffix": list(TRACKING_DOMAINS), "action": "reject"})
+        if ad_cfg["block_malicious"]:
+            rules.append({"domain_suffix": list(MALICIOUS_DOMAINS), "action": "reject"})
         final = G_SELECT
     else:  # direct: 不引用任何远程 rule-set, 客户端零下载
         final = G_FINAL

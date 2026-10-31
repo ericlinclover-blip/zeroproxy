@@ -236,13 +236,30 @@ def render(
         else:
             add(f"    domain(suffix: '{p}') -> proxy")
 
+    # 广告防误杀白名单 (优先级高于任何广告拦截规则)
+    allowlist = share_links.ad_allowlist_of(state)
+    for w in allowlist:
+        add(f"    domain(suffix: '{w}') -> direct")
+
     if tpl == "direct":
         add("    # 模板: 全直连 (只保留上面的放行) —— 与 mihomo 的 direct 模板同一个意思")
         add("    fallback: direct")
     else:
-        if geo:
-            add("    # 广告拦截 —— 与 mihomo smart / global 模板同一档 (需分流数据)")
-            add("    domain(geosite:category-ads-all) -> block")
+        ad_cfg = share_links.ad_settings_of(state)
+        if ad_cfg["block_ads"]:
+            add("    # 商业广告与开屏广告拦截")
+            if geo:
+                add("    domain(geosite:category-ads-all) -> block")
+            for d in share_links.COMMERCIAL_ADS_DOMAINS:
+                add(f"    domain(suffix: '{d}') -> block")
+        if ad_cfg["block_tracking"]:
+            add("    # 隐私遥测与数据防追踪")
+            for d in share_links.TRACKING_DOMAINS:
+                add(f"    domain(suffix: '{d}') -> block")
+        if ad_cfg["block_malicious"]:
+            add("    # 恶意软件与挖矿拦截")
+            for d in share_links.MALICIOUS_DOMAINS:
+                add(f"    domain(suffix: '{d}') -> block")
         add(f"    {QUIC_BLOCK}   # 关 h3: 省下 UDP 443 的用户态开销, 浏览器会自动回落 TCP/2")
         if tpl in ("smart", "precision"):
             if geo:

@@ -1324,6 +1324,9 @@ class SettingsIn(BaseModel):
     geodata_enabled: bool | None = None
     block_private: bool | None = None
     block_ads: bool | None = None
+    block_tracking: bool | None = None
+    block_malicious: bool | None = None
+    ad_allowlist: list[str] | None = None
 
 
 class UpdateIn(BaseModel):
@@ -1471,21 +1474,49 @@ def update_settings(payload: SettingsIn, request: Request):
             geo["enabled"] = bool(payload.geodata_enabled)
             geo["user_set"] = True
             changed.append(f"geodata={'on' if geo['enabled'] else 'off'}")
-        for field, key in (("block_private", "block_private"), ("block_ads", "block_ads")):
+        for field, key in (
+            ("block_private", "block_private"),
+            ("block_ads", "block_ads"),
+            ("block_tracking", "block_tracking"),
+            ("block_malicious", "block_malicious"),
+        ):
             value = getattr(payload, field)
             if value is not None and bool(value) != bool(geo.get(key, True)):
                 geo[key] = bool(value)
                 geo["user_set"] = True
                 changed.append(f"{key}={'on' if value else 'off'}")
 
+        if payload.ad_allowlist is not None:
+            cleaned_allow: list[str] = []
+            for item in payload.ad_allowlist:
+                n = share_links.normalize_target(item)
+                if n and n not in cleaned_allow:
+                    cleaned_allow.append(n)
+            if cleaned_allow != list(geo.get("ad_allowlist") or []):
+                geo["ad_allowlist"] = cleaned_allow
+                geo["user_set"] = True
+                changed.append(f"ad_allowlist={len(cleaned_allow)}条")
+
         if not changed:
             return _err("没有需要修改的内容")
 
         config.audit(state, "settings", ", ".join(changed), actor=_client_ip(request))
-        # 分流模板与自定义规则只影响订阅输出, 服务端配置一字不变 → 直接保存, 不做无谓的重载
-        if all(item.startswith("template=") or item.startswith("custom_rules") for item in changed):
+        # 分流模板与自定义规则只影响订阅输出；未就绪的 geo 规则同样不影响服务端内核 → 直接保存, 不做无谓的重载
+        client_rules_only = all(
+            item.startswith("template=")
+            or item.startswith("custom_rules")
+            or (not geodata.usable(state) and (
+                any(item.startswith(k) for k in ("block_ads", "block_tracking", "block_malicious", "ad_allowlist"))
+            ))
+            for item in changed
+        )
+        if client_rules_only:
             steps = _steps_recorder()
-            action_title = "切换分流模板" if any(item.startswith("template=") for item in changed) else "更新分流规则"
+            action_title = (
+                "切换分流模板"
+                if any(item.startswith("template=") for item in changed)
+                else "更新分流规则"
+            )
             steps.append(
                 {
                     "name": action_title,

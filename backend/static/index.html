@@ -351,12 +351,30 @@
       </div>
       <div class="divider"></div>
       <div class="row-between">
-        <span class="sub-title">GeoIP 分流防护</span>
+        <span class="sub-title">GeoIP 分流与智能防护</span>
         <span class="muted fs-sm" id="geo-status">—</span>
       </div>
       <div class="row wide mt-3">
-        <label class="chk"><input type="checkbox" id="geo-private"> 私有地址防护</label>
-        <label class="chk"><input type="checkbox" id="geo-ads"> 广告域名拦截</label>
+        <label class="chk" title="阻止客户端访问服务器私有/内网网段 (SSRF防护)"><input type="checkbox" id="geo-private"> 私有地址防护</label>
+        <label class="chk" title="拦截商业广告、开屏及弹窗推广 (geosite:category-ads-all 与高频商业广告 SDK)"><input type="checkbox" id="geo-ads"> 商业广告拦截</label>
+        <label class="chk" title="拦截应用埋点、行为追踪与操作系统遥测 (友盟/极光/Adjust/Appsflyer/OS遥测等)"><input type="checkbox" id="geo-tracking"> 隐私与遥测防追踪</label>
+        <label class="chk" title="拦截网页挖矿脚本 (Coinhive等) 与钓鱼威胁"><input type="checkbox" id="geo-malicious"> 恶意/挖矿防护</label>
+      </div>
+      <div class="mt-3">
+        <div class="row-between mb-1">
+          <label class="muted fs-xs block">🛡️ 广告放行白名单 (防误杀放行，每行一个域名)</label>
+          <div class="row" id="geo-preset-badges">
+            <span class="ad-preset-badge" id="btn-preset-google" title="放行 Google 购物搜索与推广">+Google推广</span>
+            <span class="ad-preset-badge" id="btn-preset-apple" title="放行 Apple 测速与私有诊断">+Apple诊断</span>
+            <span class="ad-preset-badge" id="btn-preset-ms" title="放行 Windows 遥测诊断更新">+微软更新</span>
+            <span class="ad-preset-badge" id="btn-preset-rebate" title="放行电商返利联盟与淘客跳转">+电商返利</span>
+          </div>
+        </div>
+        <textarea id="geo-allowlist" class="input-text ad-allowlist-ta" rows="2" placeholder="例: googleadservices.com、alimama.com (输入域名防误杀放行)"></textarea>
+        <div class="row-between mt-1">
+          <span class="muted fs-xs">白名单域名优先直连放行，不受广告拦截或 blackhole 规则阻断</span>
+          <button class="btn ghost small" id="btn-save-allowlist">保存白名单</button>
+        </div>
       </div>
       <div class="row mt-3">
         <button class="btn ghost small" id="btn-geo-update">下载 / 更新 GeoIP 数据</button>

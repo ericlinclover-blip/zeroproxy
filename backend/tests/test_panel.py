@@ -910,6 +910,86 @@ def test_routing_simulation_endpoint(client, configured):
     assert r_block["action"] == "reject"
 
 
+def test_ad_blocking_matrix_and_allowlist(client, configured):
+    """广告拦截三维防护体系 (商业广告/隐私追踪/恶意挖矿) 与防误杀白名单验证。"""
+    from zeroproxy import config
+
+    yaml = pytest.importorskip("yaml")
+
+    # 1. 默认状态: 三维全开，白名单为空
+    st = config.load_state()
+    geo = st.get("geodata", {})
+    assert geo.get("block_ads") is True
+    assert geo.get("block_tracking") is True
+    assert geo.get("block_malicious") is True
+    assert geo.get("ad_allowlist") == []
+
+    # 2. 默认订阅规则验证: 包含商业广告、追踪与恶意挖矿规则
+    sub_text = _sub(client, configured).text
+    clash = yaml.safe_load(sub_text)
+    rules_text = "\n".join(clash["rules"])
+    assert "GEOSITE,category-ads-all,🛑 广告拦截" in rules_text
+    assert "DOMAIN-SUFFIX,pangolin-sdk.com,🛑 广告拦截" in rules_text
+    assert "DOMAIN-SUFFIX,umeng.com,🛑 广告拦截" in rules_text
+    assert "DOMAIN-SUFFIX,telemetry.microsoft.com,🛑 广告拦截" in rules_text
+    assert "DOMAIN-SUFFIX,coinhive.com,🛑 广告拦截" in rules_text
+
+    # sing-box 默认也包含 ads rule_set 与内置追踪域名
+    sb_profile = json.loads(_sub(client, configured, fmt="singbox").text)
+    sb_rules_str = json.dumps(sb_profile["route"]["rules"], ensure_ascii=False)
+    assert '{"rule_set": ["ads"], "action": "reject"}' in sb_rules_str
+    assert "umeng.com" in sb_rules_str
+    assert "coinhive.com" in sb_rules_str
+
+    # 3. 路由模拟器测试
+    r_ad = client.get("/api/routing/test?target=pangolin-sdk.com").json()["result"]
+    assert r_ad["group"] == "🛑 广告拦截"
+    assert r_ad["action"] == "reject"
+    assert "商业广告" in r_ad["reason"]
+
+    r_track = client.get("/api/routing/test?target=telemetry.microsoft.com").json()["result"]
+    assert r_track["group"] == "🛑 广告拦截"
+    assert r_track["action"] == "reject"
+    assert "防追踪" in r_track["reason"]
+
+    r_mal = client.get("/api/routing/test?target=coinhive.com").json()["result"]
+    assert r_mal["group"] == "🛑 广告拦截"
+    assert r_mal["action"] == "reject"
+    assert "恶意软件" in r_mal["reason"]
+
+    # 4. 配置白名单与关闭隐私防追踪
+    res = client.post("/api/settings", json={
+        "ad_allowlist": ["googleadservices.com", "https://*.metrics.apple.com/stat"],
+        "block_tracking": False,
+    })
+    assert res.status_code == 200
+    fresh_st = config.load_state()
+    fresh_geo = fresh_st["geodata"]
+    assert "googleadservices.com" in fresh_geo["ad_allowlist"]
+    assert "metrics.apple.com" in fresh_geo["ad_allowlist"]
+    assert fresh_geo["block_tracking"] is False
+
+    # 5. 白名单放行优先权验证
+    clash_allow = yaml.safe_load(_sub(client, configured).text)
+    c_rules = clash_allow["rules"]
+    allow_idx = c_rules.index("DOMAIN-SUFFIX,googleadservices.com,🎯 全球直连")
+    ads_idx = c_rules.index("GEOSITE,category-ads-all,🛑 广告拦截")
+    assert allow_idx < ads_idx, "白名单必须排在广告拦截规则之前！"
+    # 追踪规则在关闭后不再下发
+    assert "DOMAIN-SUFFIX,umeng.com,🛑 广告拦截" not in c_rules
+
+    # sing-box 白名单优先放行验证
+    sb_allow = json.loads(_sub(client, configured, fmt="singbox").text)
+    sb_str = json.dumps(sb_allow["route"]["rules"], ensure_ascii=False)
+    assert sb_str.index("googleadservices.com") < sb_str.index('"rule_set": ["ads"]')
+
+    # 模拟器白名单防误杀反馈验证
+    r_unblock = client.get("/api/routing/test?target=googleadservices.com").json()["result"]
+    assert r_unblock["group"] == "🎯 全球直连"
+    assert r_unblock["action"] == "direct"
+    assert "白名单" in r_unblock["reason"]
+
+
 # ---------------------------------------------------------------- 节点操作
 
 def test_toggle_node_updates_subscription(client, configured):
