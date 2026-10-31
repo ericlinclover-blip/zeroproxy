@@ -27,7 +27,8 @@ except ImportError:  # pragma: no cover
 #: state.json 结构版本 — 新增字段时 +1, `_merge` 会自动补齐缺失键
 #: v5: 新增 devices (客户端设备注册表, 见 devices.py)
 #: v6: 新增 wireguard (原生 WireGuard 入站 / 每设备 peer, 见 wireguard.py)
-STATE_VERSION = 6
+#: v7: 新增 wireguard.awg_* (AmneziaWG 抗 DPI 混淆参数)
+STATE_VERSION = 7
 
 
 class StateError(RuntimeError):
@@ -244,6 +245,17 @@ DEFAULTS: dict = {
         "endpoint": "",            # 留空 = 用面板域名
         "server_private_key": "",
         "server_public_key": "",
+        # AmneziaWG 抗 DPI 混淆参数 (支持 Shadowrocket / sing-box / AmneziaVPN)
+        "awg_enabled": False,      # 是否启用 AmneziaWG 混淆
+        "awg_jc": 4,               # 握手前垃圾包数量 (Junk Packet Count)
+        "awg_jmin": 40,            # 垃圾包最小尺寸 (Junk Packet Min Size)
+        "awg_jmax": 70,            # 垃圾包最大尺寸 (Junk Packet Max Size)
+        "awg_s1": 56,              # 握手发起包填充长度 (Init Packet Padding)
+        "awg_s2": 84,              # 握手响应包填充长度 (Response Packet Padding)
+        "awg_h1": 0,               # 握手发起 Magic Header (32 位整数)
+        "awg_h2": 0,               # 握手响应 Magic Header
+        "awg_h3": 0,               # Under Load / Cookie Magic Header
+        "awg_h4": 0,               # Transport / 数据 Magic Header
         "peers": [],               # [{id,name,private_key,public_key,preshared_key,address,...}]
         "one_time_links": [],      # [{token,peer_id,created_at,expires_at}]
     },
@@ -293,8 +305,12 @@ def paths() -> dict:
         "wireguard_runtime": f"{h}/wireguard/wg0.runtime.conf",
         "wireguard_firewall": f"{h}/wireguard/firewall.sh",
         "wireguard_reload": f"{h}/wireguard/reload.sh",
+        "wireguard_start": f"{h}/wireguard/start.sh",
+        "wireguard_stop": f"{h}/wireguard/stop.sh",
+        "wireguard_userspace_start": f"{h}/wireguard/userspace-start.sh",
         "wireguard_userspace_up": f"{h}/wireguard/userspace-up.sh",
         "wireguard_userspace_down": f"{h}/wireguard/userspace-down.sh",
+        "wireguard_awg_flag": f"{h}/wireguard/awg.enabled",
         # 链式代理的内层 QUIC (Hysteria 2) — 配置 / 进程日志 / 临时测速都放这里
         "chain_quic_dir": f"{h}/data/chain-quic",
         "chain_quic_cert": f"{h}/data/chain-quic/cert.pem",
@@ -650,6 +666,7 @@ AUDIT_ACTIONS: dict[str, tuple[str, str]] = {
     "device_template": ("客户端分流模板", "device"),
     "device_remove": ("移除客户端", "device"),
     "wireguard_settings": ("WireGuard 设置", "config"),
+    "wireguard_awg_reseed": ("重置 AmneziaWG 混淆参数", "config"),
     "wireguard_peer_add": ("新增 WireGuard 客户端", "device"),
     "wireguard_peer_update": ("修改 WireGuard 客户端", "device"),
     "wireguard_peer_remove": ("移除 WireGuard 客户端", "device"),

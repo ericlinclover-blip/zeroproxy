@@ -4,12 +4,13 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-# 由面板生成 /opt/zeroproxy/wireguard/wg0.conf；PostUp/PostDown 会挂上 NAT 规则。
-# 重新加载走 reload.sh 里的 `wg syncconf`，在线 peer 不会因为改一个客户端而被踢掉。
+# 由面板生成 /opt/zeroproxy/wireguard/wg0.conf 与 start.sh/stop.sh；PostUp/PostDown 会挂上 NAT 规则。
+# 支持标准 WireGuard (wg-quick) 与 AmneziaWG (awg-quick)。
+# 重新加载走 reload.sh 里的 `wg/awg syncconf`，在线 peer 不会因为改一个客户端而被踢掉。
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/bin/wg-quick up /opt/zeroproxy/wireguard/wg0.conf
-ExecStop=/usr/bin/wg-quick down /opt/zeroproxy/wireguard/wg0.conf
+ExecStart=/bin/sh /opt/zeroproxy/wireguard/start.sh
+ExecStop=/bin/sh /opt/zeroproxy/wireguard/stop.sh
 ExecReload=/bin/sh /opt/zeroproxy/wireguard/reload.sh
 TimeoutStartSec=30
 TimeoutStopSec=30

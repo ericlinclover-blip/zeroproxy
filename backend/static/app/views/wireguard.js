@@ -102,6 +102,7 @@ function statusPill(wg) {
 
 function enabledView(wg) {
   const hasPeers = (wg.peers || []).length > 0;
+  const awg = wg.awg || {};
   return `
   <div class="row-between top">
     <div>
@@ -110,6 +111,7 @@ function enabledView(wg) {
         <span class="wg-endpoint">${esc(wg.endpoint || "尚未确定地址")}</span>
         <span class="muted fs-xs">接口 ${esc(wg.interface)} · MTU ${esc(wg.mtu)}</span>
         ${wg.active_mode ? `<span class="tag-chip">${wg.active_mode === "userspace" ? "用户态 (wireguard-go)" : "内核"}</span>` : ""}
+        ${awg.enabled ? `<span class="tag-chip">AmneziaWG 混淆</span>` : ""}
       </div>
       ${wg.reason ? `<div class="muted fs-xs mt-1">${esc(wg.reason)}</div>` : ""}
     </div>
@@ -117,7 +119,7 @@ function enabledView(wg) {
   </div>
 
   <details class="client-help mt-2" ${hasPeers ? "" : "open"}>
-    <summary>端口 / 网段 / MTU / DNS</summary>
+    <summary>端口 / 网段 / MTU / DNS / 混淆</summary>
     <div class="wg-form mt-2">
       <div class="field">
         <label>监听端口 (UDP)</label>
@@ -128,10 +130,10 @@ function enabledView(wg) {
         <select id="wg-mode">
           <option value="auto" ${wg.mode === "auto" ? "selected" : ""}>自动 (内核优先, 失败退用户态)</option>
           <option value="kernel" ${wg.mode === "kernel" ? "selected" : ""}>仅内核</option>
-          <option value="userspace" ${wg.mode === "userspace" ? "selected" : ""}>仅用户态 (wireguard-go)</option>
+          <option value="userspace" ${wg.mode === "userspace" ? "selected" : ""}>仅用户态 (wireguard-go / amneziawg-go)</option>
         </select>
         <div class="muted fs-xs mt-1">
-          ${wg.userspace_available ? "wireguard-go 与 /dev/net/tun 已就绪" : "未检测到 wireguard-go 或 /dev/net/tun"}
+          ${wg.userspace_available ? "用户态与 /dev/net/tun 已就绪" : "未检测到用户态工具或 /dev/net/tun"}
         </div>
       </div>
       <div class="field">
@@ -159,7 +161,58 @@ function enabledView(wg) {
       <label class="chk"><input type="checkbox" id="wg-ipv6" ${wg.ipv6 ? "checked" : ""}> 同时分配 IPv6 隧道地址</label>
       <span class="muted fs-xs">关闭后已有客户端需要重新下载配置</span>
     </div>
-    <div class="row mt-2">
+
+    <div class="card-section mt-3 pt-3">
+      <div class="row-between">
+        <div>
+          <b>AmneziaWG 抗 DPI 混淆</b>
+          <div class="muted fs-xs mt-1">
+            消除固定握手包长与协议头特征，专治防火墙秒封 UDP。开启后客户端请使用 <b>Shadowrocket / sing-box / AmneziaVPN</b>。
+          </div>
+        </div>
+        <label class="chk">
+          <input type="checkbox" id="wg-awg-enabled" ${awg.enabled ? "checked" : ""}>
+          开启混淆
+        </label>
+      </div>
+      ${awg.enabled ? `
+        <div class="wg-form mt-2">
+          <div class="field">
+            <label>H1 (握手发起 Header)</label>
+            <input id="wg-awg-h1" class="mono" inputmode="numeric" value="${escAttr(awg.h1 || 0)}">
+          </div>
+          <div class="field">
+            <label>H2 (握手响应 Header)</label>
+            <input id="wg-awg-h2" class="mono" inputmode="numeric" value="${escAttr(awg.h2 || 0)}">
+          </div>
+          <div class="field">
+            <label>H3 (Cookie Header)</label>
+            <input id="wg-awg-h3" class="mono" inputmode="numeric" value="${escAttr(awg.h3 || 0)}">
+          </div>
+          <div class="field">
+            <label>H4 (传输数据 Header)</label>
+            <input id="wg-awg-h4" class="mono" inputmode="numeric" value="${escAttr(awg.h4 || 0)}">
+          </div>
+          <div class="field">
+            <label>Jc (前置垃圾包数)</label>
+            <input id="wg-awg-jc" class="mono" inputmode="numeric" value="${escAttr(awg.jc || 4)}">
+          </div>
+          <div class="field">
+            <label>S1 / S2 (握手包填充)</label>
+            <div class="row">
+              <input id="wg-awg-s1" class="mono" placeholder="S1" value="${escAttr(awg.s1 || 56)}">
+              <input id="wg-awg-s2" class="mono" placeholder="S2" value="${escAttr(awg.s2 || 84)}">
+            </div>
+          </div>
+        </div>
+        <div class="row mt-2">
+          <button class="btn ghost small" id="wg-awg-reseed">重新随机混淆参数</button>
+          <span class="muted fs-xs">${awg.tools_available ? "awg / awg-quick 已安装" : "未检测到 awg-quick（开启时自动尝试或作为配置下发）"}</span>
+        </div>
+      ` : ""}
+    </div>
+
+    <div class="row mt-3">
       <button class="btn small" id="wg-save">保存并应用</button>
       <span class="muted fs-xs">改端口 / MTU / DNS 用 <code class="mono">wg syncconf</code> 增量生效，不会踢掉在线设备</span>
     </div>
@@ -168,10 +221,10 @@ function enabledView(wg) {
 
   <div class="client-actions mt-3">
     <button class="btn primary" id="wg-add">＋ 添加设备</button>
-    <span class="muted fs-xs">每台设备一条独立密钥；二维码直接给官方 WireGuard App 扫</span>
+    <span class="muted fs-xs">每台设备一条独立密钥；二维码可直接扫码导入</span>
   </div>
   ${hasPeers ? `
-    <div class="wg-grid mt-3">${wg.peers.map(peerCard).join("")}</div>
+    <div class="wg-grid mt-3">${wg.peers.map((p) => peerCard(p, wg)).join("")}</div>
     <div class="muted fs-xs mt-3">
       一次性链接默认 ${Math.round((wg.one_time_ttl || 600) / 60)} 分钟内有效，取一次即作废。
       删除或轮换密钥后，旧配置立刻失效。
@@ -185,20 +238,20 @@ function enabledView(wg) {
 
 function howTo() {
   return `<details class="client-help">
-    <summary>官方客户端怎么导入？</summary>
+    <summary>客户端怎么导入与使用？</summary>
     <div class="muted fs-sm mt-2">
-      <b>iOS / Android</b>: 安装官方 WireGuard App → 右上角 <b>+</b> → 从二维码创建 / 扫描二维码。<br>
-      <b>Windows / macOS</b>: 安装官方 WireGuard → 左下角「导入隧道」→ 选择下载的
-      <code class="mono">.conf</code> 文件。<br>
-      <b>GL.iNet / 路由器</b>: 如果一直停在「连接中」，编辑这台设备并勾选
-      <b>GL.iNet / 路由器兼容模式</b>，重新下载 <code class="mono">.conf</code> 再导入。<br>
-      <b>一次给多台设备</b>: 每台单独添加一条 peer；不要把同一份配置复制到多台设备
-      (它们会争用同一个隧道地址)。
+      <b>开启 AmneziaWG 抗封锁混淆后</b>：<br>
+      • <b>iOS / macOS (Shadowrocket 小火箭)</b>：首页右上角扫码，或将下载的 <code class="mono">.conf</code> 导入小火箭，直接作为节点连接。<br>
+      • <b>全平台 (AmneziaVPN 官方客户端)</b>：打开 AmneziaVPN → 底部加号 → 从文件/配置导入。<br>
+      • <b>sing-box (1.10+)</b>：支持直接使用导出的 AWG 参数作为 outbound。<br><br>
+      <b>标准 WireGuard 模式（未开启混淆）</b>：<br>
+      • <b>官方 WireGuard App</b>：iOS/Android 右上角 <b>+</b> 扫码；Windows/macOS 点击左下角导入 <code class="mono">.conf</code>。<br>
+      • <b>GL.iNet / 路由器</b>：编辑设备并勾选 <b>GL.iNet 兼容模式</b>（自动禁用混淆与 PSK）。
     </div>
   </details>`;
 }
 
-function peerCard(p) {
+function peerCard(p, wg) {
   const state = p.expired
     ? `<span class="pill bad"><i class="dot err"></i>已过期</span>`
     : !p.enabled
@@ -209,6 +262,7 @@ function peerCard(p) {
   const expiry = p.expires_at
     ? `<span class="tag-chip">到期 ${esc(fmtTime(p.expires_at))}</span>`
     : `<span class="tag-chip">永久</span>`;
+  const isAwg = !!((wg && wg.awg && wg.awg.enabled)) && !p.compat;
   return `
   <div class="wg-peer ${p.enabled && !p.expired ? "on" : "off"}">
     <div class="wg-peer-top">
@@ -218,6 +272,27 @@ function peerCard(p) {
     <div class="wg-peer-ip">${esc(p.address)}${p.address6 ? ` · ${esc(p.address6)}` : ""}</div>
     <div class="wg-peer-stats">
       <span>握手 <b>${esc(p.latest_handshake ? ago(p.latest_handshake) : "从未")}</b></span>
+      <span>↑ <b>${fmtBytes(p.rx)}</b></span>
+      <span>↓ <b>${fmtBytes(p.tx)}</b></span>
+    </div>
+    <div class="wg-peer-meta">
+      <span class="tag-chip" title="客户端侧 AllowedIPs">${esc(p.allowed_ips)}</span>
+      ${p.compat ? `<span class="tag-chip" title="GL.iNet 兼容模式：服务端/客户端都不使用 PSK，单 DNS、无 MTU">路由器兼容</span>` : ""}
+      ${isAwg ? `<span class="tag-chip" title="已启用 AmneziaWG 混淆 (Shadowrocket / sing-box / Amnezia)">AmneziaWG</span>` : ""}
+      ${expiry}
+      ${p.endpoint ? `<span class="tag-chip mono">${esc(p.endpoint)}</span>` : ""}
+    </div>
+    <div class="wg-peer-actions">
+      <button class="btn small" data-wg-qr="${escAttr(p.id)}">二维码</button>
+      <button class="btn ghost small" data-wg-download="${escAttr(p.id)}">下载 .conf</button>
+      <button class="btn ghost small" data-wg-link="${escAttr(p.id)}">一次性链接</button>
+      <button class="btn ghost small" data-wg-edit="${escAttr(p.id)}">编辑</button>
+      <button class="btn ghost small" data-wg-toggle="${escAttr(p.id)}">${p.enabled ? "停用" : "启用"}</button>
+      <button class="btn ghost small" data-wg-rotate="${escAttr(p.id)}">轮换密钥</button>
+      <button class="btn ghost small danger" data-wg-remove="${escAttr(p.id)}">删除</button>
+    </div>
+  </div>`;
+}
       <span>↑ <b>${fmtBytes(p.rx)}</b></span>
       <span>↓ <b>${fmtBytes(p.tx)}</b></span>
     </div>
@@ -269,6 +344,18 @@ function bind(wg) {
   if (save) save.onclick = () => saveSettings(wg, save);
   const add = $("#wg-add");
   if (add) add.onclick = () => addPeer(wg);
+  const reseed = $("#wg-awg-reseed");
+  if (reseed) {
+    reseed.onclick = () => openConfirm({
+      title: "重新生成 AmneziaWG 混淆密钥？",
+      html: `<b>旧客户端配置会无法连接</b>，所有设备需要重新扫码或下载配置。<br>
+             <span class="muted">适用于怀疑混淆参数被防火墙识别探测时的紧急轮换。</span>`,
+      okLabel: "重新生成",
+      onOk: () => applyAction(
+        "POST", "/api/wireguard/settings", { awg_regenerate: true }, reseed, "生成中…", "混淆参数已重新生成"
+      ),
+    });
+  }
 
   document.querySelectorAll("[data-wg-qr]").forEach((el) => {
     el.onclick = () => showQr(wg, el.dataset.wgQr);
@@ -357,6 +444,27 @@ async function saveSettings(wg, btn) {
   if (endpoint !== (wg.endpoint_input || "")) payload.endpoint = endpoint;
   if (keepalive !== wg.keepalive) payload.keepalive = keepalive;
   if (ipv6 !== wg.ipv6) payload.ipv6 = ipv6;
+  const awgBox = $("#wg-awg-enabled");
+  if (awgBox) {
+    const isAwg = awgBox.checked;
+    if (isAwg !== !!((wg.awg || {}).enabled)) payload.awg_enabled = isAwg;
+    if (isAwg) {
+      const h1El = $("#wg-awg-h1");
+      const h2El = $("#wg-awg-h2");
+      const h3El = $("#wg-awg-h3");
+      const h4El = $("#wg-awg-h4");
+      const jcEl = $("#wg-awg-jc");
+      const s1El = $("#wg-awg-s1");
+      const s2El = $("#wg-awg-s2");
+      if (h1El) payload.awg_h1 = parseInt(h1El.value, 10);
+      if (h2El) payload.awg_h2 = parseInt(h2El.value, 10);
+      if (h3El) payload.awg_h3 = parseInt(h3El.value, 10);
+      if (h4El) payload.awg_h4 = parseInt(h4El.value, 10);
+      if (jcEl) payload.awg_jc = parseInt(jcEl.value, 10);
+      if (s1El) payload.awg_s1 = parseInt(s1El.value, 10);
+      if (s2El) payload.awg_s2 = parseInt(s2El.value, 10);
+    }
+  }
   if (!Object.keys(payload).length) {
     toast("没有需要修改的内容");
     return;
@@ -364,7 +472,7 @@ async function saveSettings(wg, btn) {
   await applyAction(
     "POST", "/api/wireguard/settings", payload, btn, "应用中…", "WireGuard 设置已应用"
   );
-  clearDraft("#wg-port, #wg-subnet, #wg-mtu, #wg-dns, #wg-endpoint, #wg-keepalive");
+  clearDraft("#wg-port, #wg-subnet, #wg-mtu, #wg-dns, #wg-endpoint, #wg-keepalive, #wg-awg-h1, #wg-awg-h2, #wg-awg-h3, #wg-awg-h4, #wg-awg-jc, #wg-awg-s1, #wg-awg-s2");
 }
 
 function addPeer(wg) {
@@ -406,7 +514,8 @@ function addPeer(wg) {
         if (body.peer_id && body.config) {
           const peer = ((S.dash || {}).wireguard || {}).peers || [];
           const item = peer.find((p) => p.id === body.peer_id);
-          showConfigQr(item ? item.name : name || "设备", body.config, body.peer_id);
+          const isAwg = !!((wg.awg || {}).enabled) && !compat;
+          showConfigQr(item ? item.name : name || "设备", body.config, body.peer_id, isAwg);
         }
       } catch (e) {
         toast("添加失败: " + e.message);
@@ -475,9 +584,10 @@ async function updatePeer(id, payload, btn, busyText) {
   }
 }
 
-async function fetchConfig(id, inline = 1) {
+async function fetchConfig(id, inline = 1, awg = null) {
+  const awgParam = awg !== null ? `&awg=${awg ? 1 : 0}` : "";
   const res = await fetch(
-    `/api/wireguard/peers/${encodeURIComponent(id)}/config?inline=${inline}`,
+    `/api/wireguard/peers/${encodeURIComponent(id)}/config?inline=${inline}${awgParam}`,
     { credentials: "same-origin", cache: "no-store" }
   );
   if (!res.ok) {
@@ -488,23 +598,24 @@ async function fetchConfig(id, inline = 1) {
   return res.text();
 }
 
-function showConfigQr(name, config, id) {
+function showConfigQr(name, config, id, isAwg = false) {
   openQr({
-    title: `WireGuard · ${name}`,
-    sub: "用官方 WireGuard App 扫码导入",
+    title: `${isAwg ? "AmneziaWG (抗封锁)" : "WireGuard"} · ${name}`,
+    sub: isAwg ? "用 Shadowrocket / sing-box / Amnezia 扫码导入" : "用官方 WireGuard App 扫码导入",
     link: config,
-    svg: `/api/wireguard/peers/${encodeURIComponent(id)}/qr?img=svg`,
-    png: `/api/wireguard/peers/${encodeURIComponent(id)}/qr?size=8`,
-    file: `zeroproxy-wg-${safeFile(name)}.png`,
+    svg: `/api/wireguard/peers/${encodeURIComponent(id)}/qr?img=svg${isAwg ? "&awg=1" : "&awg=0"}`,
+    png: `/api/wireguard/peers/${encodeURIComponent(id)}/qr?size=8${isAwg ? "&awg=1" : "&awg=0"}`,
+    file: `zeroproxy-${isAwg ? "awg" : "wg"}-${safeFile(name)}.png`,
   });
 }
 
 async function showQr(wg, id) {
   const peer = peerById(wg, id);
   if (!peer) return;
+  const isAwg = !!((wg.awg || {}).enabled) && !peer.compat;
   try {
-    const config = await fetchConfig(id, 1);
-    showConfigQr(peer.name, config, id);
+    const config = await fetchConfig(id, 1, isAwg ? 1 : 0);
+    showConfigQr(peer.name, config, id, isAwg);
   } catch (e) {
     toast("读取配置失败: " + e.message);
   }
@@ -513,9 +624,10 @@ async function showQr(wg, id) {
 function download(wg, id) {
   const peer = peerById(wg, id);
   if (!peer) return;
+  const isAwg = !!((wg.awg || {}).enabled) && !peer.compat;
   const a = document.createElement("a");
-  a.href = `/api/wireguard/peers/${encodeURIComponent(id)}/config`;
-  a.download = `zeroproxy-wg-${safeFile(peer.name)}.conf`;
+  a.href = `/api/wireguard/peers/${encodeURIComponent(id)}/config?awg=${isAwg ? 1 : 0}`;
+  a.download = `zeroproxy-${isAwg ? "awg" : "wg"}-${safeFile(peer.name)}.conf`;
   document.body.appendChild(a);
   a.click();
   a.remove();
@@ -524,12 +636,16 @@ function download(wg, id) {
 async function oneTime(wg, id) {
   const peer = peerById(wg, id);
   if (!peer) return;
+  const isAwg = !!((wg.awg || {}).enabled) && !peer.compat;
   try {
-    const body = await api(`/api/wireguard/peers/${encodeURIComponent(id)}/link`, { method: "POST" });
+    const body = await api(
+      `/api/wireguard/peers/${encodeURIComponent(id)}/link${isAwg ? "?awg=1" : "?awg=0"}`,
+      { method: "POST" }
+    );
     openConfirm({
       title: `一次性配置链接 · ${peer.name}`,
       html: `
-        <div class="muted fs-sm">把这个链接发给这台设备，打开即下载 .conf；</div>
+        <div class="muted fs-sm">把这个链接发给这台设备，打开即下载 ${isAwg ? "AmneziaWG " : ""}.conf；</div>
         <div class="muted fs-sm"><b>取一次即作废</b>，${Math.round((body.ttl || 600) / 60)} 分钟后过期。</div>
         <div class="cmd-box mt-2"><code class="mono">${esc(body.url)}</code></div>`,
       okLabel: "复制链接",

@@ -4,10 +4,10 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-# 当 `ip link add ... type wireguard` 不可用时使用。wireguard-go 需要
+# 当 `ip link add ... type wireguard` 不可用时使用。wireguard-go / amneziawg-go 需要
 # /dev/net/tun 以及容器的 NET_ADMIN；面板会在启动前探测这两项。
 Type=simple
-ExecStart=/usr/bin/wireguard-go -f wg0
+ExecStart=/bin/sh /opt/zeroproxy/wireguard/userspace-start.sh
 ExecStartPost=/bin/sh /opt/zeroproxy/wireguard/userspace-up.sh
 ExecReload=/bin/sh /opt/zeroproxy/wireguard/reload.sh
 ExecStopPost=/bin/sh /opt/zeroproxy/wireguard/userspace-down.sh

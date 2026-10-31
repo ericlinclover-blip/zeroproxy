@@ -385,3 +385,94 @@ def test_peer_add_failure_rolls_back_the_peer_list(client, configured, monkeypat
     res = client.post("/api/wireguard/peers", json={"name": "iPhone"})
     assert res.status_code == 200
     assert res.json()["wireguard"]["peer_count"] == 0, "新增失败要把 peer 回滚掉"
+
+
+# ---------------------------------------------------------------- AmneziaWG 混淆与抗 DPI 测试
+
+def test_awg_params_generation_and_validation():
+    params = wireguard.generate_awg_params()
+    assert params["awg_enabled"] is True
+    assert 3 <= params["awg_jc"] <= 6
+    assert params["awg_jmin"] <= params["awg_jmax"]
+    assert 20 <= params["awg_s1"] <= 80
+    assert 40 <= params["awg_s2"] <= 100
+    headers = [params["awg_h1"], params["awg_h2"], params["awg_h3"], params["awg_h4"]]
+    assert len(set(headers)) == 4, "H1~H4 必须互不相同"
+    assert all(100_000 <= h <= 2_147_483_647 for h in headers)
+
+    state = _state()
+    wireguard.bucket(state)["awg_enabled"] = True
+    wireguard.ensure_awg_params(state)
+    wg = wireguard.bucket(state)
+    assert wg["awg_h1"] > 0 and wg["awg_h2"] > 0 and wg["awg_h3"] > 0 and wg["awg_h4"] > 0
+
+
+def test_awg_server_and_client_configs(home):
+    state = _state()
+    wireguard.bucket(state)["awg_enabled"] = True
+    wireguard.ensure_awg_params(state)
+    wg = wireguard.bucket(state)
+    peer = wireguard.add_peer(state, "MacBook")
+    compat_peer = wireguard.add_peer(state, "Router", compat=True)
+    wireguard.generate(state)
+
+    # 服务端配置包含 AWG 混淆字段
+    server = wireguard.server_config(state)
+    assert f"Jc = {wg['awg_jc']}" in server
+    assert f"H1 = {wg['awg_h1']}" in server
+    assert f"H4 = {wg['awg_h4']}" in server
+
+    # 客户端配置: 默认 (awg=None) 应该包含 AWG 参数
+    client_awg = wireguard.client_config(state, peer)
+    assert f"Jc = {wg['awg_jc']}" in client_awg
+    assert f"H1 = {wg['awg_h1']}" in client_awg
+    assert f"H4 = {wg['awg_h4']}" in client_awg
+
+    # 强制标准模式 (awg=False): 不应包含 AWG 参数 (给官方 WireGuard App)
+    client_std = wireguard.client_config(state, peer, awg=False)
+    assert "Jc =" not in client_std
+    assert "H1 =" not in client_std
+
+    # 路由器兼容模式设备: 即使开启 AWG 也自动降级为标准模式
+    client_compat = wireguard.client_config(state, compat_peer)
+    assert "Jc =" not in client_compat
+    assert "H1 =" not in client_compat
+
+    # 脚本生成测试
+    start_sh = home / "wireguard" / "start.sh"
+    stop_sh = home / "wireguard" / "stop.sh"
+    assert start_sh.is_file() and stop_sh.is_file()
+    assert oct(start_sh.stat().st_mode)[-3:] == "700"
+    assert "awg-quick" in start_sh.read_text()
+
+
+def test_awg_api_settings_and_peer_export(client, configured):
+    # 开启 AmneziaWG
+    res = client.post("/api/wireguard/settings", json={"enabled": True, "awg_enabled": True})
+    assert res.status_code == 200, res.text
+    awg_data = res.json()["wireguard"]["awg"]
+    assert awg_data["enabled"] is True
+    assert awg_data["h1"] > 0
+    h1_orig = awg_data["h1"]
+
+    # 重新随机混淆参数 (reseed)
+    reseed = client.post("/api/wireguard/settings", json={"awg_regenerate": True})
+    assert reseed.status_code == 200
+    assert reseed.json()["wireguard"]["awg"]["h1"] != h1_orig
+
+    # 添加 peer
+    peer_body = client.post("/api/wireguard/peers", json={"name": "iPad"}).json()
+    peer_id = peer_body["peer_id"]
+
+    # 下载配置: 默认带 awg
+    conf_awg = client.get(f"/api/wireguard/peers/{peer_id}/config")
+    assert conf_awg.status_code == 200
+    assert 'filename="zeroproxy-awg-' in conf_awg.headers.get("content-disposition", "")
+    assert "H1 =" in conf_awg.text
+
+    # 下载配置: 指定标准格式 (awg=0)
+    conf_std = client.get(f"/api/wireguard/peers/{peer_id}/config?awg=0")
+    assert conf_std.status_code == 200
+    assert 'filename="zeroproxy-wg-' in conf_std.headers.get("content-disposition", "")
+    assert "H1 =" not in conf_std.text
+

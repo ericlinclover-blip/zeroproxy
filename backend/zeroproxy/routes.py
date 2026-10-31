@@ -3463,6 +3463,17 @@ class WireGuardSettingsIn(BaseModel):
     endpoint: str | None = None
     ipv6: bool | None = None
     ipv6_subnet: str | None = None
+    awg_enabled: bool | None = None
+    awg_jc: int | None = None
+    awg_jmin: int | None = None
+    awg_jmax: int | None = None
+    awg_s1: int | None = None
+    awg_s2: int | None = None
+    awg_h1: int | None = None
+    awg_h2: int | None = None
+    awg_h3: int | None = None
+    awg_h4: int | None = None
+    awg_regenerate: bool | None = None
 
 
 class WireGuardPeerIn(BaseModel):
@@ -3642,6 +3653,35 @@ def wireguard_settings(payload: WireGuardSettingsIn, request: Request):
                 return _err(str(exc))
         if payload.enabled is not None:
             updates["enabled"] = bool(payload.enabled)
+
+        if payload.awg_enabled is not None:
+            updates["awg_enabled"] = bool(payload.awg_enabled)
+            if updates["awg_enabled"]:
+                wireguard.ensure_awg_params(state)
+
+        if payload.awg_regenerate:
+            gen = wireguard.generate_awg_params()
+            updates.update(gen)
+
+        for key, name, min_v, max_v in (
+            ("awg_jc", "Jc (垃圾包数)", 1, 128),
+            ("awg_jmin", "Jmin (垃圾包下限)", 0, 1200),
+            ("awg_jmax", "Jmax (垃圾包上限)", 0, 1200),
+            ("awg_s1", "S1 (握手发起填充)", 0, 1200),
+            ("awg_s2", "S2 (握手响应填充)", 0, 1200),
+            ("awg_h1", "H1 (握手发起 Header)", 1, 2_147_483_647),
+            ("awg_h2", "H2 (握手响应 Header)", 1, 2_147_483_647),
+            ("awg_h3", "H3 (Cookie Header)", 1, 2_147_483_647),
+            ("awg_h4", "H4 (数据传输 Header)", 1, 2_147_483_647),
+        ):
+            val = getattr(payload, key, None)
+            if val is not None:
+                try:
+                    updates[key] = wireguard.validate_awg_int(val, name, min_v, max_v)
+                except ValueError as exc:
+                    return _err(str(exc))
+        if updates.get("awg_jmin", wg.get("awg_jmin", 40)) > updates.get("awg_jmax", wg.get("awg_jmax", 70)):
+            return _err("Jmin 不能大于 Jmax")
 
         changed = [f"{key}={value}" for key, value in updates.items() if wg.get(key) != value]
         if not changed:
@@ -3831,32 +3871,37 @@ def wireguard_peer_rotate(peer_id: str, request: Request):
 
 
 @router.get("/api/wireguard/peers/{peer_id}/config")
-def wireguard_peer_config(peer_id: str, request: Request, inline: int = 0):
+def wireguard_peer_config(peer_id: str, request: Request, inline: int = 0, awg: int | None = None):
     state = load_state()
     if not _require_auth(state, request):
         return _err("未登录", 401)
     peer = wireguard.find_peer(state, peer_id)
     if peer is None:
         return _err("客户端不存在", 404)
-    text = wireguard.client_config(state, peer)
+    awg_flag = None if awg is None else bool(awg)
+    text = wireguard.client_config(state, peer, awg=awg_flag)
+    wg = wireguard.bucket(state)
+    is_awg = (bool(wg.get("awg_enabled")) if awg_flag is None else awg_flag) and not peer.get("compat")
+    prefix = "zeroproxy-awg" if is_awg else "zeroproxy-wg"
     return _wg_text_response(
-        text, f"zeroproxy-wg-{peer_id}.conf", inline=bool(inline)
+        text, f"{prefix}-{peer_id}.conf", inline=bool(inline)
     )
 
 
 @router.get("/api/wireguard/peers/{peer_id}/qr")
-def wireguard_peer_qr(peer_id: str, request: Request, size: int = 8, img: str = "png"):
+def wireguard_peer_qr(peer_id: str, request: Request, size: int = 8, img: str = "png", awg: int | None = None):
     state = load_state()
     if not _require_auth(state, request):
         return _err("未登录", 401)
     peer = wireguard.find_peer(state, peer_id)
     if peer is None:
         return _err("客户端不存在", 404)
-    return _qr_response(wireguard.client_config(state, peer), size, img)
+    awg_flag = None if awg is None else bool(awg)
+    return _qr_response(wireguard.client_config(state, peer, awg=awg_flag), size, img)
 
 
 @router.post("/api/wireguard/peers/{peer_id}/link")
-def wireguard_peer_one_time(peer_id: str, request: Request):
+def wireguard_peer_one_time(peer_id: str, request: Request, awg: int | None = None):
     with config.locked():
         state = load_state()
         if not _require_auth(state, request):
@@ -3871,7 +3916,8 @@ def wireguard_peer_one_time(peer_id: str, request: Request):
             state, "wireguard_one_time", str(peer.get("name")), actor=_client_ip(request)
         )
         save_state(state)
-        url = f"{share_links.panel_base_url(request, state)}/wg/one/{token}"
+        suffix = "?awg=1" if (awg == 1 or (awg is None and wireguard.bucket(state).get("awg_enabled"))) else ""
+        url = f"{share_links.panel_base_url(request, state)}/wg/one/{token}{suffix}"
         return {
             "url": url,
             "expires_at": int(time.time()) + wireguard.ONE_TIME_TTL,
@@ -3880,16 +3926,20 @@ def wireguard_peer_one_time(peer_id: str, request: Request):
 
 
 @router.get("/wg/one/{token}")
-def wireguard_one_time_config(token: str):
+def wireguard_one_time_config(token: str, awg: int | None = None):
     """一次性配置下载。链接本身就是凭据：用一次即作废，默认 10 分钟过期。"""
     with config.locked():
         state = load_state()
-        got = wireguard.one_time_consume(state, token)
+        awg_flag = None if awg is None else bool(awg)
+        got = wireguard.one_time_consume(state, token, awg=awg_flag)
         if got is None:
             return _err("链接无效、已使用或已过期", 404)
-        _peer, text = got
+        peer, text = got
         save_state(state)
-        return _wg_text_response(text, "zeroproxy-wireguard.conf")
+        wg = wireguard.bucket(state)
+        is_awg = (bool(wg.get("awg_enabled")) if awg_flag is None else awg_flag) and not peer.get("compat")
+        filename = "zeroproxy-amneziawg.conf" if is_awg else "zeroproxy-wireguard.conf"
+        return _wg_text_response(text, filename)
 
 
 # ---------------------------------------------------------------- 客户端设备
