@@ -488,6 +488,91 @@ body.zp-leaving { opacity: 0; pointer-events: none; }
 }
 .url-preview.hidden { display: none; }
 
+/* 获取链接指引卡片与常见问答设计 */
+.guide-box {
+  margin-top: 14px;
+  background: var(--card-sub);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 12px 14px;
+  font-size: 12.5px;
+}
+.guide-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-weight: 650;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+.guide-header svg {
+  width: 16px;
+  height: 16px;
+  fill: var(--accent);
+  flex-shrink: 0;
+}
+.guide-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.guide-steps {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--sub);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  line-height: 1.55;
+}
+.guide-steps li b {
+  color: var(--text);
+}
+.guide-jump {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11.5px;
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: 500;
+  padding: 2px 7px;
+  background: var(--accent-soft);
+  border-radius: 6px;
+  transition: all 0.2s var(--ease);
+}
+.guide-jump:hover {
+  filter: brightness(1.1);
+  text-decoration: underline;
+}
+.guide-faq {
+  margin-top: 10px;
+  border-top: 1px dashed var(--border);
+  padding-top: 8px;
+}
+.guide-faq summary {
+  font-size: 12px;
+  color: var(--sub);
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.guide-faq-content {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--sub);
+  line-height: 1.5;
+}
+.guide-faq-item b {
+  color: var(--text);
+}
+
 /* 性能模式仪表盘 (保持 perf.js 兼容性) */
 .perf { --boost: #22d3ee; }
 #perf-gauge { display: block; width: 100%; max-width: 280px; margin: 4px auto 0; height: auto; }
@@ -814,13 +899,17 @@ pre {
 
       <!-- 添加/更换面板表单 -->
       <div style="margin-top:18px;padding-top:14px;border-top:1px dashed var(--border)">
-        <h3 style="margin:0 0 6px;font-size:13px;font-weight:700">添加订阅面板 / 更换主控面板</h3>
-        <div class="fs-xs muted" style="margin-bottom:10px">
-          支持直接粘贴面板复制的完整 <span class="mono">curl / wget</span> 命令或 <span class="mono">https://…/c/…</span> 配对链接，系统会自动智能提取。
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:8px">
+          <h3 style="margin:0;font-size:13px;font-weight:700">添加订阅面板 / 更换主控面板</h3>
+          <a id="panel-direct-jump" href="#" target="_blank" class="guide-jump" style="display:none">🔗 打开当前主控面板后台 ↗</a>
         </div>
+        <div class="fs-xs muted" style="margin-bottom:10px">
+          输入或粘贴从 ZeroProxy 服务端面板生成的配对短链或安装命令，系统会自动智能提取。
+        </div>
+
         <div class="url-input-wrap">
-          <input type="text" id="url" placeholder="粘贴 curl 安装命令或 https://面板域名/c/配对码" autocomplete="off" spellcheck="false" style="flex:1">
-          <button class="btn" id="btn-paste-url" type="button" title="从剪贴板粘贴并自动提取配对链接">📋 粘贴</button>
+          <input type="text" id="url" placeholder="粘贴 curl / wget 安装命令，或输入 https://面板域名/c/配对码" autocomplete="off" spellcheck="false" style="flex:1">
+          <button class="btn" id="btn-paste-url" type="button" title="从剪贴板粘贴并自动提取配对短链">📋 粘贴</button>
           <button class="btn primary" id="add">接入</button>
         </div>
         <div id="url-preview" class="url-preview hidden"></div>
@@ -830,6 +919,40 @@ pre {
           </label>
         </div>
         <div class="fs-xs muted" id="add-hint" style="margin-top:8px"></div>
+
+        <!-- 获取链接指引与常见问答 -->
+        <div class="guide-box">
+          <div class="guide-header">
+            <div class="guide-title">
+              <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-6h2v6zm0-8h-2V7h2v2z"/></svg>
+              <span>如何获取接入链接？（操作指引）</span>
+            </div>
+            <span class="fs-xs muted">无需手动删减命令字符</span>
+          </div>
+          <ol class="guide-steps">
+            <li><b>第一步：打开服务端后台</b> — 浏览器打开你的 ZeroProxy 服务器管理面板（如 <code class="mono">https://你的面板域名:8899</code>）；</li>
+            <li><b>第二步：进入客户端页</b> — 在面板导航菜单点击 <b>「客户端」</b>，在上方选择 <b>「路由器」</b> 标签页；</li>
+            <li><b>第三步：生成接入命令</b> — 点击 <b>「生成安装命令」</b> 或 <b>「＋ 再接入一台路由器」</b> 按钮；</li>
+            <li><b>第四步：一键复制粘入</b> — 点击代码框旁的 <b>「复制」</b> 按钮，回到本页直接点击上方 <b>「📋 粘贴」</b> 即可自动识别接入！</li>
+          </ol>
+          <details class="guide-faq">
+            <summary>常见疑问解答 (FAQ)</summary>
+            <div class="guide-faq-content">
+              <div class="guide-faq-item">
+                <b>Q: 为什么不能直接填机场的 Clash / V2Ray 订阅链接？</b><br>
+                A: 路由器端运行的是 ZeroProxy 全屋透明网关系统，具备双向心跳、分流策略热下发、节点多源聚合与健康自愈能力，必须与 ZeroProxy 服务端面板配对联动。普通第三方订阅链接仅供手机/电脑客户端使用。
+              </div>
+              <div class="guide-faq-item">
+                <b>Q: 配对码失效了怎么办？</b><br>
+                A: 面板生成的配对码是一次性握手令牌（30 分钟内有效）。如已超时，只需在面板中再次点击「生成安装命令」获取新配对码重新粘贴即可。配对成功后路由器将持久化凭据，不受配对码过期影响。
+              </div>
+              <div class="guide-faq-item">
+                <b>Q: 还没有自己的 ZeroProxy 服务端？</b><br>
+                A: ZeroProxy 采用独立私有化部署。请先在你的云服务器（Ubuntu / Debian）运行安装脚本部署专属服务端面板，随后即可在此处接入管理。
+              </div>
+            </div>
+          </details>
+        </div>
       </div>
     </div>
 

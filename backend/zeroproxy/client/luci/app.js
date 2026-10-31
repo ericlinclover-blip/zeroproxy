@@ -149,10 +149,14 @@ function render(state) {
 
 function extractPairUrl(raw) {
   if (!raw) return '';
-  const trimmed = String(raw).trim();
+  let trimmed = String(raw).trim();
+  trimmed = trimmed.replace(/^["']|["']$/g, '');
   // 智能从 curl / wget 等命令中提取短链配对 URL，如 https://domain:port/c/shortcode
   const match = trimmed.match(/(https?:\/\/[^\s"'`<>|]+?\/c\/[a-zA-Z0-9_-]+)/i);
   if (match) return match[1];
+  // 匹配类似 domain.com:8899/c/shortcode (缺少协议头)
+  const noProtoMatch = trimmed.match(/([a-zA-Z0-9.-]+:\d+\/c\/[a-zA-Z0-9_-]+)/i);
+  if (noProtoMatch) return 'https://' + noProtoMatch[1];
   // 兜底提取普通 http/https URL
   const urlMatch = trimmed.match(/(https?:\/\/[^\s"'`<>|]+)/i);
   if (urlMatch) return urlMatch[1];
@@ -162,6 +166,17 @@ function extractPairUrl(raw) {
 function renderServers(servers) {
   const container = $('servers');
   if (!container) return;
+  const jumpLink = $('panel-direct-jump');
+  if (jumpLink) {
+    const primary = servers.find((s) => s.primary) || servers[0];
+    if (primary && primary.base) {
+      jumpLink.href = primary.base.replace(/\/+$/, '') + '/#/clients';
+      jumpLink.title = `在浏览器新标签页打开主控面板客户端管理页 (${primary.base})`;
+      jumpLink.style.display = 'inline-flex';
+    } else {
+      jumpLink.style.display = 'none';
+    }
+  }
   if (!servers.length) {
     container.innerHTML = '<div class="empty">还没有接入任何面板订阅源 — 请在下方添加一台。</div>';
     return;
@@ -869,7 +884,8 @@ function initUrlInputHelpers() {
     if (extracted && extracted.includes('/c/')) {
       try {
         const u = new URL(extracted);
-        preview.innerHTML = `<span>✓ 识别到配对链接：</span><b class="mono">${esc(u.origin + u.pathname)}</b>`;
+        const code = u.pathname.split('/c/')[1] || '';
+        preview.innerHTML = `<span>✓ 识别到配对短链：</span><b class="mono">${esc(u.origin + u.pathname)}</b> <span class="muted fs-xs">(配对码: ${esc(code)})</span>`;
         preview.classList.remove('hidden');
       } catch {
         preview.classList.add('hidden');
