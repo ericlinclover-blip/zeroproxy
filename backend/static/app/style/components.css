@@ -569,8 +569,16 @@ dialog.modal-mask::backdrop { background: transparent; }
   .reveal { opacity: 1; transform: none; }
 }
 
-/* ---------- 高级设置: 分流模板下拉 ---------- */
+/* ---------- 高级设置: 分流模板下拉与自定义分流 ---------- */
 .template-select { max-width: 260px; }
+.route-test-box { flex: 1; min-width: 240px; }
+.route-match-direct { color: var(--ok, #10b981); font-weight: 600; }
+.route-match-proxy { color: var(--accent, #3b82f6); font-weight: 600; }
+.route-match-reject { color: var(--err, #ef4444); font-weight: 600; }
+.custom-rules-card { background: var(--hover); border: 1px dashed var(--border); border-radius: var(--radius-sm, 6px); }
+.custom-rules-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.custom-rules-ta { width: 100%; font-family: ui-monospace, monospace; font-size: 12px; }
+.mx-1 { margin-left: 6px; margin-right: 6px; }
 
 /* ---------- 回到顶部 ----------
    用 .on 而不是 .hidden 控制显隐: display:none 会让过渡动画直接失效

@@ -220,6 +220,22 @@ def render(
         )
     for rule in panel_direct_rules(base):
         add(f"    {rule}")
+
+    # 自定义规则 (支持用户配置的高优先级放行/拦截/代理)
+    custom = share_links.custom_rules_of(state)
+    for b in custom.get("block", []):
+        add(f"    domain(suffix: '{b}') -> block")
+    for d in custom.get("direct", []):
+        if "/" in d or d.replace(".", "").isdigit():
+            add(f"    dip({d}) -> direct")
+        else:
+            add(f"    domain(suffix: '{d}') -> direct")
+    for p in custom.get("proxy", []) + custom.get("ai", []) + custom.get("streaming", []) + custom.get("landing", []):
+        if "/" in p or p.replace(".", "").isdigit():
+            add(f"    dip({p}) -> proxy")
+        else:
+            add(f"    domain(suffix: '{p}') -> proxy")
+
     if tpl == "direct":
         add("    # 模板: 全直连 (只保留上面的放行) —— 与 mihomo 的 direct 模板同一个意思")
         add("    fallback: direct")
@@ -228,7 +244,7 @@ def render(
             add("    # 广告拦截 —— 与 mihomo smart / global 模板同一档 (需分流数据)")
             add("    domain(geosite:category-ads-all) -> block")
         add(f"    {QUIC_BLOCK}   # 关 h3: 省下 UDP 443 的用户态开销, 浏览器会自动回落 TCP/2")
-        if tpl == "smart":
+        if tpl in ("smart", "precision"):
             if geo:
                 add("    # 国内直连 —— 与 mihomo smart 模板同一档")
                 add("    dip(geoip:cn) -> direct")

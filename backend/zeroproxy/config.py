@@ -176,8 +176,18 @@ DEFAULTS: dict = {
     },
     "hysteria_hopping": True,   # 端口跳跃 (技术文档 附录 C)
     "hysteria_ports": [30001, 31001, 32001],
-    # 客户端分流模板 — 决定订阅里生成的规则 (smart/global/direct, 见 share_links)
-    "routing": {"template": "smart"},
+    # 客户端分流模板 — 决定订阅里生成的规则 (smart/precision/global/direct, 见 share_links)
+    "routing": {
+        "template": "smart",
+        "custom_rules": {
+            "direct": [],     # 自定义直连 (域名或 IP/CIDR)
+            "proxy": [],      # 自定义代理 (走 🚀 节点选择)
+            "ai": [],         # 自定义走 🤖 AI 服务
+            "streaming": [],  # 自定义走 🎬 国际流媒体
+            "landing": [],    # 自定义走 🌍 落地节点
+            "block": [],      # 自定义拦截 (走 🛑 广告拦截)
+        },
+    },
     # GeoIP/GeoSite 数据 (Loyalsoldier/v2ray-rules-dat) 与基于它的分流防护。
     # 关键: 只要配置里出现 `geoip:*` / `geosite:*` 规则, 而数据文件不存在,
     # Xray 会直接拒绝启动整份配置 — 因此 `enabled` 只在数据齐备时才允许为真

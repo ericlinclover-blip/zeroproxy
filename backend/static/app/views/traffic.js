@@ -219,6 +219,103 @@ function renderRouting(d) {
       toast("切换失败: " + e.message);
     }
   };
+
+  // 1. 填充并挂载自定义分流规则
+  const cr = r.custom_rules || {};
+  const mapIds = {
+    "cr-direct": cr.direct,
+    "cr-block": cr.block,
+    "cr-ai": cr.ai,
+    "cr-streaming": cr.streaming,
+    "cr-landing": cr.landing,
+    "cr-proxy": cr.proxy,
+  };
+  for (const [id, list] of Object.entries(mapIds)) {
+    const el = $("#" + id);
+    if (el && !el.dataset.dirty) {
+      el.value = (list || []).join("\n");
+      el.oninput = () => { el.dataset.dirty = "1"; };
+    }
+  }
+
+  const btnToggleCr = $("#btn-toggle-custom-rules");
+  const panelCr = $("#custom-rules-panel");
+  if (btnToggleCr && panelCr && !btnToggleCr.dataset.bound) {
+    btnToggleCr.dataset.bound = "1";
+    btnToggleCr.onclick = () => {
+      panelCr.classList.toggle("hidden");
+    };
+  }
+
+  const btnSaveCr = $("#btn-save-custom-rules");
+  if (btnSaveCr && !btnSaveCr.dataset.bound) {
+    btnSaveCr.dataset.bound = "1";
+    btnSaveCr.onclick = async () => {
+      const getLines = (id) =>
+        ($("#" + id)?.value || "")
+          .split("\n")
+          .map((s) => s.trim())
+          .filter(Boolean);
+      const payload = {
+        custom_rules: {
+          direct: getLines("cr-direct"),
+          block: getLines("cr-block"),
+          ai: getLines("cr-ai"),
+          streaming: getLines("cr-streaming"),
+          landing: getLines("cr-landing"),
+          proxy: getLines("cr-proxy"),
+        },
+      };
+      try {
+        await api("/api/settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        toast("自定义分流规则已更新并即刻生效");
+        for (const id of Object.keys(mapIds)) {
+          const el = $("#" + id);
+          if (el) delete el.dataset.dirty;
+        }
+      } catch (e) {
+        toast("保存失败: " + e.message);
+      }
+    };
+  }
+
+  // 2. 分流命中模拟测试器
+  const btnTest = $("#btn-route-test");
+  const inpTest = $("#route-test-input");
+  const resBox = $("#route-test-result");
+  if (btnTest && inpTest && resBox && !btnTest.dataset.bound) {
+    btnTest.dataset.bound = "1";
+    const runTest = async () => {
+      const target = inpTest.value.trim();
+      if (!target) return;
+      try {
+        const res = await api(`/api/routing/test?target=${encodeURIComponent(target)}`);
+        const item = res.result || {};
+        resBox.classList.remove("hidden");
+        const isDirect = item.action === "direct";
+        const isReject = item.action === "reject";
+        const cls = isDirect ? "route-match-direct" : (isReject ? "route-match-reject" : "route-match-proxy");
+        resBox.innerHTML = `<span>测试: <b>${esc(item.target)}</b></span> &rarr; ` +
+          `<span class="${cls}">${esc(item.group)}</span> ` +
+          `<span class="tag-chip mx-1">${esc(item.matched_rule)}</span> ` +
+          `<span class="muted fs-xs">${esc(item.reason)}</span>`;
+      } catch (e) {
+        resBox.classList.remove("hidden");
+        resBox.innerHTML = `<span class="route-match-reject">测试失败: ${esc(e.message)}</span>`;
+      }
+    };
+    btnTest.onclick = runTest;
+    inpTest.onkeydown = (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        runTest();
+      }
+    };
+  }
 }
 
 /* ---------------- GeoIP 数据版本 ----------------

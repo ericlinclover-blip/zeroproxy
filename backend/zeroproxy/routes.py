@@ -1126,11 +1126,17 @@ def _dashboard_body(state: dict, request: Request, traffic: dict | None = None) 
         "nodes": _node_view(state, traffic),
         "routing": {
             "template": share_links.template_of(state),
+            "custom_rules": share_links.custom_rules_of(state),
             "templates": [
                 {
                     "id": "smart",
                     "name": "智能分流",
-                    "desc": "国内直连 (含微信/支付宝等 App) + 广告拦截, 其余走代理",
+                    "desc": "国内直连 (含微信/支付宝等 App) + 广告拦截 + AI/流媒体专线, 其余走代理",
+                },
+                {
+                    "id": "precision",
+                    "name": "精细分流",
+                    "desc": "AI 服务、国际流媒体、落地节点、国内生态独立选路",
                 },
                 {"id": "global", "name": "全局代理", "desc": "除局域网外全部走代理"},
                 {"id": "direct", "name": "全部直连", "desc": "不下载 geo 数据, 全部直连 (手动切组)"},
@@ -1312,6 +1318,8 @@ class SettingsIn(BaseModel):
     ports: dict[str, int] | None = None
     # 客户端分流模板 (只影响订阅生成, 不动服务端配置)
     template: str | None = None
+    # 用户自定义分流规则 (直连/代理/AI/流媒体/落地/拦截)
+    custom_rules: dict[str, list[str]] | None = None
     # GeoIP 分流开关 (数据文件缺失时规则不会下发, 见 xray_config.geo_rules)
     geodata_enabled: bool | None = None
     block_private: bool | None = None
@@ -1425,6 +1433,24 @@ def update_settings(payload: SettingsIn, request: Request):
             state.setdefault("routing", {})["template"] = new_template
             changed.append(f"template={new_template}")
 
+        if payload.custom_rules is not None:
+            cleaned_rules: dict[str, list[str]] = {
+                "direct": [], "proxy": [], "ai": [], "streaming": [], "landing": [], "block": [],
+            }
+            for k in cleaned_rules:
+                items = payload.custom_rules.get(k) or []
+                if not isinstance(items, list):
+                    return _err(f"自定义规则分类 {k} 必须为列表")
+                for item in items:
+                    n = share_links.normalize_target(str(item))
+                    if n and n not in cleaned_rules[k]:
+                        cleaned_rules[k].append(n)
+            routing_cfg = state.setdefault("routing", {})
+            old_custom = routing_cfg.get("custom_rules") or {}
+            if cleaned_rules != old_custom:
+                routing_cfg["custom_rules"] = cleaned_rules
+                changed.append("custom_rules")
+
         moved_ports: list[tuple[str, int]] = []
         for key, port in new_ports.items():
             if port != state["ports"].get(key):
@@ -1456,14 +1482,15 @@ def update_settings(payload: SettingsIn, request: Request):
             return _err("没有需要修改的内容")
 
         config.audit(state, "settings", ", ".join(changed), actor=_client_ip(request))
-        # 分流模板只影响订阅输出, 服务端配置一字不变 → 直接保存, 不做无谓的重载
-        if all(item.startswith("template=") for item in changed):
+        # 分流模板与自定义规则只影响订阅输出, 服务端配置一字不变 → 直接保存, 不做无谓的重载
+        if all(item.startswith("template=") or item.startswith("custom_rules") for item in changed):
             steps = _steps_recorder()
+            action_title = "切换分流模板" if any(item.startswith("template=") for item in changed) else "更新分流规则"
             steps.append(
                 {
-                    "name": "切换分流模板",
+                    "name": action_title,
                     "ok": True,
-                    "detail": f"{changed[0]} (订阅即刻生效, 未重载服务)",
+                    "detail": f"{', '.join(changed)} (订阅即刻生效, 未重载服务)",
                     "ms": 0,
                 }
             )
@@ -1493,6 +1520,20 @@ def update_settings(payload: SettingsIn, request: Request):
             return out
 
         return _landing_body(state, request, after=open_moved_ports)
+
+
+@router.get("/api/routing/test")
+def test_routing_match(request: Request, target: str = "", tpl: str = ""):
+    """实时测试域名或 IP 在当前分流模板与自定义规则下的命中策略。"""
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        t = (target or "").strip()
+        if not t:
+            return _err("请输入待测试的域名或 IP", 400)
+        res = share_links.simulate_match(t, state, tpl or None)
+        return {"result": res}
 
 
 # ---------------------------------------------------------------- 链式代理

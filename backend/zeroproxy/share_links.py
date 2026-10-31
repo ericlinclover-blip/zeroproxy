@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 import re
 from urllib.parse import quote, urlsplit
@@ -73,67 +74,357 @@ ADS_RULE_SET = ("ads", "sing-geosite@rule-set/geosite-category-ads-all.srs")
 #: (不能写 detour: "direct": 实测报 "detour to an empty direct outbound makes no sense")
 DEFAULT_HTTP_CLIENT = "bootstrap-direct"
 
-#: 分流模板。smart = 国内直连 + 广告拦截; global = 全部走代理; direct = 全部直连
-TEMPLATES = ("smart", "global", "direct")
+#: 分流模板。smart = 经典智能分流; precision = 业务精细分流; global = 全部走代理; direct = 全部直连
+TEMPLATES = ("smart", "precision", "global", "direct")
 DEFAULT_TEMPLATE = "smart"
 
 #: 策略组名 (Clash 与 sing-box 共用, 保证两种格式语义一致)
 G_SELECT = "🚀 节点选择"
 G_AUTO = "♻️ 自动选择"
-G_FINAL = "🐟 漏网之鱼"
-G_ADS = "🛑 广告拦截"
-G_DIRECT = "🎯 全球直连"
-
-#: 落地节点组 + "必须走落地"的站点。
-#:
-#: 为什么需要它: 链式节点 (中转 → 落地) 的延迟永远高于直连节点, 所以"自动选择"不会选它;
-#: 而 OpenAI / Netflix 这类服务**只认落地地区的 IP** —— 结果是香港直连节点能上网, 但这些
-#: 站点一律拒绝。解决办法不是全局切到落地 (那会很慢), 而是把这几类域名单独指过去:
-#: 默认走最快的节点, 只有它们走落地。
-#:
-#: 规则写法有两类, 缺一不可:
-#:   * GEOSITE/GEOIP: 覆盖广 (一个分类几百上千个域名), 但依赖 geo 数据库里有这个分类;
-#:   * DOMAIN-SUFFIX: 显式域名, 不依赖数据库 —— 对"必须能通"的服务用这种兜底。
+G_AI = "🤖 AI 服务"
+G_STREAMING = "🎬 国际流媒体"
 G_LANDING = "🌍 落地节点"
+G_DIRECT = "🎯 全球直连"
+G_ADS = "🛑 广告拦截"
+G_FINAL = "🐟 漏网之鱼"
 
-#: 严格限制地区或纯净度的服务 (AI / 流媒体 / 验证风控 / 纯净度检测 / 国际支付)
-LANDING_DOMAINS = (
-    # ---- AI 核心服务 ----
+#: AI 核心服务域名
+AI_DOMAINS = (
     "openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com",
     "anthropic.com", "claude.ai", "claude.com",
     "gemini.google.com", "bard.google.com", "aistudio.google.com",
     "generativelanguage.googleapis.com",
     "perplexity.ai", "x.ai", "grok.com", "midjourney.com",
-    "poe.com", "character.ai", "sora.com",
-    # ---- 人机验证 / 边缘风控 (Cloudflare Turnstile, Arkose 等) ----
-    "challenges.cloudflare.com", "turnstile.cloudflare.com",
-    "arkoselabs.com", "hcaptcha.com",
-    # ---- IP 纯净度 / 欺诈分 / 泄漏检测平台 ----
-    "scamalytics.com", "iphey.com", "browserleaks.com", "whoer.net",
-    "ipinfo.io", "ipdata.co", "ipqualityscore.com", "maxmind.com",
-    "ip-api.com", "ipapi.co", "ip.sb",
-    # ---- 国际支付与风控 ----
-    "stripe.com", "paypal.com", "paypalobjects.com",
-    # ---- 流媒体服务 ----
+    "poe.com", "character.ai", "sora.com", "cursor.com", "cursor.sh",
+)
+
+#: 国际流媒体服务域名
+STREAMING_DOMAINS = (
     "primevideo.com", "hulu.com", "max.com", "hbomax.com",
     "disneyplus.com", "spotify.com", "soundcloud.com", "deezer.com",
     "pandora.com", "crunchyroll.com", "paramountplus.com", "peacocktv.com",
+    "netflix.com", "netflix.net", "nflxvideo.net", "nflximg.net",
+    "youtube.com", "ytimg.com", "googlevideo.com",
 )
 
-#: 流媒体/服务分类 (geo 数据库收录广, 一个分类顶几百个域名)
-LANDING_GEOSITES = ("netflix", "disney", "hbo", "primevideo", "youtube")
+STREAMING_GEOSITES = ("netflix", "disney", "hbo", "primevideo", "youtube")
+
+#: 纯净度检测 / 边缘风控 / 人机验证 / 国际支付平台 (必须走纯净落地 IP)
+PURITY_LANDING_DOMAINS = (
+    # 人机验证 / 边缘风控 (Cloudflare Turnstile, Arkose 等)
+    "challenges.cloudflare.com", "turnstile.cloudflare.com",
+    "arkoselabs.com", "hcaptcha.com",
+    # IP 纯净度 / 欺诈分 / 泄漏检测平台
+    "scamalytics.com", "iphey.com", "browserleaks.com", "whoer.net",
+    "ipinfo.io", "ipdata.co", "ipqualityscore.com", "maxmind.com",
+    "ip-api.com", "ipapi.co", "ip.sb",
+    # 国际支付与风控
+    "stripe.com", "paypal.com", "paypalobjects.com",
+)
+
+#: 保持 LANDING_DOMAINS 与 LANDING_GEOSITES 向后兼容
+LANDING_DOMAINS = AI_DOMAINS + PURITY_LANDING_DOMAINS + STREAMING_DOMAINS
+LANDING_GEOSITES = STREAMING_GEOSITES
 
 
 def _landing_rules(geo: bool = True) -> list[str]:
-    """"必须走落地"的规则 (放在最前面, 早于国内直连)。
-
-    `geo=False` 时只留显式域名那批: GEOSITE 需要分流数据库, 而这一步的意思是
-    "这台设备现在拿不到数据库"。
-    """
+    """"必须走落地"的规则 (兼容旧接口, 包含 AI + 流媒体 + 纯净度/风控)。"""
     rules = [f"DOMAIN-SUFFIX,{d},{G_LANDING}" for d in LANDING_DOMAINS]
     if geo:
         rules += [f"GEOSITE,{g},{G_LANDING}" for g in LANDING_GEOSITES]
     return rules
+
+
+def _is_ip_or_cidr(val: str) -> bool:
+    try:
+        ipaddress.ip_network(val, strict=False)
+        return True
+    except ValueError:
+        return False
+
+
+def normalize_target(raw: str) -> str:
+    """清理与规范化用户输入的域名或 IP/CIDR"""
+    t = str(raw or "").strip().lower()
+    if not t:
+        return ""
+    if "://" in t:
+        t = t.split("://", 1)[1]
+    if "/" in t and not _is_ip_or_cidr(t):
+        t = t.split("/", 1)[0]
+    if ":" in t and not (t.startswith("[") or t.count(":") > 1):
+        t = t.split(":", 1)[0]
+    if t.startswith("*."):
+        t = t[2:]
+    elif t.startswith("."):
+        t = t[1:]
+    return _comment_safe(t, 120)
+
+
+def custom_rules_of(state: dict) -> dict[str, list[str]]:
+    """读取并清洗用户自定义分流规则"""
+    raw = (state.get("routing") or {}).get("custom_rules") or {}
+    res: dict[str, list[str]] = {
+        "direct": [], "proxy": [], "ai": [], "streaming": [], "landing": [], "block": [],
+    }
+    for k in res:
+        items = raw.get(k) or []
+        cleaned: list[str] = []
+        for x in items:
+            n = normalize_target(x)
+            if n and n not in cleaned:
+                cleaned.append(n)
+        res[k] = cleaned
+    return res
+
+
+def _custom_clash_rules(custom: dict[str, list[str]]) -> list[str]:
+    """Clash 格式的自定义分流规则 (优先级高于广告/落地/国内直连)"""
+    rules: list[str] = []
+    order = [
+        ("block", G_ADS),
+        ("landing", G_LANDING),
+        ("ai", G_AI),
+        ("streaming", G_STREAMING),
+        ("proxy", G_SELECT),
+        ("direct", G_DIRECT),
+    ]
+    for key, group in order:
+        for item in custom.get(key, []):
+            if _is_ip_or_cidr(item):
+                rules.append(f"IP-CIDR,{item},{group},no-resolve")
+            else:
+                rules.append(f"DOMAIN-SUFFIX,{item},{group}")
+    return rules
+
+
+def _custom_singbox_rules(custom: dict[str, list[str]]) -> list[dict]:
+    """sing-box 格式的自定义分流规则"""
+    rules: list[dict] = []
+    order = [
+        ("block", "reject", None),
+        ("landing", "route", G_LANDING),
+        ("ai", "route", G_AI),
+        ("streaming", "route", G_STREAMING),
+        ("proxy", "route", G_SELECT),
+        ("direct", "route", G_DIRECT),
+    ]
+    for key, action, group in order:
+        ips: list[str] = []
+        domains: list[str] = []
+        for item in custom.get(key, []):
+            if _is_ip_or_cidr(item):
+                ips.append(item)
+            else:
+                domains.append(item)
+        if ips:
+            rule_entry: dict = {"ip_cidr": ips, "action": action}
+            if group:
+                rule_entry["outbound"] = group
+            rules.append(rule_entry)
+        if domains:
+            rule_entry = {"domain_suffix": domains, "action": action}
+            if group:
+                rule_entry["outbound"] = group
+            rules.append(rule_entry)
+    return rules
+
+
+def simulate_match(target: str, state: dict, override_template: str | None = None) -> dict:
+    """分流命中模拟查询核心逻辑 (供 API 与前端测试器使用)"""
+    norm = normalize_target(target)
+    tpl = template_of(state, override_template)
+    if not norm:
+        return {
+            "target": target,
+            "normalized": "",
+            "template": tpl,
+            "group": G_FINAL,
+            "action": "proxy",
+            "matched_rule": "MATCH",
+            "reason": "目标为空，回落至默认规则",
+        }
+
+    is_ip = _is_ip_or_cidr(norm)
+    custom = custom_rules_of(state)
+
+    # 1. 自定义规则 (最高优先级)
+    custom_order = [
+        ("block", G_ADS, "reject", "自定义拦截黑名单"),
+        ("landing", G_LANDING, "proxy", "自定义落地专线"),
+        ("ai", G_AI, "proxy", "自定义 AI 服务"),
+        ("streaming", G_STREAMING, "proxy", "自定义国际流媒体"),
+        ("proxy", G_SELECT, "proxy", "自定义强制代理"),
+        ("direct", G_DIRECT, "direct", "自定义强制直连白名单"),
+    ]
+    for key, group, action, reason in custom_order:
+        items = custom.get(key, [])
+        if is_ip:
+            for item in items:
+                if _is_ip_or_cidr(item):
+                    try:
+                        net = ipaddress.ip_network(item, strict=False)
+                        target_ip = ipaddress.ip_address(norm)
+                        if target_ip in net:
+                            return {
+                                "target": target,
+                                "normalized": norm,
+                                "template": tpl,
+                                "group": group,
+                                "action": action,
+                                "matched_rule": f"IP-CIDR,{item}",
+                                "reason": reason,
+                            }
+                    except ValueError:
+                        pass
+        else:
+            for item in items:
+                if norm == item or norm.endswith("." + item):
+                    return {
+                        "target": target,
+                        "normalized": norm,
+                        "template": tpl,
+                        "group": group,
+                        "action": action,
+                        "matched_rule": f"DOMAIN-SUFFIX,{item}",
+                        "reason": reason,
+                    }
+
+    # 2. 全直连模式
+    if tpl == "direct":
+        return {
+            "target": target,
+            "normalized": norm,
+            "template": tpl,
+            "group": G_FINAL,
+            "action": "direct",
+            "matched_rule": "MATCH (direct template)",
+            "reason": "全部直连模板：除自定义规则外全部直连",
+        }
+
+    # 3. 全局代理模式
+    if tpl == "global":
+        if is_ip:
+            try:
+                ip_obj = ipaddress.ip_address(norm)
+                if ip_obj.is_private or ip_obj.is_loopback:
+                    return {
+                        "target": target,
+                        "normalized": norm,
+                        "template": tpl,
+                        "group": G_DIRECT,
+                        "action": "direct",
+                        "matched_rule": "GEOIP,LAN",
+                        "reason": "局域网/私有地址直连",
+                    }
+            except ValueError:
+                pass
+        return {
+            "target": target,
+            "normalized": norm,
+            "template": tpl,
+            "group": G_SELECT,
+            "action": "proxy",
+            "matched_rule": "MATCH (global template)",
+            "reason": "全局代理模板：除私有地址外全部走节点选择",
+        }
+
+    # 4. smart / precision 模式
+    # 4a. AI 核心域名
+    if not is_ip:
+        for d in AI_DOMAINS:
+            if norm == d or norm.endswith("." + d):
+                return {
+                    "target": target,
+                    "normalized": norm,
+                    "template": tpl,
+                    "group": G_AI,
+                    "action": "proxy",
+                    "matched_rule": f"DOMAIN-SUFFIX,{d}",
+                    "reason": "AI 专线服务 (OpenAI/Claude/Gemini/Cursor 等)",
+                }
+
+    # 4b. 国际流媒体
+    if not is_ip:
+        for d in STREAMING_DOMAINS:
+            if norm == d or norm.endswith("." + d):
+                return {
+                    "target": target,
+                    "normalized": norm,
+                    "template": tpl,
+                    "group": G_STREAMING,
+                    "action": "proxy",
+                    "matched_rule": f"DOMAIN-SUFFIX,{d}",
+                    "reason": "国际流媒体服务 (YouTube/Netflix/Disney+ 等)",
+                }
+
+    # 4c. 落地纯净度与人机验证
+    if not is_ip:
+        for d in PURITY_LANDING_DOMAINS:
+            if norm == d or norm.endswith("." + d):
+                return {
+                    "target": target,
+                    "normalized": norm,
+                    "template": tpl,
+                    "group": G_LANDING,
+                    "action": "proxy",
+                    "matched_rule": f"DOMAIN-SUFFIX,{d}",
+                    "reason": "人机验证 / IP 纯净度检测 / 国际支付风控",
+                }
+
+    # 4d. 国内核心应用生态 (零数据库硬编码直连)
+    if not is_ip:
+        for d in CN_DIRECT_DOMAINS:
+            if norm == d or norm.endswith("." + d):
+                return {
+                    "target": target,
+                    "normalized": norm,
+                    "template": tpl,
+                    "group": G_DIRECT,
+                    "action": "direct",
+                    "matched_rule": f"DOMAIN-SUFFIX,{d}",
+                    "reason": "国内核心应用生态 (微信/支付宝/阿里/腾讯等)",
+                }
+
+    # 4e. 私有 IP / 局域网
+    if is_ip:
+        try:
+            ip_obj = ipaddress.ip_address(norm)
+            if ip_obj.is_private or ip_obj.is_loopback:
+                return {
+                    "target": target,
+                    "normalized": norm,
+                    "template": tpl,
+                    "group": G_DIRECT,
+                    "action": "direct",
+                    "matched_rule": "GEOIP,LAN",
+                    "reason": "局域网/私有地址直连",
+                }
+        except ValueError:
+            pass
+
+    # 4f. .cn 顶级域名
+    if not is_ip and (norm.endswith(".cn") or norm == "cn"):
+        return {
+            "target": target,
+            "normalized": norm,
+            "template": tpl,
+            "group": G_DIRECT,
+            "action": "direct",
+            "matched_rule": "GEOSITE,cn",
+            "reason": "中国大陆顶级域名直连",
+        }
+
+    # 4g. 兜底 (漏网之鱼)
+    return {
+        "target": target,
+        "normalized": norm,
+        "template": tpl,
+        "group": G_FINAL,
+        "action": "proxy",
+        "matched_rule": "MATCH",
+        "reason": "未命中直连/专线规则，走漏网之鱼出站代理",
+    }
 
 
 #: 「必须走直连」的国内应用生态域名 —— **纯域名规则, 不依赖分流数据库**。
@@ -266,6 +557,7 @@ def _cn_direct_rules(geo: bool = True) -> list[str]:
 LANDING_RULE_SETS = tuple(
     (g, f"sing-geosite@rule-set/geosite-{g}.srs") for g in LANDING_GEOSITES
 )
+STREAMING_RULE_SETS = LANDING_RULE_SETS
 CN_RULE_SETS = tuple((g, f"sing-geosite@rule-set/geosite-{g}.srs") for g in CN_DIRECT_GEOSITES)
 
 
@@ -766,10 +1058,26 @@ def _groups_for(names: list[str], tpl: str) -> list[dict]:
             "name": G_LANDING, "type": "url-test", "url": HEALTH_URL,
             "interval": 60, "lazy": False, "tolerance": 50, "proxies": landing,
         }
+        ai_group = {
+            "name": G_AI, "type": "url-test", "url": HEALTH_URL,
+            "interval": 60, "lazy": False, "tolerance": 50, "proxies": landing,
+        }
     else:
         landing_group = {"name": G_LANDING, "type": "select", "proxies": landing + [G_SELECT]}
+        ai_group = {
+            "name": G_AI,
+            "type": "select",
+            "proxies": (landing + [G_LANDING, G_SELECT]) if landing else [G_SELECT],
+        }
+    streaming_group = {
+        "name": G_STREAMING,
+        "type": "select",
+        "proxies": _dedup(([G_AUTO] if names else []) + names + [G_SELECT, "DIRECT"]),
+    }
     groups += [
         {"name": G_SELECT, "type": "select", "proxies": select_members},
+        ai_group,
+        streaming_group,
         landing_group,
         {"name": G_DIRECT, "type": "select", "proxies": ["DIRECT", G_SELECT]},
         {"name": G_ADS, "type": "select", "proxies": ["REJECT", "DIRECT"]},
@@ -882,6 +1190,19 @@ def clash_profile(
             # 而在真机上测活失败, 导致落地组被判定为不可用, 访问 OpenAI/Claude 等落地域名
             # 出现"无法连接"。用 select 组则能在无链式节点时无缝 fallback 到 G_SELECT。
             {
+                "name": G_AI,
+                "type": "select",
+                "use": [],
+                "filter": "(?i)链式",
+                "proxies": [G_LANDING, G_SELECT],
+            },
+            {
+                "name": G_STREAMING,
+                "type": "select",
+                "use": [],
+                "proxies": [G_AUTO, G_SELECT, "DIRECT"],
+            },
+            {
                 "name": G_LANDING,
                 "type": "select",
                 "use": [],
@@ -899,37 +1220,54 @@ def clash_profile(
     else:
         groups = _groups_for(names, tpl)
 
-    if tpl == "smart":
-        # 顺序即优先级: 广告拦截 → 落地 → 国内 App 直连 → 国内通用直连 → 漏网之鱼。
-        # 落地规则必须早于国内直连 (这些站点要用落地 IP, 不能被 cn 规则抢先放行);
+    custom = custom_rules_of(state)
+    custom_rules_clash = _custom_clash_rules(custom)
+
+    if tpl in ("smart", "precision"):
+        # 顺序即优先级: 自定义规则 → 广告拦截 → AI/流媒体/落地 → 国内 App 直连 → 通用 geo 直连 → 漏网之鱼。
+        # 用户自定义规则最优先 (Layer 0.5); 落地与 AI 规则必须早于国内直连;
         # 国内 App 直连层早于通用 geo 规则, 而且**不依赖数据库** —— 降级配置里它是
         # 唯一的国内直连来源 (见 CN_DIRECT_DOMAINS 的说明)。
         rules = []
+        rules += custom_rules_clash
         if geo:
             rules.append(f"GEOSITE,category-ads-all,{G_ADS}")
-        rules += _landing_rules(geo)
+        # AI 核心服务走 AI 专线
+        for d in AI_DOMAINS:
+            rules.append(f"DOMAIN-SUFFIX,{d},{G_AI}")
+        # 国际流媒体走流媒体专线
+        for d in STREAMING_DOMAINS:
+            rules.append(f"DOMAIN-SUFFIX,{d},{G_STREAMING}")
+        if geo:
+            for g in STREAMING_GEOSITES:
+                rules.append(f"GEOSITE,{g},{G_STREAMING}")
+        # 纯净度检测 / 边缘人机验证 / 国际支付走落地节点
+        for d in PURITY_LANDING_DOMAINS:
+            rules.append(f"DOMAIN-SUFFIX,{d},{G_LANDING}")
         rules += _cn_direct_rules(geo)
         if geo:
             rules.append(f"GEOSITE,private,{G_DIRECT}")
         # GEOIP,LAN 是内建判断 (私有地址), 不需要数据库 —— 降级时也留着
         rules.append(f"GEOIP,LAN,{G_DIRECT},no-resolve")
         if geo:
-            # 必须加 no-resolve: 在 fake-ip 模式下, 若缺少 no-resolve, 未命中前置规则的境外域名
-            # 会被 mihomo 暂停匹配并调用 nameserver (国内阿里/腾讯 DNS) 解析真实 IP 来匹配 GEOIP。
-            # 这会导致:
-            #   1. 境外域名向国内 DNS 发生 DNS 泄漏与被污染;
-            #   2. 污染返回国内 IP 时被错误路由到直连, 导致目标网站连接超时失败;
-            #   3. 落地机与 DNS 出口 ASN 不一致被 Cloudflare 等高纯净度风控拦截。
             rules.append(f"GEOIP,CN,{G_DIRECT},no-resolve")
         rules.append(f"MATCH,{G_FINAL}")
     elif tpl == "global":
         rules = []
+        rules += custom_rules_clash
         if geo:
             rules.append(f"GEOSITE,category-ads-all,{G_ADS}")
-        rules += _landing_rules(geo)
+        for d in AI_DOMAINS:
+            rules.append(f"DOMAIN-SUFFIX,{d},{G_AI}")
+        for d in STREAMING_DOMAINS:
+            rules.append(f"DOMAIN-SUFFIX,{d},{G_STREAMING}")
+        for d in PURITY_LANDING_DOMAINS:
+            rules.append(f"DOMAIN-SUFFIX,{d},{G_LANDING}")
         rules += [f"GEOIP,LAN,{G_DIRECT},no-resolve", f"MATCH,{G_SELECT}"]
-    else:  # direct: 不依赖任何 geo 数据 (无需下载), 只做广告拦截与手动切换
-        rules = [f"MATCH,{G_FINAL}"]
+    else:  # direct: 不依赖任何 geo 数据 (无需下载), 自定义规则照常生效
+        rules = []
+        rules += custom_rules_clash
+        rules.append(f"MATCH,{G_FINAL}")
 
     # 管理面 (面板自己) 的直连规则放在**最前面**: 上面哪一档模板都不该把"连面板"这件事
     # 交给代理 —— 见 management_direct_rules。只有路由器端有 base (手机/电脑那份订阅
@@ -1247,6 +1585,22 @@ def singbox_profile(state: dict, template: str | None = None, next_gen: bool = F
     outbounds.append(
         {
             "type": "selector",
+            "tag": G_AI,
+            "outbounds": (landing_tags + [G_LANDING, G_SELECT]) if landing_tags else [G_SELECT],
+            "default": landing_tags[0] if landing_tags else G_SELECT,
+        }
+    )
+    outbounds.append(
+        {
+            "type": "selector",
+            "tag": G_STREAMING,
+            "outbounds": _dedup(([G_AUTO] if tags else []) + tags + [G_SELECT, "direct"]),
+            "default": G_AUTO if tags else (tags[0] if tags else "direct"),
+        }
+    )
+    outbounds.append(
+        {
+            "type": "selector",
             "tag": G_LANDING,
             "outbounds": landing_tags + [G_SELECT],
             "default": landing_tags[0] if landing_tags else G_SELECT,
@@ -1261,25 +1615,39 @@ def singbox_profile(state: dict, template: str | None = None, next_gen: bool = F
         }
     )
 
+    custom = custom_rules_of(state)
+    custom_rules_sb = _custom_singbox_rules(custom)
+
     rule_set: list[dict] = []
     rules: list[dict] = [
         # sing-box 1.11 起 sniff 等 legacy inbound 字段被移除, 改用路由动作
         {"action": "sniff"},
         {"ip_is_private": True, "action": "route", "outbound": G_DIRECT},
     ]
-    if tpl == "smart":
+    # 自定义规则在基础嗅探与私有 IP 放行后立刻生效 (Layer 0.5)
+    rules += custom_rules_sb
+
+    if tpl in ("smart", "precision"):
         rule_set = [_singbox_rule_set(tag, name, next_gen) for tag, name in smart_rule_sets()]
         rules.append({"rule_set": ["ads"], "action": "reject"})
-        # 落地优先于国内直连 (与 Clash 侧同一顺序), 否则 AI / 流媒体会被 cn 规则放行
+        # 业务分流: AI 专线
         rules.append(
-            {"domain_suffix": list(LANDING_DOMAINS), "action": "route", "outbound": G_LANDING}
+            {"domain_suffix": list(AI_DOMAINS), "action": "route", "outbound": G_AI}
+        )
+        # 业务分流: 国际流媒体
+        rules.append(
+            {"domain_suffix": list(STREAMING_DOMAINS), "action": "route", "outbound": G_STREAMING}
         )
         rules.append(
             {
-                "rule_set": [tag for tag, _ in LANDING_RULE_SETS],
+                "rule_set": [tag for tag, _ in STREAMING_RULE_SETS],
                 "action": "route",
-                "outbound": G_LANDING,
+                "outbound": G_STREAMING,
             }
+        )
+        # 业务分流: 纯净度检测 / 边缘人机验证 / 国际支付
+        rules.append(
+            {"domain_suffix": list(PURITY_LANDING_DOMAINS), "action": "route", "outbound": G_LANDING}
         )
         # 国内 App 直连: 域名那批**不依赖 rule-set**, 所以没有网络也能生效
         rules.append(

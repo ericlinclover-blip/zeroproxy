@@ -558,11 +558,14 @@ def test_clash_templates(client, configured):
     assert "GEOSITE,category-ads-all" in rules and "GEOSITE,cn," in rules
     assert "GEOIP,LAN," in rules and "GEOIP,CN," in rules
     assert smart["rules"][-1] == "MATCH,🐟 漏网之鱼"
-    # 落地组 (🌍 落地节点) 是 v2.9.0 加的: 只放链式节点, 没链式节点时兜底到节点选择
+    # 策略组矩阵: 自动选择、节点选择、AI 服务、国际流媒体、落地节点、直连、广告拦截、漏网之鱼
     assert [g["name"] for g in smart["proxy-groups"]] == [
         "♻️ 自动选择",
         "🚀 节点选择",
-        "🌍 落地节点", "🎯 全球直连",
+        "🤖 AI 服务",
+        "🎬 国际流媒体",
+        "🌍 落地节点",
+        "🎯 全球直连",
         "🛑 广告拦截",
         "🐟 漏网之鱼",
     ]
@@ -802,6 +805,109 @@ def test_routing_template_validation_and_override(client, configured):
     # URL 参数覆盖不改变面板设置
     _sub(client, configured, extra="&rules=direct")
     assert config.load_state()["routing"]["template"] == "smart"
+
+
+def test_precision_template(client, configured):
+    """精细分流模板: 支持 AI 服务、国际流媒体、落地节点与国内生态独立选路。"""
+    yaml = pytest.importorskip("yaml")
+    res = client.post("/api/settings", json={"template": "precision"})
+    assert res.status_code == 200, res.text
+    assert config.load_state()["routing"]["template"] == "precision"
+
+    clash = yaml.safe_load(_sub(client, configured).text)
+    group_names = [g["name"] for g in clash["proxy-groups"]]
+    assert "🤖 AI 服务" in group_names
+    assert "🎬 国际流媒体" in group_names
+    assert "🌍 落地节点" in group_names
+    assert "🎯 全球直连" in group_names
+    assert "🛑 广告拦截" in group_names
+    rules_text = "\n".join(clash["rules"])
+    assert "DOMAIN-SUFFIX,chatgpt.com,🤖 AI 服务" in rules_text
+    assert "DOMAIN-SUFFIX,netflix.com,🎬 国际流媒体" in rules_text
+    assert "DOMAIN-SUFFIX,qq.com,🎯 全球直连" in rules_text
+
+
+def test_custom_rules_persists_and_applies(client, configured):
+    """用户自定义分流规则: 0 重载热生效、支持域名/CIDR、并在 Clash 与 sing-box 订阅中优先匹配。"""
+    yaml = pytest.importorskip("yaml")
+    custom_payload = {
+        "custom_rules": {
+            "direct": ["internal.company.com", "10.0.0.0/8", "https://*.intranet.local/path"],
+            "block": ["telemetry.bad.org"],
+            "ai": ["custom-llm.ai"],
+            "streaming": ["custom-video.tv"],
+            "landing": ["special-bank.com"],
+            "proxy": ["custom-proxy.org"],
+        }
+    }
+    res = client.post("/api/settings", json=custom_payload)
+    assert res.status_code == 200, res.text
+    steps = {s["name"]: s for s in res.json()["steps"]}
+    assert "更新分流规则" in steps or "切换分流模板" in steps
+    assert "重载服务 (nginx/xray/hysteria2)" not in steps
+
+    state = config.load_state()
+    rules = state["routing"]["custom_rules"]
+    assert "internal.company.com" in rules["direct"]
+    assert "10.0.0.0/8" in rules["direct"]
+    assert "intranet.local" in rules["direct"]  # 规范化清理
+    assert "telemetry.bad.org" in rules["block"]
+
+    # Clash 订阅中的 Layer 0.5 验证
+    clash = yaml.safe_load(_sub(client, configured).text)
+    c_rules = "\n".join(clash["rules"])
+    assert "DOMAIN-SUFFIX,internal.company.com,🎯 全球直连" in c_rules
+    assert "IP-CIDR,10.0.0.0/8,🎯 全球直连,no-resolve" in c_rules
+    assert "DOMAIN-SUFFIX,telemetry.bad.org,🛑 广告拦截" in c_rules
+    assert "DOMAIN-SUFFIX,custom-llm.ai,🤖 AI 服务" in c_rules
+    assert "DOMAIN-SUFFIX,special-bank.com,🌍 落地节点" in c_rules
+
+    # 自定义规则必须排在通用广告与 geo 规则之前
+    assert c_rules.index("telemetry.bad.org") < c_rules.index("GEOSITE,category-ads-all")
+
+    # sing-box 订阅验证
+    sb = json.loads(_sub(client, configured, fmt="singbox").text)
+    sb_str = json.dumps(sb["route"]["rules"], ensure_ascii=False)
+    assert "internal.company.com" in sb_str
+    assert "telemetry.bad.org" in sb_str
+
+
+def test_routing_simulation_endpoint(client, configured):
+    """分流命中模拟查询接口 (GET /api/routing/test)。"""
+    # 1. 常见海外 AI 核心服务
+    r_ai = client.get("/api/routing/test?target=chatgpt.com").json()["result"]
+    assert r_ai["group"] == "🤖 AI 服务"
+    assert r_ai["action"] == "proxy"
+
+    # 2. 国际流媒体
+    r_media = client.get("/api/routing/test?target=www.netflix.com").json()["result"]
+    assert r_media["group"] == "🎬 国际流媒体"
+    assert r_media["action"] == "proxy"
+
+    # 3. 国内应用生态
+    r_cn = client.get("/api/routing/test?target=mp.weixin.qq.com").json()["result"]
+    assert r_cn["group"] == "🎯 全球直连"
+    assert r_cn["action"] == "direct"
+
+    # 4. 私有内网 IP
+    r_lan = client.get("/api/routing/test?target=192.168.1.1").json()["result"]
+    assert r_lan["group"] == "🎯 全球直连"
+    assert r_lan["action"] == "direct"
+
+    # 5. 自定义规则优先命中
+    client.post("/api/settings", json={
+        "custom_rules": {
+            "direct": ["my-special-site.xyz"],
+            "block": ["ad-tracker.io"]
+        }
+    })
+    r_custom = client.get("/api/routing/test?target=my-special-site.xyz").json()["result"]
+    assert r_custom["group"] == "🎯 全球直连"
+    assert "自定义强制直连白名单" in r_custom["reason"]
+
+    r_block = client.get("/api/routing/test?target=ad-tracker.io").json()["result"]
+    assert r_block["group"] == "🛑 广告拦截"
+    assert r_block["action"] == "reject"
 
 
 # ---------------------------------------------------------------- 节点操作
