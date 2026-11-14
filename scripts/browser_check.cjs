@@ -272,21 +272,12 @@ async function main() {
     const certText = await page.locator("#sys-grid").innerText();
     check("证书卡片", certText.includes("TLS 证书"), certText.split("\n").slice(0, 4).join(" "));
 
-    // 侧栏菜单的顺序必须与页面板块的顺序一致 —— 否则会出现"点上一个却滚到下面",
-    // 滚动高亮也会往回跳。曾经 链式代理 与 高级/分流 在菜单里是正序、页面里是反序。
-    const navOrder = await page.evaluate(() => {
-      const hrefs = [...document.querySelectorAll("#dash-nav a[href^='#']")]
-        .map((a) => a.getAttribute("href").slice(1));
-      const tops = hrefs.map((id) => {
-        const el = document.getElementById(id);
-        return el ? Math.round(el.getBoundingClientRect().top + window.scrollY) : -1;
-      });
-      return { hrefs, tops };
-    });
-    check("侧栏顺序 = 页面板块顺序 (点哪去哪, 高亮不往回跳)",
-      !navOrder.tops.includes(-1)
-      && navOrder.tops.every((top, i) => i === 0 || top > navOrder.tops[i - 1]),
-      navOrder.hrefs.map((h, i) => `${h}@${navOrder.tops[i]}`).join(" "));
+    const goWorkspace = async (key) => {
+      await page.locator(`[data-workspace="${key}"]`).click();
+    };
+    check("五个工作区导航就绪", await page.locator("#dash-nav a").count() === 5);
+    check("首页连接画布可见", await page.locator("#connection-field").isVisible());
+    check("其他工作区没有堆在首页", !(await page.locator("#sec-clients").isVisible()));
 
     console.log("\n[3] 交互");
     // 开关的 input 是视觉隐藏的 (opacity:0), 要点它的滑块
@@ -329,6 +320,7 @@ async function main() {
     const enabledLabels = await page.locator("#node-grid .switch input:checked").count();
     check("开关状态可往返切换", enabledLabels === 5, `启用中 ${enabledLabels}/5`);
 
+    await goWorkspace("devices");
     await page.locator("[data-qr-fmt='singbox']").click();
     await page.waitForSelector("#qr-mask:not(.hidden)");
     await page.waitForFunction(() => {
@@ -356,6 +348,7 @@ async function main() {
     await page.click("#qr-close");
     check("关闭后不残留二维码", await page.evaluate(() => !document.querySelector("#qr-img").getAttribute("src")), "");
 
+    await goWorkspace("network");
     await page.locator("[data-qr='vless-xhttp']").click();
     await page.waitForSelector("#qr-mask:not(.hidden)");
     await page.waitForFunction(() => {
@@ -389,6 +382,7 @@ async function main() {
       await waitCardInView(page, "#diag-card"), "");
 
     console.log("\n[3b] 新增能力 (测速 / GeoIP / 备份)");
+    await goWorkspace("network");
     // 自动测速在进入仪表盘时就跑了一次, 这里等结果落到节点卡片上
     await page.waitForSelector("#probe-summary .ping", { timeout: 30000 });
     const probeSummary = (await page.locator("#probe-summary").innerText()).trim();
@@ -426,6 +420,7 @@ async function main() {
       }),
     }));
     await page.evaluate(() => document.querySelector("#toast").classList.remove("show"));
+    await goWorkspace("routing");
     await page.click("#btn-geo-check");
     await page.waitForSelector("#toast.show", { timeout: 10000 });
     const checkToast = (await page.locator("#toast").innerText()).trim();
@@ -462,7 +457,7 @@ async function main() {
 
     console.log("\n[3c] 分流模板");
     const tplCount = await page.locator("#adv-template option").count();
-    check("分流模板选择器有三个选项", tplCount === 3, `实际 ${tplCount}`);
+    check("分流模板选择器有四个选项", tplCount === 4, `实际 ${tplCount}`);
     await page.selectOption("#adv-template", "direct");
     await page.waitForFunction(
       () => (document.querySelector("#adv-template") || {}).value === "direct",
@@ -546,6 +541,7 @@ async function main() {
       && /\.enc/.test(await page.locator("#restore-file").getAttribute("accept") || ""));
     // 导出前必须先弹确认框: 写清"备份等价 root", 并给一个可选的加密口令输入
     // (口令不落 URL —— 加密请求走 X-ZP-Passphrase 头)。
+    await goWorkspace("maintenance");
     await page.click("#btn-backup");
     await page.waitForSelector("#confirm-mask:not(.hidden)", { timeout: 10000 });
     const backupConfirm = await page.evaluate(() => ({
@@ -732,7 +728,7 @@ async function main() {
       updateInfo = {
         ...updateInfo, running: false, current: "2.3.10", latest: "2.3.11", update_available: true,
         log_tail: "== 安装新代码\ncp: 无法写入",
-        last: { state: "failed", from: "2.3.10", to: "2.3.11", trigger: "panel",
+        last: { state: "failed", rolled_back: true, from: "2.3.10", to: "2.3.11", trigger: "panel",
           started_at: Math.round(Date.now() / 1000) - 5, finished_at: Math.round(Date.now() / 1000),
           current: "", plan, message: "",
           steps: [{ name: plan[0], ok: true, detail: "完成" },
@@ -815,6 +811,7 @@ async function main() {
     check("证书不是真证书时改成告警语气",
       ipBanner.selfSigned.includes("bad") && ipBanner.restored, ipBanner.selfSigned);
 
+    await goWorkspace("network");
     console.log("\n[3f] 链式代理 (入口 → 落地)");
     check("链式代理区有说明 + 两张卡 (落地端 / 入口端)",
       (await page.locator("#chain-intro").count()) === 1
@@ -1009,6 +1006,14 @@ async function main() {
       `${clashText.length} 字节`);
     await page.locator("#chain-entries").screenshot({ path: path.join(SHOT_DIR, "chain-entry.png") });
 
+    // Previewing a route must not silently change the default exit.
+    await page.selectOption("#field-object-select", `chain:${entryCard.id}`);
+    check("连接场域可查看落地端", (await page.locator("#field-object-name").innerText()).includes("美国落地"));
+    await page.click("#field-apply-route");
+    await page.waitForSelector("#confirm-mask:not(.hidden)");
+    check("画布中的出口更改仍需影响确认", /改道/.test(await page.locator("#confirm-body").innerText()));
+    await page.click("#confirm-cancel");
+    check("取消预览更改后默认出口不变", !(await page.evaluate((id) => dash.chain.entries.find(e => e.id === id).default_out, entryCard.id)));
     // 设为默认出口: 本机 4 个主力节点整体改道 (客户端不用换节点)
     await page.click(`[data-chain-default='${entryCard.id}']`);
     await page.waitForSelector("#confirm-mask:not(.hidden)");
@@ -1154,7 +1159,7 @@ async function main() {
       bg: getComputedStyle(document.body).backgroundColor,
     }));
     check("CSP 收紧后内联的主题引导脚本仍然生效 (预置深色, 首屏即深色不闪白)",
-      bootTheme.theme === "dark" && /rgb\(10, 12, 17\)/.test(bootTheme.bg),
+      bootTheme.theme === "dark" && /rgb\(17, 23, 15\)/.test(bootTheme.bg),
       `${bootTheme.theme} ${bootTheme.bg}`);
     const injectedBlocked = await page.evaluate(() => {
       const s = document.createElement("script");
@@ -1224,6 +1229,7 @@ async function main() {
       ""
     );
 
+    await goWorkspace("maintenance");
     console.log("\n[3i] 操作记录");
     check("操作记录卡片渲染出条目",
       (await page.locator("#audit-list .audit-row").count()) > 0,
@@ -1242,7 +1248,7 @@ async function main() {
       credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username: "admin", password: "definitely-wrong" }),
-    }).then((r) => r.status));
+    }).then(async (r) => { await r.text(); return r.status; }));
     const firstBad = await badLogin();
     await badLogin();
     for (let i = consoleErrors.length - 1; i >= loginErrMark; i -= 1) {
@@ -1322,6 +1328,7 @@ async function main() {
     check("点它真的回到顶部, 且自己隐藏",
       !(await page.evaluate(() => document.querySelector("#to-top").classList.contains("on"))), "");
 
+    await goWorkspace("network");
     console.log("\n[3i-3] 顶部「出口 IP」卡片: 落地 IP 与本机 IP 都在, 都能点复制");
     // 以前这张卡只显示落地出口 IP, 本机公网 IP (用户要填进客户端的那个) 面板里无处可查,
     // 也没有任何"点一下复制"的入口。这里把 /api/dashboard 拦下来塞一个本机 IP + 一条
@@ -1366,9 +1373,10 @@ async function main() {
     check("点本机 IP 就能复制", /已复制/.test(copyToast), copyToast);
     await page.unroute("**/api/dashboard");
 
+    await goWorkspace("maintenance");
     console.log("\n[3j] 面板设置 (管理员账号 / 面板域名)");
-    check("侧栏有「面板设置」入口",
-      (await page.locator("#dash-nav a[href='#sec-panel']").count()) === 1);
+    check("维护工作区提供面板设置",
+      await page.locator("#sec-panel").isVisible());
     const panelText = await page.locator("#panel-grid").innerText();
     check("设置里同时有账号与域名两块",
       /管理员账号/.test(panelText) && /面板域名/.test(panelText)
@@ -1462,6 +1470,7 @@ async function main() {
     await page.unroute("**/api/domain");
     await page.locator("#sec-panel").screenshot({ path: path.join(SHOT_DIR, "panel-settings.png") });
 
+    await goWorkspace("network");
     console.log("\n[3k] 节点卡的说明文字不再被省略号截断");
     // 用户反馈: 每个节点下面那句"这个协议是干什么的"被单行省略号切掉, 又难看又看不清。
     // 这里量的是**真的没被切**: -webkit-line-clamp 生效时 scrollHeight 会超过 clientHeight。

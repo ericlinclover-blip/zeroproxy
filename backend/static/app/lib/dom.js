@@ -61,6 +61,7 @@ export function show(id) {
 export function revealSection(sel) {
   const el = typeof sel === "string" ? document.querySelector(sel) : sel;
   if (!el) return;
+  document.dispatchEvent(new CustomEvent("zp:reveal-section", { detail: el }));
   const box = el.getBoundingClientRect();
   const fullyVisible = box.top >= 0 && box.bottom <= window.innerHeight;
   if (!fullyVisible) {

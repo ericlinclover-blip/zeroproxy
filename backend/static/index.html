@@ -3,28 +3,29 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ZeroProxy · 极简代理面板</title>
+<title>ZeroProxy · 连接场域</title>
 <!-- 内联图标: 避免浏览器请求 /favicon.ico 造成 404 (面板无外部资源依赖) -->
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230a84ff'/%3E%3Ctext x='32' y='44' font-family='-apple-system,Segoe UI,sans-serif' font-size='38' font-weight='700' fill='%23fff' text-anchor='middle'%3EZ%3C/text%3E%3C/svg%3E">
-<!-- 样式分三层: 设计令牌 → 基础元素 → 组件。改主题/字号/间距只动 tokens.css -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2320261d'/%3E%3Ctext x='32' y='44' font-family='-apple-system,Segoe UI,sans-serif' font-size='38' font-weight='700' fill='%23d4f56a' text-anchor='middle'%3EZ%3C/text%3E%3C/svg%3E">
+<!-- 基础令牌与组件保留兼容; field.css 定义连接场域主题、工作区与响应式布局。 -->
 <link rel="stylesheet" href="/static/app/style/tokens.css">
 <link rel="stylesheet" href="/static/app/style/base.css">
 <link rel="stylesheet" href="/static/app/style/components.css">
+<link rel="stylesheet" href="/static/app/style/field.css">
 <!-- 首屏前把主题定下来 (深色模式下不闪白)。必须同步执行, 所以这条留在 head 里内联 -->
 <script>
   try {
     document.documentElement.dataset.theme =
-      localStorage.getItem("zp-theme") ||
-      (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+      localStorage.getItem("zp-theme") || "light";
   } catch (e) { /* 隐私模式下 localStorage 不可用: 退回默认浅色 */ }
 </script>
 </head>
 <body>
+<a class="skip-link" href="#workspace-title">跳到工作区</a>
 <div class="wrap">
 
   <div class="brand">
     <div class="logo"><span class="mark">Z</span> ZeroProxy</div>
-    <button class="theme-btn" id="themeBtn" title="切换深浅色">◐</button>
+    <button class="theme-btn" id="themeBtn" aria-label="切换深浅色" title="切换深浅色">◐</button>
   </div>
 
   <!-- 首屏到"选好视图"之间的空档: 页面已经到手, 但 boot() 还在等 /api/status
@@ -42,14 +43,14 @@
     <div class="proto-row" id="protoRow"></div>
     <div class="card setup-card">
       <div class="field">
-        <label>域名 (已解析到本服务器)</label>
-        <input id="in-domain" placeholder="proxy.example.com" spellcheck="false"></div>
+        <label for="in-domain">域名 (已解析到本服务器)</label>
+        <input id="in-domain" name="in-domain" autocomplete="off" placeholder="proxy.example.com" spellcheck="false"></div>
       <div class="field">
-        <label>管理用户名</label>
-        <input id="in-user" placeholder="admin" spellcheck="false"></div>
+        <label for="in-user">管理用户名</label>
+        <input id="in-user" name="in-user" autocomplete="username" placeholder="admin" spellcheck="false"></div>
       <div class="field">
-        <label>管理密码 (同时作为代理口令)</label>
-      <input id="in-pass" type="password" placeholder="••••••••"></div>
+        <label for="in-pass">管理密码 (同时作为代理口令)</label>
+      <input id="in-pass" name="in-pass" autocomplete="new-password" type="password" placeholder="••••••••"></div>
       <button class="btn w-full" id="btn-setup">一键生成</button>
       <!-- 部署是一次长请求 (证书签发 30-60s), 这里给一条不定量斜纹进度条: 只表示"在动", 不谎报百分比 -->
       <div class="bar live hidden mt-4" id="setup-bar"><i class="w-full"></i></div>
@@ -68,8 +69,8 @@
     <div class="hero"><h1>登录面板</h1></div>
     <div class="card setup-card">
       <div class="hint-box hidden" id="login-hint"></div>
-      <div class="field"><label>用户名</label><input id="login-user" spellcheck="false"></div>
-      <div class="field"><label>密码</label><input id="login-pass" type="password"></div>
+      <div class="field"><label for="login-user">用户名</label><input id="login-user" name="login-user" autocomplete="username" spellcheck="false"></div>
+      <div class="field"><label for="login-pass">密码</label><input id="login-pass" name="login-pass" autocomplete="current-password" type="password"></div>
       <button class="btn w-full" id="btn-login">登录</button>
       <div class="err-box hidden" id="login-err"></div>
     </div>
@@ -79,30 +80,20 @@
   <section id="view-dash" class="hidden">
     <div class="console">
       <aside class="side">
-        <nav class="nav" id="dash-nav">
-          <a href="#sec-nodes" class="on"><span class="ic">◆</span>节点<span class="cnt" id="nav-nodes">—</span></a>
-          <a href="#sec-subs"><span class="ic">⌘</span>订阅</a>
-          <a href="#sec-clients"><span class="ic">⇱</span>客户端<span class="cnt" id="nav-clients">—</span></a>
-          <a href="#sec-wireguard"><span class="ic">◈</span>WireGuard<span class="cnt" id="nav-wg">—</span></a>
-          <a href="#sec-traffic"><span class="ic">▤</span>流量</a>
-          <a href="#chain-intro"><span class="ic">⇄</span>链式代理<span class="cnt" id="nav-chain">—</span></a>
-          <a href="#sec-adv"><span class="ic">⑃</span>高级 / 分流</a>
-          <a href="#diag-card"><span class="ic">✓</span>诊断<span class="cnt" id="nav-diag">—</span></a>
-          <a href="#unlock-card"><span class="ic">🌍</span>解锁检测</a>
-          <a href="#sec-sys"><span class="ic">⚙</span>系统</a>
-          <a href="#sec-panel"><span class="ic">⚿</span>面板设置</a>
-          <a href="#sec-audit"><span class="ic">≡</span>操作记录<span class="cnt" id="nav-audit"></span></a>
-          <a href="#update-card"><span class="ic">↑</span>程序更新<span class="cnt" id="nav-update"></span></a>
+        <nav class="nav" id="dash-nav" aria-label="主导航">
+          <a href="#connection-field" class="on" data-workspace="network">网络<span class="cnt" id="nav-nodes">—</span></a>
+          <a href="#sec-clients" data-workspace="devices">设备<span class="cnt" id="nav-clients">—</span></a>
+          <a href="#sec-adv" data-workspace="routing">分流</a>
+          <a href="#diag-card" data-workspace="diagnostics">诊断<span class="cnt" id="nav-diag"></span></a>
+          <a href="#sec-sys" data-workspace="maintenance">维护<span class="cnt" id="nav-update"></span></a>
         </nav>
-        <div class="side-foot">
-          <div class="kv"><span class="k">管理员</span><b id="side-user">—</b></div>
-          <div class="kv"><span class="k">主机</span><b id="side-os" title="">—</b></div>
-          <div class="kv"><span class="k">在线</span><b id="side-uptime">—</b></div>
-          <div class="kv"><span class="k">版本</span><b id="side-ver">—</b></div>
-        </div>
       </aside>
 
-      <div class="main">
+      <main class="main" id="workspace-main">
+    <div class="workspace-heading">
+      <div><span class="eyebrow">ZEROPROXY / CONTROL SPACE</span><h1 id="workspace-title" tabindex="-1">你的连接，尽在此处。</h1><p id="workspace-description">从入口到出口，沿着路径管理你的网络。</p></div>
+      <button class="btn field-search" id="btn-find">查找功能 <kbd>⌘ K</kbd></button>
+    </div>
     <div class="head-card reveal">
       <div>
         <div class="row">
@@ -123,19 +114,43 @@
     <div id="dash-banner" class="hidden"></div>
     <div id="apply-strip" class="hidden"></div>
 
+    <section class="connection-field" id="connection-field" aria-label="连接路径预览">
+      <div class="field-canvas">
+        <div class="field-caption"><span>CONNECTION FIELD / 01</span><span id="field-proof">等待探测</span></div>
+        <h2 id="field-headline">正在读取连接。</h2>
+        <p class="field-summary" id="field-summary">选择节点，查看它的配置与验证结果。</p>
+        <div class="field-topology">
+          <svg class="field-wires" viewBox="0 0 800 230" preserveAspectRatio="none" aria-hidden="true"><path class="wire-back" d="M65 150 C190 150 180 70 320 70 S510 160 570 130 S690 100 745 100"/><path class="wire-main" d="M65 150 C190 150 180 70 320 70 S510 160 570 130 S690 100 745 100"/><path class="wire-alternate" d="M65 150 C200 260 390 260 570 130"/></svg>
+          <div class="field-hop hop-device"><span class="field-dot"></span><span class="hop-index">01 / CLIENT</span><strong>你的设备</strong><small>按设备分流与选组出网</small></div>
+          <button class="field-hop hop-entry" id="field-entry"><span class="field-dot"></span><span class="hop-index">02 / ENTRY</span><strong id="field-entry-name">本机入口</strong><small id="field-entry-host">—</small></button>
+          <button class="field-hop hop-exit" id="field-exit"><span class="field-dot"></span><span class="hop-index">03 / EGRESS</span><strong id="field-exit-name">直接出网</strong><small id="field-exit-host">—</small></button>
+        </div>
+        <div class="field-bottom"><span id="field-scope">路径为配置预览，不代表设备实时流向</span><a href="#chain-intro">管理链式连接 ↗</a></div>
+      </div>
+      <aside class="field-inspector" aria-label="选中对象详情">
+        <div class="inspector-top"><span class="eyebrow">SELECTED / 当前查看</span><span id="field-selection-kind">节点</span></div>
+        <h3 id="field-object-name">选择一个节点</h3>
+        <div class="field-object-switch"><label for="field-object-select">查看节点或落地端</label><select id="field-object-select"></select></div>
+        <dl id="field-facts"></dl>
+        <p id="field-evidence" class="field-evidence" role="status"></p>
+        <div class="field-inspector-actions"><button class="btn primary" id="field-verify">验证连接</button><button class="btn hidden" id="field-apply-route">设为默认出口</button><button class="btn ghost" id="field-manage">管理此对象 ↗</button></div>
+        <p class="field-disclaimer">选择只更新预览。更改出口需在管理页确认并应用。</p>
+      </aside>
+    </section>
+
     <div class="kpi reveal">
       <div class="k">
-        <div class="k-lab">健康节点</div>
+        <div class="k-lab">启用节点</div>
         <div class="k-val" id="kpi-nodes">—</div>
         <div class="k-sub" id="kpi-nodes-sub">—</div>
       </div>
       <div class="k">
-        <div class="k-lab">出口 IP</div>
+        <div class="k-lab">参考出口 IP</div>
         <div class="k-val mono fs-xl" id="kpi-egress">—</div>
         <div class="k-sub" id="kpi-egress-sub">正在读取本机公网 IP…</div>
       </div>
       <div class="k">
-        <div class="k-lab">平均握手延迟</div>
+        <div class="k-lab">服务器探测耗时</div>
         <div class="k-val" id="kpi-lat">—</div>
         <div class="k-sub" id="kpi-lat-sub">点「节点测速」后更新</div>
         <svg class="k-spark" id="kpi-lat-spark" viewBox="0 0 120 22" preserveAspectRatio="none"></svg>
@@ -404,7 +419,7 @@
         <button class="btn ghost small" id="btn-unlock-probe">刷新检测</button>
       </div>
       <div class="muted fs-sm mb-3" id="unlock-summary">点击「刷新检测」检查服务器出口对主流 AI 服务与流媒体的解锁能力。</div>
-      <div class="grid" id="unlock-grid" style="grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px;"></div>
+      <div class="grid" id="unlock-grid"></div>
     </section>
 
     <section class="card reveal" id="sec-sys">
@@ -461,13 +476,19 @@
         <span class="muted fs-sm" id="update-hint">升级只替换程序代码, 密钥 / 订阅令牌 / 节点配置全部保留</span>
       </div>
     </section>
-      </div>
+      </main>
     </div>
   </section>
 
-  <div class="footer">ZeroProxy · 0 配置, 1 行部署</div>
+  <footer class="footer"><span>ZeroProxy / 连接场域</span><span id="side-user">—</span><span id="side-os">—</span><span id="side-uptime">—</span><span id="side-ver">—</span></footer>
 </div>
 
+<dialog class="modal-mask hidden" id="find-mask" aria-labelledby="find-title">
+  <div class="modal find-modal"><div class="row-between"><h3 id="find-title">查找功能</h3><button class="btn ghost small" id="find-close">关闭 Esc</button></div>
+    <label for="find-input">搜索节点、设备或设置</label><input id="find-input" type="search" placeholder="例如：WireGuard、分流、备份" autocomplete="off">
+    <div id="find-results"></div>
+  </div>
+</dialog>
 <!-- 原生 <dialog>: 焦点陷阱 / Esc 关闭 / 关闭后焦点回到原处 / 背景 inert 全部由浏览器给,
      不再靠手写 keydown + div。.hidden 保留为显式状态 (回归脚本按它断言, 且 CSS 里
      dialog 一旦被写成 display:grid 就盖掉了 UA 的 display:none)。 -->

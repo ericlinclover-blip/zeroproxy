@@ -12,6 +12,7 @@ import { api } from "../lib/api.js";
 import { openQr } from "../lib/dialog.js";
 import { S } from "../lib/state.js";
 import { settleApply } from "../lib/jobs.js";
+import { renderField } from "./field.js";
 import { renderBanner } from "../lib/render.js";
 
 export function renderDashboardBanner() {
@@ -91,7 +92,7 @@ export function renderNodes() {
               n.chain
                 ? '<span class="badge hysteria" title="链式中转: 客户端连本机, 出口 IP 是落地服务器">链式</span>'
                 : `<span class="badge ${PROTO_BADGE[n.protocol] || "vless"}">${esc(n.protocol)}</span>`
-            }<span class="nm">${esc(n.name)}</span>${
+            }<button class="nm node-select" data-field-node="${escAttr(n.id)}" title="查看连接详情">${esc(n.name)}</button>${
               n.default_out ? '<span class="badge trojan">默认出口</span>' : ""
             }</span>
           </div>
@@ -150,7 +151,7 @@ export function renderNodes() {
                <button class="btn ghost small" data-qr="${escAttr(n.id)}" title="显示 ${escAttr(n.name)} 的二维码">二维码</button>`
             : `<span class="muted fs-sm">已关闭</span>`}
           <label class="switch" title="${n.enabled ? "点击停用" : "点击启用"}">
-            <input type="checkbox" data-node="${escAttr(n.id)}" ${n.enabled ? "checked" : ""}>
+            <input type="checkbox" aria-label="启用 ${escAttr(n.name)}" data-node="${escAttr(n.id)}" ${n.enabled ? "checked" : ""}>
             <span class="slider"></span></label>
         </div>
       </div>`;
@@ -190,6 +191,7 @@ export function renderNodes() {
       });
   });
   renderProbe();
+  renderField();
 }
 
 function renderProbe() {
@@ -225,7 +227,7 @@ function chainEgress() {
 
 /** 可点击复制的 IP。CSP 不允许内联事件, 所以渲染完统一用 bindIpCopy 绑。 */
 function ipChip(ip, title, prefix = "") {
-  return `${prefix}<span class="copy-ip" data-copy-ip="${escAttr(ip)}" title="${escAttr(title)}">${esc(ip)}</span>`;
+  return `${prefix}<button type="button" class="copy-ip" data-copy-ip="${escAttr(ip)}" title="${escAttr(title)}">${esc(ip)}</button>`;
 }
 
 function bindIpCopy(root) {
@@ -297,6 +299,7 @@ export function renderKpis() {
       (bad ? `${bad} 个服务异常` : dev ? "本地开发模式" : "面板运行中");
   }
   renderSidebar();
+  renderField();
 }
 
 /* 侧栏: 管理员 / 主机 / 在线 / 版本 + 各锚点的计数与告警角标 */

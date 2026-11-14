@@ -78,11 +78,16 @@ $("#qr-close").onclick = closeQr;
  * 补回去并做各自的清理 (二维码不留在内存里, 待确认动作不残留)。原来这两件事各由一段
  * 全局 keydown + 一段遮罩 onclick 完成, 现在浏览器负责 Esc 与遮罩, 只留这一处。 */
 [["#qr-mask", () => $("#qr-img").removeAttribute("src")],
- ["#confirm-mask", () => { confirmAction = null; }]].forEach(([sel, cleanup]) => {
+ ["#confirm-mask", () => { confirmAction = null; }],
+ ["#find-mask", () => {}]].forEach(([sel, cleanup]) => {
   const el = $(sel);
   // cancel 在 Esc 的按键处理里同步触发, close 是随后排队的一个任务 —— 两个都挂上:
   // 前者保证"按下 Esc 的那一刻状态就已经对", 后者覆盖 close() 与点遮罩。
   el.addEventListener("cancel", () => { el.classList.add("hidden"); cleanup(); });
-  el.addEventListener("close", () => { el.classList.add("hidden"); cleanup(); });
+  el.addEventListener("close", () => {
+    // A queued close event may belong to a previous opening of this dialog.
+    if (el.open) return;
+    el.classList.add("hidden"); cleanup();
+  });
   el.addEventListener("click", (e) => { if (e.target === el) el.close(); });   // 点遮罩 = 关闭
 });

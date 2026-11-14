@@ -2127,28 +2127,23 @@ def test_geodata_ttl_counts_from_last_check(home):
 # ---------------------------------------------------------------- 终端快捷管理 (z)
 
 
-def test_sidebar_order_matches_the_page_order():
-    """侧栏菜单的顺序必须与页面板块的顺序一致。
-
-    用户看到的症状: 「链式代理」和「高级 / 分流」两个按钮点下去跑到的板块是反的
-    (菜单里链式在前, 页面里高级在前) —— 于是点上一个会滚到下面, 滚动高亮也往回跳。
-    这类"两个列表各改一处"的错位在浏览器里才看得出来, 所以在这里钉死。
-    """
+def test_workspace_navigation_targets_existing_sections():
+    """All five workspaces have real targets; every main section has one owner."""
     import re
     from pathlib import Path
 
-    html = (Path(__file__).resolve().parents[1] / "static" / "index.html").read_text(encoding="utf-8")
-    dash = html[html.index('id="view-dash"'):]
-    nav = re.findall(r'<a href="#([\w-]+)"', dash)
-    assert len(nav) >= 8, nav                                  # 侧栏锚点
-    positions = {}
-    for match in re.finditer(r'id="([\w-]+)"', dash):
-        positions.setdefault(match.group(1), match.start())     # 只记第一次出现
-    missing = [name for name in nav if name not in positions]
-    assert not missing, f"侧栏指向了不存在的板块: {missing}"
-    tops = [positions[name] for name in nav]
-    assert tops == sorted(tops), f"菜单顺序与页面顺序不一致: {list(zip(nav, tops))}"
-    assert len(set(tops)) == len(tops), "同一个板块被挂到了两个锚点上"
+    static = Path(__file__).resolve().parents[1] / "static"
+    html = (static / "index.html").read_text(encoding="utf-8")
+    nav_html = html.split('id="dash-nav"', 1)[1].split("</nav>", 1)[0]
+    links = re.findall(r'<a href="#([\w-]+)"[^>]*data-workspace="([\w-]+)"', nav_html)
+    assert [key for _, key in links] == ["network", "devices", "routing", "diagnostics", "maintenance"]
+    sections = set(re.findall(r'<section[^>]*id="([\w-]+)"', html)) - {"view-setup", "view-login", "view-dash"}
+    workspace = (static / "app" / "views" / "workspace.js").read_text(encoding="utf-8")
+    owners = re.findall(r'ids: \[([^\]]+)\]', workspace)
+    assigned = [id_ for owner in owners for id_ in re.findall(r'"([\w-]+)"', owner)]
+    assert len(assigned) == len(set(assigned)), "A section belongs to multiple workspaces"
+    assert set(assigned) == sections, "A section is unreachable from the workspace navigation"
+    assert all(target in sections for target, _ in links)
 
 
 def test_node_description_wraps_instead_of_being_cut_off():

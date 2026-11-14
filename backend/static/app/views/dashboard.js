@@ -10,6 +10,7 @@ import { readToken, rememberToken } from "../lib/bootstrap.js";
 import { snapshotDraftInputs, restoreDraftInputs } from "../lib/drafts.js";
 import { openQr, SUB_FMT_LABEL } from "../lib/dialog.js";
 import { S, setDashRenderers, pollInterval } from "../lib/state.js";
+import { initWorkspace } from "./workspace.js";
 import { renderAudit } from "./audit.js";
 import { renderNodes, renderKpis, renderDashboardBanner, runProbe } from "./status.js";
 import { renderTraffic, renderAdvanced, renderSystem } from "./traffic.js";
@@ -112,40 +113,7 @@ function revealBlocks() {
   document.querySelectorAll("#view-dash .reveal").forEach((el, i) => {
     setTimeout(() => el.classList.add("in"), Math.min(i * 40, 400));
   });
-  setupScrollSpy();
-}
-
-function setupScrollSpy() {
-  const nav = $("#dash-nav");
-  if (!nav) return;
-  const links = [...nav.querySelectorAll("a")];
-  const secs = links
-    .map((a) => document.querySelector(a.getAttribute("href")))
-    .filter(Boolean);
-  links.forEach((a) => {
-    a.addEventListener("click", (e) => {
-      const target = document.querySelector(a.getAttribute("href"));
-      if (!target) return;
-      e.preventDefault();
-      target.scrollIntoView({ behavior: "smooth", block: "start" });
-      history.replaceState(null, "", a.getAttribute("href"));
-    });
-  });
-  if (!("IntersectionObserver" in window) || !secs.length) return;
-  const visible = new Map();
-  const io = new IntersectionObserver(
-    (entries) => {
-      entries.forEach((en) => visible.set(en.target.id, en.isIntersecting ? en.intersectionRatio : 0));
-      let best = "", bestRatio = 0;
-      visible.forEach((ratio, id) => {
-        if (ratio > bestRatio) { bestRatio = ratio; best = id; }
-      });
-      if (!best) return;
-      links.forEach((a) => a.classList.toggle("on", a.getAttribute("href") === "#" + best));
-    },
-    { rootMargin: "-84px 0px -55% 0px", threshold: [0, 0.15, 0.4, 0.75, 1] }
-  );
-  secs.forEach((s) => io.observe(s));
+  initWorkspace();
 }
 
 (function bindBackToTop() {
