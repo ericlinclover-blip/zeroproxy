@@ -248,6 +248,7 @@ DEFAULTS: dict = {
         # auto: 先试内核, 失败自动退到 wireguard-go 用户态; kernel / userspace 可强制
         "mode": "auto",
         "active_mode": "",         # 上次成功启动用的是 kernel / userspace
+        "active_awg": False,       # 已应用协议，切换 WG/AWG 时重建接口
         "port": 51820,             # UDP 监听端口
         "subnet": "10.66.66.0/24", # 隧道网段; 服务端固定用 .1
         "ipv6": False,             # 可选 IPv6 隧道 (ULA), 默认关

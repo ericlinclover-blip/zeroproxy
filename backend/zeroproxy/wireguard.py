@@ -14,6 +14,7 @@ WireGuard 不是能挂到 Xray 入站上的代理协议，而是 UDP + 内核接
 from __future__ import annotations
 
 import base64
+import contextlib
 import copy
 import hmac
 import ipaddress
@@ -21,6 +22,7 @@ import os
 import re
 import secrets
 import shutil
+import threading
 import time
 
 from cryptography.hazmat.primitives import serialization
@@ -46,6 +48,43 @@ ONE_TIME_TTL = 10 * 60
 MAX_ONE_TIME = 32
 
 _NAME_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+_OPERATION_LOCK = threading.RLock()
+_OPERATION_DEPTH = threading.local()
+
+
+class OperationBusy(RuntimeError):
+    """另一个线程或进程正在改变 WireGuard 配置。"""
+
+
+@contextlib.contextmanager
+def operation():
+    """串行化完整的读改写/同步事务，不占用全局状态锁。
+
+    非阻塞获取，允许已持 config 锁的 CLI/apply 安全失败，避免反向锁序死锁。
+    flock 覆盖面板外的 apply 进程；同线程嵌套复用外层描述符。
+    """
+    if not _OPERATION_LOCK.acquire(blocking=False):
+        raise OperationBusy("WireGuard 配置正在应用，请稍后重试")
+    fd = None
+    depth = getattr(_OPERATION_DEPTH, "value", 0)
+    try:
+        if not depth:
+            os.makedirs(paths()["data_dir"], exist_ok=True)
+            fd = os.open(os.path.join(paths()["data_dir"], "wireguard.lock"),
+                         os.O_CREAT | os.O_RDWR, 0o600)
+            if config.fcntl is not None:
+                try:
+                    config.fcntl.flock(fd, config.fcntl.LOCK_EX | config.fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise OperationBusy("WireGuard 配置正在应用，请稍后重试") from None
+        _OPERATION_DEPTH.value = depth + 1
+        yield
+    finally:
+        _OPERATION_DEPTH.value = depth
+        if fd is not None:
+            os.close(fd)
+        _OPERATION_LOCK.release()
 
 
 def _now() -> int:
@@ -255,11 +294,11 @@ def ensure_awg_params(state: dict) -> None:
             if not wg.get(k):
                 wg[k] = v
     else:
-        wg["awg_jc"] = int(wg.get("awg_jc") or 4)
-        wg["awg_jmin"] = int(wg.get("awg_jmin") or 40)
-        wg["awg_jmax"] = int(wg.get("awg_jmax") or 70)
-        wg["awg_s1"] = int(wg.get("awg_s1") or 56)
-        wg["awg_s2"] = int(wg.get("awg_s2") or 84)
+        wg["awg_jc"] = int(wg.get("awg_jc", 4))
+        wg["awg_jmin"] = int(wg.get("awg_jmin", 40))
+        wg["awg_jmax"] = int(wg.get("awg_jmax", 70))
+        wg["awg_s1"] = int(wg.get("awg_s1", 56))
+        wg["awg_s2"] = int(wg.get("awg_s2", 84))
         wg["awg_h1"] = int(wg["awg_h1"])
         wg["awg_h2"] = int(wg["awg_h2"])
         wg["awg_h3"] = int(wg["awg_h3"])
@@ -482,8 +521,7 @@ def _peer_allowed(peer: dict, ipv6: bool) -> str:
 def client_config(state: dict, peer: dict, awg: bool | None = None) -> str:
     wg = bucket(state)
     compat = bool(peer.get("compat"))
-    # 默认策略: 服务端开启 awg 且 peer 非兼容模式时下发 AWG 配置; 也支持显式指定
-    use_awg = (bool(wg.get("awg_enabled")) and not compat) if awg is None else (bool(awg) and not compat)
+    use_awg = client_mode(state, peer, awg)
     # 客户端侧固定用 /32 (/128): GL.iNet 4.9.0 会把 10.x/24 当成 classful /8,
     # 把整个 10.0.0.0/8 路由进隧道 (连上游 DNS/网关一起吞掉), 表现为一直"连接中"。
     # /32 是点对点隧道端点的标准写法, 路由由 AllowedIPs 负责, 不影响全流量/分流。
@@ -503,11 +541,11 @@ def client_config(state: dict, peer: dict, awg: bool | None = None) -> str:
         lines.append(f"MTU = {int(wg.get('mtu') or DEFAULT_MTU)}")
     if use_awg:
         lines += [
-            f"Jc = {int(wg.get('awg_jc') or 4)}",
-            f"Jmin = {int(wg.get('awg_jmin') or 40)}",
-            f"Jmax = {int(wg.get('awg_jmax') or 70)}",
-            f"S1 = {int(wg.get('awg_s1') or 56)}",
-            f"S2 = {int(wg.get('awg_s2') or 84)}",
+            f"Jc = {int(wg.get('awg_jc', 4))}",
+            f"Jmin = {int(wg.get('awg_jmin', 40))}",
+            f"Jmax = {int(wg.get('awg_jmax', 70))}",
+            f"S1 = {int(wg.get('awg_s1', 56))}",
+            f"S2 = {int(wg.get('awg_s2', 84))}",
             f"H1 = {int(wg.get('awg_h1') or 1)}",
             f"H2 = {int(wg.get('awg_h2') or 2)}",
             f"H3 = {int(wg.get('awg_h3') or 3)}",
@@ -543,6 +581,27 @@ def client_config(state: dict, peer: dict, awg: bool | None = None) -> str:
     return "\n".join(lines)
 
 
+def client_mode(state: dict, peer: dict, awg: bool | None = None) -> bool:
+    """单接口协议由服务端决定，去掉导出字段不能把 AWG 变成标准 WG。"""
+    server_awg = bool(bucket(state).get("awg_enabled"))
+    if (awg is not None and bool(awg) != server_awg) or (server_awg and peer.get("compat")):
+        raise ValueError("客户端协议与服务端不一致：AWG 混淆开启时请使用 AWG 配置；标准 WireGuard/GL.iNet 兼容模式需先关闭服务端混淆")
+    return server_awg
+
+
+def validate_settings(state: dict) -> None:
+    wg = bucket(state)
+    if not wg.get("awg_enabled"):
+        return
+    headers = [int(wg.get(f"awg_h{i}") or 0) for i in range(1, 5)]
+    if len(set(headers)) != 4 or any(h <= 0 for h in headers):
+        raise ValueError("AWG 的 H1~H4 必须是互不相同的正整数")
+    if int(wg.get("awg_jmin", 40)) > int(wg.get("awg_jmax", 70)):
+        raise ValueError("Jmin 不能大于 Jmax")
+    if any(p.get("compat") and p.get("enabled", True) and not peer_expired(p) for p in peers(state)):
+        raise ValueError("已有启用的标准 WireGuard 兼容设备，请先停用兼容设备或关闭 AWG 混淆")
+
+
 def _server_interface(state: dict, runtime: bool = False) -> list[str]:
     wg = bucket(state)
     v4, v6 = server_addresses(state)
@@ -555,11 +614,11 @@ def _server_interface(state: dict, runtime: bool = False) -> list[str]:
     ]
     if bool(wg.get("awg_enabled")):
         lines += [
-            f"Jc = {int(wg.get('awg_jc') or 4)}",
-            f"Jmin = {int(wg.get('awg_jmin') or 40)}",
-            f"Jmax = {int(wg.get('awg_jmax') or 70)}",
-            f"S1 = {int(wg.get('awg_s1') or 56)}",
-            f"S2 = {int(wg.get('awg_s2') or 84)}",
+            f"Jc = {int(wg.get('awg_jc', 4))}",
+            f"Jmin = {int(wg.get('awg_jmin', 40))}",
+            f"Jmax = {int(wg.get('awg_jmax', 70))}",
+            f"S1 = {int(wg.get('awg_s1', 56))}",
+            f"S2 = {int(wg.get('awg_s2', 84))}",
             f"H1 = {int(wg.get('awg_h1') or 1)}",
             f"H2 = {int(wg.get('awg_h2') or 2)}",
             f"H3 = {int(wg.get('awg_h3') or 3)}",
@@ -719,10 +778,8 @@ def reload_script(state: dict) -> str:
     ]
     if awg:
         lines += [
-            'WG_CMD="wg"',
-            'if command -v awg >/dev/null 2>&1; then',
-            '  WG_CMD="awg"',
-            'fi',
+            'command -v awg >/dev/null 2>&1 || { echo "需要 awg 工具" >&2; exit 1; }',
+            'WG_CMD="awg"',
             f'$WG_CMD syncconf {INTERFACE} "{paths()["wireguard_runtime"]}"',
         ]
     else:
@@ -781,8 +838,8 @@ def start_script(state: dict) -> str:
             'if command -v awg-quick >/dev/null 2>&1; then',
             '  exec awg-quick up "$CONF"',
             'fi',
-            'echo "未检测到 awg-quick, 回退尝试 wg-quick (混淆参数可能被标准内核拒绝)" >&2',
-            'exec wg-quick up "$CONF"',
+            'echo "AmneziaWG 需要 awg-quick，不能用 wg-quick 代替" >&2',
+            'exit 1',
         ]
     else:
         lines += [
@@ -829,8 +886,8 @@ def userspace_start_script(state: dict) -> str:
             'if command -v amneziawg-go >/dev/null 2>&1; then',
             '  exec amneziawg-go -f "$IFACE"',
             'fi',
-            'echo "未检测到 amneziawg-go, 回退尝试 wireguard-go" >&2',
-            'exec wireguard-go -f "$IFACE"',
+            'echo "AmneziaWG 用户态需要 amneziawg-go" >&2',
+            'exit 1',
         ]
     else:
         lines += [
@@ -861,10 +918,8 @@ def userspace_up_script(state: dict) -> str:
     ]
     if awg:
         lines += [
-            'WG_CMD="wg"',
-            'if command -v awg >/dev/null 2>&1; then',
-            '  WG_CMD="awg"',
-            'fi',
+            'command -v awg >/dev/null 2>&1 || { echo "需要 awg 工具" >&2; exit 1; }',
+            'WG_CMD="awg"',
             f'$WG_CMD setconf "$IFACE" "{paths()["wireguard_runtime"]}"',
         ]
     else:
@@ -917,11 +972,7 @@ def userspace_down_script(state: dict) -> str:
 
 
 def _write(path: str, text: str, mode: int) -> None:
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(text)
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    config.atomic_write_text(path, text, mode=mode)
 
 
 def _ensure_wireguard_dir() -> None:
@@ -941,6 +992,11 @@ def generate(state: dict) -> tuple[bool, str]:
         wg["server_public_key"] = public_key(wg["server_private_key"])
     if bool(wg.get("awg_enabled")):
         ensure_awg_params(state)
+    try:
+        if wg.get("enabled"):
+            validate_settings(state)
+    except ValueError as exc:
+        return False, str(exc)
     ensure_peer_addresses(state)
     _ensure_wireguard_dir()
     _write(paths()["wireguard_config"], server_config(state), 0o600)
@@ -971,10 +1027,7 @@ def generate(state: dict) -> tuple[bool, str]:
 # ---------------------------------------------------------------- 运行时
 
 def tools_available() -> bool:
-    return bool(
-        (shutil.which("awg") and shutil.which("awg-quick"))
-        or (shutil.which("wg") and shutil.which("wg-quick"))
-    )
+    return bool(shutil.which("wg") and shutil.which("wg-quick"))
 
 
 def awg_tools_available() -> bool:
@@ -990,8 +1043,8 @@ def firewall_tool_available() -> bool:
 
 
 def userspace_available() -> bool:
-    """wireguard-go / amneziawg-go 与 TUN 都在才谈得上用户态回退。"""
-    has_daemon = bool(shutil.which("wireguard-go") or shutil.which("amneziawg-go"))
+    """标准 WireGuard 的用户态工具与 TUN 是否可用。"""
+    has_daemon = bool(shutil.which("wireguard-go"))
     return bool(has_daemon and os.path.exists("/dev/net/tun"))
 
 
@@ -1023,16 +1076,17 @@ def ensure_tools(timeout: int = 180, state: dict | None = None) -> tuple[bool, s
     if not services.is_prod():
         return False, "本地开发环境没有 wg / wg-quick（生产机会自动安装）"
     need: list[str] = []
-    if not tools_available() or not shutil.which("ip"):
-        need += ["wireguard-tools", "iproute2"]
+    if not shutil.which("ip"):
+        need.append("iproute2")
     if not firewall_tool_available():
         need.append("iptables")
     wg = bucket(state) if state else {}
-    if bool(wg.get("awg_enabled")) and not awg_tools_available():
-        need.append("amneziawg-tools")
+    ready = awg_tools_available if wg.get("awg_enabled") else tools_available
+    if not ready():
+        need.append("amneziawg-tools" if wg.get("awg_enabled") else "wireguard-tools")
     if need:
         ok, out = _apt_install(need, timeout)
-        if not ok or not tools_available():
+        if not ok or not ready():
             return False, f"WireGuard 工具安装失败: {out}"
     detail = "wireguard-tools 已就绪"
     if awg_tools_available():
@@ -1067,7 +1121,7 @@ def interface_exists() -> bool:
     return ok
 
 
-def kernel_probe() -> tuple[bool, str]:
+def kernel_probe(awg: bool = False) -> tuple[bool, str]:
     """真正建一个临时 WireGuard 接口再删掉 —— 只看 /sys/module 会误判。
 
     容器里常见两种情况: 模块根本不存在; 或者宿主机加载了模块, 但容器没有
@@ -1076,7 +1130,7 @@ def kernel_probe() -> tuple[bool, str]:
     probe = "zpwgprobe0"
     services.run(["ip", "link", "delete", "dev", probe], timeout=5)
     ok, out = services.run(
-        ["ip", "link", "add", "dev", probe, "type", "wireguard"], timeout=10
+        ["ip", "link", "add", "dev", probe, "type", "amneziawg" if awg else "wireguard"], timeout=10
     )
     services.run(["ip", "link", "delete", "dev", probe], timeout=5)
     if ok:
@@ -1088,6 +1142,19 @@ def kernel_probe() -> tuple[bool, str]:
 def runtime_mode(state: dict) -> tuple[str, str]:
     """决定这次用内核还是 wireguard-go。返回 (kernel|userspace|none, 说明)。"""
     wg = bucket(state)
+    if wg.get("awg_enabled"):
+        pref = validate_mode(wg.get("mode") or "auto")
+        if not awg_tools_available():
+            return "none", "AmneziaWG 需要 awg / awg-quick，标准 WireGuard 工具不能代替"
+        if pref != "userspace":
+            ok, err = kernel_probe(awg=True)
+            if ok:
+                return "kernel", "AmneziaWG 内核"
+            if pref == "kernel":
+                return "none", f"AmneziaWG 内核不可用: {err}"
+        if awg_userspace_available():
+            return "userspace", "AmneziaWG 用户态 (amneziawg-go)"
+        return "none", "AmneziaWG 内核不可用或指定用户态，但缺少 amneziawg-go / TUN"
     try:
         pref = validate_mode(wg.get("mode") or "auto")
     except ValueError:
@@ -1229,6 +1296,7 @@ def sync(state: dict, timeout: int = 90) -> tuple[bool, str]:
             if not ok:
                 return False, out
         wg["active_mode"] = ""
+        wg["active_awg"] = False
         return True, "已停用 WireGuard (wg0 已拆除)"
     if not services.is_prod():
         return True, detail + " · 本地开发跳过服务操作"
@@ -1248,19 +1316,20 @@ def sync(state: dict, timeout: int = 90) -> tuple[bool, str]:
     pref = validate_mode(wg.get("mode") or "auto")
     active_name = active_service()
     mode_detail = ""
-    if pref == "auto" and active_name and interface_exists():
+    protocol_changed = bool(wg.get("active_awg")) != bool(wg.get("awg_enabled"))
+    if pref == "auto" and active_name and interface_exists() and not protocol_changed:
         # 已经在跑就不要每次加 peer 都重新探测内核 (探测会建/删临时接口)
         mode = "kernel" if active_name == SERVICE else "userspace"
     else:
         mode, mode_detail = runtime_mode(state)
-        if mode == "none" and pref != "kernel" and not shutil.which("wireguard-go"):
+        if mode == "none" and pref != "kernel" and not wg.get("awg_enabled") and not shutil.which("wireguard-go"):
             # 只有真的走不通内核时才去装用户态, 不让正常服务器每次同步都碰 apt
             _apt_install(["wireguard-go"], timeout)
             if userspace_available():
                 mode, mode_detail = runtime_mode(state)
     if mode == "none":
         return False, mode_detail
-    if mode == "userspace" and not userspace_available():
+    if mode == "userspace" and not wg.get("awg_enabled") and not userspace_available():
         _apt_install(["wireguard-go"], timeout)
         if not userspace_available():
             return False, (
@@ -1280,6 +1349,15 @@ def sync(state: dict, timeout: int = 90) -> tuple[bool, str]:
             time.sleep(0.1)
 
     active = service_state(unit) in ("active", "activating", "reloading")
+    if active and protocol_changed:
+        ok, out = _stop_unit(unit, timeout)
+        if not ok:
+            return False, f"切换 WireGuard/AWG 协议失败: {out}"
+        if interface_exists():
+            ok, out = _teardown_interface(state, timeout)
+            if not ok:
+                return False, out
+        active = False
     if active and not interface_exists():
         ok, out = services.run(["systemctl", "restart", unit], timeout=timeout)
         action = "重启"
@@ -1313,6 +1391,7 @@ def sync(state: dict, timeout: int = 90) -> tuple[bool, str]:
             message += f" · 最近日志: {tail}"
         return False, message
     wg["active_mode"] = mode
+    wg["active_awg"] = bool(wg.get("awg_enabled"))
     suffix = f" · {mode_detail}" if mode_detail else ""
     return True, (
         f"WireGuard {action}成功{suffix} · {len(active_peers(state))} 个客户端 · "
@@ -1418,7 +1497,7 @@ def view(state: dict, now: int | None = None) -> dict:
                 "public_key": peer.get("public_key") or "",
             }
         )
-    tools = tools_available()
+    tools = awg_tools_available() if wg.get("awg_enabled") else tools_available()
     running = interface_exists() if is_enabled else False
     active = active_service() if is_enabled else ""
     service = active or ("inactive" if prod else "dry-run")
@@ -1437,7 +1516,7 @@ def view(state: dict, now: int | None = None) -> dict:
         "enabled": bool(wg.get("enabled")),
         "mode": mode_pref,
         "active_mode": str(wg.get("active_mode") or ""),
-        "userspace_available": userspace_available(),
+        "userspace_available": awg_userspace_available() if wg.get("awg_enabled") else userspace_available(),
         "port": int(wg.get("port") or DEFAULT_PORT),
         "subnet": str(wg.get("subnet") or DEFAULT_SUBNET),
         "mtu": int(wg.get("mtu") or DEFAULT_MTU),
@@ -1456,11 +1535,11 @@ def view(state: dict, now: int | None = None) -> dict:
             "enabled": bool(wg.get("awg_enabled")),
             "tools_available": awg_tools_available(),
             "userspace_available": awg_userspace_available(),
-            "jc": int(wg.get("awg_jc") or 4),
-            "jmin": int(wg.get("awg_jmin") or 40),
-            "jmax": int(wg.get("awg_jmax") or 70),
-            "s1": int(wg.get("awg_s1") or 56),
-            "s2": int(wg.get("awg_s2") or 84),
+            "jc": int(wg.get("awg_jc", 4)),
+            "jmin": int(wg.get("awg_jmin", 40)),
+            "jmax": int(wg.get("awg_jmax", 70)),
+            "s1": int(wg.get("awg_s1", 56)),
+            "s2": int(wg.get("awg_s2", 84)),
             "h1": int(wg.get("awg_h1") or 0),
             "h2": int(wg.get("awg_h2") or 0),
             "h3": int(wg.get("awg_h3") or 0),
@@ -1486,7 +1565,7 @@ def diagnose(state: dict) -> tuple[bool, str]:
         return True, "未启用"
     if not services.is_prod():
         return True, "本地开发环境, 跳过接口检查"
-    if not tools_available():
+    if not (awg_tools_available() if wg.get("awg_enabled") else tools_available()):
         return False, "未安装 wireguard-tools / amneziawg-tools（wg / awg 不存在）"
     if not firewall_tool_available():
         return False, "未安装 iptables / nftables, 无法建立 NAT 转发"

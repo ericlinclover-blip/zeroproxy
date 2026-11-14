@@ -88,6 +88,9 @@ export async function watchApply(job) {
   }
   renderApplyStrip(last);
   S.lastApplyJob = last;
+  if (last.state === "running") {
+    throw new Error("尚未取得任务完成结果，请刷新面板确认实际状态");
+  }
   if (last.state !== "running") setTimeout(() => renderApplyStrip(null), 4000);
   return last.steps || [];
 }

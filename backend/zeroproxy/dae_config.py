@@ -146,6 +146,8 @@ def render(
         add(f"# 跳过了 dae 不支持的节点: {', '.join(skipped)} (dae 没有 XHTTP 传输)")
     add("")
 
+    add("# 策略降级: dae 当前使用统一 proxy 组；AI/流媒体/落地不保留独立选组。")
+    add("")
     add("global {")
     add(f"    tproxy_port: {TPROXY_PORT}")
     # 只接管从局域网侧进来的包 —— 与 mihomo 那边一样, 不碰 WAN 侧入站。
@@ -208,6 +210,22 @@ def render(
     add("    pname(NetworkManager) -> direct")
     add("    # 组播 / 广播不该进代理")
     add("    dip(224.0.0.0/3, 'ff00::/8') -> direct")
+    for rule in panel_direct_rules(base):
+        add(f"    {rule}")
+
+    # 与 Clash 同序：block > landing > ai > streaming > proxy > direct。
+    custom = share_links.custom_rules_of(state)
+    for key in ("block", "landing", "ai", "streaming", "proxy", "direct"):
+        action = "block" if key == "block" else "direct" if key == "direct" else "proxy"
+        for target in custom.get(key, []):
+            try:
+                net = ipaddress.ip_network(target, strict=False)
+            except ValueError:
+                add(f"    domain(suffix: {_quote(target)}) -> {action}")
+            else:
+                value = _quote(str(net)) if net.version == 6 else str(net)
+                add(f"    dip({value}) -> {action}")
+
     # 私有/回环地址直连。有分流数据就用 geoip:private; 降级 (geo=False) 时必须换成
     # 显式 CIDR —— dae 读不到 geoip.dat 时**整份配置校验失败**, 不是跳过这条规则,
     # 而这个降级分支存在的唯一场景恰恰就是"面板还没准备好数据文件"。
@@ -218,24 +236,6 @@ def render(
             "    dip(10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, "
             "169.254.0.0/16, 'fc00::/7', 'fe80::/10') -> direct"
         )
-    for rule in panel_direct_rules(base):
-        add(f"    {rule}")
-
-    # 自定义规则 (支持用户配置的高优先级放行/拦截/代理)
-    custom = share_links.custom_rules_of(state)
-    for b in custom.get("block", []):
-        add(f"    domain(suffix: '{b}') -> block")
-    for d in custom.get("direct", []):
-        if "/" in d or d.replace(".", "").isdigit():
-            add(f"    dip({d}) -> direct")
-        else:
-            add(f"    domain(suffix: '{d}') -> direct")
-    for p in custom.get("proxy", []) + custom.get("ai", []) + custom.get("streaming", []) + custom.get("landing", []):
-        if "/" in p or p.replace(".", "").isdigit():
-            add(f"    dip({p}) -> proxy")
-        else:
-            add(f"    domain(suffix: '{p}') -> proxy")
-
     # 广告防误杀白名单 (优先级高于任何广告拦截规则)
     allowlist = share_links.ad_allowlist_of(state)
     for w in allowlist:
@@ -262,6 +262,8 @@ def render(
                 add(f"    domain(suffix: '{d}') -> block")
         add(f"    {QUIC_BLOCK}   # 关 h3: 省下 UDP 443 的用户态开销, 浏览器会自动回落 TCP/2")
         if tpl in ("smart", "precision"):
+            for d in share_links.CN_DIRECT_DOMAINS:
+                add(f"    domain(suffix: {_quote(d)}) -> direct")
             if geo:
                 add("    # 国内直连 —— 与 mihomo smart 模板同一档")
                 add("    dip(geoip:cn) -> direct")

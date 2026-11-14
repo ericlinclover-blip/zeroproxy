@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import pytest
 from urllib.parse import urlsplit
 
 from zeroproxy import config, wireguard
@@ -428,15 +429,11 @@ def test_awg_server_and_client_configs(home):
     assert f"H1 = {wg['awg_h1']}" in client_awg
     assert f"H4 = {wg['awg_h4']}" in client_awg
 
-    # 强制标准模式 (awg=False): 不应包含 AWG 参数 (给官方 WireGuard App)
-    client_std = wireguard.client_config(state, peer, awg=False)
-    assert "Jc =" not in client_std
-    assert "H1 =" not in client_std
-
-    # 路由器兼容模式设备: 即使开启 AWG 也自动降级为标准模式
-    client_compat = wireguard.client_config(state, compat_peer)
-    assert "Jc =" not in client_compat
-    assert "H1 =" not in client_compat
+    # 同一混淆接口不能靠删除客户端字段转成标准协议。
+    with pytest.raises(ValueError, match="协议与服务端不一致"):
+        wireguard.client_config(state, peer, awg=False)
+    with pytest.raises(ValueError, match="协议与服务端不一致"):
+        wireguard.client_config(state, compat_peer)
 
     # 脚本生成测试
     start_sh = home / "wireguard" / "start.sh"
@@ -470,7 +467,10 @@ def test_awg_api_settings_and_peer_export(client, configured):
     assert 'filename="zeroproxy-awg-' in conf_awg.headers.get("content-disposition", "")
     assert "H1 =" in conf_awg.text
 
-    # 下载配置: 指定标准格式 (awg=0)
+    # 标准格式必须与服务端协议一致。
+    conf_std = client.get(f"/api/wireguard/peers/{peer_id}/config?awg=0")
+    assert conf_std.status_code == 409
+    assert client.post('/api/wireguard/settings', json={'awg_enabled': False}).status_code == 200
     conf_std = client.get(f"/api/wireguard/peers/{peer_id}/config?awg=0")
     assert conf_std.status_code == 200
     assert 'filename="zeroproxy-wg-' in conf_std.headers.get("content-disposition", "")

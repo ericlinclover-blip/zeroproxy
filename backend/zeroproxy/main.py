@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import base64
 import hashlib
 import os
@@ -112,27 +113,34 @@ def _geodata_loop(stop: threading.Event) -> None:
             return
 
 
+def _wireguard_once() -> None:
+    # 与 API/apply 共用事务锁；忙时下一轮再试，不能反向等待全局状态锁。
+    with wireguard.operation():
+        with config.locked():
+            state = config.load_state()
+            if not state.get("configured") or not wireguard.enabled(state):
+                return
+            before = copy.deepcopy(state["wireguard"])
+            if not wireguard.reap_expired(state):
+                return
+        ok, detail = wireguard.sync(state)
+        with config.locked():
+            fresh = config.load_state()
+            # 失败保留到期 peer 的启用标记，让下一轮继续尝试从内核移除。
+            fresh["wireguard"] = state["wireguard"] if ok else before
+            config.audit(fresh, "wireguard_expire",
+                         ("自动停用到期客户端 · " if ok else "到期客户端停用失败，将重试 · ")
+                         + detail[:160], actor="scheduler")
+            config.save_state(fresh)
+
+
 def _wireguard_loop(stop: threading.Event) -> None:
-    """到期 peer 自动停用：从内核里摘掉，而不是只在面板上标红。"""
     if os.environ.get("ZP_WIREGUARD_AUTO", "1") == "0":
         return
     while not stop.wait(WIREGUARD_CHECK_INTERVAL):
         try:
-            with config.locked():
-                state = config.load_state()
-                if not state.get("configured") or not wireguard.enabled(state):
-                    continue
-                if not wireguard.reap_expired(state):
-                    continue
-                ok, detail = wireguard.sync(state)
-                config.audit(
-                    state,
-                    "wireguard_expire",
-                    ("自动停用到期客户端 · " if ok else "到期客户端停用失败 · ") + detail[:160],
-                    actor="scheduler",
-                )
-                config.save_state(state)
-        except Exception:  # noqa: BLE001 — 后台任务不能因单次异常退出
+            _wireguard_once()
+        except Exception:  # 后台单次失败不终止后续回收
             pass
 
 

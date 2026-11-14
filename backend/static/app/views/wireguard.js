@@ -167,7 +167,7 @@ function enabledView(wg) {
         <div>
           <b>AmneziaWG 抗 DPI 混淆</b>
           <div class="muted fs-xs mt-1">
-            消除固定握手包长与协议头特征，专治防火墙秒封 UDP。开启后客户端请使用 <b>Shadowrocket / sing-box / AmneziaVPN</b>。
+            修改握手包长与协议头特征。开启后请使用支持当前 AWG 参数的客户端；同一接口不能同时连接标准 WireGuard 客户端。
           </div>
         </div>
         <label class="chk">
@@ -195,19 +195,19 @@ function enabledView(wg) {
           </div>
           <div class="field">
             <label>Jc (前置垃圾包数)</label>
-            <input id="wg-awg-jc" class="mono" inputmode="numeric" value="${escAttr(awg.jc || 4)}">
+            <input id="wg-awg-jc" class="mono" inputmode="numeric" value="${escAttr(awg.jc ?? 4)}">
           </div>
           <div class="field">
             <label>S1 / S2 (握手包填充)</label>
             <div class="row">
-              <input id="wg-awg-s1" class="mono" placeholder="S1" value="${escAttr(awg.s1 || 56)}">
-              <input id="wg-awg-s2" class="mono" placeholder="S2" value="${escAttr(awg.s2 || 84)}">
+              <input id="wg-awg-s1" class="mono" placeholder="S1" value="${escAttr(awg.s1 ?? 56)}">
+              <input id="wg-awg-s2" class="mono" placeholder="S2" value="${escAttr(awg.s2 ?? 84)}">
             </div>
           </div>
         </div>
         <div class="row mt-2">
           <button class="btn ghost small" id="wg-awg-reseed">重新随机混淆参数</button>
-          <span class="muted fs-xs">${awg.tools_available ? "awg / awg-quick 已安装" : "未检测到 awg-quick（开启时自动尝试或作为配置下发）"}</span>
+          <span class="muted fs-xs">${awg.tools_available ? "awg / awg-quick 已安装" : "缺少 awg / awg-quick，请在服务器安装 AmneziaWG 工具；用户态还需 amneziawg-go"}</span>
         </div>
       ` : ""}
     </div>
@@ -243,10 +243,10 @@ function howTo() {
       <b>开启 AmneziaWG 抗封锁混淆后</b>：<br>
       • <b>iOS / macOS (Shadowrocket 小火箭)</b>：首页右上角扫码，或将下载的 <code class="mono">.conf</code> 导入小火箭，直接作为节点连接。<br>
       • <b>全平台 (AmneziaVPN 官方客户端)</b>：打开 AmneziaVPN → 底部加号 → 从文件/配置导入。<br>
-      • <b>sing-box (1.10+)</b>：支持直接使用导出的 AWG 参数作为 outbound。<br><br>
+      • 客户端需要支持导出配置中的全部 AWG 参数，具体兼容性取决于客户端版本。<br><br>
       <b>标准 WireGuard 模式（未开启混淆）</b>：<br>
       • <b>官方 WireGuard App</b>：iOS/Android 右上角 <b>+</b> 扫码；Windows/macOS 点击左下角导入 <code class="mono">.conf</code>。<br>
-      • <b>GL.iNet / 路由器</b>：编辑设备并勾选 <b>GL.iNet 兼容模式</b>（自动禁用混淆与 PSK）。
+      • <b>GL.iNet / 路由器</b>：先关闭服务端 AWG 混淆，再勾选设备的 <b>GL.iNet 兼容模式</b>（单 DNS、无 MTU 与 PSK）。
     </div>
   </details>`;
 }

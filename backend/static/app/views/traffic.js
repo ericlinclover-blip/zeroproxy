@@ -299,10 +299,10 @@ function renderRouting(d) {
         const isDirect = item.action === "direct";
         const isReject = item.action === "reject";
         const cls = isDirect ? "route-match-direct" : (isReject ? "route-match-reject" : "route-match-proxy");
-        resBox.innerHTML = `<span>测试: <b>${esc(item.target)}</b></span> &rarr; ` +
+        resBox.innerHTML = `<span>Clash 规则预估: <b>${esc(item.target)}</b></span> &rarr; ` +
           `<span class="${cls}">${esc(item.group)}</span> ` +
           `<span class="tag-chip mx-1">${esc(item.matched_rule)}</span> ` +
-          `<span class="muted fs-xs">${esc(item.reason)}</span>`;
+          `<span class="muted fs-xs">${esc(item.reason)}。${esc(item.note || "")}</span>`;
       } catch (e) {
         resBox.classList.remove("hidden");
         resBox.innerHTML = `<span class="route-match-reject">测试失败: ${esc(e.message)}</span>`;

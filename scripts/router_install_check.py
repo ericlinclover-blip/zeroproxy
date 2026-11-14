@@ -306,6 +306,7 @@ class Panel:
             "ZP_GEODATA_AUTO": "0",
             "ZP_APPLY_ASYNC": "0",
             "ZP_CORE_MIN_BYTES": "16",   # 假内核只有几百字节
+            "ZP_SUPPLY_VERIFY": "0",    # 假制品不可能匹配官方二进制摘要
             "ZP_BTF_MIN_BYTES": "16",    # [13] 的假 BTF 包同理
             # BTF 包的上游资产清单 (api.github.com) 也换掉: 演练必须离线可跑, 而且这一节
             # 验的是"缓存里有匹配的包时面板发不发得出来", 不是"面板能不能访问 GitHub"。
@@ -384,7 +385,8 @@ def main() -> int:
     global RUNTIME_STAGE
     RUNTIME_STAGE = os.path.join(tmp, "runtime-stage")
     os.makedirs(RUNTIME_STAGE, exist_ok=True)
-    env = {**os.environ, "ZP_GEODATA_AUTO": "0", "ZP_PUBLIC_IP": "0"}
+    env = {**os.environ, "ZP_GEODATA_AUTO": "0", "ZP_PUBLIC_IP": "0",
+           "ZP_SUPPLY_VERIFY": "0"}
     os.environ.update(env)
     sys.path.insert(0, BACKEND)
     from zeroproxy import router_client  # noqa: E402
@@ -709,7 +711,7 @@ def main() -> int:
                 .replace("/etc/init.d/zeroproxy", "true")
             )
         out = subprocess.run(
-            ["sh", cli, "add", f"{panel_b.base}/c/{code_b}"], capture_output=True, text=True
+            ["sh", cli, "add", "--replace", f"{panel_b.base}/c/{code_b}"], capture_output=True, text=True
         )
         print(out.stdout.strip() or out.stderr[-400:])
         if "配置更新失败" in out.stdout:
@@ -831,13 +833,19 @@ def main() -> int:
         os.chmod(os.path.join(fake_bin, "df"), 0o755)
 
         def run_low_space(root: str) -> subprocess.CompletedProcess:
+            stage_runtime(root)
             code_ = panel.pair_code("space")
             _, script_, _ = http("GET", f"/c/{code_}")
             path_ = os.path.join(tmp, "space.sh")
             with open(path_, "w") as fh:
                 fh.write(patch_for_local_run(script_, root))
-            env_ = {**os.environ, "PATH": fake_bin + ":" + os.environ.get("PATH", "")}
-            return subprocess.run(["sh", path_], capture_output=True, text=True, env=env_)
+            env_ = {**os.environ, "PATH": fake_bin + ":" + os.environ.get("PATH", ""),
+                    "ZP_CORE_MIN_BYTES": "16"}
+            try:
+                return subprocess.run(["sh", path_], capture_output=True, text=True, env=env_, timeout=30)
+            except subprocess.TimeoutExpired as exc:
+                print("低空间演练超时，最后输出:\n" + (exc.stdout or b"")[-3000:].decode(errors="replace"))
+                raise
 
         space_root = os.path.join(tmp, "space-root")
         fresh = run_low_space(space_root)
@@ -846,11 +854,11 @@ def main() -> int:
         # 真机上 /etc/zeroproxy 是上一次失败的安装留下的 (里面有内核), 这里补上目录与内核
         os.makedirs(space_root, exist_ok=True)
         with open(os.path.join(space_root, "mihomo"), "w") as fh:
-            fh.write('#!/bin/sh\n[ "$1" = "-v" ] && echo "stub"\n')
+            fh.write(stub)
         os.chmod(os.path.join(space_root, "mihomo"), 0o755)
         again_space = run_low_space(space_root)
         check("已经有可用的内核时, 同样的剩余空间直接放行",
-              "可用空间不足" not in again_space.stdout + again_space.stderr,
+              again_space.returncode == 0 and "可用空间不足" not in again_space.stdout + again_space.stderr,
               again_space.stdout.splitlines()[-1][:60] if again_space.stdout else "")
 
         # [6] 面板还没准备好内核 —— 真机上这一步的表现就是"卡在下载代理内核上不动"

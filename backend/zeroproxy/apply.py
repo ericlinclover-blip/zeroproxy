@@ -23,6 +23,7 @@ import copy
 import hashlib
 import json
 import os
+import stat
 import sys
 import threading
 import time
@@ -686,6 +687,35 @@ def _config_digests() -> dict[str, str | None]:
     }
 
 
+def _snapshot_generated_files() -> dict[str, tuple[str, int] | None]:
+    p = paths()
+    names = {p[key] for key in ("xray_config", "hysteria_config", "nginx_home", "nginx_etc")}
+    names.update(value for key, value in p.items() if key.startswith("wireguard_") and key != "wireguard_dir")
+    snapshot = {}
+    for name in names:
+        try:
+            with open(name, encoding="utf-8") as fh:
+                snapshot[name] = (fh.read(), stat.S_IMODE(os.stat(name).st_mode))
+        except FileNotFoundError:
+            snapshot[name] = None
+    return snapshot
+
+
+def _restore_generated_files(snapshot: dict) -> list[str]:
+    errors = []
+    for name, entry in snapshot.items():
+        try:
+            if entry is None:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(name)
+            else:
+                content, mode = entry
+                config.atomic_write_text(name, content, mode=mode)
+        except OSError as exc:
+            errors.append(f"{name}: {exc}")
+    return errors
+
+
 _MISSING = object()
 
 
@@ -752,6 +782,19 @@ def _save_merged(state: dict, baseline: dict) -> None:
 
 
 def reapply(state: dict, timeout: int = 0, progress=None) -> list[dict]:
+    try:
+        with wireguard.operation():
+            # 后台任务的快照可能早于一次已完成的 peer 修改。
+            if not config.lock_held_here():
+                with config.locked():
+                    state["wireguard"] = copy.deepcopy(load_state().get("wireguard") or {})
+            return _reapply_locked(state, timeout, progress)
+    except wireguard.OperationBusy as exc:
+        return [{"name": "等待 WireGuard 配置事务", "ok": False,
+                 "detail": str(exc), "ms": 0}]
+
+
+def _reapply_locked(state: dict, timeout: int = 0, progress=None) -> list[dict]:
     """完整闭环: 重新生成配置 → 校验 → 重载服务 → 验证端口。
 
     `progress` 可选, 形如 `fn(index, total, name)`: 每进入一步回调一次 ——
@@ -760,6 +803,7 @@ def reapply(state: dict, timeout: int = 0, progress=None) -> list[dict]:
     steps = steps_recorder()
     # 收尾落盘要跟这份快照对比才知道"这次改了什么" (见 _save_merged)
     baseline = copy.deepcopy(state)
+    previous_files = _snapshot_generated_files()
     before = _config_digests()
     # 证书文件兜底要放在生成 Xray / Nginx 之前: 证书不可用时 Trojan 入站会被直接
     # 跳过, nginx 配置也会指向一个不存在的文件 (见 ensure_cert_files)。
@@ -780,11 +824,13 @@ def reapply(state: dict, timeout: int = 0, progress=None) -> list[dict]:
         (STEP_NAMES[6], verify_listeners, 12),
     )
     # 配置生成/校验步骤 (索引 1-4): 任一步失败立即 abort, 不再进入 restart
-    validation_steps = {1, 2, 3, 4}
+    validation_steps = {0, 1, 2, 3, 4}
     for index, (name, fn, t) in enumerate(plan):
         if progress is not None:
             progress(index, len(plan), name)
         add_step(steps, name, fn, state, timeout=t)
+        if index == 0 and not _cert_ok:
+            steps[-1]["ok"] = False
         if index == 0 and cert_detail != "证书文件就绪":
             # 证书是兜底补回来的话, 让这一步的说明里能看见 —— 否则用户只会注意到
             # "证书怎么变成自签了", 找不到原因
@@ -792,6 +838,13 @@ def reapply(state: dict, timeout: int = 0, progress=None) -> list[dict]:
         if index in validation_steps and not steps[-1]["ok"]:
             # F07: 配置校验失败 → 立即 abort, 不进入 restart_services / verify
             steps[-1]["abort"] = True
+            restore_errors = _restore_generated_files(previous_files)
+            steps[-1]["files_restored"] = not restore_errors
+            steps[-1]["detail"] += ("; 已恢复上次配置文件" if not restore_errors else
+                                     "; 配置文件恢复失败: " + "; ".join(restore_errors))
+            # 保留调用前的期望配置，撤销生成步骤临时补齐的密钥/证书元数据。
+            state.clear()
+            state.update(copy.deepcopy(baseline))
             break
     state["steps"] = steps
     _save_merged(state, baseline)

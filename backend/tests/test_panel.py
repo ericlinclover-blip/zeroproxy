@@ -1950,7 +1950,8 @@ def test_geodata_is_opt_in_by_default(client, configured):
     cfg = xray_config.build_xray_config(state)
     rules = json.dumps(cfg["routing"]["rules"], ensure_ascii=False)
     assert "geoip:" not in rules and "geosite:" not in rules
-    assert all(o.get("tag") != "block" for o in cfg["outbounds"])
+    assert any(o.get("tag") == "block" for o in cfg["outbounds"])
+    assert "127.0.0.0/8" in rules and "domain:umeng.com" in rules
 
 
 def test_geodata_rules_dropped_when_files_missing(client, configured, home):

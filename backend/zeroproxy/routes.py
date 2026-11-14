@@ -25,6 +25,7 @@ import socket
 import threading
 import time
 import uuid as uuid_mod
+from functools import wraps
 
 import qrcode
 import qrcode.constants
@@ -128,6 +129,18 @@ def _add_step(steps: list[dict], name: str, fn, state: dict, timeout: int = 120)
 
 def _err(message: str, code: int = 400) -> JSONResponse:
     return JSONResponse({"error": message}, status_code=code)
+
+
+def _wg_transaction(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        try:
+            with wireguard.operation():
+                return fn(*args, **kwargs)
+        except (wireguard.OperationBusy, ValueError) as exc:
+            return _err(str(exc), 409)
+    return wrapped
+
 
 
 def _client_ip(request: Request) -> str:
@@ -428,6 +441,10 @@ def _new_job(
 
 
 def _finish_job(job_id: str, steps: list[dict], error: str = "") -> None:
+    if not error:
+        failed = next((step for step in steps if not step.get("ok")), None)
+        if failed:
+            error = f"{failed.get('name', '配置应用')}: {failed.get('detail', '失败')}"
     with _APPLY_JOBS_LOCK:
         job = _APPLY_JOBS.get(job_id)
         if job is not None:
@@ -1446,6 +1463,8 @@ def update_settings(payload: SettingsIn, request: Request):
                     return _err(f"自定义规则分类 {k} 必须为列表")
                 for item in items:
                     n = share_links.normalize_target(str(item))
+                    if str(item).strip() and not n:
+                        return _err(f"自定义规则 {k} 包含非法域名或 IP/CIDR")
                     if n and n not in cleaned_rules[k]:
                         cleaned_rules[k].append(n)
             routing_cfg = state.setdefault("routing", {})
@@ -1490,6 +1509,8 @@ def update_settings(payload: SettingsIn, request: Request):
             cleaned_allow: list[str] = []
             for item in payload.ad_allowlist:
                 n = share_links.normalize_target(item)
+                if item.strip() and (not n or share_links._is_ip_or_cidr(n)):
+                    return _err("广告放行白名单只接受合法域名")
                 if n and n not in cleaned_allow:
                     cleaned_allow.append(n)
             if cleaned_allow != list(geo.get("ad_allowlist") or []):
@@ -1501,13 +1522,10 @@ def update_settings(payload: SettingsIn, request: Request):
             return _err("没有需要修改的内容")
 
         config.audit(state, "settings", ", ".join(changed), actor=_client_ip(request))
-        # 分流模板与自定义规则只影响订阅输出；未就绪的 geo 规则同样不影响服务端内核 → 直接保存, 不做无谓的重载
+        # 只有模板/自定义客户端规则跳过应用；基础防护不再依赖 Geo 数据。
         client_rules_only = all(
             item.startswith("template=")
             or item.startswith("custom_rules")
-            or (not geodata.usable(state) and (
-                any(item.startswith(k) for k in ("block_ads", "block_tracking", "block_malicious", "ad_allowlist"))
-            ))
             for item in changed
         )
         if client_rules_only:
@@ -1563,7 +1581,10 @@ def test_routing_match(request: Request, target: str = "", tpl: str = ""):
         t = (target or "").strip()
         if not t:
             return _err("请输入待测试的域名或 IP", 400)
-        res = share_links.simulate_match(t, state, tpl or None)
+        if not share_links.normalize_target(t) or "/" in share_links.normalize_target(t):
+            return _err("测试目标需为单个合法域名或 IP 地址", 400)
+        res = share_links.simulate_match(t, state, tpl or None,
+                                         base=share_links.panel_base_url(request, state))
         return {"result": res}
 
 
@@ -2691,6 +2712,7 @@ def _restore_validate(state: dict) -> str:
 
 
 @router.post("/api/restore")
+@_wg_transaction
 def restore(request: Request, raw: bytes = Depends(_raw_request_body)):
     """从备份恢复状态, 然后重新生成全部配置并热重载。
 
@@ -3253,18 +3275,23 @@ def _run_geo_job(job_id: str, actor: str, force: bool = False) -> None:
                 detail[:190],
                 actor=actor,
             )
-            if ok:
+            save_state(fresh)
+        if ok:
+            with _APPLY_RUN_LOCK:
+                with config.locked():
+                    fresh = load_state()
                 steps = _geo_steps(detail) + apply.reapply(
                     fresh,
                     progress=lambda index, _total, name: _job_update(
                         job_id, index=dl_total + index + 1, total=total, current=name
                     ),
                 )
-            else:
-                steps = _geo_steps(detail)
-                steps[0]["ok"] = False
-                error = detail
-            # 步骤要在 save_state 之前写进去: reapply 内部存过一次, 这里覆盖成完整清单
+        else:
+            steps = _geo_steps(detail)
+            steps[0]["ok"] = False
+            error = detail
+        with config.locked():
+            fresh = load_state()
             fresh["steps"] = steps
             save_state(fresh)
     except Exception as exc:  # noqa: BLE001 — 后台任务不能把异常吞成"静默失败"
@@ -3576,23 +3603,15 @@ def _wg_text_response(text: str, filename: str, inline: bool = False) -> Respons
 
 
 def _wg_reply(state: dict, request: Request, steps: list[dict]) -> dict:
-    """回执 + 落盘。**只并回真正改过的东西**, 不整份覆盖。
-
-    `state` 可能是几秒前的快照: 调用方在锁外跑过 `systemctl`/`wg syncconf`, 有的分支
-    后面还跟一次 `ufw`(最长 25 秒)。这段时间里登录会话、设备心跳、配对码都在正常写
-    state.json —— 直接 `save_state(state)` 会把它们**静默覆盖**掉。所以这里重新读一份
-    最新的, 只把"步骤记录"与 WireGuard 段盖上去。
-    """
+    """只保存步骤；WireGuard 事务已提交，回执不再写回旧配置。"""
     with config.locked():
         fresh = load_state()
         fresh["steps"] = steps
-        wireguard_state = state.get("wireguard")
-        if isinstance(wireguard_state, dict):
-            fresh["wireguard"] = wireguard_state
         save_state(fresh)
     body = _dashboard_body(fresh, request)
     body["steps"] = steps
     return body
+
 
 
 def _wg_sync_and_persist(
@@ -3617,6 +3636,17 @@ def _wg_sync_and_persist(
         ok, sync_detail = wireguard.sync(snapshot, timeout=180)
     except Exception as exc:  # noqa: BLE001 — 异常同样走回滚路径
         ok, sync_detail = False, f"异常: {type(exc).__name__}: {exc}"
+    restored = False
+    rollback_detail = ""
+    if not ok:
+        rollback_state = copy.deepcopy(state)
+        rollback_state["wireguard"] = copy.deepcopy(before)
+        try:
+            restored, rollback_detail = wireguard.sync(rollback_state, timeout=180)
+        except Exception as exc:
+            rollback_detail = f"{type(exc).__name__}: {exc}"
+        if restored:
+            before = rollback_state["wireguard"]
     steps = [
         {
             "name": step_name,
@@ -3625,6 +3655,10 @@ def _wg_sync_and_persist(
             "ms": int((time.time() - started) * 1000),
         }
     ]
+    if not ok:
+        steps[0]["runtime_rolled_back"] = restored
+        steps[0]["detail"] += (" · 运行配置已恢复" if restored else
+                               f" · 运行配置恢复失败，请执行修复: {rollback_detail[:180]}")
     with config.locked():
         fresh = load_state()
         if ok:
@@ -3654,6 +3688,7 @@ def wireguard_status(request: Request):
 
 
 @router.post("/api/wireguard/settings")
+@_wg_transaction
 def wireguard_settings(payload: WireGuardSettingsIn, request: Request):
     with config.locked():
         state = load_state()
@@ -3736,7 +3771,7 @@ def wireguard_settings(payload: WireGuardSettingsIn, request: Request):
             updates.update(gen)
 
         for key, name, min_v, max_v in (
-            ("awg_jc", "Jc (垃圾包数)", 1, 128),
+            ("awg_jc", "Jc (垃圾包数)", 0, 128),
             ("awg_jmin", "Jmin (垃圾包下限)", 0, 1200),
             ("awg_jmax", "Jmax (垃圾包上限)", 0, 1200),
             ("awg_s1", "S1 (握手发起填充)", 0, 1200),
@@ -3768,6 +3803,7 @@ def wireguard_settings(payload: WireGuardSettingsIn, request: Request):
                 elif not updates["ipv6"] and peer.get("allowed_ips") == "0.0.0.0/0, ::/0":
                     peer["allowed_ips"] = "0.0.0.0/0"
 
+        wireguard.validate_settings(state)
         # 锁内只落"期望状态"; sync() (apt/systemctl/等 wg0) 放到锁外执行 (P2-2)
         save_state(state)
     fresh, steps, ok = _wg_sync_and_persist(
@@ -3794,6 +3830,7 @@ def wireguard_settings(payload: WireGuardSettingsIn, request: Request):
 
 
 @router.post("/api/wireguard/peers")
+@_wg_transaction
 def wireguard_peer_add(payload: WireGuardPeerIn, request: Request):
     with config.locked():
         state = load_state()
@@ -3812,6 +3849,7 @@ def wireguard_peer_add(payload: WireGuardPeerIn, request: Request):
             )
         except ValueError as exc:
             return _err(str(exc))
+        wireguard.validate_settings(state)
         save_state(state)
     fresh, steps, _ok = _wg_sync_and_persist(
         state,
@@ -3823,12 +3861,15 @@ def wireguard_peer_add(payload: WireGuardPeerIn, request: Request):
         f"{peer['name']} ({peer['address']})",
     )
     body = _wg_reply(fresh, request, steps)
-    body["peer_id"] = peer["id"]
-    body["config"] = wireguard.client_config(fresh, peer)
+    committed = wireguard.find_peer(fresh, peer["id"])
+    if _ok and committed is not None:
+        body["peer_id"] = committed["id"]
+        body["config"] = wireguard.client_config(fresh, committed)
     return body
 
 
 @router.post("/api/wireguard/peers/{peer_id}")
+@_wg_transaction
 def wireguard_peer_update(peer_id: str, payload: WireGuardPeerPatch, request: Request):
     with config.locked():
         state = load_state()
@@ -3877,6 +3918,7 @@ def wireguard_peer_update(peer_id: str, payload: WireGuardPeerPatch, request: Re
             changed.append(f"compat={bool(payload.compat)}")
         if not changed:
             return _err("没有需要修改的内容")
+        wireguard.validate_settings(state)
         save_state(state)
     fresh, steps, _ok = _wg_sync_and_persist(
         state,
@@ -3888,12 +3930,15 @@ def wireguard_peer_update(peer_id: str, payload: WireGuardPeerPatch, request: Re
         f"{peer.get('name')}: {', '.join(changed)}",
     )
     body = _wg_reply(fresh, request, steps)
-    body["peer_id"] = peer["id"]
-    body["config"] = wireguard.client_config(fresh, peer)
+    committed = wireguard.find_peer(fresh, peer["id"])
+    if _ok and committed is not None:
+        body["peer_id"] = committed["id"]
+        body["config"] = wireguard.client_config(fresh, committed)
     return body
 
 
 @router.delete("/api/wireguard/peers/{peer_id}")
+@_wg_transaction
 def wireguard_peer_delete(peer_id: str, request: Request):
     with config.locked():
         state = load_state()
@@ -3903,6 +3948,7 @@ def wireguard_peer_delete(peer_id: str, request: Request):
         peer = wireguard.remove_peer(state, peer_id)
         if peer is None:
             return _err("客户端不存在", 404)
+        wireguard.validate_settings(state)
         save_state(state)
     fresh, steps, _ok = _wg_sync_and_persist(
         state,
@@ -3917,6 +3963,7 @@ def wireguard_peer_delete(peer_id: str, request: Request):
 
 
 @router.post("/api/wireguard/peers/{peer_id}/rotate")
+@_wg_transaction
 def wireguard_peer_rotate(peer_id: str, request: Request):
     with config.locked():
         state = load_state()
@@ -3926,6 +3973,7 @@ def wireguard_peer_rotate(peer_id: str, request: Request):
         peer = wireguard.rotate_peer(state, peer_id)
         if peer is None:
             return _err("客户端不存在", 404)
+        wireguard.validate_settings(state)
         save_state(state)
     fresh, steps, _ok = _wg_sync_and_persist(
         state,
@@ -3937,12 +3985,15 @@ def wireguard_peer_rotate(peer_id: str, request: Request):
         str(peer.get("name")),
     )
     body = _wg_reply(fresh, request, steps)
-    body["peer_id"] = peer["id"]
-    body["config"] = wireguard.client_config(fresh, peer)
+    committed = wireguard.find_peer(fresh, peer["id"])
+    if _ok and committed is not None:
+        body["peer_id"] = committed["id"]
+        body["config"] = wireguard.client_config(fresh, committed)
     return body
 
 
 @router.get("/api/wireguard/peers/{peer_id}/config")
+@_wg_transaction
 def wireguard_peer_config(peer_id: str, request: Request, inline: int = 0, awg: int | None = None):
     state = load_state()
     if not _require_auth(state, request):
@@ -3961,6 +4012,7 @@ def wireguard_peer_config(peer_id: str, request: Request, inline: int = 0, awg: 
 
 
 @router.get("/api/wireguard/peers/{peer_id}/qr")
+@_wg_transaction
 def wireguard_peer_qr(peer_id: str, request: Request, size: int = 8, img: str = "png", awg: int | None = None):
     state = load_state()
     if not _require_auth(state, request):
@@ -3973,6 +4025,7 @@ def wireguard_peer_qr(peer_id: str, request: Request, size: int = 8, img: str = 
 
 
 @router.post("/api/wireguard/peers/{peer_id}/link")
+@_wg_transaction
 def wireguard_peer_one_time(peer_id: str, request: Request, awg: int | None = None):
     with config.locked():
         state = load_state()
@@ -3981,6 +4034,7 @@ def wireguard_peer_one_time(peer_id: str, request: Request, awg: int | None = No
         peer = wireguard.find_peer(state, peer_id)
         if peer is None:
             return _err("客户端不存在", 404)
+        wireguard.client_mode(state, peer, None if awg is None else bool(awg))
         token = wireguard.one_time_create(state, peer_id)
         if token is None:
             return _err("客户端不存在", 404)
@@ -3988,7 +4042,7 @@ def wireguard_peer_one_time(peer_id: str, request: Request, awg: int | None = No
             state, "wireguard_one_time", str(peer.get("name")), actor=_client_ip(request)
         )
         save_state(state)
-        suffix = "?awg=1" if (awg == 1 or (awg is None and wireguard.bucket(state).get("awg_enabled"))) else ""
+        suffix = "" if awg is None else f"?awg={int(bool(awg))}"
         url = f"{share_links.panel_base_url(request, state)}/wg/one/{token}{suffix}"
         return {
             "url": url,
@@ -3998,6 +4052,7 @@ def wireguard_peer_one_time(peer_id: str, request: Request, awg: int | None = No
 
 
 @router.get("/wg/one/{token}")
+@_wg_transaction
 def wireguard_one_time_config(token: str, awg: int | None = None):
     """一次性配置下载。链接本身就是凭据：用一次即作废，默认 10 分钟过期。"""
     with config.locked():

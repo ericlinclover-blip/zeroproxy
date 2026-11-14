@@ -194,31 +194,30 @@ def cert_usable(state: dict) -> bool:
 
 
 def geo_rules(state: dict) -> list[dict]:
-    """基于 GeoIP/GeoSite 的分流防护规则。
-
-    硬前置: 只要 geo 数据文件不齐备就返回空列表。原因是 Xray 在配置构建阶段
-    就要求数据文件存在, 缺文件时**整份配置加载失败**(见 geodata.py 顶部),
-    宁可少两条规则也不能让核心起不来。
-    """
-    if not geodata.usable(state):
-        return []
+    """基础私网/域名防护始终可用；数据库齐备时才添加 Geo 匹配。"""
     from . import share_links
 
     geo = state.get("geodata", {})
+    usable = geodata.usable(state)
     rules: list[dict] = []
+
+    if geo.get("block_private", True):
+        private = ["geoip:private"] if usable else [
+            "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+            "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16",
+            "224.0.0.0/4", "240.0.0.0/4", "::/128", "::1/128",
+            "fc00::/7", "fe80::/10", "ff00::/8", "::ffff:0:0/96",
+        ]
+        rules.append({"type": "field", "outboundTag": "block", "ip": private})
 
     # 广告防误杀白名单优先直连放行 (早于任何广告与黑洞拦截)
     allowlist = share_links.ad_allowlist_of(state)
     if allowlist:
         rules.append({"type": "field", "outboundTag": "direct", "domain": [f"domain:{d}" for d in allowlist]})
 
-    if geo.get("block_private", True):
-        # 阻止客户端借道服务器访问其内网 / 私有网段 (SSRF 面收窄)
-        rules.append({"type": "field", "outboundTag": "block", "ip": ["geoip:private"]})
-
     if geo.get("block_ads", True):
         # 商业广告与开屏广告拦截
-        ad_domains = ["geosite:category-ads-all"] + [f"domain:{d}" for d in share_links.COMMERCIAL_ADS_DOMAINS]
+        ad_domains = (["geosite:category-ads-all"] if usable else []) + [f"domain:{d}" for d in share_links.COMMERCIAL_ADS_DOMAINS]
         rules.append({"type": "field", "outboundTag": "block", "domain": ad_domains})
 
     if geo.get("block_tracking", True):
@@ -424,13 +423,13 @@ def build_xray_config(state: dict) -> dict:
             }
         ],
         "routing": {
-            "domainStrategy": "AsIs",
+            "domainStrategy": "IPOnDemand" if state.get("geodata", {}).get("block_private", True) else "AsIs",
             # API 入站的流量必须交给 tag=api 的内置处理器 (而不是 direct),
             # 否则 `xray api statsquery` 会直接连不上
             "rules": [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}],
         },
     }
-    # geo 分流规则 (数据缺失时为空列表, 不影响核心启动)
+    # 基础防护不引用数据库，数据缺失时仍可启动并阻止私网访问。
     extra_rules = geo_rules(state)
     if extra_rules:
         cfg["outbounds"].append({"protocol": "blackhole", "tag": "block"})
