@@ -242,12 +242,18 @@ case "$action" in
         perf_prog="$(tail -n 3 "$ZP_DIR/perf/progress" 2>/dev/null | tr '\n' '|')"
         # WAN 口的收+发字节数: 表盘上那根针的转速就是它算出来的 —— 真流量才有转速,
         # 拿不到就退回 0 (表针贴怠速), 绝不假装在动。
-        wan=0
+        wan=""
+        wan_rx=""; wan_tx=""
         _wdev="$(ip route show default 2>/dev/null | awk 'NR==1{print $5}' | head -n1)"
         if [ -n "$_wdev" ] && [ -r "/sys/class/net/$_wdev/statistics/rx_bytes" ]; then
-            _rx="$(cat "/sys/class/net/$_wdev/statistics/rx_bytes" 2>/dev/null || echo 0)"
-            _tx="$(cat "/sys/class/net/$_wdev/statistics/tx_bytes" 2>/dev/null || echo 0)"
-            wan=$(( ${_rx:-0} + ${_tx:-0} ))
+            _rx="$(cat "/sys/class/net/$_wdev/statistics/rx_bytes" 2>/dev/null)"
+            _tx="$(cat "/sys/class/net/$_wdev/statistics/tx_bytes" 2>/dev/null)"
+            case "$_rx" in ''|*[!0-9]*) _rx="" ;; esac
+            case "$_tx" in ''|*[!0-9]*) _tx="" ;; esac
+            if [ -n "$_rx" ] && [ -n "$_tx" ]; then
+                wan_rx="$_rx"; wan_tx="$_tx"
+                wan=$(( _rx + _tx ))
+            fi
         fi
         ver=""
         [ -f "$ZP_DIR/version" ] && ver="$(cat "$ZP_DIR/version" 2>/dev/null)"
@@ -283,9 +289,10 @@ case "$action" in
             [ -n "$_primary" ] && [ "$_primary" = "$base" ] && is_prim="true"
             items="${items:+$items,}{\"key\":\"$(jval_s "$key")\",\"base\":\"$(jval_s "$base")\",\"id\":\"$(jval_s "$did")\",\"primary\":$is_prim}"
         done
+        applied_rev="$(sed -n '1p' "$ZP_DIR/applied.rev" 2>/dev/null | tr -d '\r\n')"
         header
-        printf '{"ok":true,"core":"%s","mode":"%s","covered":"%s","why":"%s","ipv6":"%s","client":"%s","wan":"%s","packets":%s,"routing_mode":"%s","servers":[%s],' \
-            "$core" "$mode" "$covered" "$(jstr "$why")" "$ipv6" "$(jval_s "$ver")" "$wan" "$packets" "$(jval_s "$rmode")" "$items"
+        printf '{"ok":true,"core":"%s","mode":"%s","covered":"%s","why":"%s","ipv6":"%s","client":"%s","wan":"%s","wan_rx":"%s","wan_tx":"%s","applied_rev":"%s","packets":%s,"routing_mode":"%s","servers":[%s],' \
+            "$core" "$mode" "$covered" "$(jstr "$why")" "$ipv6" "$(jval_s "$ver")" "$wan" "$wan_rx" "$wan_tx" "$(jval_s "$applied_rev")" "$packets" "$(jval_s "$rmode")" "$items"
         printf '"perf":{"cap":"%s","state":"%s","live":"%s","why":"%s","exit_ip":"%s","wan_ip":"%s","busy":"%s","progress":"%s"}}\n' \
             "$perf_cap" "$perf_state" "$perf_live" "$(jstr "$perf_why")" "$(jval_s "$perf_exit")" \
             "$(jval_s "$perf_wan_ip")" "$perf_busy" "$(jstr "$perf_prog")"

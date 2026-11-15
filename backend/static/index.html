@@ -114,27 +114,30 @@
     <div id="dash-banner" class="hidden"></div>
     <div id="apply-strip" class="hidden"></div>
 
-    <section class="connection-field" id="connection-field" aria-label="连接路径预览">
+    <section class="connection-field" id="connection-field" aria-label="连接检查与路线管理">
       <div class="field-canvas">
         <div class="field-caption"><span>CONNECTION FIELD / 01</span><span id="field-proof">等待探测</span></div>
+        <div class="field-toolbar field-object-switch"><label for="field-object-select">当前检查路线</label><select id="field-object-select"></select></div>
         <h2 id="field-headline">正在读取连接。</h2>
         <p class="field-summary" id="field-summary">选择节点，查看它的配置与验证结果。</p>
         <div class="field-topology">
-          <svg class="field-wires" viewBox="0 0 800 230" preserveAspectRatio="none" aria-hidden="true"><path class="wire-back" d="M65 150 C190 150 180 70 320 70 S510 160 570 130 S690 100 745 100"/><path class="wire-main" d="M65 150 C190 150 180 70 320 70 S510 160 570 130 S690 100 745 100"/><path class="wire-alternate" d="M65 150 C200 260 390 260 570 130"/></svg>
-          <div class="field-hop hop-device"><span class="field-dot"></span><span class="hop-index">01 / CLIENT</span><strong>你的设备</strong><small>按设备分流与选组出网</small></div>
-          <button class="field-hop hop-entry" id="field-entry"><span class="field-dot"></span><span class="hop-index">02 / ENTRY</span><strong id="field-entry-name">本机入口</strong><small id="field-entry-host">—</small></button>
-          <button class="field-hop hop-exit" id="field-exit"><span class="field-dot"></span><span class="hop-index">03 / EGRESS</span><strong id="field-exit-name">直接出网</strong><small id="field-exit-host">—</small></button>
+          <svg class="field-wires" viewBox="0 0 800 230" preserveAspectRatio="none" aria-hidden="true"><path class="wire-back" d="M65 150 C190 150 180 70 320 70 S510 160 570 130"/><path class="wire-device" d="M65 150 C190 150 180 70 320 70"/><path class="wire-main" d="M320 70 C460 70 510 160 570 130"/></svg>
+          <button class="field-hop hop-device" id="field-device" aria-pressed="false"><span class="field-dot"></span><span class="hop-index">01 / CLIENT</span><strong>设备接入</strong><small id="field-device-status">设备端待检查</small></button>
+          <button class="field-hop hop-entry" id="field-entry"><span class="field-dot"></span><span class="hop-index">02 / ENTRY</span><strong id="field-entry-name">本机入口</strong><small id="field-entry-host">—</small><span class="hop-status" id="field-entry-status"></span></button>
+          <button class="field-hop hop-exit" id="field-exit"><span class="field-dot"></span><span class="hop-index">03 / EGRESS</span><strong id="field-exit-name">直接出网</strong><small id="field-exit-host">—</small><span class="hop-status" id="field-exit-status"></span></button>
         </div>
-        <div class="field-bottom"><span id="field-scope">路径为配置预览，不代表设备实时流向</span><a href="#chain-intro">管理链式连接 ↗</a></div>
+        <div class="field-metrics" aria-label="当前路线检查结果"><div><span>服务器探测耗时</span><strong id="field-latency">—</strong></div><div><span>验证层级</span><strong id="field-level">尚未检查</strong></div><div><span>结果时效</span><strong id="field-age">尚无结果</strong></div></div>
+        <p id="field-feedback" class="field-feedback" role="status" aria-live="polite"></p>
+        <div class="field-bottom"><span id="field-scope">设备段未验证 · 点击路径查看每段证据</span><a href="#diag-card">打开完整诊断 ↗</a></div>
       </div>
       <aside class="field-inspector" aria-label="选中对象详情">
         <div class="inspector-top"><span class="eyebrow">SELECTED / 当前查看</span><span id="field-selection-kind">节点</span></div>
         <h3 id="field-object-name">选择一个节点</h3>
-        <div class="field-object-switch"><label for="field-object-select">查看节点或落地端</label><select id="field-object-select"></select></div>
+
         <dl id="field-facts"></dl>
         <p id="field-evidence" class="field-evidence" role="status"></p>
-        <div class="field-inspector-actions"><button class="btn primary" id="field-verify">验证连接</button><button class="btn hidden" id="field-apply-route">设为默认出口</button><button class="btn ghost" id="field-manage">管理此对象 ↗</button></div>
-        <p class="field-disclaimer">选择只更新预览。更改出口需在管理页确认并应用。</p>
+        <div class="field-inspector-actions"><button class="btn primary" id="field-verify">验证连接</button><button class="btn hidden" id="field-apply-route">设为默认出口</button><button class="btn ghost" id="field-manage">管理此对象 ↗</button><a class="btn ghost" href="#diag-card" id="field-diagnose">定位异常 ↗</a></div>
+        <p class="field-disclaimer">查看路线不会改变流量。设备端连接需在设备上确认；更改默认出口须确认应用。</p>
       </aside>
     </section>
 

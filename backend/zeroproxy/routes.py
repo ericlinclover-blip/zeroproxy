@@ -2552,7 +2552,7 @@ _PROBE_LOCK = threading.Lock()
 
 
 @router.get("/api/probe")
-def probe(request: Request, force: int = 0, deep: int = 0):
+def probe(request: Request, force: int = 0, deep: int = 0, node: str = ""):
     """节点体检: 对每个本地入站做一次真实握手, 并测量服务器到伪装目标的 RTT。
 
     `?deep=1` 换成深度体检: 起一个临时 Xray 客户端, 真的从每个节点穿一次外网。
@@ -2565,12 +2565,20 @@ def probe(request: Request, force: int = 0, deep: int = 0):
         if not _require_auth(state, request):
             return _err("未登录", 401)
 
+    if node and node not in NODE_IDS and not services.chain_entry(state, node):
+        return _err("节点不存在", 404)
+    probe_keys = ("nodes", "ports", "domain", "uuid", "reality", "xhttp", "cert",
+                  "trojan_password", "hysteria_password", "hysteria_ports", "advanced")
+    def selected_revision(snapshot):
+        shape = [snapshot.get(k) for k in probe_keys] + [chain.routing_fingerprint(snapshot)]
+        return hashlib.sha256(json.dumps(shape, sort_keys=True).encode()).hexdigest()
+    tested_revision = selected_revision(state) if node else ""
     want_deep = bool(deep)
     now = time.time()
     ttl = 20 if want_deep else 3
     # 缓存不能跨状态变更: 刚关掉一个节点就点测速, 命中 20s 内的旧结果会显示
     # "这个节点还在" —— 用 updated_at 当指纹, 任何写操作都会让旧结果立即作废。
-    key = f"{'deep' if want_deep else 'fast'}:{int(state.get('updated_at') or 0)}"
+    key = f"{'deep' if want_deep else 'fast'}:{int(state.get('updated_at') or 0)}:{node}:{tested_revision}"
     with _PROBE_LOCK:
         for stale in [k for k in _PROBE_CACHE if k != key]:
             _PROBE_CACHE.pop(stale, None)
@@ -2578,7 +2586,25 @@ def probe(request: Request, force: int = 0, deep: int = 0):
         if entry and not force and now - entry["at"] < ttl:
             return entry["body"]
 
-    body = services.probe_all(state, deep=want_deep)
+    if node:
+        # A scoped check never starts clients for unrelated routes or probes the
+        # camouflage target separately. Unsupported deep checks remain unknown.
+        try:
+            result = (services.deep_probe_node(state, node) if want_deep and node != "hysteria2"
+                      else services.probe_node(state, node))
+        except Exception as exc:  # A failed diagnostic must not become an opaque 500.
+            result = {"node": node, "ok": False, "kind": "deep" if want_deep else "?",
+                      "ms": None, "detail": f"探测异常: {exc}"}
+        with config.locked():
+            current = load_state()
+            if not _require_auth(current, request):
+                return _err("未登录", 401)
+            if selected_revision(current) != tested_revision:
+                return _err("检查期间配置已变化，结果已丢弃，请重新检查", 409)
+        body = {"checked_at": int(time.time()), "chain_revision": chain.routing_fingerprint(state),
+                "nodes": [result], "deep": want_deep, "scope": node}
+    else:
+        body = services.probe_all(state, deep=want_deep)
     with _PROBE_LOCK:
         _PROBE_CACHE[key] = {"at": time.time(), "body": body}
     return body

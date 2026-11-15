@@ -231,13 +231,13 @@
       // 心跳看到的就是它), 那这条流量根本没走代理 —— 如实标出来, 不把它写成"节点出口"(8.86)。
       const own = String(perf.exit_ip || '') !== '' && String(perf.exit_ip) === String(perf.wan_ip || '');
       capEl.textContent = (perf.exit_ip ? '出口 ' + perf.exit_ip + (own ? ' (本机)' : '') + ' · ' : '') +
-        '内核态 eBPF 分流 · 上限约 100 Mbps';
+        '内核态 eBPF 分流 · 表盘量程约 100 Mbps';
       if (own && warnEl) {
         warnEl.textContent = '探针走的是本机出口: 路由器自身的流量没走代理 (局域网设备不受影响)';
       }
       sub.textContent = '直连流量不再经过用户态 (eBPF 在内核里分流)。' +
         (failed || perf.why ? ' 上次的结论: ' + (perf.why || '') : '');
-      btn.textContent = '熄火 (回到标准模式)';
+      btn.textContent = '切回标准模式';
       btn.disabled = false;
     } else {
       pill.className = 'pill off';
@@ -246,7 +246,7 @@
       sub.textContent = perf.why
         ? '上次的结论: ' + perf.why
         : '直连流量将不再经过用户态; 切换过程中会验证出口, 失败自动退回。';
-      btn.textContent = '启动引擎';
+      btn.textContent = '启用性能模式';
       btn.disabled = false;
     }
 

@@ -744,3 +744,38 @@ printf 'bad=%s\\n' "$?"
     proc = subprocess.run(["/bin/sh", "-c", script], capture_output=True, text=True, timeout=10)
     assert "ok=0" in proc.stdout, proc.stdout + proc.stderr
     assert "bad=7" in proc.stdout, proc.stdout + proc.stderr
+
+
+def test_router_cgi_reports_actual_wan_directions_and_unknowns(tmp_path):
+    """Read each real counter independently; unavailable counters stay unknown."""
+    import json
+    zdir = tmp_path / "zp"
+    zdir.mkdir()
+    (zdir / "ui.token").write_text("counter-test\n")
+    (zdir / "applied.rev").write_text("revision-123\n")
+    netdir = tmp_path / "net" / "wan-test" / "statistics"
+    netdir.mkdir(parents=True)
+    (netdir / "rx_bytes").write_text("8000\n")
+    (netdir / "tx_bytes").write_text("2000\n")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    ip = bindir / "ip"
+    ip.write_text('#!/bin/sh\nif [ "$1 $2 $3" = "route show default" ]; then echo "default via 192.0.2.1 dev wan-test"; else exit 1; fi\n')
+    ip.chmod(0o755)
+    source = open(CGI, encoding="utf-8").read()
+    source = source.replace("ZP_DIR=/etc/zeroproxy", f"ZP_DIR={zdir}")
+    source = source.replace("TOKFILE=/etc/zeroproxy/ui.token", f"TOKFILE={zdir / 'ui.token'}")
+    source = source.replace("PATH=/usr/sbin:/usr/bin:/sbin:/bin", f"PATH={bindir}:/usr/bin:/bin:/usr/sbin:/sbin")
+    source = source.replace("/sys/class/net/", str(tmp_path / "net") + "/")
+    script = tmp_path / "cgi"
+    script.write_text(source)
+    def read_status():
+        result = subprocess.run(["/bin/sh", str(script)], env={**os.environ,"QUERY_STRING":"a=status&k=counter-test","REQUEST_METHOD":"GET"},capture_output=True,text=True,timeout=10)
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout.split("\n\n",1)[1])
+    result = read_status()
+    assert (result["wan"],result["wan_rx"],result["wan_tx"]) == ("10000","8000","2000")
+    assert result["applied_rev"] == "revision-123"
+    (netdir / "rx_bytes").unlink()
+    result = read_status()
+    assert result["wan"] == result["wan_rx"] == result["wan_tx"] == ""

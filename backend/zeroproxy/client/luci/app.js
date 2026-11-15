@@ -17,6 +17,92 @@ let lastWanBytes = 0;
 let lastWanTime = 0;
 let activeTab = 'dashboard';
 let fullLogContent = '';
+let lastRxBytes = null, lastTxBytes = null;
+let lastServerSignature = null;
+let lastReadAt = 0;
+let routeReadBusy = false;
+let routeAttempted = false;
+let routeReadAt = 0;
+let lastProxySignature = null;
+let modeChanging = false;
+let toggleChanging = false;
+let pendingToggle = null;
+let statusRead = null;
+const blockedControls = new Set();
+const WORKSPACES = {
+  dashboard: ['让连接，流向每台设备。', '核对接管范围，再选择你的出网路线。'],
+  nodes: ['每一程，都有方向。', '选择代理组路线，管理面板订阅来源。'],
+  clients: ['看见网络里的每台设备。', '设备发现来自路由器；在线不等于流量已经过代理。'],
+  diagnostics: ['找到连接的断点。', '按实际检测结果定位数据面、节点和网络问题。'],
+  logs: ['照顾网络的每一天。', '更新路由器客户端，查看执行进度与日志。'],
+};
+
+function blockControls() {
+  document.querySelectorAll('button:not(.tab-btn):not(#btn-quick-refresh):not(#router-theme):not([data-open-tab]), input').forEach((el) => {
+    if (!el.disabled) { blockedControls.add(el); el.disabled = true; }
+  });
+}
+function restoreControls() {
+  blockedControls.forEach((el) => { if (document.body.contains(el)) el.disabled = false; });
+  blockedControls.clear();
+  // Initial loading controls were disabled in the markup.
+  if (!currentState) document.querySelectorAll('#toggle, .mode-card').forEach((el) => { el.disabled = false; });
+}
+function coverageInfo(state) {
+  const perfLive = state.perf && state.perf.state === 'on' && state.perf.live === '1';
+  const running = perfLive || state.core === 'running';
+  const busy = state.perf && state.perf.busy === '1';
+  const mode = state.mode || 'none';
+  const scope = mode === 'none' ? 'none' : state.covered || ({tun:'full',ebpf:'full',tproxy:'lan',redirect:'lan_tcp'}[mode] || 'none');
+  const coverage = {full:'局域网与路由器自身',lan:'局域网流量',lan_tcp:'仅局域网 TCP',none:'没有透明接管'}[scope] || '接管范围待确认';
+  const ready = running && scope !== 'none';
+  return { running, mode, scope, coverage, busy,
+    state: busy ? 'switching' : !running ? 'off' : !ready ? 'unknown' : scope === 'full' ? 'ready' : 'partial',
+    title: busy ? '正在切换数据面。' : !running ? '代理已停用。' : !ready ? '接管尚未就绪。' : scope === 'full' ? '透明接管已就绪。' : '部分流量已接管。' };
+}
+function renderField(state) {
+  const info = coverageInfo(state);
+  $('router-field').dataset.state = info.state;
+  $('rf-headline').textContent = info.title;
+  $('rf-proof').textContent = '配置与内核状态 / 非出网验证';
+  $('rf-summary').textContent = info.busy ? '请等待切换完成，再核对实际接管范围。' : !info.running ? '代理服务已停止，当前不作为透明代理就绪状态。' : '接管就绪不等于出口验证通过；不同分流规则可能使用不同出口。';
+  $('rf-dataplane').textContent = {tun:'TUN / 标准模式',ebpf:'eBPF / 性能模式',tproxy:'TPROXY / 标准模式',redirect:'REDIRECT / TCP',none:'未检测到数据面'}[info.mode] || info.mode;
+  $('rf-mode').textContent = {tun:'TUN',ebpf:'eBPF / dae',tproxy:'TPROXY',redirect:'REDIRECT',none:'未接管'}[info.mode] || info.mode;
+  $('rf-coverage').textContent = info.running ? info.coverage : '当前没有透明代理';
+  $('rf-scope-tag').textContent = info.busy ? '切换中' : info.state === 'ready' ? '范围已回报' : info.state === 'partial' ? '部分接管' : '待就绪';
+  $('rf-ipv6').textContent = !info.running ? '代理未运行' : state.ipv6 === '1' || state.ipv6 === 1 ? '已报告接管' : state.ipv6 === '0' || state.ipv6 === 0 ? '未接管 · 直接出网' : '尚未报告';
+  $('rf-policy').textContent = state.perf && state.perf.live === '1' ? '性能模式统一组' : {rule:'智能分流',global:'全局代理',direct:'全局直连'}[state.routing_mode] || '尚未报告';
+  $('rf-sources').textContent = `${(state.servers || []).length} 个已登记来源`;
+  $('rf-applied').textContent = state.applied_rev ? String(state.applied_rev).slice(0,12) : '接口未提供版本记录';
+  $('rf-updated').textContent = new Date(lastReadAt).toLocaleTimeString('zh-CN',{hour12:false});
+  $('rf-evidence').textContent = state.ipv6 === '0' ? 'IPv6 未接管，仍会直接出网。WAN 计数包含直连与代理，不代表代理专用流量。' : info.mode === 'redirect' ? 'REDIRECT 仅接管局域网 TCP，UDP 和路由器自身不在此范围。' : info.mode === 'tproxy' ? 'TPROXY 不包含路由器自身；请用网络体检核对实际出口。' : '应用版本是历史记录；当前运行与出口可用性仍需分别核对。';
+  $('hero-sub-text').textContent = `${info.running ? info.coverage : '代理服务未运行'}；分流策略只作用于已接管的流量。`;
+  if (!info.running) {
+    $('rf-route').textContent = '未启用代理转发';
+  } else if (info.mode === 'ebpf') {
+    $('rf-route').textContent = '性能模式统一组';
+  } else if (!proxiesData) {
+    $('rf-route').textContent = '等待代理组回报';
+  } else {
+    const key = Object.keys(proxiesData).find((k)=>k.includes('节点选择') || k==='GLOBAL') || Object.keys(proxiesData)[0];
+    $('rf-route').textContent = (proxiesData[key] || {}).now || '尚未选择';
+  }
+}
+function staleField(message, authorization) {
+  $('router-field').dataset.state = authorization ? 'locked' : 'stale';
+  $('rf-headline').textContent = authorization ? '需要授权后读取。' : '状态暂时不可用。';
+  $('rf-proof').textContent = authorization ? '尚未授权' : '连接中断 / 上次状态';
+  $('rf-summary').textContent = authorization ? '登录 LuCI，或使用路由器终端 zeroproxy ui 打印的授权地址。' : '保留上次读数，请刷新重试；恢复后会先读取实际状态。';
+  $('rf-evidence').textContent = message;
+  $('rf-coverage').textContent = '当前范围无法确认';
+  $('rf-scope-tag').textContent = '状态未知';
+  $('rf-rate').textContent = '—';
+  $('perf-pill').textContent = '上次状态 · 未刷新';
+  $('perf-cap').textContent = '当前性能模式状态无法确认';
+  lastWanTime = 0; lastRxBytes = null; lastTxBytes = null;
+  blockControls();
+}
+
 
 function toast(msg) {
   const el = $('toast');
@@ -34,6 +120,7 @@ const esc = (s) => String(s == null ? '' : s)
 const unesc = (s) => String(s || '').replace(/\\n/g, '\n');
 
 async function call(path, body) {
+  if (body !== undefined && ['stale','locked','loading'].includes($('router-field').dataset.state)) throw new Error('请先刷新并确认路由器状态，再执行操作');
   const res = await fetch(API + '?a=' + path + (TOKEN ? '&k=' + encodeURIComponent(TOKEN) : ''), body === undefined ? {} : {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -43,9 +130,9 @@ async function call(path, body) {
   try {
     data = await res.json();
   } catch (e) {
-    throw new Error('路由器返回了无法解析的内容 (uhttpd 的 CGI 可能没生效)');
+    const error = new Error('路由器返回了无法解析的内容 (uhttpd 的 CGI 可能没生效)'); error.status=res.status; throw error;
   }
-  if (!data.ok) throw new Error(data.error || '操作失败');
+  if (!res.ok || !data.ok) { const error = new Error(data.error || '操作失败'); error.status = res.status; throw error; }
   return data;
 }
 
@@ -54,19 +141,26 @@ function initTabs() {
   document.querySelectorAll('.tab-btn').forEach((btn) => {
     btn.onclick = () => {
       const tab = btn.dataset.tab;
-      switchTab(tab);
+      switchTab(tab, true);
     };
   });
 }
 
-function switchTab(tab) {
+function switchTab(tab, focus = false) {
+  if (!WORKSPACES[tab]) return;
   activeTab = tab;
+  try { sessionStorage.setItem('zp-router-tab',tab); } catch(e) {}
   document.querySelectorAll('.tab-btn').forEach((b) => {
     b.classList.toggle('active', b.dataset.tab === tab);
+    if (b.dataset.tab === tab) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
   });
   document.querySelectorAll('.tab-pane').forEach((p) => {
     p.hidden = p.id !== 'tab-' + tab;
   });
+  $('router-heading').textContent = WORKSPACES[tab][0];
+  $('router-description').textContent = WORKSPACES[tab][1];
+  document.title = 'ZeroProxy · ' + {dashboard:'网络',nodes:'路线',clients:'设备',diagnostics:'诊断',logs:'维护'}[tab];
+  if (focus) { $('router-heading').focus({preventScroll:true}); window.scrollTo({top:0,behavior:'auto'}); }
   if (tab === 'nodes') loadProxies();
   if (tab === 'clients') loadClients();
   if (tab === 'logs') loadLog();
@@ -74,7 +168,11 @@ function switchTab(tab) {
 
 // ---------------------------------------------------------------- 状态渲染
 function render(state) {
+  restoreControls();
+  lastReadAt = Date.now();
   currentState = state;
+  $('sub').style.color = "";
+  renderField(state);
   if (window.zpPerf) window.zpPerf.render(state);
 
   const MODE_TEXT = {
@@ -116,32 +214,40 @@ function render(state) {
 
   // 总开关
   const on = perfOn || state.core === 'running';
+  if (pendingToggle && on === pendingToggle.on) pendingToggle = null;
+  if (pendingToggle && Date.now() - pendingToggle.at > 30000) {
+    pendingToggle = null; toast('尚未确认开关已应用，请核对路由器实际状态');
+  }
   $('toggle').checked = on;
-  $('toggle-txt').textContent = on ? '开' : '关';
+  $('toggle').disabled = toggleChanging || !!pendingToggle || !!(state.perf && state.perf.busy === '1');
+  $('toggle-txt').textContent = state.perf && state.perf.busy === '1' ? '切换中' : pendingToggle ? '等待回报' : on ? '开' : '关';
 
   // 分流模式高亮
   const rmode = state.routing_mode || 'rule';
   document.querySelectorAll('.mode-card').forEach((mc) => {
-    mc.classList.toggle('active', mc.dataset.mode === rmode);
+    const unavailable = perfOn || !!(state.perf && state.perf.busy === '1');
+    mc.disabled = modeChanging || unavailable;
+    mc.title = unavailable ? '性能模式或数据面切换中，标准模式策略当前不可用' : '';
+    mc.classList.toggle('active', !unavailable && mc.dataset.mode === rmode);
+    mc.setAttribute('aria-pressed', String(!unavailable && mc.dataset.mode === rmode));
   });
 
-  // 实时流量与速率计算
+  // WAN counters include all traffic. Never infer upload from a fixed ratio.
   const now = Date.now();
-  const currentWan = Number(state.wan) || 0;
-  if (lastWanTime > 0 && now > lastWanTime && currentWan >= lastWanBytes) {
-    const deltaBytes = currentWan - lastWanBytes;
-    const deltaSec = (now - lastWanTime) / 1000;
-    const speedKbps = deltaSec > 0 ? (deltaBytes / 1024) / deltaSec : 0;
-    const downSpeed = speedKbps >= 1024 ? (speedKbps / 1024).toFixed(1) + ' MB/s' : Math.round(speedKbps) + ' KB/s';
-    const upSpeed = speedKbps >= 1024 ? ((speedKbps * 0.15) / 1024).toFixed(1) + ' MB/s' : Math.round(speedKbps * 0.15) + ' KB/s';
-    if ($('stat-down')) $('stat-down').textContent = on ? downSpeed : '0 KB/s';
-    if ($('stat-up')) $('stat-up').textContent = on ? upSpeed : '0 KB/s';
-  }
-  lastWanBytes = currentWan;
-  lastWanTime = now;
-
-  if ($('stat-packets')) $('stat-packets').textContent = (state.packets || 0).toLocaleString();
-  if ($('stat-wan')) $('stat-wan').textContent = (currentWan / (1024 * 1024)).toFixed(1) + ' MB';
+  const counter = (value) => /^\d+$/.test(String(value)) ? Number(value) : null;
+  const currentWan = counter(state.wan), rx = counter(state.wan_rx), tx = counter(state.wan_tx);
+  const seconds = lastWanTime && now > lastWanTime ? (now - lastWanTime) / 1000 : 0;
+  const speed = (value) => value >= 1024 * 1024 ? (value / 1024 / 1024).toFixed(1) + ' MB/s' : Math.round(value / 1024) + ' KB/s';
+  const rate = (value, before) => seconds && value !== null && before !== null && value >= before ? speed((value-before)/seconds) : '—';
+  $('rf-rate').textContent = rate(currentWan, lastWanBytes);
+  $('stat-down').textContent = rate(rx,lastRxBytes);
+  $('stat-up').textContent = rate(tx,lastTxBytes);
+  $('stat-down-sub').textContent = rx === null ? '接口未提供下载计数，不推算' : 'WAN 接收；包含直连与代理';
+  $('stat-up-sub').textContent = tx === null ? '接口未提供上传计数，不推算' : 'WAN 发送；包含直连与代理';
+  lastWanBytes = currentWan; lastWanTime = currentWan === null ? 0 : now;
+  lastRxBytes = rx; lastTxBytes = tx;
+  $('stat-packets').textContent = state.mode === 'ebpf' || state.packets === undefined ? '—' : Number(state.packets).toLocaleString();
+  $('stat-wan').textContent = currentWan === null ? '—' : (currentWan / (1024 * 1024)).toFixed(1) + ' MB';
 
   // 渲染服务器列表
   renderServers(state.servers || []);
@@ -170,13 +276,16 @@ function renderServers(servers) {
   if (jumpLink) {
     const primary = servers.find((s) => s.primary) || servers[0];
     if (primary && primary.base) {
-      jumpLink.href = primary.base.replace(/\/+$/, '') + '/#/clients';
+      jumpLink.href = primary.base.replace(/\/+$/, '') + '/#sec-clients';
       jumpLink.title = `在浏览器新标签页打开主控面板客户端管理页 (${primary.base})`;
       jumpLink.style.display = 'inline-flex';
     } else {
       jumpLink.style.display = 'none';
     }
   }
+  const signature = JSON.stringify(servers);
+  if (signature === lastServerSignature) return;
+  lastServerSignature = signature;
   if (!servers.length) {
     container.innerHTML = '<div class="empty">还没有接入任何面板订阅源 — 请在下方添加一台。</div>';
     return;
@@ -281,6 +390,8 @@ function renderServers(servers) {
 }
 
 function locked(msg) {
+  staleField(msg, true);
+  lastServerSignature = null;
   $('sub').textContent = msg;
   $('sub').style.color = 'var(--err)';
   $('toggle').disabled = true;
@@ -298,26 +409,47 @@ function locked(msg) {
     </div>`;
 }
 
-async function load() {
+function load() {
+  if (!statusRead) statusRead = loadStatus().finally(()=>{statusRead=null;});
+  return statusRead;
+}
+
+async function loadStatus() {
   try {
     const s = await call('status');
     render(s);
+    if ((!routeAttempted || Date.now()-routeReadAt > 15000) && s.core === 'running' && s.mode !== 'ebpf') { routeAttempted = true; loadProxies(); }
   } catch (e) {
-    locked(e.message);
+    if (e.status === 401 || e.status === 403 || /未登录|未授权|令牌/.test(e.message)) locked(e.message);
+    else { $('sub').textContent = '状态读取失败 · 正在重试'; staleField(e.message, false); }
   }
 }
 
 // ---------------------------------------------------------------- 节点选择与测速
 async function loadProxies() {
   const container = $('nodes-container');
-  if (!container) return;
+  if (!container || routeReadBusy) return;
+  if (currentState && currentState.mode === 'ebpf') {
+    container.innerHTML = '<div class="empty">性能模式使用统一代理组；标准模式的独立组选项当前不可用。</div>';
+    $('cur-node-title').textContent = '性能模式统一组';
+    $('cur-node-meta').textContent = '切回标准模式后可查看和选择独立代理组路线。';
+    $('cur-node-delay').textContent = '标准组接口不适用';
+    $('btn-ping-all').disabled = true;
+    lastProxySignature = null;
+    return;
+  }
+  if (currentState && !['stale','locked'].includes($('router-field').dataset.state)) $('btn-ping-all').disabled = false;
+  routeReadBusy = true;
+  routeReadAt = Date.now();
   try {
     const data = await call('proxies');
     proxiesData = data.proxies || {};
     renderProxies(proxiesData);
   } catch (e) {
     container.innerHTML = `<div class="empty">无法获取节点列表: ${esc(e.message)}（内核正在运行吗？）</div>`;
-  }
+    $('rf-route').textContent = '代理组状态未知';
+    lastProxySignature = null;
+  } finally { routeReadBusy = false; }
 }
 
 function renderProxies(proxies) {
@@ -334,9 +466,17 @@ function renderProxies(proxies) {
   }
 
   const currentSelected = group.now || '';
+  if (currentState && currentState.mode !== 'ebpf') $('rf-route').textContent = currentSelected || '尚未选择';
+  $('rf-route-note').textContent = '当前选组 / 分流出口可能不同';
+  if ($('cur-node-meta')) $('cur-node-meta').textContent = '当前代理组的选择，不等于所有分流都经过这条路线。';
+  if ($('cur-node-delay')) $('cur-node-delay').textContent = '已选中 · 未代表出网验证';
   if ($('cur-node-title')) {
     $('cur-node-title').textContent = currentSelected || '自动选择';
   }
+
+  const signature = JSON.stringify(proxies);
+  if (signature === lastProxySignature) return;
+  lastProxySignature = signature;
 
   // 渲染所有候选节点
   const nodesHtml = group.all.map((name) => {
@@ -355,11 +495,11 @@ function renderProxies(proxies) {
             ${isActive ? '<span class="dot ok"></span>' : '<span class="dot off"></span>'}
             ${esc(name)}
           </div>
-          <div class="node-meta">协议: ${esc(proto)} · ${isActive ? '当前正在使用' : '点击切换此路线'}</div>
+          <div class="node-meta">协议: ${esc(proto)} · ${isActive ? '当前组选中' : '选择后会立即提交到代理组'}</div>
         </div>
         <div class="row" style="gap:8px">
-          <span class="node-ping ${delayClass}" data-ping="${esc(name)}" title="点击测试此节点延迟">${delayText}</span>
-          ${!isActive ? `<button class="btn small" data-select="${esc(name)}">选择</button>` : '<span class="pill ok" style="font-size:11px">活跃</span>'}
+          <button type="button" class="node-ping ${delayClass}" data-ping="${esc(name)}" title="点击测试此节点延迟">${delayText}</button>
+          ${!isActive ? `<button class="btn small" data-select="${esc(name)}">选择</button>` : '<span class="pill ok" style="font-size:11px">已选中</span>'}
         </div>
       </div>
     `;
@@ -436,12 +576,18 @@ if ($('btn-ping-all')) {
 document.querySelectorAll('.mode-card').forEach((mc) => {
   mc.onclick = async () => {
     const mode = mc.dataset.mode;
+    if (mc.disabled) return;
+    modeChanging = true;
+    document.querySelectorAll('.mode-card').forEach((el)=>{el.disabled=true;});
     try {
       await call('mode', { mode });
       toast(`分流策略已切换为: ${mode === 'rule' ? '智能分流' : mode === 'global' ? '全局代理' : '全局直连'}`);
-      document.querySelectorAll('.mode-card').forEach((m) => m.classList.toggle('active', m === mc));
+      await load();
     } catch (e) {
       toast(e.message);
+    } finally {
+      modeChanging = false;
+      if (currentState && !['stale','locked'].includes($('router-field').dataset.state)) document.querySelectorAll('.mode-card').forEach((el)=>{el.disabled=!!(currentState.perf && (currentState.perf.live==='1' || currentState.perf.busy==='1'));});
     }
   };
 });
@@ -450,7 +596,7 @@ document.querySelectorAll('.mode-card').forEach((mc) => {
 async function loadClients() {
   const tbody = $('device-tbody');
   if (!tbody) return;
-  tbody.innerHTML = '<tr><td colspan="4" class="empty">正在扫描局域网连接设备…</td></tr>';
+  tbody.innerHTML = '<tr><td colspan="4" class="empty">正在读取局域网设备发现记录…</td></tr>';
   try {
     const res = await call('clients');
     const clients = res.clients || [];
@@ -463,7 +609,7 @@ async function loadClients() {
         <td style="font-weight:600">${esc(c.name || '局域网终端')}</td>
         <td class="mono">${esc(c.ip)}</td>
         <td class="mono fs-xs muted">${esc(c.mac || '—')}</td>
-        <td><span class="pill ok" style="font-size:11px"><span class="dot"></span>在线</span></td>
+        <td><span class="pill" style="font-size:11px"><span class="dot"></span>已发现</span></td>
       </tr>
     `).join('');
   } catch (e) {
@@ -570,14 +716,16 @@ if ($('btn-copy-log')) {
 // ---------------------------------------------------------------- 总开关与控制
 $('toggle').onchange = async (ev) => {
   const on = ev.target.checked;
+  toggleChanging = true; $('toggle').disabled = true; $('toggle-txt').textContent = '提交中…';
   try {
     const r = await call('toggle', { on });
+    pendingToggle = {on,at:Date.now()};
     toast(unesc(r.message).split('\n')[0]);
-    setTimeout(load, 1500);
   } catch (e) {
-    ev.target.checked = !on;
     toast(e.message);
-    locked(e.message);
+  } finally {
+    toggleChanging = false;
+    await load();
   }
 };
 
@@ -933,8 +1081,16 @@ function initUrlInputHelpers() {
   }
 }
 
+document.querySelectorAll('[data-open-tab]').forEach((btn)=>{btn.onclick=()=>switchTab(btn.dataset.openTab,true);});
+$('rf-doctor').onclick=()=>{switchTab('diagnostics',true);$('btn-doctor').click();};
+$('router-theme').onclick=()=>{
+  const theme=document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+  document.documentElement.dataset.theme=theme;
+  try { localStorage.setItem('zp-router-theme',theme); } catch(e) {}
+};
 // 初始化应用
 initTabs();
+try { const tab=sessionStorage.getItem('zp-router-tab'); if (tab && WORKSPACES[tab]) switchTab(tab); } catch(e) {}
 initUrlInputHelpers();
 load();
 // 周期性轮询基本状态

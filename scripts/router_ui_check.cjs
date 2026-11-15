@@ -20,7 +20,7 @@ const fs = require("fs");
 const ROOT = path.resolve(__dirname, "..");
 const LUCi_DIR = path.join(ROOT, "backend", "zeroproxy", "client", "luci");
 const SHOT_DIR = process.env.ZP_SHOT_DIR || path.join(ROOT, "work", "browser-check");
-const PORT = parseInt(process.env.ZP_UI_PORT || "8907", 10);
+let PORT = parseInt(process.env.ZP_UI_PORT || "0", 10);
 
 for (const extra of (process.env.ZP_NODE_PATH || "").split(path.delimiter)) {
   if (extra && !module.paths.includes(extra)) module.paths.push(extra);
@@ -54,7 +54,7 @@ function makeMock() {
     mode: "tun",
     covered: "full",
     why: "",
-    client: "1.0.0",
+    client: "1.4.52",
     servers: [{ key: "hkk_i3_pub_8899", base: "https://hkk.i3.pub:8899", id: "dv056b52958542564a" }],
     log: "zeroproxy-agent: 配置已更新并重载",
     // 一键更新的模拟: 每问一次 update-log 就"长"一段, 最后一段带 EXIT=0。
@@ -223,6 +223,12 @@ function makeMock() {
           if (state.updAt > 0 && state.updAt < UPD_LOG.length - 1) state.updAt += 1;
           return json(res, { ok: true, message: UPD_LOG[state.updAt] });
         }
+        if (action === "proxies") return json(res, {ok:true,proxies:{"🚀 节点选择":{all:["香港 Reality","日本 QUIC"],now:state.selected || "香港 Reality"},"香港 Reality":{type:"VLESS",history:[{delay:42}]},"日本 QUIC":{type:"Hysteria2",history:[]}}});
+        if (action === "select-node") { state.selected=payload.name; return json(res,{ok:true}); }
+        if (action === "test-delay") return json(res,{ok:true,delay:42});
+        if (action === "mode") { state.routing_mode=payload.mode; return json(res,{ok:true}); }
+        if (action === "clients") return json(res,{ok:true,clients:[{name:"客厅的电视与媒体设备",ip:"2001:db8:abcd:1234::100",mac:"AA:BB:CC:DD:EE:FF"}]});
+        if (action === "doctor") return json(res,{ok:true,message:"模拟诊断完成"});
         if (action === "log") return json(res, { ok: true, log: state.log });
         return json(res, { ok: false, error: "未知操作" });
       });
@@ -252,7 +258,8 @@ function makeMock() {
 async function main() {
   fs.mkdirSync(SHOT_DIR, { recursive: true });
   const server = makeMock();
-  await new Promise((r) => server.listen(PORT, "127.0.0.1", r));
+  await new Promise((resolve,reject) => { server.once("error",reject); server.listen(PORT,"127.0.0.1",resolve); });
+  PORT = server.address().port;
   const base = `http://127.0.0.1:${PORT}/cgi-bin/zeroproxy`;
   let browser;
   try {
@@ -286,7 +293,7 @@ async function main() {
     console.log("\n[2] 已登录 (带上 LuCI 会话 cookie)");
     await ctx.addCookies([{ name: "sysauth_http", value: "mock-session", url: `http://127.0.0.1:${PORT}` }]);
     await page.reload();
-    await page.waitForSelector(".srv");
+    await page.waitForSelector(".srv", {state:"attached"});
     check("状态卡显示内核与模式", /内核运行中/.test(await page.locator("#sub").innerText())
       && /TUN/.test(await page.locator("#sub").innerText()), await page.locator("#sub").innerText());
     check("总开关按实际状态打开", await page.locator("#toggle").isChecked());
@@ -294,6 +301,8 @@ async function main() {
     check("服务器显示地址与设备 id", /hkk\.i3\.pub/.test(await page.locator(".srv").innerText()));
     await page.screenshot({ path: path.join(SHOT_DIR, "router-ui.png") });
 
+    const go = async (tab) => page.locator(`.tab-btn[data-tab="${tab}"]`).click();
+    await go("nodes");
     console.log("\n[3] 添加第二台服务器");
     await page.fill("#url", "https://usa.example.com:8899/c/abcdef123456");
     await page.click("#add");
@@ -309,17 +318,20 @@ async function main() {
     check("乱填时给出可理解的提示", true, await page.locator("#add-hint").innerText());
 
     console.log("\n[5] 总开关与移除");
+    await go("dashboard");
     await page.click("#toggle + .track");
     await page.waitForTimeout(300);
     check("关掉开关后立刻有反馈", /已请求面板/.test(await page.locator("#toast").innerText()));
 
     page.on("dialog", (d) => d.accept());
-    await page.click(".srv >> nth=1 >> button");
+    await go("nodes");
+    await page.locator(".srv").nth(1).locator("[data-drop]").click();
     await page.waitForFunction(() => document.querySelectorAll(".srv").length === 1);
     check("移除后只剩一台", (await page.locator(".srv").count()) === 1);
 
     console.log("\n[6] 日志");
-    await page.click("details summary");
+    await go("logs");
+    await page.locator("#tab-logs details summary").click();
     await page.waitForFunction(() => /zeroproxy-agent/.test(document.getElementById("log").textContent));
     check("日志能展开并显示内容", true);
 
@@ -331,7 +343,7 @@ async function main() {
     server.zpState.covered = "none";
     server.zpState.why = "建不出 tun 设备: Operation not supported";
     await page.reload();
-    await page.waitForSelector(".srv");
+    await page.waitForSelector(".srv", {state:"attached"});
     const noneSub = await page.locator("#sub").innerText();
     check("明说未接管, 不说成全屋透明代理",
       /未接管/.test(noneSub) && !/全屋透明代理/.test(noneSub), noneSub);
@@ -430,7 +442,7 @@ async function main() {
       (await page.locator("#update-hint").innerText()).split("\n")[0]);
     check("没开始就不显示进度面板", await page.locator("#upd").isHidden());
     await page.reload();
-    await page.waitForSelector(".srv");
+    await page.waitForSelector(".srv", {state:"attached"});
     await page.waitForTimeout(700);          // 给"刷新后接着显示"那段判断留出时间
     check("刷新之后也不会恢复成一个转不完的假进度",
       await page.locator("#upd").isHidden());
@@ -492,7 +504,7 @@ async function main() {
     server.zpState.updOverride = "";
     server.zpState.updNoLog = true;
     await page.reload();
-    await page.waitForSelector(".srv");
+    await page.waitForSelector(".srv", {state:"attached"});
     await page.waitForTimeout(700);          // 让"刷新后接着显示"那段判断跑完
     check("没有更新记录 → 不显示进度面板", await page.locator("#upd").isHidden());
     check("「更新客户端」按钮没被锁住 (还能点)",
@@ -506,7 +518,7 @@ async function main() {
     server.zpState.updOverride = "面板版本 v1.9.9 (本机 v1.9.8) —— 开始更新。\n"
       + "==> 检查环境\n  ✓ 面板可达\n==> 接入账号\n";
     await page.reload();
-    await page.waitForSelector(".srv");
+    await page.waitForSelector(".srv", {state:"attached"});
     await page.waitForFunction(
       () => document.getElementById("upd").hidden === false, null, { timeout: 5000 });
     check("断掉的那次运行照实显示成进度面板", await page.locator("#upd").isVisible());
@@ -520,6 +532,7 @@ async function main() {
       await page.locator("#update").isEnabled(), await page.locator("#update").innerText());
     server.zpState.updOverride = "";
 
+    await go("dashboard");
     console.log("\n[14] 性能模式: 那块速率表 (真的点一次)");
     // 刻度是 perf.js 用 SVG 画出来的 —— 它存在, 就说明那个脚本真的被加载、被 cgi 发出来了
     // (而不是浏览器把 index.html 当成了 js)。9 根里 5 根长的; 盘面上**不写数字** ——
@@ -534,7 +547,7 @@ async function main() {
     server.zpState.perf = { cap: "0", state: "off", live: "0", why: "内核 5.4.281 低于 5.17",
                             exit_ip: "", busy: "0", progress: "" };
     await page.reload();
-    await page.waitForSelector(".srv");
+    await page.waitForSelector(".srv", {state:"attached"});
     check("开不了的时候: 表盘写清原因, 按钮点不动",
       /不可用/.test(await page.locator("#perf-pill").innerText())
       && /5\.4\.281/.test(await page.locator("#perf-cap").innerText())
@@ -545,7 +558,7 @@ async function main() {
     server.zpState.perf = { cap: "1", state: "off", live: "0", why: "", exit_ip: "", busy: "0", progress: "" };
     server.zpState.wan = 0;
     await page.reload();
-    await page.waitForSelector(".srv");
+    await page.waitForSelector(".srv", {state:"attached"});
     // SVG <text> 没有 innerText —— 统一走 textContent 读表盘上的数字。
     const rpmText = () => page.locator("#perf-rpm").evaluate((el) => el.textContent);
     const unitText = () => page.locator("#perf-unit").evaluate((el) => el.textContent);
@@ -568,7 +581,7 @@ async function main() {
       await page.locator("#perf-cap").innerText());
     check("生效后五段收起 (它不是速度条, 开着还亮五条像进度没走完)",
       await page.locator("#perf-segs").evaluate((el) => el.classList.contains("hidden")));
-    check("按钮变成「熄火」", /熄火/.test(await page.locator("#perf-btn").innerText()),
+    check("按钮变成「切回标准模式」", /切回标准模式/.test(await page.locator("#perf-btn").innerText()),
       await page.locator("#perf-btn").innerText());
     // 读数必须跟着**真实流量**走: 让模拟器多推一点字节, 数字就该变
     const rpmBefore = parseFloat(await rpmText());
@@ -578,12 +591,13 @@ async function main() {
     const rpmAfter = parseFloat(await rpmText());
     check("读数跟着真实流量走 (WAN 字节数涨了, 数字就变)",
       rpmAfter !== rpmBefore, `${rpmBefore} → ${rpmAfter} ${await unitText()}`);
+    check("性能模式不开放标准模式三档策略",await page.locator("#mode-global").isDisabled());
     // 出口探针那次要是从本机直连出去的 (等于面板看到的本机地址), 卡片必须**如实标出来**,
     // 不许把本机地址写成节点出口 —— 真机上用户看到的就是这个 (8.86)。
     server.zpState.perf.exit_ip = "219.133.176.186";
     server.zpState.perf.wan_ip = "219.133.176.186";
     await page.reload();
-    await page.waitForSelector(".srv");
+    await page.waitForSelector(".srv", {state:"attached"});
     await page.waitForFunction(() => /已开启/.test(document.getElementById("perf-pill").textContent), null, { timeout: 8000 });
     check("出口等于本机地址时: 标成 (本机) 并给出警告, 不冒充节点出口",
       /\(本机\)/.test(await page.locator("#perf-cap").innerText())
@@ -593,9 +607,73 @@ async function main() {
 
     await page.click("#perf-btn");
     await page.waitForFunction(() => /未开启/.test(document.getElementById("perf-pill").textContent), null, { timeout: 6000 });
-    check("「熄火」把状态切回未开启 (同一个按钮的两个方向)",
+    check("切回标准模式后性能模式关闭",
       /未开启/.test(await page.locator("#perf-pill").innerText())
-      && /启动引擎/.test(await page.locator("#perf-btn").innerText()));
+      && /启用性能模式/.test(await page.locator("#perf-btn").innerText()));
+
+    console.log("\n[15] 连接场域与真实数据语义");
+    server.zpState.core="running";server.zpState.mode="tun";server.zpState.covered="full";server.zpState.ipv6="1";server.zpState.routing_mode="rule";
+    server.zpState.perf={cap:"1",state:"off",live:"0",busy:"0",why:"",progress:""};
+    await page.evaluate(()=>load());
+    check("五工作区与主题就绪",await page.locator('.tab-btn').count()===5 && await page.locator('#router-field').isVisible());
+    check("旧接口不推算上传下载",await page.locator('#stat-down').innerText()==='—' && await page.locator('#stat-up').innerText()==='—');
+    check("接管状态不声称出口已验证",/非出网验证/.test(await page.locator('#rf-proof').innerText()));
+    const rates=await page.evaluate(()=>{
+      const nativeNow=Date.now;let now=100000;Date.now=()=>now;lastWanTime=0;
+      try {
+        const fixture={...currentState,wan:1200000,wan_rx:1000000,wan_tx:200000};render(fixture);
+        now+=1000;render({...fixture,wan:1205120,wan_rx:1004096,wan_tx:201024});
+        return {down:document.getElementById('stat-down').textContent,up:document.getElementById('stat-up').textContent,total:document.getElementById('rf-rate').textContent};
+      }finally {Date.now=nativeNow;lastWanTime=0;}
+    });
+    check("WAN 上下行按各自真实字节差计算",rates.down==='4 KB/s' && rates.up==='1 KB/s' && rates.total==='5 KB/s',JSON.stringify(rates));
+    await page.evaluate(()=>load());
+    await page.focus('#mode-global');await page.keyboard.press('Enter');
+    await page.waitForFunction(()=>document.getElementById('mode-global').getAttribute('aria-pressed')==='true');
+    check("策略按钮支持键盘并回读实际状态",server.zpState.routing_mode==='global');
+    await go('nodes');await page.fill('#url','https://draft.example.com/c/unfinished');await page.focus('#url');await page.evaluate(()=>load());
+    check("状态轮询保留接入草稿和焦点",await page.inputValue('#url')==='https://draft.example.com/c/unfinished' && await page.evaluate(()=>document.activeElement.id)==='url');
+    await page.locator('[data-sync]').first().focus();await page.evaluate(()=>load());
+    check("来源未变化时不重建操作按钮",await page.evaluate(()=>document.activeElement.hasAttribute('data-sync')));
+    await page.locator('[data-select="日本 QUIC"]').click();
+    await page.waitForFunction(()=>document.getElementById('rf-route').textContent==='日本 QUIC');
+    check("切换路线后画布使用实际组选中结果",server.zpState.selected==='日本 QUIC');
+    await go('dashboard');server.zpState.mode='redirect';server.zpState.covered='lan_tcp';server.zpState.ipv6='0';await page.evaluate(()=>load());
+    check("REDIRECT 明确仅局域网 TCP 且 IPv6 未接管",/仅局域网 TCP/.test(await page.locator('#rf-coverage').innerText()) && /未接管/.test(await page.locator('#rf-ipv6').innerText()));
+    server.zpState.mode='none';server.zpState.covered='full';await page.evaluate(()=>load());
+    check("没有数据面时不因旧范围字段显示已就绪",await page.locator('#router-field').getAttribute('data-state')==='unknown');
+    server.zpState.mode='tun';server.zpState.covered='full';await page.evaluate(()=>load());
+    server.zpState.mode='ebpf';server.zpState.perf={cap:'1',state:'on',live:'1',busy:'0'};await page.evaluate(()=>load());await go('nodes');
+    check("性能模式路线页明确统一组限制",/统一代理组/.test(await page.locator('#nodes-container').innerText()) && await page.locator('#btn-ping-all').isDisabled());
+    server.zpState.mode='tun';server.zpState.perf={cap:'1',state:'off',live:'0',busy:'0'};await page.evaluate(()=>load());await go('nodes');
+    await page.waitForSelector('[data-select]');
+    check("切回标准模式恢复路线选择",await page.locator('[data-select]').count()>0 && await page.locator('#btn-ping-all').isEnabled());await go('dashboard');
+    await page.waitForFunction(()=>!document.getElementById('toast').classList.contains('on'));
+    const errMark=errors.length;
+    await page.route('**/cgi-bin/zeroproxy?a=status*',route=>route.abort('connectionfailed'));
+    await page.evaluate(()=>load());
+    check("断线显示状态未知并禁用变更",await page.locator('#router-field').getAttribute('data-state')==='stale' && await page.locator('#toggle').isDisabled());
+    await page.unroute('**/cgi-bin/zeroproxy?a=status*');await page.evaluate(()=>load());
+    check("重连后读取实际状态并恢复操作",await page.locator('#router-field').getAttribute('data-state')==='ready' && await page.locator('#toggle').isEnabled());
+    for(let i=errors.length-1;i>=errMark;i--) if(/ERR_FAILED|ERR_CONNECTION|Failed to fetch/.test(errors[i]))errors.splice(i,1);
+    for(const width of [1440,1024,820,768,390,320]){
+      await page.setViewportSize({width,height:1000});
+      for(const tab of ['dashboard','nodes','clients','diagnostics','logs']){
+        await go(tab);
+        const box=await page.evaluate(()=>({width:innerWidth,scroll:document.documentElement.scrollWidth,offenders:[...document.querySelectorAll('body *')].filter(el=>{const r=el.getBoundingClientRect();return r.width && r.right>innerWidth+1;}).slice(0,5).map(el=>({tag:el.tagName,id:el.id,cls:el.className}))}));
+        check(`${width}px / ${tab} 无页面横向溢出`,box.scroll<=box.width+1,box.scroll<=box.width+1?'':JSON.stringify(box));
+      }
+      await go('dashboard');
+      await page.screenshot({path:path.join(SHOT_DIR,`router-field-${width}.png`),fullPage:true});
+    }
+    await page.setViewportSize({width:1440,height:1200});await page.screenshot({path:path.join(SHOT_DIR,'router-field-desktop.png')});
+    await page.click('#router-theme');
+    check("深浅主题可切换",await page.evaluate(()=>document.documentElement.dataset.theme)==='dark');
+    await page.screenshot({path:path.join(SHOT_DIR,'router-field-dark.png')});
+    await page.reload();await page.waitForSelector('.srv',{state:'attached'});
+    check("重载保留主题偏好",await page.evaluate(()=>document.documentElement.dataset.theme)==='dark');
+    await page.emulateMedia({reducedMotion:'reduce'});
+    check("减少动态效果生效",await page.locator('#status-dot').evaluate(el=>getComputedStyle(el).animationName)==='none');
 
     // 浏览器自己会请求 /favicon.ico 之类, 那是模拟器的事, 不算页面问题
     const real = errors.filter((e) => !/favicon|404 \(Not Found\)/.test(e));

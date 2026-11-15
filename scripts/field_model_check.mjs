@@ -4,7 +4,7 @@ const now = 10000;
 const node = { id:'reality', name:'Reality', enabled:true, protocol:'VLESS', service:'xray', service_state:'active', port:8443 };
 const chain = { id:'c1', enabled:true, host:'exit.example', default_out:true, local_port:9001, pin_ok:true, last_probe:{ok:true,probe_ok:true,ts:now-10,ms:40} };
 const dash = {nodes:[node],chain:{entries:[chain]}};
-const probe = {checked_at:now-20,nodes:[{node:'reality',ok:true,ms:20}]};
+const probe = {checked_at:now-20,nodes:[{node:'reality',ok:true,kind:'deep',ms:20}]};
 const model=(d=dash,p=probe,s='')=>connectionModel(d,p,s,now);
 assert.equal(model().state,'verified');
 assert.equal(model().chain.id,'c1');
@@ -21,5 +21,13 @@ assert.equal(model({...dash,chain:{entries:[{...chain,enabled:false}]}},probe,'c
 assert.equal(model({...dash,nodes:[{...node,protocol:'Hysteria 2',service:'hysteria2'}]}).chain,undefined);
 assert.equal(model(dash,probe,'node:deleted').key,'node:reality');
 assert.equal(model({nodes:[]}).state,'unknown');
-assert.equal(model({...dash,nodes:[{...node,id:'chain-c1',chain:true,port:9001,last_probe:chain.last_probe}]},null).state,'verified');
-console.log('16 connection model assertions passed');
+assert.equal(model({...dash,nodes:[{...node,id:'chain-c1',chain:true,port:9001,last_probe:chain.last_probe}]},null).state,'unknown');
+// A listening socket is not an authenticated trip through the selected node.
+assert.equal(model(dash,{...probe,nodes:[{node:'reality',ok:true,kind:'tls',ms:20}]}).state,'unknown');
+assert.equal(model(dash,{...probe,nodes:[{node:'reality',ok:true,kind:'udp'}]}).state,'unknown');
+assert.equal(model(dash,{...probe,nodes:[{node:'reality',ok:null,kind:'deep'}]}).state,'unknown');
+assert.equal(model(dash,{...probe,nodes:[{node:'reality',ok:true,kind:'deep',checked_at:now-301}]}).state,'unknown');
+const chained = {...dash,nodes:[{...node,id:'chain-c1',chain:true,port:9001,last_probe:chain.last_probe}]};
+assert.equal(model(chained,{...probe,nodes:[{node:'chain-c1',ok:false,kind:'deep'}]}).state,'failed');
+assert.equal(model(dash,{...probe,nodes:[]}).checked,null);
+console.log('22 connection model assertions passed');

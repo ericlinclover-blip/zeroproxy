@@ -73,7 +73,7 @@ function check(name, ok, detail = "") {
 /**
  * 把本机生成的配对码改成"另一台服务器"的 (校验和按新内容重算)。
  * 验证链路要两台机器, 这里只有一台, 所以借本机的密钥造一个指向测试网段
- * (203.0.113.0/24, 永远连不上) 的配对码 —— 正好用来验证"探测不通要拦一下"这条路径。
+ * (127.0.0.2 的未监听地址) 的配对码 —— 正好用来验证"探测不通要拦一下"这条路径。
  */
 function retargetCode(code, host) {
   const crypto = require("crypto");
@@ -917,7 +917,8 @@ async function main() {
     await page.keyboard.press("Escape");
 
     // 入口端: 粘贴"另一台服务器"的配对码 → 真实链路探测失败 → 二次确认 → 强行添加
-    const peerHost = "203.0.113.9";
+    // Avoid TEST-NET addresses: system proxy software may accept their TCP handshakes.
+    const peerHost = "127.0.0.2";
     const peerCode = retargetCode(exitCard.code, peerHost);
     await page.fill("#chain-code", peerCode);
     await page.fill("#chain-label", "美国落地");
@@ -957,7 +958,7 @@ async function main() {
       };
     });
     check("入口端落地成一张链式卡片 (经落地地址 + 本机端口)",
-      /203\.0\.113\.9:8447/.test(entryCard.text) && /已启用/.test(entryCard.text)
+      entryCard.text.includes(`${peerHost}:8447`) && /已启用/.test(entryCard.text)
       && entryCard.hasToggle && entryCard.hasDefault && entryCard.hasDelete && entryCard.toggled,
       entryCard.text.split("\n").slice(0, 3).join(" · "));
     // v1 配对码 = 落地端没开内层 QUIC → 没有 QUIC 凭据, 不该出现「改用 QUIC 内层」
@@ -1009,6 +1010,7 @@ async function main() {
     // Previewing a route must not silently change the default exit.
     await page.selectOption("#field-object-select", `chain:${entryCard.id}`);
     check("连接场域可查看落地端", (await page.locator("#field-object-name").innerText()).includes("美国落地"));
+    await page.click("#field-exit");
     await page.click("#field-apply-route");
     await page.waitForSelector("#confirm-mask:not(.hidden)");
     check("画布中的出口更改仍需影响确认", /改道/.test(await page.locator("#confirm-body").innerText()));
