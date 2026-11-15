@@ -218,7 +218,7 @@ json_get_bool() {
 # curl/uclient-fetch 的"证书类错误"判据 (与 CLI 里那一份同一个口径)。
 zp_tls_rc() {
     case "${1:-}" in
-        35|51|58|59|60|64|66|77|80|83|90|91) return 0 ;;
+        51|60) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -278,8 +278,8 @@ http_post() {
                 command -v "$_tool" >/dev/null 2>&1 || continue
                 if "$_tool" -q -T 20 -O - --post-data "$_body" "$_url" 2>"$_errf"; then
                     _rc=0
-                elif grep -Eqi 'ssl|tls|certificate|cert verify|x509' "$_errf" 2>/dev/null; then
-                    # 只有 stderr 明确是 TLS/证书类时才降级一次
+                elif grep -Eqi 'certificate verify failed|certificate verification failed|certificate validation failed|cannot verify.*certificate|invalid (ssl |tls )?certificate|self.?signed certificate|certificate.*(not trusted|untrusted|expired|not yet valid|does not match)|unable to (get local issuer|verify).*certificate|x509:.*(unknown authority|expired|not yet valid|valid for)' "$_errf" 2>/dev/null; then
+                    # 只有 stderr 明确表明对端证书验证失败时才降级一次
                     zp_tls_warn "$_url" "$_tool 证书校验失败"
                     if "$_tool" -q --no-check-certificate -T 20 -O - \
                         --post-data "$_body" "$_url" 2>/dev/null; then
@@ -292,7 +292,10 @@ http_post() {
         fi
         [ "$_rc" = "0" ] && return 0
         [ "$_rc" != "22" ] || return "$_rc"     # HTTP 层面失败 (403/404…): 面板已明确答复
-        [ "$_tries" -lt 3 ] || return "$_rc"
+        if [ "$_tries" -ge 3 ]; then
+            [ "$_rc" != "35" ] || log "面板 TLS 握手失败 (curl 35)，保留证书验证重试 3 次后仍失败"
+            return "$_rc"
+        fi
         sleep 1
     done
 }
@@ -316,7 +319,7 @@ http_get() {
                 _rc=0
             else
                 _rc=$?
-                # 只有证书类错误才降级一次 (旧版只认 60, 而 35/51/58/77 同样是 TLS 层失败)
+                # 只有对端证书验证失败才兼容自签证书；握手失败不能用跳过验证解决。
                 if zp_tls_rc "$_rc"; then
                     zp_tls_warn "$1" "curl $_rc"
                     if _out="$(curl -fsSk -m 10 "$1" 2>/dev/null)"; then _rc=0; fi
@@ -329,7 +332,7 @@ http_get() {
                 command -v "$_tool" >/dev/null 2>&1 || continue
                 if _out="$("$_tool" -q -O - "$1" 2>"$_egt")"; then
                     _rc=0
-                elif grep -Eqi 'ssl|tls|certificate|cert verify|x509' "$_egt" 2>/dev/null; then
+                elif grep -Eqi 'certificate verify failed|certificate verification failed|certificate validation failed|cannot verify.*certificate|invalid (ssl |tls )?certificate|self.?signed certificate|certificate.*(not trusted|untrusted|expired|not yet valid|does not match)|unable to (get local issuer|verify).*certificate|x509:.*(unknown authority|expired|not yet valid|valid for)' "$_egt" 2>/dev/null; then
                     zp_tls_warn "$1" "$_tool 证书校验失败"
                     if _out="$("$_tool" -q --no-check-certificate -O - "$1" 2>/dev/null)"; then _rc=0; fi
                 fi
@@ -349,7 +352,8 @@ http_get() {
             18) _why='收到不完整的数据 (被截断)' ;;
             22) _why='面板明确拒绝 (HTTP 4xx / 5xx)' ;;
             28) _why='超时 —— 多半是链路在丢包' ;;
-            35|60) _why='TLS / 证书错误' ;;
+            35) _why='TLS 握手失败 (保留证书验证重试)' ;;
+            51|60) _why='证书验证失败' ;;
             52|56) _why='连接被中断' ;;
             *)  _why="其它错误 (curl $_rc)" ;;
         esac
@@ -366,9 +370,8 @@ http_get() {
 http_get_file() {
     _tmo="${2:-600}"
     if command -v curl >/dev/null 2>&1; then
-        # 先校验证书; 只有证书类错误 (curl 35/51/…/60) 才降级一次并说出来。
-        if curl -fsS -m "$_tmo" "$1" 2>/dev/null; then return 0; fi
-        _rgf=$?
+        # 先校验证书; 只有证书类错误 (curl 51/60) 才降级一次并说出来。
+        if curl -fsS -m "$_tmo" "$1" 2>/dev/null; then return 0; else _rgf=$?; fi
         if zp_tls_rc "$_rgf"; then
             zp_tls_warn "$1" "curl $_rgf"
             curl -fsSk -m "$_tmo" "$1" 2>/dev/null && return 0
@@ -380,7 +383,7 @@ http_get_file() {
     for _tool in uclient-fetch wget; do
         command -v "$_tool" >/dev/null 2>&1 || continue
         if "$_tool" -q -T "$_tmo" -O - "$1" 2>"$_egf"; then rm -f "$_egf"; return 0; fi
-        if grep -Eqi 'ssl|tls|certificate|cert verify|x509' "$_egf" 2>/dev/null; then
+        if grep -Eqi 'certificate verify failed|certificate verification failed|certificate validation failed|cannot verify.*certificate|invalid (ssl |tls )?certificate|self.?signed certificate|certificate.*(not trusted|untrusted|expired|not yet valid|does not match)|unable to (get local issuer|verify).*certificate|x509:.*(unknown authority|expired|not yet valid|valid for)' "$_egf" 2>/dev/null; then
             zp_tls_warn "$1" "$_tool 证书校验失败"
             if "$_tool" -q --no-check-certificate -T "$_tmo" -O - "$1" 2>/dev/null; then
                 rm -f "$_egf"; return 0

@@ -116,15 +116,15 @@ running() { /etc/init.d/zeroproxy running >/dev/null 2>&1 && echo yes || echo no
 # ---------------------------------------------------------------- 面板请求 (TLS)
 # 这里以前是**一律** `curl -fsSk` / `uclient-fetch --no-check-certificate`: 链路上任何
 # 一个 DNS 劫持 / 反代投毒都能把 update 的 install.sh 换成别人的, 而它由 root 执行
-# (P1-3)。现在改成与 agent.sh 一样的写法 —— **先校验证书, 只有确实是证书/TLS 错误时才
+# (P1-3)。现在改成与 agent.sh 一样的写法 —— **先校验证书, 只有确实是对端证书验证失败时才
 # 降级一次, 并且把那句话打出来**。超时 / 丢包 / 面板确认拒绝都不降级 (那几类不是证书问题,
 # 降级也解决不了, 只会把"面板还没配好证书"与"链路在丢包"混成同一件事)。
 #
-# 退出码取自 curl: 35/51/58/59/60/64/66/77/80/83/90/91 都是 TLS 层握手或校验失败
-# (60 最常见: 自签证书 / 证书链不全)。
+# 只识别对端证书验证失败 (51/60)。35 是握手失败，其他 TLS 配置/引擎错误
+# 也不能靠关闭证书验证解决，应保留原始错误交给调用方重试或诊断。
 zp_tls_error() {
     case "${1:-}" in
-        35|51|58|59|60|64|66|77|80|83|90|91) return 0 ;;
+        51|60) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -139,7 +139,7 @@ zp_tls_warn() {
 }
 
 # 没有 curl 的固件: uclient-fetch / wget 也默认校验证书, 但它们的退出码分不出
-# "证书错误"与"连不上"。所以先按默认 (校验) 跑一次, 只有 stderr 明确是 TLS/证书类的
+# "证书错误"与"连不上"。所以先按默认 (校验) 跑一次, 只有 stderr 明确表明对端证书验证失败的
 # 失败才降级一次 —— 与 curl 那条同一个原则, 只是判据从退出码换成错误文本。
 zp_fetch_plain() {  # <tool> <url> <out|-> [timeout]  (无 --no-check-certificate)
     case "$1" in
@@ -150,7 +150,7 @@ zp_fetch_plain() {  # <tool> <url> <out|-> [timeout]  (无 --no-check-certificat
 
 zp_err_is_tls() {
     [ -s "$ZP_ERR" ] || return 1
-    grep -Eqi 'ssl|tls|certificate|cert verify|x509' "$ZP_ERR"
+    grep -Eqi 'certificate verify failed|certificate verification failed|certificate validation failed|cannot verify.*certificate|invalid (ssl |tls )?certificate|self.?signed certificate|certificate.*(not trusted|untrusted|expired|not yet valid|does not match)|unable to (get local issuer|verify).*certificate|x509:.*(unknown authority|expired|not yet valid|valid for)' "$ZP_ERR"
 }
 
 # 取一个 URL 存到文件 (GET)。返回 0 = 拿到; 非 0 = 失败 (与 curl 的退出码同义)。

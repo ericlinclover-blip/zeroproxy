@@ -119,7 +119,8 @@ http_why() {
         18) printf '收到不完整的数据 (被截断)' ;;
         22) printf '面板明确拒绝 (HTTP 4xx / 5xx)' ;;
         28) printf '超时 —— 多半是链路在丢包' ;;
-        35|60) printf 'TLS / 证书错误' ;;
+        35) printf 'TLS 握手失败' ;;
+        51|60) printf '证书验证失败' ;;
         52|56) printf '连接被中断' ;;
         *)  printf '其它错误 (curl %s)' "${1:-?}" ;;
     esac
@@ -145,8 +146,8 @@ detect_http() {
 #   * 超时 / 丢包 / 面板明确拒绝 都不是证书问题, 降级解决不了它们, 只会把
 #     "面板还没配好证书"与"链路在丢包"混成同一件事 —— 而后者在真机链路上占四成。
 #
-# 判据: curl 走退出码 (35/51/58/59/60/64/66/77/80/83/90/91); 没有 curl 的固件看一次
-# uclient-fetch/wget 的 stderr, 只有明确是 SSL/TLS/证书类才降级。
+# 判据: curl 走退出码 (51/60); 没有 curl 的固件看一次
+# uclient-fetch/wget 的 stderr, 只有明确表明对端证书验证失败才兼容降级。
 TLS_WHY=""
 http_probe() {
     _url="$1"
@@ -155,12 +156,12 @@ http_probe() {
     _tls_bad=0
     if [ "$HTTP" = "curl" ]; then
         case "$_rc" in
-            35|51|58|59|60|64|66|77|80|83|90|91) _tls_bad=1 ;;
+            51|60) _tls_bad=1 ;;
         esac
     else
         _pe="$(mktemp /tmp/.zp-probe.XXXXXX 2>/dev/null || echo /tmp/.zp-probe.$$)"
         "$HTTP" -q -T 10 -O /dev/null "$_url" >/dev/null 2>"$_pe" || true
-        grep -Eqi 'ssl|tls|certificate|cert verify|x509' "$_pe" 2>/dev/null && _tls_bad=1
+        grep -Eqi 'certificate verify failed|certificate verification failed|certificate validation failed|cannot verify.*certificate|invalid (ssl |tls )?certificate|self.?signed certificate|certificate.*(not trusted|untrusted|expired|not yet valid|does not match)|unable to (get local issuer|verify).*certificate|x509:.*(unknown authority|expired|not yet valid|valid for)' "$_pe" 2>/dev/null && _tls_bad=1
         rm -f "$_pe"
     fi
     [ "$_tls_bad" = "1" ] || return "$_rc"

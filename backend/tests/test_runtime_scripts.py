@@ -386,7 +386,7 @@ def test_cli_get_degrades_only_on_certificate_errors(tmp_path):
     funcs = "\n".join(
         _function(source, name) for name in ("zp_tls_error", "zp_tls_warn", "http_get_to")
     )
-    for rc, want_second in ((28, False), (60, True)):
+    for rc, want_second in ((28, False), (35, False), (77, False), (60, True)):
         bindir = tmp_path / f"bin{rc}"
         log = tmp_path / f"curl{rc}.log"
         _two_attempt_curl(bindir, log)
@@ -410,9 +410,9 @@ printf 'rc=%s\\n' "${{rrc:-0}}"
         )
         called = log.read_text(encoding="utf-8")
         assert ("-fsSk" in called) is want_second, (rc, called)
-        if rc == 28:
+        if rc != 60:
             # 丢包/超时: 不降级、不告警"证书", 并把原始退出码如实返回
-            assert "rc=28" in proc.stdout, proc.stdout
+            assert f"rc={rc}" in proc.stdout, proc.stdout
             assert "证书校验没通过" not in proc.stderr, proc.stderr
         else:
             # 证书错误: 降级一次, 而且说出来
@@ -436,7 +436,7 @@ def test_cli_post_prefers_bearer_header(tmp_path):
     fake.chmod(0o755)
     script = f"""
 set -u
-zp_tls_error() {{ case "${{1:-}}" in 35|51|58|59|60) return 0 ;; *) return 1 ;; esac; }}
+zp_tls_error() {{ case "${{1:-}}" in 51|60) return 0 ;; *) return 1 ;; esac; }}
 zp_tls_warn() {{ :; }}
 {func}
 http_post_out https://panel.example/c/report 15 '{{"k":"sec"}}' sec
@@ -488,7 +488,7 @@ def test_install_probe_only_degrades_on_certificate_errors(tmp_path):
     func = _function(source, "http_probe")
     bindir = tmp_path / "bin"
     _toolchain(bindir, "mktemp", "rm", "grep")
-    for name, rc, want in (("timeout", 28, ""), ("tls", 60, "insecure")):
+    for name, rc, want in (("timeout", 28, ""), ("handshake", 35, ""), ("local-ca", 77, ""), ("tls", 60, "insecure")):
         script = f"""
 set -u
 HTTP=curl

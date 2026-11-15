@@ -1302,9 +1302,10 @@ html[data-embedded="1"] body { min-height:0; padding:24px 32px 32px; font-family
       <div class="row" style="margin-bottom:10px">
         <input type="text" id="log-filter" aria-label="过滤日志关键词" placeholder="搜索关键词过滤日志…" style="font-size:12px;padding:6px 12px">
       </div>
+      <p style="font-size:12px;color:var(--sub);margin:0 0 10px">日志可能包含升级前记录。请刷新后核对行首时间；升级不会删除历史日志。</p>
       <!-- 保持 details/summary 与 #log 兼容 -->
       <details open>
-        <summary style="font-size:12px;color:var(--sub);margin-bottom:8px">实时内核日志流 (logread)</summary>
+        <summary style="font-size:12px;color:var(--sub);margin-bottom:8px">最近系统日志（刷新时读取，含历史记录）</summary>
         <pre id="log">正在加载日志…</pre>
       </details>
     </div>

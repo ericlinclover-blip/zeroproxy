@@ -19,7 +19,7 @@ ZP_INIT=/etc/init.d/zeroproxy
 #: 可以在环境里覆盖 (比如换成自己的地址)。
 ZP_PERF_PROBE="${ZP_PERF_PROBE:-https://www.cloudflare.com/cdn-cgi/trace}"
 
-log() { logger -t zeroproxy-perf "$*"; }
+zp_perf_log() { logger -t zeroproxy-perf "$*"; }
 
 zp_perf_state() { sed -n '1p' "$ZP_PERF_STATE" 2>/dev/null | tr -d '\r\n'; }
 zp_perf_set_state() { mkdir -p "$ZP_PERF_DIR"; printf '%s\n' "$1" > "$ZP_PERF_STATE"; }
@@ -77,12 +77,12 @@ zp_perf_panel() {
 }
 
 # ---------------------------------------------------------------- 面板请求 (TLS)
-# 与 CLI / agent.sh 同一个口径: **先校验证书, 只有确实是证书/TLS 错误时才降级一次**。
+# 与 CLI / agent.sh 同一个口径: **先校验证书, 只有确实是对端证书验证失败时才降级一次**。
 # 旧版这里一律 `-k` / `--no-check-certificate` —— 性能模式要更新的 dae 内核与配置同样
 # 以 root 落盘/执行, 无条件关掉证书校验等于把分发权交给链路上的任何人 (P1-3)。
 _zp_perf_tls_rc() {
     case "${1:-}" in
-        35|51|58|59|60|64|66|77|80|83|90|91) return 0 ;;
+        51|60) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -102,28 +102,30 @@ zp_perf_get() {  # $1=url $2=目标 $3=超时 $4=最多试几次 [$5=请求头] 
     while [ "$_i" -lt "$_tries" ]; do
         _i=$((_i + 1))
         _code=""; _rc=0
+        _perf_request_url="$_url"; _perf_request_hdr="$_hdr"
         if command -v curl >/dev/null 2>&1; then
             if [ -n "$_hdr" ]; then
                 _code="$(curl -fsSL -D "$_dst.hdr" -H "$_hdr" -m "$_tmo" -o "$_dst" \
                     -w '%{http_code}' "$_url" 2>/dev/null)" || _rc=$?
                 # 旧面板不认 Bearer → 去掉头、把 secret 拼回 URL 再来一次 (回退, 不是主路径)
                 if { [ "${_code:-000}" = "403" ] || [ "${_code:-000}" = "401" ]; } && [ -n "$_fb" ]; then
+                    _perf_request_url="${_url}${_fb}"; _perf_request_hdr=""; _rc=0
                     _code="$(curl -fsSL -D "$_dst.hdr" -m "$_tmo" -o "$_dst" \
-                        -w '%{http_code}' "${_url}${_fb}" 2>/dev/null || true)"
+                        -w '%{http_code}' "$_perf_request_url" 2>/dev/null)" || _rc=$?
                 fi
             else
                 _code="$(curl -fsSL -D "$_dst.hdr" -m "$_tmo" -o "$_dst" \
                     -w '%{http_code}' "$_url" 2>/dev/null)" || _rc=$?
             fi
             # 证书错误: 只降级这一次
-            if [ -z "$_code" ] && _zp_perf_tls_rc "$_rc"; then
+            if [ "$_rc" != "0" ] && _zp_perf_tls_rc "$_rc"; then
                 _zp_perf_tls_warn "$_url" "curl $_rc"
-                if [ -n "$_hdr" ]; then
-                    _code="$(curl -fsSkL -H "$_hdr" -m "$_tmo" -o "$_dst" \
-                        -w '%{http_code}' "$_url" 2>/dev/null || true)"
+                if [ -n "$_perf_request_hdr" ]; then
+                    _code="$(curl -fsSkL -D "$_dst.hdr" -H "$_perf_request_hdr" -m "$_tmo" -o "$_dst" \
+                        -w '%{http_code}' "$_perf_request_url" 2>/dev/null || true)"
                 else
-                    _code="$(curl -fsSkL -m "$_tmo" -o "$_dst" \
-                        -w '%{http_code}' "$_url" 2>/dev/null || true)"
+                    _code="$(curl -fsSkL -D "$_dst.hdr" -m "$_tmo" -o "$_dst" \
+                        -w '%{http_code}' "$_perf_request_url" 2>/dev/null || true)"
                 fi
             fi
         else
@@ -131,7 +133,7 @@ zp_perf_get() {  # $1=url $2=目标 $3=超时 $4=最多试几次 [$5=请求头] 
             for _tool in uclient-fetch wget; do
                 command -v "$_tool" >/dev/null 2>&1 || continue
                 if "$_tool" -q -T "$_tmo" -O "$_dst" "$_url" 2>"$_errf"; then _code=200
-                elif grep -Eqi 'ssl|tls|certificate|cert verify|x509' "$_errf" 2>/dev/null; then
+                elif grep -Eqi 'certificate verify failed|certificate verification failed|certificate validation failed|cannot verify.*certificate|invalid (ssl |tls )?certificate|self.?signed certificate|certificate.*(not trusted|untrusted|expired|not yet valid|does not match)|unable to (get local issuer|verify).*certificate|x509:.*(unknown authority|expired|not yet valid|valid for)' "$_errf" 2>/dev/null; then
                     _zp_perf_tls_warn "$_url" "$_tool 证书校验失败"
                     "$_tool" -q --no-check-certificate -T "$_tmo" -O "$_dst" "$_url" >/dev/null 2>&1 || true
                     [ -s "$_dst" ] && _code=200
@@ -449,7 +451,7 @@ zp_perf_enter() {
     zp_perf_why_set ""
     zp_perf_caps 1 ""
     printf '性能模式已开启 —— 出口 %s (内核态分流: 直连流量不再经过用户态)\n' "$_ip"
-    log "性能模式开启, 出口 $_ip"
+    zp_perf_log "性能模式开启, 出口 $_ip"
     return 0
 }
 
@@ -473,7 +475,7 @@ zp_perf_leave() {
     "$ZP_INIT" restart >/dev/null 2>&1 || true
     zp_perf_flush_dns
     printf '已回到标准模式 (数据面: %s)\n' "$_prev"
-    [ -n "$_why" ] || log "性能模式关闭 (用户操作)"
+    [ -n "$_why" ] || zp_perf_log "性能模式关闭 (用户操作)"
     return 0
 }
 
@@ -488,7 +490,7 @@ zp_perf_tick() {
     _n=$(( ${_n:-0} + 1 ))
     printf '%s\n' "$_n" > "$ZP_PERF_DIR/bad"
     [ "$_n" -ge 3 ] || return 0
-    log "dae 连续 $_n 次检查都不在, 自动退回标准模式"
+    zp_perf_log "dae 连续 $_n 次检查都不在, 自动退回标准模式"
     zp_perf_leave "dae 不在了 (连续 3 次没看到进程) —— 已自动退回标准模式"
     return 0
 }

@@ -54,7 +54,7 @@ function makeMock() {
     mode: "tun",
     covered: "full",
     why: "",
-    client: "1.4.57",
+    client: "1.4.58",
     servers: [{ key: "hkk_i3_pub_8899", base: "https://hkk.i3.pub:8899", id: "dv056b52958542564a" }],
     log: "zeroproxy-agent: 配置已更新并重载",
     // 一键更新的模拟: 每问一次 update-log 就"长"一段, 最后一段带 EXIT=0。
@@ -344,10 +344,13 @@ async function main() {
     check("移除后只剩一台", (await page.locator(".srv").count()) === 1);
 
     console.log("\n[6] 日志");
+    server.zpState.log = 'Sat Nov 14 12:20:19 2026 zeroproxy-perf: 历史记录 curl 35\n' + server.zpState.log;
     await go("logs");
     await page.locator("#tab-logs details summary").click();
     await page.waitForFunction(() => /zeroproxy-agent/.test(document.getElementById("log").textContent));
     check("日志能展开并显示内容", true);
+    check("日志明确为快照并提醒保留升级前记录", /刷新时读取/.test(await page.locator('#tab-logs details summary').innerText()) && /升级不会删除历史日志/.test(await page.locator('#tab-logs').innerText()));
+    check("历史错误原文保留，不通过删日志掩盖问题", (await page.locator('#log').textContent()).includes('Sat Nov 14 12:20:19 2026 zeroproxy-perf: 历史记录 curl 35'));
 
     // 真机 8.45: 内核启动成功、面板/界面显示"全屋代理已开启", 而 tun 建不出来、tproxy
     // 也没有 —— 局域网里一台设备都没被接管。所以界面必须按**现场**说话。
