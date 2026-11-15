@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ZeroProxy · 路由器连接场域</title>
 <script>
+if (window.self !== window.top) document.documentElement.dataset.embedded = '1';
 try { document.documentElement.dataset.theme = localStorage.getItem('zp-router-theme') || 'light'; } catch(e) { document.documentElement.dataset.theme = 'light'; }
 </script>
 <style>
@@ -816,6 +817,64 @@ pre { background:var(--card-sub); border-radius:6px; font-size:12px; }.upd { bor
 .url-preview > * { min-width:0; max-width:100%; }
 
 .switch input:checked + .track { background:var(--accent); box-shadow:none; }
+
+/* LuCI owns the shell, palette and scrolling. The standalone theme stays local. */
+html[data-embedded="1"] { --bg:#fff; --card:#fff; --card-sub:#f6f7f9; --card-hover:#f0f3fa; --text:#303640; --sub:#566170; --muted:#566170; --border:#d9dee7; --border-soft:#edf0f4; --accent:#5e72e4; --accent-soft:#eef0fc; --boost:#5e72e4; --boost-soft:#eef0fc; --field:#f6f7f9; --field-ink:#303640; --field-muted:#566170; --lime:#5e72e4; --accent-ink:#fff; }
+html[data-embedded="1"] body { min-height:0; padding:0 2px 12px; font-family:var(--host-font,system-ui,sans-serif); background:var(--bg); }
+[data-embedded="1"] .app-wrap { max-width:none; gap:12px; }
+[data-embedded="1"] .header-card { padding:8px 0 12px; gap:10px; }
+[data-embedded="1"] .brand-icon { width:26px; height:26px; font-size:16px; background:var(--accent); color:var(--accent-ink); }
+[data-embedded="1"] .brand-meta h1 { font-size:18px; letter-spacing:-.3px; }
+[data-embedded="1"] #router-theme { display:none; }
+[data-embedded="1"] .tab-nav { position:static; gap:24px; background:var(--bg); }
+[data-embedded="1"] .tab-btn { min-height:42px; padding:10px 2px; font-size:13px; }
+[data-embedded="1"] .tab-btn.active { color:var(--accent); }
+[data-embedded="1"] .workspace-heading { margin:4px 0 0; gap:12px; }
+[data-embedded="1"] .workspace-heading .eyebrow,[data-embedded="1"] .router-label { display:none; }
+[data-embedded="1"] .workspace-heading h2 { margin:0 0 4px; font-size:20px; letter-spacing:0; line-height:1.4; }
+[data-embedded="1"] .workspace-heading p { font-size:12px; }
+[data-embedded="1"] .tab-pane { gap:14px; }
+[data-embedded="1"] .card { padding:16px; border-radius:6px; margin-bottom:0!important; }
+[data-embedded="1"] .card-title-row { margin-bottom:12px; }
+[data-embedded="1"] .card-title-row h2 { font-size:15px; }
+[data-embedded="1"] .btn { min-height:36px; padding:7px 12px; font-size:12px; }
+[data-embedded="1"] .btn,[data-embedded="1"] input,[data-embedded="1"] .node-card,[data-embedded="1"] .srv,[data-embedded="1"] .tab-btn,[data-embedded="1"] .track { transition:none; }
+[data-embedded="1"] .btn.primary { background:var(--accent); border-color:var(--accent); color:var(--accent-ink); }
+[data-embedded="1"] .btn.primary:hover { color:var(--accent-ink); }
+[data-embedded="1"] .node-card.active { outline:0; box-shadow:none; border-left:3px solid var(--accent); padding-left:12px; border-bottom:0; background:var(--accent-soft); }
+[data-embedded="1"] .srv,[data-embedded="1"] .node-card { padding-top:12px; padding-bottom:12px; }
+[data-embedded="1"] .empty { padding:18px 12px; font-size:12px; }
+[data-embedded="1"] .router-field { grid-template-columns:minmax(0,1fr) 286px; border-radius:6px; }
+[data-embedded="1"] .rf-canvas { padding:18px; min-height:0; background-image:none; }
+[data-embedded="1"] .rf-canvas h2 { font-size:26px; margin:20px 0 8px; letter-spacing:-.6px; }
+[data-embedded="1"] .rf-topology { height:185px; min-height:185px; flex:none; margin-top:8px; }
+[data-embedded="1"] .rf-bottom { margin-top:30px; }
+[data-embedded="1"] .rf-inspector { padding:18px; gap:12px; }
+[data-embedded="1"] .rf-inspector h3 { font-size:20px; letter-spacing:0; }
+[data-embedded="1"] .rf-inspector dl { gap:8px; }
+[data-embedded="1"] .rf-inspector dl > div { padding-bottom:8px; }
+[data-embedded="1"] .rf-hop strong { font-size:14px; }
+[data-embedded="1"] .rf-hop i { box-shadow:none; }
+[data-embedded="1"] .rf-wire-base { stroke:var(--border); }
+[data-embedded="1"] .rf-wire-alt { stroke:var(--sub); }
+[data-embedded="1"] .hero-row { margin-bottom:14px; }
+[data-embedded="1"] .hd-title { font-size:16px; }
+[data-embedded="1"] .mode-card { padding:12px; }
+[data-embedded="1"] .stats-grid { margin-top:16px; padding-top:14px; }
+[data-embedded="1"] .sb-val { font-size:22px; }
+[data-embedded="1"] #perf-gauge { max-width:190px; }
+[data-embedded="1"] .router-footer { margin:14px auto 0; padding-top:12px; max-width:none; }
+@media(max-width:800px) {
+  [data-embedded="1"] .router-field { grid-template-columns:1fr; }
+  [data-embedded="1"] .rf-inspector { display:flex; }
+}
+@media(max-width:600px) {
+  [data-embedded="1"] .tab-nav { justify-content:space-between; gap:6px; }
+  [data-embedded="1"] .rf-topology { height:230px; min-height:230px; margin-top:20px; }
+  [data-embedded="1"] .rf-hop strong { font-size:16px; }
+  [data-embedded="1"] .btn { min-height:44px; }
+  [data-embedded="1"] .rf-topology::before { border-color:var(--accent); }
+}
 </style>
 </head>
 <body>
@@ -1002,7 +1061,7 @@ pre { background:var(--card-sub); border-radius:6px; font-size:12px; }.upd { bor
       <div class="card-title-row">
         <h2>
           <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
-          当前生效出海路线
+          当前代理组路线
         </h2>
         <div class="head-actions">
           <button class="btn small" id="btn-ping-all">一键测速全部</button>
@@ -1011,10 +1070,10 @@ pre { background:var(--card-sub); border-radius:6px; font-size:12px; }.upd { bor
       </div>
       <div id="active-node-banner" class="node-card active" style="margin-bottom:12px">
         <div class="node-info">
-          <div class="node-name" id="cur-node-title">♻️ 自动选择 (最优延迟)</div>
-          <div class="node-meta" id="cur-node-meta">由内核根据实时健康检查与统一延迟自动切换</div>
+          <div class="node-name" id="cur-node-title">正在读取代理组</div>
+          <div class="node-meta" id="cur-node-meta">等待内核回报当前选择；尚未验证出网。</div>
         </div>
-        <span class="pill ok" id="cur-node-delay">就绪</span>
+        <span class="pill" id="cur-node-delay">未取得状态</span>
       </div>
       <!-- 节点选择列表容器 -->
       <div id="nodes-container">

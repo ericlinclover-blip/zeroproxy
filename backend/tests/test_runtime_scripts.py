@@ -779,3 +779,35 @@ def test_router_cgi_reports_actual_wan_directions_and_unknowns(tmp_path):
     (netdir / "rx_bytes").unlink()
     result = read_status()
     assert result["wan"] == result["wan_rx"] == result["wan_tx"] == ""
+
+
+@pytest.mark.parametrize("fail_move", [False, True])
+def test_luci_upgrade_refreshes_offline_wrapper_without_losing_previous_file(tmp_path, fail_move):
+    """Offline repair must restore the new host-aware wrapper after an upgrade."""
+    source = _read(INSTALL)
+    start = source.index("luci_builtin() {")
+    end = source.index("\n# 把内置的三件套", start)
+    builtin = source[start:end]
+    cache = _function(source, "luci_builtin_cache")
+    bindir = tmp_path / "bin"
+    _toolchain(bindir, "cat", "head", "mkdir", "rm", *([] if fail_move else ["mv"]))
+    if fail_move:
+        move = bindir / "mv"
+        move.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        move.chmod(0o755)
+    cached = tmp_path / "luci"
+    cached.mkdir()
+    old = "'use strict';\n// old fixed-height wrapper\n"
+    (cached / "status.js").write_text(old, encoding="utf-8")
+    for name in ("menu.json", "acl.json"):
+        (cached / name).write_text('{"custom":"preserve"}\n', encoding="utf-8")
+    result = subprocess.run(
+        ["/bin/sh", "-c", _function(source, "ui_file_ok") + "\n" + builtin + "\n" + cache + "\nluci_builtin_cache"],
+        env={**os.environ, "PATH": str(bindir), "ZP_DIR": str(tmp_path)},
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    expected = old if fail_move else _read(os.path.join(os.path.dirname(CGI), "status.js"))
+    assert (cached / "status.js").read_text(encoding="utf-8") == expected
+    assert (cached / "menu.json").read_text(encoding="utf-8") == '{"custom":"preserve"}\n'
+    assert not list(cached.glob("*.new.*"))

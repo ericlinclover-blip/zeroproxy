@@ -54,7 +54,7 @@ function makeMock() {
     mode: "tun",
     covered: "full",
     why: "",
-    client: "1.4.52",
+    client: "1.4.53",
     servers: [{ key: "hkk_i3_pub_8899", base: "https://hkk.i3.pub:8899", id: "dv056b52958542564a" }],
     log: "zeroproxy-agent: 配置已更新并重载",
     // 一键更新的模拟: 每问一次 update-log 就"长"一段, 最后一段带 EXIT=0。
@@ -101,6 +101,17 @@ function makeMock() {
     const url = new URL(req.url, "http://x");
     const action = url.searchParams.get("a") || "";
     const authed = /sysauth/.test(req.headers.cookie || "");
+    if (url.pathname === '/luci-host') {
+      res.writeHead(200, {'Content-Type':'text/html; charset=utf-8'});
+      const wrapper=JSON.stringify(fs.readFileSync(path.join(LUCi_DIR,'status.js'),'utf8'));
+      res.end(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>
+        :root{--primary:#5e72e4;--surface:#fff;--host-bg:#f4f5f7;--host-text:#454a54}*{box-sizing:border-box}body{margin:0;background:var(--host-bg);color:var(--host-text);font:14px/1.5 system-ui,sans-serif}body[data-theme=dark]{--surface:#252932;--host-bg:#171b22;--host-text:#e4e7ef;--primary:#93a7ff}.sidebar{position:fixed;inset:0 auto 0 0;width:210px;background:var(--surface);padding:24px 16px}.sidebar h1{color:var(--primary);font-size:24px;margin:0 0 36px}.sidebar a{display:block;padding:14px;margin:4px 0}.sidebar .active{background:var(--primary);color:white;border-radius:5px}.topbar{height:70px;margin-left:210px;background:var(--primary)}main{margin-left:210px;padding:20px}#host-panel{background:var(--surface);padding:16px;border-radius:8px;min-width:0}footer{margin:20px;color:var(--primary);font-size:12px;text-align:right}@media(max-width:700px){.sidebar{display:none}.topbar,main{margin-left:0}main{padding:12px}#host-panel{padding:10px}.topbar{height:48px}}
+      </style></head><body><aside class="sidebar"><h1>GL · OpenWrt</h1><a>首页</a><a>状态</a><a>网络</a><a class="active">服务 / ZeroProxy</a><a>系统</a></aside><header class="topbar"></header><main><section id="host-panel"></section><footer>LuCI / 主题嵌入测试环境</footer></main><script>
+      const wrapper=new Function('view','E',${wrapper});
+      const view=wrapper({extend:obj=>obj},(tag,attrs)=>{const el=document.createElement(tag);for(const [k,v] of Object.entries(attrs))el.setAttribute(k,v);return el;});
+      document.getElementById('host-panel').appendChild(view.render());
+      </script></body></html>`); return;
+    }
     if (url.pathname.startsWith("/cgi-bin/")) {
       // 与 cgi 一致: 页面与脚本本身不需要登录, 数据接口才要
       const want = url.searchParams.get("file");
@@ -674,6 +685,79 @@ async function main() {
     check("重载保留主题偏好",await page.evaluate(()=>document.documentElement.dataset.theme)==='dark');
     await page.emulateMedia({reducedMotion:'reduce'});
     check("减少动态效果生效",await page.locator('#status-dot').evaluate(el=>getComputedStyle(el).animationName)==='none');
+
+    console.log("\n[16] LuCI 实际承载页、主题与尺寸");
+    const host=await ctx.newPage();
+    await host.setViewportSize({width:1440,height:1000});
+    host.on('pageerror',e=>errors.push(e.message));
+    await host.goto(`http://127.0.0.1:${PORT}/luci-host`);
+    const embedded=host.frameLocator('iframe');
+    await embedded.locator('#sub').filter({hasText:'内核运行中'}).waitFor();
+    await host.waitForFunction(()=>document.querySelector('iframe').contentDocument.documentElement.style.getPropertyValue('--host-font'));
+    const frame=host.frames().find(f=>f.url().includes('/cgi-bin/zeroproxy'));
+    const embedState=()=>frame.evaluate(()=>({theme:document.documentElement.dataset.theme,embedded:document.documentElement.dataset.embedded,bg:getComputedStyle(document.body).backgroundColor,accent:getComputedStyle(document.documentElement).getPropertyValue('--accent'),heading:parseFloat(getComputedStyle(document.getElementById('router-heading')).fontSize),scroll:document.documentElement.scrollHeight,viewport:innerHeight,height:document.body.getBoundingClientRect().height}));
+    let details=await embedState();
+    check('LuCI 嵌入覆盖独立页主题偏好',details.theme==='light'&&details.embedded==='1');
+    check('嵌入页跟随宿主白底与蓝色强调',details.bg==='rgb(255, 255, 255)'&&details.accent.replaceAll(' ','')==='rgb(94,114,228)',JSON.stringify(details));
+    check('嵌入工作区使用紧凑标题',details.heading<=22);
+    check('嵌入页跟随系统主题且不提供冲突的独立开关',!(await embedded.locator('#router-theme').isVisible()));
+    const longHeight=await host.locator('iframe').evaluate(el=>el.getBoundingClientRect().height);
+    await embedded.locator('[data-tab="nodes"]').click();
+    await embedded.locator('[data-select]').first().waitFor();
+    await host.waitForFunction(()=>{const f=document.querySelector('iframe');return Math.abs(f.getBoundingClientRect().height-f.contentDocument.body.getBoundingClientRect().height)<=4;});
+    details=await embedState();
+    const routeHeight=await host.locator('iframe').evaluate(el=>el.getBoundingClientRect().height);
+    check('切换较短工作区时承载高度会缩回',routeHeight<longHeight,`${Math.round(longHeight)} → ${Math.round(routeHeight)}`);
+    check('只有 LuCI 外层页面滚动、内容不被 78vh 裁切',details.scroll<=details.viewport+2&&Math.abs(details.viewport-details.height)<=4,JSON.stringify(details));
+    check('路线列表在标题后直接可见',await embedded.locator('#nodes-container').evaluate(el=>el.getBoundingClientRect().top)<400);
+    await host.screenshot({path:path.join(SHOT_DIR,'router-luci-light.png'),fullPage:true});
+    await host.evaluate(()=>document.getElementById('host-panel').style.backgroundColor='#edf2ff');
+    await host.waitForFunction(()=>getComputedStyle(document.querySelector('iframe').contentDocument.body).backgroundColor==='rgb(237, 242, 255)');
+    check('宿主内容面板单独换色也会同步',true);
+    await host.evaluate(()=>{document.getElementById('host-panel').style.removeProperty('background-color');document.body.dataset.theme='dark';});
+    await host.waitForFunction(()=>document.querySelector('iframe').contentDocument.documentElement.dataset.theme==='dark');
+    details=await embedState();
+    check('宿主切换深色后嵌入页自动跟随',details.bg==='rgb(37, 41, 50)'&&details.accent.replaceAll(' ','')==='rgb(147,167,255)',JSON.stringify(details));
+    const darkContrast=await frame.evaluate(()=>{
+      const parse=c=>c.match(/[\d.]+/g).slice(0,3).map(Number);
+      const lum=c=>{const v=c.map(n=>{n/=255;return n<=0.04045?n/12.92:((n+0.055)/1.055)**2.4;});return v[0]*.2126+v[1]*.7152+v[2]*.0722;};
+      const node=document.querySelector('.node-card.active .node-name');
+      const fg=lum(parse(getComputedStyle(node).color)),bg=lum(parse(getComputedStyle(node.closest('.node-card')).backgroundColor));
+      return (Math.max(fg,bg)+.05)/(Math.min(fg,bg)+.05);
+    });
+    check('深色选中路线文字保持可读对比度',darkContrast>=4.5,String(darkContrast));
+    await host.screenshot({path:path.join(SHOT_DIR,'router-luci-dark.png'),fullPage:true});
+    await host.evaluate(()=>{document.body.dataset.theme='light';document.documentElement.style.setProperty('--primary','#0f766e');});
+    await host.waitForFunction(()=>document.querySelector('iframe').contentDocument.documentElement.style.getPropertyValue('--accent').replaceAll(' ','')==='rgb(15,118,110)');
+    check('自定义主题强调色也可跟随',true);
+    const widths=[1440,1024,820,768,390,320];
+    for(const width of widths){
+      await host.setViewportSize({width,height:1000});
+      for(const tab of ['dashboard','nodes','clients','diagnostics','logs']){
+        await embedded.locator(`[data-tab="${tab}"]`).click();
+        await host.waitForFunction(()=>{const f=document.querySelector('iframe');return Math.abs(f.getBoundingClientRect().height-f.contentDocument.body.getBoundingClientRect().height)<=4;});
+        const spill=await frame.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1);
+        check(`LuCI ${width}px / ${tab} 无内部横向溢出`,spill);
+      }
+    }
+    await embedded.locator('[data-tab="nodes"]').click();
+    await host.setViewportSize({width:390,height:1000});
+    await host.screenshot({path:path.join(SHOT_DIR,'router-luci-mobile.png'),fullPage:true});
+    await host.setViewportSize({width:1440,height:1000});
+    await embedded.locator('[data-tab="dashboard"]').click();
+    await host.evaluate(()=>{document.documentElement.style.removeProperty('--primary');});
+    await host.waitForFunction(()=>document.querySelector('iframe').contentDocument.documentElement.style.getPropertyValue('--accent').replaceAll(' ','')==='rgb(94,114,228)');
+    await host.screenshot({path:path.join(SHOT_DIR,'router-luci-network.png'),fullPage:true});
+    // A failed proxy read must not leave an optimistic static banner behind.
+    await host.route('**/cgi-bin/zeroproxy?a=proxies*',route=>route.fulfill({json:{ok:false,error:'控制接口不可用'}}));
+    await embedded.locator('[data-tab="nodes"]').click();
+    await embedded.locator('#cur-node-title').filter({hasText:'未知'}).waitFor();
+    check('节点读取失败不再残留自动选择或就绪',await embedded.locator('#cur-node-delay').innerText()==='未取得状态'&&await embedded.locator('#btn-ping-all').isDisabled());
+    await host.unroute('**/cgi-bin/zeroproxy?a=proxies*');
+    await embedded.locator('#refresh').click();
+    await embedded.locator('[data-select]').first().waitFor();
+    check('节点接口恢复后重新读取实际选组',!(await embedded.locator('#cur-node-title').innerText()).includes('未知'));
+    await host.close();
 
     // 浏览器自己会请求 /favicon.ico 之类, 那是模拟器的事, 不算页面问题
     const real = errors.filter((e) => !/favicon|404 \(Not Found\)/.test(e));

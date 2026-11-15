@@ -8,6 +8,7 @@
 'use strict';
 
 const API = '/cgi-bin/zeroproxy';
+const EMBEDDED = document.documentElement.dataset.embedded === '1';
 const TOKEN = (new URLSearchParams(location.search).get('k') || '');
 const $ = (id) => document.getElementById(id);
 
@@ -157,7 +158,7 @@ function switchTab(tab, focus = false) {
   document.querySelectorAll('.tab-pane').forEach((p) => {
     p.hidden = p.id !== 'tab-' + tab;
   });
-  $('router-heading').textContent = WORKSPACES[tab][0];
+  $('router-heading').textContent = EMBEDDED ? {dashboard:'网络接管',nodes:'路线与订阅',clients:'局域网设备',diagnostics:'网络诊断',logs:'维护与日志'}[tab] : WORKSPACES[tab][0];
   $('router-description').textContent = WORKSPACES[tab][1];
   document.title = 'ZeroProxy · ' + {dashboard:'网络',nodes:'路线',clients:'设备',diagnostics:'诊断',logs:'维护'}[tab];
   if (focus) { $('router-heading').focus({preventScroll:true}); window.scrollTo({top:0,behavior:'auto'}); }
@@ -446,6 +447,12 @@ async function loadProxies() {
     proxiesData = data.proxies || {};
     renderProxies(proxiesData);
   } catch (e) {
+    proxiesData = null;
+    $('cur-node-title').textContent = '代理组状态未知';
+    $('cur-node-meta').textContent = '节点接口未返回有效结果；请重试或在诊断工作区检查控制接口。';
+    $('cur-node-delay').textContent = '未取得状态';
+    $('cur-node-delay').className = 'pill';
+    $('btn-ping-all').disabled = true;
     container.innerHTML = `<div class="empty">无法获取节点列表: ${esc(e.message)}（内核正在运行吗？）</div>`;
     $('rf-route').textContent = '代理组状态未知';
     lastProxySignature = null;
@@ -461,6 +468,14 @@ function renderProxies(proxies) {
   const group = proxies[groupKey];
 
   if (!group || !group.all || !group.all.length) {
+    proxiesData = null;
+    $('cur-node-title').textContent = '尚无可用代理组';
+    $('cur-node-meta').textContent = '请先同步订阅，再重新读取节点列表。';
+    $('cur-node-delay').textContent = '未取得状态';
+    $('cur-node-delay').className = 'pill';
+    $('btn-ping-all').disabled = true;
+    $('rf-route').textContent = '尚无可用代理组';
+    lastProxySignature = null;
     container.innerHTML = '<div class="empty">当前配置中没有找到可用节点。请确认是否已接入面板。</div>';
     return;
   }
@@ -1084,6 +1099,7 @@ function initUrlInputHelpers() {
 document.querySelectorAll('[data-open-tab]').forEach((btn)=>{btn.onclick=()=>switchTab(btn.dataset.openTab,true);});
 $('rf-doctor').onclick=()=>{switchTab('diagnostics',true);$('btn-doctor').click();};
 $('router-theme').onclick=()=>{
+  if (EMBEDDED) return;
   const theme=document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
   document.documentElement.dataset.theme=theme;
   try { localStorage.setItem('zp-router-theme',theme); } catch(e) {}
