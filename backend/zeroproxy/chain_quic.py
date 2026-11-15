@@ -660,14 +660,12 @@ def status(state: dict) -> dict:
     }
 
 
-def pick_socks_port(state: dict, preferred: int | None = None) -> int:
+def pick_socks_port(state: dict, preferred: int | None = None, reserved: set[int] | None = None) -> int:
     """给入口端的本地 hysteria 客户端挑一个回环端口。"""
-    used = {
-        int(entry.get("hy_socks_port") or 0)
-        for entry in (state.get("chain") or {}).get("entries") or []
-    }
-    used.update(int(v) for v in (state.get("ports") or {}).values() if str(v).isdigit())
-    if preferred:
+    from . import chain
+
+    used = chain.used_ports(state) | (reserved or set())
+    if preferred is not None:
         port = int(preferred)
         if not 1 <= port <= 65535:
             raise ValueError("端口需在 1-65535 之间")

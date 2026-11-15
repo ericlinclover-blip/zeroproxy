@@ -4744,13 +4744,13 @@ def test_chain_view_exposes_pin_fields(client, configured, monkeypatch):
     # Reality 内层不涉及证书固定, 不产生误报
     assert entries["e3"]["pin_ok"] is True and entries["e3"]["needs_repair"] is False
 
-    # 落地端重签后: 已固定的条目指纹过期 → mismatch
+    # 本机证书重签不改变另一个服务器的身份，不能误报远端 pin 失效。
     monkeypatch.setattr(chain, "current_exit_pin", lambda state: "b" * 64, raising=False)
     view = client.get("/api/dashboard").json()["chain"]
     assert view["exit_pin"] == "b" * 64
-    assert view["pin_mismatch"] is True
+    assert view["pin_mismatch"] is False
     entries = {e["id"]: e for e in view["entries"]}
-    assert entries["e2"]["pin_ok"] is False and entries["e2"]["needs_repair"] is True
+    assert entries["e2"]["pin_ok"] is True and entries["e2"]["needs_repair"] is False
 
 
 def test_reenabling_an_unpinned_quic_entry_is_rejected(client, configured):

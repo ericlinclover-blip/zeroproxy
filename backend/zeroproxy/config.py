@@ -668,6 +668,8 @@ AUDIT_ACTIONS: dict[str, tuple[str, str]] = {
     "chain_exit": ("落地端设置", "chain"),
     "chain_add": ("接入落地端", "chain"),
     "chain_update": ("修改落地端", "chain"),
+    "chain_repair_failed": ("配对更新失败", "chain"),
+    "chain_repair": ("更新配对参数", "chain"),
     "chain_probe": ("落地端测速", "chain"),
     "chain_delete": ("断开落地端", "chain"),
     "chain_warmup": ("预热入口链路", "chain"),

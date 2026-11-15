@@ -73,6 +73,27 @@ server.stdout.on('data', d=>logs+=d); server.stderr.on('data',d=>logs+=d);
     await page.locator('[data-workspace="network"]').click();
     await page.screenshot({path:path.join(SHOTS,`network-${width}.png`),fullPage:true});
   }
+  const originalEntries = await page.evaluate(() => structuredClone(dash.chain.entries));
+  await page.evaluate(() => {
+    dash.chain.entries = [{id:"ui-repair",label:"更新配对验证",host:"exit.example.com",port:8447,local_port:8446,transport:"reality",enabled:true,pin_ok:true,last_probe:{}}];
+    renderChain(dash);
+  });
+  for (const width of [1440,390]) {
+    await page.setViewportSize({width,height:1000});
+    await page.click('[data-chain-repair="ui-repair"]');
+    await page.waitForSelector('#confirm-mask[open]');
+    await page.fill('#chain-repair-code','ZPC1~test-sensitive-value');
+    const inside = await page.locator('#confirm-mask .modal').evaluate(el => {
+      const r=el.getBoundingClientRect(); const field=el.querySelector('textarea').getBoundingClientRect();
+      return r.left>=0 && r.right<=innerWidth+1 && field.left>=r.left && field.right<=r.right+1;
+    });
+    check(`${width}px / 更新配对窗口与输入框完整可见`,inside);
+    await page.locator('#confirm-mask .modal').screenshot({path:path.join(SHOTS,`repair-${width}.png`)});
+    await page.click('#confirm-cancel');
+    await page.waitForFunction(()=>document.querySelector('#chain-repair-code').value==='');
+    check(`${width}px / 关闭配对窗口清除敏感输入`,await page.inputValue('#chain-repair-code')==='');
+  }
+  await page.evaluate((entries)=>{dash.chain.entries=entries;renderChain(dash);},originalEntries);
   await page.setViewportSize({width:1440,height:1240});
   await page.screenshot({path:path.join(SHOTS,'desktop.png')});
   await page.click('#themeBtn');

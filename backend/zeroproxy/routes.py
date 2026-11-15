@@ -489,17 +489,12 @@ def _running_job(request: Request | None, kind: str | None = None) -> dict | Non
 _APPLY_RUN_LOCK = threading.Lock()
 
 
-def _run_apply_job(job_id: str, after=None) -> None:
-    """后台线程: 跑完整闭环 (含"放行端口"这类收尾步骤), 结果写回任务表。
-
-    锁的范围缩短成"读一份 state 副本": 生成配置 + 重启服务 (2-4 秒, 证书兜底时更久)
-    在锁外跑, apply.reapply 内部自己在最后落盘。并发的两次闭环由 _APPLY_RUN_LOCK
-    串行化, 不会互相踩 (P2-2)。
-    """
+def _run_apply_job(job_id: str, after=None, on_result=None) -> None:
+    """Run a serialized apply and its optional, conflict-aware compensation."""
     steps: list[dict] = []
     error = ""
-    try:
-        with _APPLY_RUN_LOCK:
+    with _APPLY_RUN_LOCK:
+        try:
             with config.locked():
                 state = load_state()
             steps = apply.reapply(
@@ -510,13 +505,18 @@ def _run_apply_job(job_id: str, after=None) -> None:
             )
             if after is not None:
                 steps.extend(after())
-    except Exception as exc:  # noqa: BLE001 — 后台任务不能把异常吞成"静默失败"
-        error = f"{type(exc).__name__}: {exc}"
+        except Exception as exc:  # noqa: BLE001
+            error = f"{type(exc).__name__}: {exc}"
+        if on_result is not None:
+            try:
+                steps.extend(on_result(steps, error))
+            except Exception as exc:  # noqa: BLE001
+                error = (error + "; " if error else "") + f"补偿异常: {type(exc).__name__}: {exc}"
     _finish_job(job_id, steps, error)
 
 
 def _reapply_job(
-    state: dict, request: Request | None = None, after=None
+    state: dict, request: Request | None = None, after=None, on_result=None
 ) -> tuple[list[dict], dict | None]:
     """落地闭环: 生产环境返回 ([], 任务描述) 让前端轮询; 同步模式返回 (steps, None)。
 
@@ -524,16 +524,28 @@ def _reapply_job(
     后台一起跑 —— 既省掉一次 `ufw status`, 也不用让用户为它多等。
     """
     if not _apply_async_enabled():
-        steps = _reapply(state, request)
-        if after is not None:
-            steps.extend(after())
+        if on_result is not None:
+            save_state(state)
+        try:
+            steps = _reapply(state, request)
+            if after is not None:
+                steps.extend(after())
+        except Exception as exc:
+            if on_result is None:
+                raise
+            error = f"{type(exc).__name__}: {exc}"
+            steps = [{"name": "应用配对参数", "ok": False, "detail": error, "ms": 0}]
+            steps.extend(on_result(steps, error))
+            return steps, None
+        if on_result is not None:
+            steps.extend(on_result(steps, ""))
         return steps, None
     job_id, job = _new_job(request, len(apply.STEP_NAMES), apply.STEP_NAMES[0])
     # 先把这次改动落盘再放任务: 后台线程是从磁盘读最新 state 的 (load_state),
     # 不先存的话这次改的节点开关 / 链式条目就白改了。
     save_state(state)
     threading.Thread(
-        target=_run_apply_job, args=(job_id, after), name=f"zp-apply-{job_id}", daemon=True
+        target=_run_apply_job, args=(job_id, after, on_result), name=f"zp-apply-{job_id}", daemon=True
     ).start()
     return [], _job_snapshot(job)
 
@@ -556,13 +568,15 @@ def apply_job(id: str, request: Request):
         return _job_snapshot(job)
 
 
-def _landing_body(state: dict, request: Request, after=None) -> dict:
+def _landing_body(state: dict, request: Request, after=None, on_result=None) -> dict:
     """改配置后的统一回执: 仪表盘数据 + 同步步骤 / 后台任务描述。
 
     同步模式 (ZP_APPLY_ASYNC=0) 里 `steps` 是完整的七步结果; 异步模式里
     `steps` 为空数组、`job` 有值, 前端据此轮询进度 —— 两种形状前端都认。
     """
-    steps, job = _reapply_job(state, request, after=after)
+    steps, job = _reapply_job(state, request, after=after, on_result=on_result)
+    if on_result is not None:
+        state = load_state()
     body = _dashboard_body(state, request)
     body["steps"] = steps
     if job is not None:
@@ -898,7 +912,7 @@ def _node_view(state: dict, traffic: dict | None) -> dict:
                 "desc": (
                     f"客户端连本机 {state['domain']}:{entry.get('local_port')}, "
                     f"出口 IP 是落地服务器 {entry.get('host')}"
-                    + (" · 已设为默认出口 (本机所有节点都走它)" if entry.get("default_out") else "")
+                    + (" · 已设为默认出口 (本机四类 Xray 节点改走它)" if entry.get("default_out") else "")
                 ),
                 "chain": True,
                 "via": f"{entry.get('host')}:{entry.get('port')}",
@@ -977,35 +991,29 @@ def _chain_view(state: dict) -> dict:
 
     QUIC 证书固定 (P1-1 / P2-7) 的三个视图字段, 字段名是前端契约:
       * `entries[].pin_ok`      —— 这条链路有没有可用的对端证书指纹;
-      * `entries[].needs_repair` —— 需要重新配对 (旧 v2 码 / 指纹与落地端当前证书不符);
+      * `entries[].needs_repair` —— 需要重新配对 (旧 v2 码 / 缺少有效指纹);
       * 顶层 `exit_pin`         —— 本机落地端证书当前指纹 (没开落地端 QUIC 时为空);
-      * 顶层 `pin_mismatch`     —— 存在"已固定但与落地端当前证书不一致"的入口条目。
+      * 顶层 `pin_mismatch`     —— 兼容字段，固定为 False；不使用本机证书推断远端身份。
     """
     exit_pin = _chain_exit_pin(state)
     chain_cfg = state.get("chain") or {}
     exit_cfg = chain_cfg.get("exit") or {}
     code = chain.exit_code(state)
     procs = chain_quic.status(state)
+    entry_service = services.service_state("xray")
     entries = []
     pin_mismatch = False
     for entry in chain_cfg.get("entries") or []:
         probe = entry.get("last_probe") or {}
         transport = entry.get("transport") or "reality"
         pin = str(entry.get("hy_cert_sha256") or "").strip().lower()
-        if transport == "hysteria2":
-            # 固定过对端证书才算 pin_ok; 指纹与落地端当前证书不一致时也算不可用
-            # (hysteria 会直接拒绝握手: no certificate matches the pinned hash)。
-            pinned = bool(pin)
-            pin_ok = pinned and (not exit_pin or pin == exit_pin)
-            if pinned and exit_pin and pin != exit_pin:
-                pin_mismatch = True
-        else:
-            # Reality 内层没有证书固定这回事, 不产生误报
-            pin_ok = True
+        # A saved pin identifies the remote peer, not this machine's certificate.
+        pin_ok = transport != "hysteria2" or bool(re.fullmatch(r"[0-9a-f]{64}", pin))
         entries.append(
             {
                 "id": entry.get("id", ""),
                 "node_id": f"chain-{entry.get('id', '')}",
+                "service_state": entry_service,
                 "label": entry.get("label", ""),
                 "host": entry.get("host", ""),
                 "port": entry.get("port", 0),
@@ -1031,6 +1039,8 @@ def _chain_view(state: dict) -> dict:
                 "default_out": bool(entry.get("default_out")),
                 "created_at": int(entry.get("created_at") or 0),
                 "last_probe": probe,
+                "probe_current": bool(probe.get("config_fingerprint")) and
+                    probe.get("config_fingerprint") == chain.probe_fingerprint(entry),
             }
         )
     return {
@@ -1048,6 +1058,7 @@ def _chain_view(state: dict) -> dict:
             "hy_available": bool(chain_quic.binary()),
         },
         "entries": entries,
+        "probe_revision": chain.routing_fingerprint(state),
         "default_out": next((e["id"] for e in entries if e["default_out"]), ""),
         # 落地端证书当前指纹 + 是否存在过期指纹 (P2-7)
         "exit_pin": exit_pin,
@@ -1285,6 +1296,7 @@ def toggle_node(node_id: str, request: Request):
             if entry is None:
                 return _err("未知的链式节点", 404)
             entry["enabled"] = not entry.get("enabled", True)
+            entry["last_probe"] = {}
             if not entry["enabled"]:
                 entry["default_out"] = False   # 停用的节点不能继续当默认出口
             label = f"{node_id}={'on' if entry['enabled'] else 'off'}"
@@ -1736,6 +1748,19 @@ class ChainEntryIn(BaseModel):
     force: bool = False
 
 
+def _chain_transport_error(target: dict, transport: str) -> str:
+    if transport not in ("reality", "hysteria2"):
+        return f"不支持的内层传输: {transport}"
+    if transport == "hysteria2":
+        if not target.get("hy_port") or not target.get("hy_pw"):
+            return "这份配对码里没有 QUIC 凭据，请到落地端开启内层 QUIC 后复制新码"
+        if not re.fullmatch(r"[0-9a-f]{64}", str(target.get("hy_cert_sha256") or "")):
+            return "配对码缺少有效 QUIC 证书指纹，请升级落地端后复制带证书指纹的新码"
+        if not chain_quic.binary():
+            return "本机没有 hysteria 二进制，用不了 QUIC 内层"
+    return ""
+
+
 @router.post("/api/chain/entries")
 def chain_entry_add(payload: ChainEntryIn, request: Request):
     """中转端: 粘贴落地端的配对码 → 校验 → 真实握手 → 落地成新节点。"""
@@ -1753,29 +1778,17 @@ def chain_entry_add(payload: ChainEntryIn, request: Request):
 
         # 内层传输: 默认 Reality; 选 QUIC 时必须真的有 QUIC 凭据 + 本机有 hysteria
         transport = (payload.transport or "reality").strip().lower()
-        if transport not in ("reality", "hysteria2"):
-            return _err(f"不支持的内层传输: {transport}")
-        if transport == "hysteria2":
-            if not target.get("hy_port"):
-                return _err(
-                    "这份配对码里没有 QUIC 凭据 (落地端还没开「内层 QUIC」); "
-                    "请让落地端打开后再复制一次配对码, 或者这次先用 Reality 内层"
-                )
-            if not target.get("hy_cert_sha256"):
-                return _err(
-                    "这份配对码来自旧版落地端, 没有 QUIC 证书指纹; "
-                    "请先升级落地端, 再重新生成配对码"
-                )
-            if not chain_quic.binary():
-                return _err("本机没有 hysteria 二进制, 用不了 QUIC 内层 (重跑 install.sh 可装上)")
+        error = _chain_transport_error(target, transport)
+        if error:
+            return _err(error)
         target["transport"] = transport
 
         entries = state.setdefault("chain", {}).setdefault("entries", [])
         for entry in entries:
-            if (entry.get("host"), int(entry.get("port") or 0)) == (target["host"], target["port"]):
+            if chain.same_target(entry, target):
                 return _err(
                     f"这个落地端已经连过了 ({target['host']}:{target['port']}); "
-                    "要换凭据请先删除那条再重新添加"
+                    "要换凭据请使用该条目的「更新配对码」"
                 )
         if target["host"] in (state["domain"], "127.0.0.1", "localhost") and target["port"] in (
             chain.used_ports(state)
@@ -1787,7 +1800,7 @@ def chain_entry_add(payload: ChainEntryIn, request: Request):
         except ValueError as exc:
             return _err(str(exc))
         try:
-            hy_socks_port = chain_quic.pick_socks_port(state) if transport == "hysteria2" else 0
+            hy_socks_port = chain_quic.pick_socks_port(state, reserved={local_port}) if transport == "hysteria2" else 0
         except ValueError as exc:
             return _err(f"本机找不到空闲的回环端口给 QUIC 客户端: {exc}")
 
@@ -1806,21 +1819,26 @@ def chain_entry_add(payload: ChainEntryIn, request: Request):
         if not _require_auth(state, request):
             return _err("未登录", 401)
         entries = state.setdefault("chain", {}).setdefault("entries", [])
+        if any(chain.same_target(entry, target) for entry in entries):
+            return _err("这个落地端已被另一项操作添加，请刷新列表后使用现有条目", 409)
         # 探测是在锁外跑的 (起临时客户端 + 真实出网, 好几秒), 期间本机状态可能已经
         # 变了。落地这一瞬间必须重新确认当初挑的端口还空着, 否则两条链会撞到同一个
         # 端口, 落地时 `xray -test` 直接失败。
         if int(local_port) in chain.used_ports(state) or not services.port_available(
             int(local_port), "tcp"
         ):
+            if payload.local_port is not None:
+                return _err("指定的本机端口在探测期间已被占用，请选择其它端口", 409)
             try:
                 local_port = chain.pick_port(state)
             except ValueError as exc:
                 return _err(str(exc))
         if transport == "hysteria2" and (
-            not hy_socks_port or not services.port_available(int(hy_socks_port), "tcp")
+            not hy_socks_port or hy_socks_port in chain.used_ports(state) or
+            hy_socks_port == local_port or not services.port_available(int(hy_socks_port), "tcp")
         ):
             try:
-                hy_socks_port = chain_quic.pick_socks_port(state)
+                hy_socks_port = chain_quic.pick_socks_port(state, reserved={local_port})
             except ValueError as exc:
                 return _err(str(exc))
         label = chain.unique_label(
@@ -1858,6 +1876,7 @@ def chain_entry_add(payload: ChainEntryIn, request: Request):
                 "detail": probe.get("detail") or "",
             },
         }
+        entry["last_probe"]["config_fingerprint"] = chain.probe_fingerprint(entry)
         if entry["default_out"]:
             for other in entries:
                 other["default_out"] = False
@@ -1935,6 +1954,7 @@ def chain_entry_update(entry_id: str, payload: ChainEntryPatch, request: Request
                     "请让落地端升级后重新生成配对码, 删掉这条再按新码接一次"
                 )
             entry["enabled"] = bool(payload.enabled)
+            entry["last_probe"] = {}
             if not entry["enabled"]:
                 entry["default_out"] = False
             changed.append(f"{label} {'启用' if entry['enabled'] else '停用'}")
@@ -1946,7 +1966,7 @@ def chain_entry_update(entry_id: str, payload: ChainEntryPatch, request: Request
                 if other is not entry:
                     other["default_out"] = False
             changed.append(
-                f"{label} 设为默认出口 (本机所有节点改走它)" if entry["default_out"]
+                f"{label} 设为默认出口 (本机四类 Xray 节点改走它)" if entry["default_out"]
                 else f"{label} 取消默认出口"
             )
         if payload.label is not None:
@@ -1983,6 +2003,7 @@ def chain_entry_update(entry_id: str, payload: ChainEntryPatch, request: Request
                         except ValueError as exc:
                             return _err(str(exc))
                 entry["transport"] = want
+                entry["last_probe"] = {}
                 changed.append(
                     "内层改为 QUIC (Hysteria 2)" if want == "hysteria2" else "内层改回 Reality"
                 )
@@ -1990,6 +2011,7 @@ def chain_entry_update(entry_id: str, payload: ChainEntryPatch, request: Request
             bw = max(0, min(int(payload.hy_bw), 10000))
             if bw != int(entry.get("hy_bw") or 0):
                 entry["hy_bw"] = bw
+                entry["last_probe"] = {}
                 changed.append(
                     f"Brutal 带宽 {bw} Mbps (重启内核生效)" if bw else "Brutal 已关闭 (回到 BBR)"
                 )
@@ -1999,6 +2021,107 @@ def chain_entry_update(entry_id: str, payload: ChainEntryPatch, request: Request
         action = "chain_update" if payload.transport is None else "chain_transport"
         config.audit(state, action, "; ".join(changed), actor=_client_ip(request))
         return _landing_body(state, request)
+
+
+class ChainPairIn(BaseModel):
+    code: str
+
+
+@router.post("/api/chain/entries/{entry_id}/pair")
+def chain_entry_pair(entry_id: str, payload: ChainPairIn, request: Request):
+    """Preflight new credentials, then replace them without changing node identity."""
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        entry = _find_chain_entry(state, entry_id)
+        if entry is None:
+            return _err("链式条目不存在", 404)
+        try:
+            target = chain.parse_code(payload.code)
+        except chain.CodeError as exc:
+            return _err(str(exc))
+        original_pair = copy.deepcopy(entry)
+        transport = entry.get("transport") or "reality"
+        error = _chain_transport_error(target, transport)
+        if error:
+            return _err(error)
+        if target["host"] in (state["domain"], "127.0.0.1", "localhost") and target["port"] in chain.used_ports(state):
+            return _err("配对码指向本机自己的端口，落地端应为另一台服务器")
+        if any(e is not entry and chain.same_target(e, target) for e in state["chain"]["entries"]):
+            return _err("这个落地端已经由其它条目使用", 409)
+        previous = chain.probe_fingerprint(entry)
+        target.update(transport=transport, hy_bw=int(entry.get("hy_bw") or 0))
+
+    probe = chain.probe_target(target, state=state)
+    if not probe.get("ok") and probe.get("probe_ok", True):
+        return _err("新配对码验证失败，原条目保留: " + str(probe.get("detail") or "链路不通"))
+
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        entry = _find_chain_entry(state, entry_id)
+        if entry is None:
+            return _err("链式条目已被删除", 409)
+        if chain.probe_fingerprint(entry) != previous:
+            return _err("验证期间条目配置已变化，请刷新后重新配对", 409)
+        if any(e is not entry and chain.same_target(e, target) for e in state["chain"]["entries"]):
+            return _err("这个落地端已被其它操作添加，原条目保留", 409)
+        if transport == "hysteria2":
+            others = {**state, "chain": {**state["chain"], "entries": [e for e in state["chain"]["entries"] if e is not entry]}}
+            socks_port = int(entry.get("hy_socks_port") or 0)
+            if not socks_port or socks_port in chain.used_ports(others) or socks_port == entry["local_port"]:
+                try:
+                    entry["hy_socks_port"] = chain_quic.pick_socks_port(state)
+                except ValueError as exc:
+                    return _err(str(exc))
+        # Keep id, local_port, label, enabled/default_out and creation time.
+        for key in ("host", "port", "uuid", "pbk", "sid", "sni", "flow",
+                    "hy_port", "hy_pw", "hy_sni", "hy_cert_sha256"):
+            entry[key] = target[key]
+        entry["last_probe"] = {
+            "config_fingerprint": chain.probe_fingerprint(entry),
+            "ts": int(time.time()), "ok": bool(probe.get("ok")),
+            "probe_ok": bool(probe.get("probe_ok", True)),
+            "ms": probe.get("ms"), "tcp_ms": probe.get("tcp_ms"),
+            "exit_ip": probe.get("exit_ip") or "", "detail": probe.get("detail") or "",
+        }
+        config.audit(state, "chain_repair", f"更新配对参数 · {entry.get('label') or entry['host']}", actor=_client_ip(request))
+        submitted = chain.probe_fingerprint(entry)
+
+        def compensate(steps: list[dict], error: str) -> list[dict]:
+            if not error and all(step.get("ok") for step in steps):
+                return []
+            with config.locked():
+                fresh = load_state()
+                current = _find_chain_entry(fresh, entry_id)
+                if current is None or chain.probe_fingerprint(current) != submitted:
+                    return [{"name": "恢复原配对参数", "ok": False, "detail": "条目已被其它操作修改，未覆盖并发更改，请核对实际配置", "ms": 0}]
+                if any(e is not current and chain.same_target(e, original_pair) for e in fresh["chain"]["entries"]):
+                    return [{"name": "恢复原配对参数", "ok": False, "detail": "原落地已被其它条目使用，请核对实际配置", "ms": 0}]
+                for key in ("host", "port", "uuid", "pbk", "sid", "sni", "flow", "hy_port", "hy_pw",
+                            "hy_sni", "hy_cert_sha256", "hy_socks_port", "last_probe"):
+                    if key in original_pair:
+                        current[key] = copy.deepcopy(original_pair[key])
+                    else:
+                        current.pop(key, None)
+                config.audit(fresh, "chain_repair_failed", "配对应用失败，恢复原凭据", actor="system")
+                save_state(fresh)
+            try:
+                recovered = apply.reapply(fresh)
+                ok = all(step.get("ok") for step in recovered)
+                detail = "已恢复原配对参数并重新应用" if ok else "原配对参数已恢复，但服务恢复失败，请查看诊断"
+            except Exception as exc:  # noqa: BLE001
+                ok, detail = False, f"原配对参数已恢复，但服务恢复异常: {exc}"
+            result = {"name": "恢复原配对参数", "ok": ok, "detail": detail, "ms": 0}
+            with config.locked():
+                final = load_state()
+                final["steps"] = [*steps, result]
+                save_state(final)
+            return [result]
+
+        return _landing_body(state, request, on_result=compensate)
 
 
 @router.post("/api/chain/entries/{entry_id}/probe")
@@ -2013,6 +2136,7 @@ def chain_entry_probe(entry_id: str, request: Request):
             return _err("链式条目不存在", 404)
         label = entry.get("label") or entry.get("host")
         target = chain.as_target(entry, state=state)
+        tested_fingerprint = chain.probe_fingerprint(entry)
 
     probe = chain.probe_target(target, state=state)
     with config.locked():
@@ -2022,7 +2146,10 @@ def chain_entry_probe(entry_id: str, request: Request):
         entry = _find_chain_entry(state, entry_id)
         if entry is None:
             return _err("链式条目不存在", 404)
+        if chain.probe_fingerprint(entry) != tested_fingerprint:
+            return _err("探测期间链路配置已变化，结果已丢弃，请重新验证", 409)
         entry["last_probe"] = {
+            "config_fingerprint": tested_fingerprint,
             "ts": int(time.time()),
             "ok": bool(probe.get("ok")),
             "probe_ok": bool(probe.get("probe_ok", True)),

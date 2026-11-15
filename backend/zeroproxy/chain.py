@@ -29,6 +29,7 @@ import base64
 import binascii
 import contextlib
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -56,15 +57,10 @@ ENTRY_PORT_BASE = 8446
 #: 连上却读不到任何字节), 放最后兜底; 前两个任一可用即可。
 IP_ECHO = ("http://ip.3322.net", "http://ifconfig.me/ip", "http://api.ipify.org")
 
-#: 出口 IP: 优先 IPv4, 拿不到再认 IPv6 (ifconfig.me 会按线路返回 v6)
-_IPV4_RE_FIND = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}")
-_IPV6_RE_FIND = re.compile(r"(?:[0-9a-f]{1,4}:){2,7}[0-9a-f]{1,4}", re.IGNORECASE)
-
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 _DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$", re.IGNORECASE)
 #: QUIC 内层的 SNI —— 证书是我们自己按这个值签的, 只挡明显不合法的输入
 _SNI_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$", re.IGNORECASE)
-_IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
 _HEX_RE = re.compile(r"^[0-9a-f]{0,16}$", re.IGNORECASE)
 FLOWS = ("", "xtls-rprx-vision")
 
@@ -100,7 +96,10 @@ def free_port() -> int:
 
 def is_host(value: str) -> bool:
     """落地地址: 域名或 IPv4 都行 (IPv6 未支持, 面板里也没暴露)。"""
-    return bool(_IPV4_RE.match(value) or _DOMAIN_RE.match(value))
+    try:
+        return isinstance(ipaddress.ip_address(value), ipaddress.IPv4Address)
+    except ValueError:
+        return bool(_DOMAIN_RE.fullmatch(value))
 
 
 def exit_host_error(state: dict) -> str:
@@ -416,7 +415,7 @@ def diagnose_items(state: dict) -> list[dict]:
 
     两项:
       * `chain_quic_pin` —— 旧 v2 配对码落地、没有证书指纹的条目 (P1-1);
-      * `chain_quic_pin_mismatch` —— 落地端证书重签后入口条目里的指纹过期 (P2-7)。
+      * `chain_quic_pin_mismatch` —— 兼容旧 id，现仅检查本机落地证书可用性。
     只在本机确实用到 QUIC 内层时才产出, 不用这个功能的机器看不到新噪声。
     """
     items: list[dict] = []
@@ -463,51 +462,19 @@ def diagnose_items(state: dict) -> list[dict]:
                 f"{len(quic_entries)} 条内层 QUIC 链路都固定了落地端证书指纹",
             )
 
-    # P2-7: 落地端重签证书后, 入口条目里那份指纹就成了"过期快照" —— 面板必须报出来,
-    # 否则用户只能去 hysteria 日志里找 `no certificate matches the pinned hash`。
+    # Local server certificates and remote client pins belong to different peers.
+    # A local read failure is actionable; it cannot prove a remote pin mismatch.
     exit_cfg = (state.get("chain") or {}).get("exit") or {}
     if exit_cfg.get("enabled") and exit_cfg.get("hy_enabled"):
         pin, pin_error = _current_exit_pin(state)
-        pinned = [e for e in quic_entries if str(e.get("hy_cert_sha256") or "").strip()]
-        if pin_error:
-            add(
-                "chain_quic_pin_mismatch",
-                False,
-                "落地端 QUIC 证书指纹",
-                f"读取落地端 QUIC 证书指纹失败: {pin_error}",
-                "检查 data/chain-quic/cert.pem 是否可读; 读不出来时配对码会退回 v1 (不带 QUIC), "
-                "重新应用配置会按当前 SNI 重签证书",
-            )
-        elif pinned and not pin:
-            add(
-                "chain_quic_pin_mismatch",
-                False,
-                "落地端 QUIC 证书指纹",
-                "落地端已启用 QUIC 但还没有可用的证书指纹 (证书尚未生成?)",
-                "重新应用配置会按当前 SNI 生成证书; 之后入口条目需要重新配对",
-            )
-        elif pinned:
-            stale = [
-                e for e in pinned
-                if str(e.get("hy_cert_sha256") or "").strip().lower() != pin
-            ]
-            if stale:
-                rows = ", ".join(node_label(e) for e in stale)
-                add(
-                    "chain_quic_pin_mismatch",
-                    False,
-                    "落地端 QUIC 证书指纹",
-                    f"落地端证书已重签 (当前指纹 {pin[:16]}…), {len(stale)} 条入口条目的指纹已过期: {rows}",
-                    "这些链路会报 no certificate matches the pinned hash; "
-                    "在入口端删掉这些条目, 用落地端新配对码重新添加",
-                )
-            else:
-                add(
-                    "chain_quic_pin_mismatch",
-                    True,
-                    "落地端 QUIC 证书指纹",
-                    f"{len(pinned)} 条入口条目的指纹与落地端当前证书一致",
-                )
+        add(
+            "chain_quic_pin_mismatch",  # Retain the existing diagnostic id.
+            bool(pin) and not pin_error,
+            "本机落地端 QUIC 证书",
+            f"本机证书指纹可读 ({pin[:16]}…); 远端证书由各链路握手独立验证"
+            if pin and not pin_error else f"本机落地端证书不可用: {pin_error or '尚未生成'}",
+            "重新应用配置以检查本机证书；本机证书不能用来判断远端链路的指纹是否匹配",
+        )
     return items
 
 
@@ -532,6 +499,8 @@ def used_ports(state: dict) -> set[int]:
     for entry in chain.get("entries") or []:
         if entry.get("local_port"):
             used.add(int(entry["local_port"]))
+        if entry.get("hy_socks_port"):
+            used.add(int(entry["hy_socks_port"]))
     used.update({80, 443, int(config.PANEL_PORT)})
     return used
 
@@ -539,7 +508,7 @@ def used_ports(state: dict) -> set[int]:
 def pick_port(state: dict, preferred: int | None = None) -> int:
     """挑一个没被占用的入站端口 (指定了就用指定的, 冲突则从 8446 往后找)。"""
     used = used_ports(state)
-    if preferred:
+    if preferred is not None:
         port = int(preferred)
         if not 1 <= port <= 65535:
             raise ValueError("端口需在 1-65535 之间")
@@ -561,51 +530,18 @@ def pick_port(state: dict, preferred: int | None = None) -> int:
 def client_config(target: dict, socks_port: int, state: dict | None = None) -> dict:
     """把落地端参数渲染成一份最小 Xray 客户端 (本地 SOCKS 入站 + Reality 出站)。
 
-    F04: state 传入时, Reality 出站额外带上 chain exit 的证书信息。
+    `state` 参数保留以兼容已有调用；出站参数与正式链式配置同源。
     """
+    from . import xray_config
+
+    # Use the exact same outbound renderer as the persistent runtime.
+    outbound = xray_config.chain_entry_outbound({**target, "id": "probe"})
+    outbound["tag"] = "chain-out"
     return {
         "log": {"loglevel": "error"},
-        "inbounds": [
-            {
-                "listen": "127.0.0.1",
-                "port": int(socks_port),
-                "protocol": "socks",
-                "settings": {"udp": False},
-            }
-        ],
-        "outbounds": [
-            {
-                "protocol": "vless",
-                "tag": "chain-out",
-                "settings": {
-                    "vnext": [
-                        {
-                            "address": target["host"],
-                            "port": int(target["port"]),
-                            "users": [
-                                {
-                                    "id": target["uuid"],
-                                    "encryption": "none",
-                                    "flow": target.get("flow") or "",
-                                }
-                            ],
-                        }
-                    ]
-                },
-                "streamSettings": {
-                    "network": "tcp",
-                    "security": "reality",
-                    "tcpSettings": {"header": {"type": "none"}},
-                    "realitySettings": {
-                        "serverName": target["sni"],
-                        "publicKey": target["pbk"],
-                        "shortId": target.get("sid") or "",
-                        "fingerprint": "chrome",
-                        "spiderX": "/",
-                    },
-                },
-            }
-        ],
+        "inbounds": [{"listen": "127.0.0.1", "port": int(socks_port),
+                      "protocol": "socks", "settings": {"udp": False}}],
+        "outbounds": [outbound],
     }
 
 
@@ -640,9 +576,12 @@ def read_exit_ip(socks_port: int, timeout: float = 10.0) -> tuple[str, str]:
         host, _, path = url[len("http://"):].partition("/")
         body, detail = services.socks5_http_get(socks_port, host, 80, "/" + path, per_try)
         last = f"{host}: {detail}"
-        found = _IPV4_RE_FIND.search(body or "") or _IPV6_RE_FIND.search(body or "")
-        if found:
-            return found.group(0), "HTTP 往返成功"
+        try:
+            ip = ipaddress.ip_address((body or "").strip())
+        except ValueError:
+            last = f"{host}: 回显内容不是合法 IP 地址"
+            continue
+        return str(ip), "HTTP 往返成功"
     return "", last
 
 
@@ -813,6 +752,27 @@ def _probe_quic(target: dict, timeout: float = 10.0, state: dict | None = None) 
         chain_quic.cleanup_temp(proc, workdir)
 
 
+def probe_fingerprint(entry: dict) -> str:
+    """Identity of the parameters actually being tested (never sent as credentials)."""
+    fields = ("host", "port", "uuid", "pbk", "sid", "sni", "flow", "transport",
+              "hy_port", "hy_pw", "hy_sni", "hy_cert_sha256", "hy_bw")
+    normalized = {key: entry.get(key) or ("reality" if key == "transport" else "") for key in fields}
+    raw = json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def routing_fingerprint(state: dict) -> str:
+    entries = (state.get("chain") or {}).get("entries") or []
+    shape = [(e.get("id"), e.get("enabled", True), bool(e.get("default_out")),
+              e.get("local_port"), probe_fingerprint(e)) for e in entries]
+    return hashlib.sha256(json.dumps(shape, separators=(",", ":")).encode()).hexdigest()
+
+
+def same_target(entry: dict, target: dict) -> bool:
+    return (str(entry.get("host") or "").lower().rstrip("."), int(entry.get("port") or 0)) == (
+        str(target.get("host") or "").lower().rstrip("."), int(target.get("port") or 0))
+
+
 def as_target(entry: dict, state: dict | None = None) -> dict:
     """从 state 里的条目取出探测 / 出站需要的参数。
 
@@ -825,7 +785,7 @@ def as_target(entry: dict, state: dict | None = None) -> dict:
         "pbk": entry["pbk"],
         "sid": entry.get("sid") or "",
         "sni": entry["sni"],
-        "flow": entry.get("flow") or "xtls-rprx-vision",
+        "flow": entry.get("flow", ""),
         "transport": entry.get("transport") or "reality",
         "hy_port": int(entry.get("hy_port") or 0),
         "hy_pw": entry.get("hy_pw") or "",
@@ -931,8 +891,12 @@ def _warm_one(binary: str, target: dict, timeout: float, state: dict | None = No
     socks_port = free_port()
     workdir = tempfile.mkdtemp(prefix="zp-chain-warmup-")
     cfg_path = os.path.join(workdir, "client.json")
+    local_cfg = client_config(target, socks_port, state=state)
+    # Warmup connects to a local inbound, not the remote chain exit. The main
+    # Reality inbound still requires Vision; chain inbounds use an empty flow.
+    local_cfg["outbounds"][0]["settings"]["vnext"][0]["users"][0]["flow"] = target.get("flow") or ""
     with open(cfg_path, "w", encoding="utf-8") as fh:
-        json.dump(client_config(target, socks_port, state=state), fh)
+        json.dump(local_cfg, fh)
     proc = subprocess.Popen(
         [binary, "run", "-c", cfg_path],
         stdout=subprocess.DEVNULL,

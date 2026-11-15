@@ -1229,8 +1229,8 @@ def test_legacy_quic_entry_without_pin_is_flagged(client, configured):
     assert [e["id"] for e in chain.unpinned_quic_entries(state)] == [legacy["id"]]
 
 
-def test_diagnose_items_detects_a_stale_exit_pin(client, configured, monkeypatch):
-    """落地端重签证书后, 入口条目里的指纹过期 → 诊断报出来 (P2-7)。"""
+def test_diagnose_does_not_compare_remote_pin_to_local_certificate(client, configured, monkeypatch):
+    """本机证书与远端 pin 互相独立；本机证书读取失败仍需要报告。"""
     from zeroproxy import chain_quic
 
     monkeypatch.setattr(chain_quic, "cert_pin", lambda: ("f" * 64, ""))   # 落地端当前指纹
@@ -1242,13 +1242,14 @@ def test_diagnose_items_detects_a_stale_exit_pin(client, configured, monkeypatch
     entry = _quic_entry(state, hy_cert_sha256="a" * 64)
     _with_entries(state, entry)
     items = {i["id"]: i for i in chain.diagnose_items(state)}
-    assert items["chain_quic_pin_mismatch"]["ok"] is False
-    assert "过期" in items["chain_quic_pin_mismatch"]["detail"]
-    # 指纹一致时不报
-    entry["hy_cert_sha256"] = "f" * 64
-    items = {i["id"]: i for i in chain.diagnose_items(state)}
     assert items["chain_quic_pin_mismatch"]["ok"] is True
-    assert "一致" in items["chain_quic_pin_mismatch"]["detail"]
+    assert "远端证书" in items["chain_quic_pin_mismatch"]["detail"]
+    assert items["chain_quic_pin"]["ok"] is True
+    # Local certificate unreadability remains actionable, independent of remote pins.
+    monkeypatch.setattr(chain_quic, "cert_pin", lambda: ("", "证书读取失败"))
+    items = {i["id"]: i for i in chain.diagnose_items(state)}
+    assert items["chain_quic_pin_mismatch"]["ok"] is False
+    assert "读取失败" in items["chain_quic_pin_mismatch"]["detail"]
 
 
 def test_cert_pin_separates_not_configured_from_read_failure(configured):
@@ -1424,8 +1425,8 @@ def test_code_rejects_a_non_numeric_version_with_code_error(configured, bad_vers
         chain.parse_code(code)
 
 
-def test_restart_step_warns_but_never_fails_on_a_stale_pin(configured, monkeypatch):
-    """P2-7: pin 过期只作警告 + 写审计, 不阻断升级 apply (回滚代价更大)。"""
+def test_restart_step_does_not_warn_about_unrelated_remote_pins(configured, monkeypatch):
+    """角色混用时，不能因为本机和远端 pin 不同就报告远端证书失效。"""
     from zeroproxy import apply as zp_apply
     from zeroproxy import chain as chain_mod, chain_quic
 
@@ -1449,9 +1450,9 @@ def test_restart_step_warns_but_never_fails_on_a_stale_pin(configured, monkeypat
 
     ok, detail = zp_apply.restart_services(state)
     assert ok is True, detail                       # 不能因为 pin 过期把整步判红
-    assert "过期" in detail and "⚠" in detail        # 但必须说出来
+    assert "过期" not in detail and "⚠" not in detail
     assert synced                                   # QUIC 进程照常对齐
-    assert any(row["action"] == "chain_quic_pin_warning" for row in state["audit"])
+    assert not any(row["action"] == "chain_quic_pin_warning" for row in state["audit"])
 
 
 def test_diagnose_endpoint_reports_an_unpinned_legacy_quic_entry(client, configured):

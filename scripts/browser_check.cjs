@@ -957,7 +957,7 @@ async function main() {
       };
     });
     check("入口端落地成一张链式卡片 (经落地地址 + 本机端口)",
-      /203\.0\.113\.9:8447/.test(entryCard.text) && /运行中/.test(entryCard.text)
+      /203\.0\.113\.9:8447/.test(entryCard.text) && /已启用/.test(entryCard.text)
       && entryCard.hasToggle && entryCard.hasDefault && entryCard.hasDelete && entryCard.toggled,
       entryCard.text.split("\n").slice(0, 3).join(" · "));
     // v1 配对码 = 落地端没开内层 QUIC → 没有 QUIC 凭据, 不该出现「改用 QUIC 内层」
@@ -1080,7 +1080,7 @@ async function main() {
       pinUi.summary && /证书指纹/.test(pinUi.summaryText) && pinUi.perEntry
       && pinUi.repairBtn && /重新配对/.test(pinUi.repairText),
       pinUi.summaryText.slice(0, 64));
-    check("落地端证书重签时当面说清入口端 pin 对不上",
+    check("兼容旧版 pin 告警时仍区分本机与远端身份",
       pinUi.exitWarn && /pin/.test(pinUi.exitText), pinUi.exitText.slice(0, 48));
     // 还原成测试里真实的那条链 (后面还要断开它), 别把注入的告警状态带出去
     await page.evaluate(() => {
@@ -1091,6 +1091,24 @@ async function main() {
       dash.chain.pin_mismatch = false;
       renderChain(dash);
     });
+
+    // Re-pair is an in-place POST, never a destructive DELETE.
+    let repairRequest = null;
+    await page.route(`**/api/chain/entries/${entryCard.id}/pair`, async (route) => {
+      repairRequest = { method: route.request().method(), body: route.request().postDataJSON() };
+      await route.fulfill({ status: 400, contentType: "application/json", body: JSON.stringify({error:"新配对码验证失败，原条目保留 (测试)"}) });
+    });
+    const repairErrMark = consoleErrors.length;
+    await page.click(`[data-chain-repair='${entryCard.id}']`);
+    await page.waitForSelector("#chain-repair-code");
+    check("原地更新说明保留节点身份与端口", /节点身份、本机端口/.test(await page.locator("#confirm-body").innerText()));
+    await page.fill("#chain-repair-code", peerCode);
+    await page.click("#confirm-ok");
+    await page.waitForFunction(() => /新配对码验证失败/.test(document.querySelector("#toast").innerText));
+    check("更新配对使用 POST /pair 并提交新码", repairRequest?.method === "POST" && repairRequest.body.code === peerCode);
+    check("更新验证失败仍保留原条目", await page.locator(`[data-chain-del='${entryCard.id}']`).count() === 1);
+    for (let i=consoleErrors.length-1; i>=repairErrMark; i--) if (/400 \(Bad Request\)/.test(consoleErrors[i])) consoleErrors.splice(i,1);
+    await page.unroute(`**/api/chain/entries/${entryCard.id}/pair`);
 
     // 断开 → 卡片与订阅里的节点一起消失
     await page.click(`[data-chain-del='${entryCard.id}']`);

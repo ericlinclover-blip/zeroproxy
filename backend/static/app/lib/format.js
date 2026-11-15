@@ -36,3 +36,22 @@ export function nodeStateText(n) {
   if (!n || n.enabled === false) return "已停用";
   return STATE_TXT[n.service_state] || n.service_state || "未知";
 }
+
+/** Configuration status and recent remote proof are separate facts. */
+export function chainHealth(entry, now = Date.now() / 1000) {
+  if (entry.enabled === false) return { state: "off", text: "已停用" };
+  if (["failed", "inactive", "not-installed"].includes(entry.service_state)) return { state: "failed", text: "入口服务未就绪" };
+  if (entry.needs_repair || entry.pin_ok === false) return { state: "failed", text: "证书固定待修复" };
+  if (entry.transport === "hysteria2" && entry.hy_ready === false) return { state: "failed", text: "内层未就绪" };
+  const p = entry.last_probe || {};
+  if (entry.probe_current === false) return { state: "unknown", text: "配置待验证" };
+  if (p.probe_ok === false || !p.ts) return { state: "unknown", text: "尚未验证" };
+  if (now - p.ts > 300) return { state: "unknown", text: "验证已过期" };
+  if (p.ok === true) return { state: "verified", text: "出口验证通过" };
+  if (p.ok === false) return { state: "failed", text: "出口验证失败" };
+  return { state: "unknown", text: "尚未验证" };
+}
+
+export function probeMatchesRouting(dash, probe) {
+  return !dash?.chain?.probe_revision || !probe?.chain_revision || dash.chain.probe_revision === probe.chain_revision;
+}

@@ -1362,10 +1362,13 @@ def probe_all(state: dict, timeout: float = 4.0, deep: bool = False) -> dict:
                     )
             dest_ok, dest_ms, dest_detail = dest.result()
 
+    from . import chain
+
     ok_count = sum(1 for r in results if r["ok"])
     label = "深度握手" if deep and is_prod() and bin_path("xray") is not None else "握手"
     return {
         "checked_at": int(time.time()),
+        "chain_revision": chain.routing_fingerprint(state),
         "nodes": results,
         "deep": bool(deep),
         "summary": f"{ok_count}/{len(results)} 个节点{label}成功",

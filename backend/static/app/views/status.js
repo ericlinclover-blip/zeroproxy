@@ -6,7 +6,7 @@
  */
 import { $, esc, escAttr, toast, copyText, applyWidths } from "../lib/dom.js";
 import {
-  fmtBytes, fmtUptime, fmtTime, STATE_TXT, stateClass, nodeStateClass, nodeStateText, PROTO_BADGE,
+  fmtBytes, fmtUptime, fmtTime, STATE_TXT, stateClass, nodeStateClass, nodeStateText, PROTO_BADGE, chainHealth, probeMatchesRouting,
 } from "../lib/format.js";
 import { api } from "../lib/api.js";
 import { openQr } from "../lib/dialog.js";
@@ -47,7 +47,7 @@ export function renderDashboardBanner() {
 
 /* ---------------- 节点卡片 + 测速 ---------------- */
 function pingOf(nodeId) {
-  if (!S.probeData) return null;
+  if (!S.probeData || !probeMatchesRouting(S.dash, S.probeData)) return null;
   return (S.probeData.nodes || []).find((p) => p.node === nodeId) || null;
 }
 
@@ -85,6 +85,9 @@ export function renderNodes() {
   $("#node-grid").innerHTML = nodes
     .map((n) => {
       const p = pingOf(n.id);
+      const peer = n.chain ? ((S.dash.chain || {}).entries || []).find((e) => `chain-${e.id}` === n.id) : null;
+      const health = peer ? chainHealth(peer) : null;
+      const dotClass = health ? ({ verified: "running", failed: "failed", off: "off", unknown: "other" }[health.state]) : nodeStateClass(n);
       // 左侧: 名称 / 传输 / 说明 / 链式出口 / 告警
       const left = `<div class="nc-info">
           <div class="top">
@@ -100,7 +103,7 @@ export function renderNodes() {
           <div class="muted nc-desc" title="${escAttr(n.desc || "")}">${esc(n.desc || "")}</div>
           ${
             n.chain && n.last_probe && n.last_probe.exit_ip
-              ? `<div class="muted fs-xs mt-1">落地出口 IP ${esc(n.last_probe.exit_ip)}${
+              ? `<div class="muted fs-xs mt-1">${health?.state === "verified" ? "验证出口 IP" : "上次出口 IP"} ${esc(n.last_probe.exit_ip)}${
                   n.last_probe.tcp_ms ? " · 链路 " + Math.round(n.last_probe.tcp_ms) + "ms" : ""
                 }</div>`
               : ""
@@ -111,8 +114,8 @@ export function renderNodes() {
       // 第二列: 地址 + 服务状态
       const addr = `<div class="nc-addr">
           <div class="addr mono" title="${escAttr(n.host + ":" + n.port)}">${esc(n.host)}:${n.port}</div>
-          <div class="state"><span class="dot ${nodeStateClass(n)}" title="${escAttr(n.service || "")}"></span>
-            <span class="muted">${esc(nodeStateText(n))}</span></div>
+          <div class="state"><span class="dot ${dotClass}" title="${escAttr(n.service || "")}"></span>
+            <span class="muted">${esc(health ? health.text : nodeStateText(n))}</span></div>
         </div>`;
 
       // 第三列: 握手延迟 (徽标 + 长度条)
@@ -197,7 +200,7 @@ export function renderNodes() {
 function renderProbe() {
   const el = $("#probe-summary");
   if (!el) return;
-  if (!S.probeData) {
+  if (!S.probeData || !probeMatchesRouting(S.dash, S.probeData)) {
     el.innerHTML = `<span class="note">点「节点测速」用真实客户端从每个节点穿一次外网 (深度握手, 能查出 Reality 密钥 / SNI / 伪装目标不匹配), 并测量服务器到伪装目标的出口延迟。本地开发环境下自动降级为裸握手。</span>`;
     return;
   }
@@ -216,8 +219,7 @@ function chainEgress() {
   // 拿它当"当前出口 IP"就是假的
   const entries = (((S.dash || {}).chain || {}).entries || []).filter((e) => e.enabled);
   const hit =
-    entries.find((e) => e.default_out && ((e.last_probe || {}).exit_ip || "").trim()) ||
-    entries.find((e) => ((e.last_probe || {}).exit_ip || "").trim());
+    entries.find((e) => e.default_out && chainHealth(e).state === "verified" && ((e.last_probe || {}).exit_ip || "").trim());
   if (!hit) return null;
   const p = hit.last_probe || {};
   // tcp_ms 才是"入口→落地"这一跳的链路延迟; ms 是整段探测的总耗时 (起临时客户端 +
@@ -240,7 +242,7 @@ export function renderKpis() {
   if (!S.dash) return;
   const nodes = S.dash.nodes || [];
   const on = nodes.filter((n) => n.enabled).length;
-  const probes = ((S.probeData && S.probeData.nodes) || []).filter((p) => p.ok === true && p.ms);
+  const probes = ((probeMatchesRouting(S.dash, S.probeData) && S.probeData && S.probeData.nodes) || []).filter((p) => p.ok === true && p.ms);
   const ms = probes.map((p) => p.ms);
 
   const kn = $("#kpi-nodes");
@@ -259,11 +261,13 @@ export function renderKpis() {
     const localIp = srv.public_ip || "";
     // 不挂链时"出口"就是本机; 挂了链才是落地端 —— 但本机 IP 两个场景下都要能看见,
     // 那才是用户要填进客户端的地址 (以前卡片只显示落地 IP, 本机 IP 无处可查)。
-    const exitIp = e ? e.ip : localIp;
-    eg.innerHTML = exitIp ? ipChip(exitIp, "点击复制出口 IP") : "—";
+    const pending = ((S.dash.chain || {}).entries || []).find((x) => x.enabled && x.default_out);
+    const exitIp = e ? e.ip : pending ? "" : localIp;
+    eg.innerHTML = exitIp ? ipChip(exitIp, "点击复制出口 IP") : pending ? "待验证" : "—";
     const sub = [];
-    if (e && localIp) sub.push(ipChip(localIp, "点击复制本机 IP", "本机 "));
+    if ((e || pending) && localIp) sub.push(ipChip(localIp, "点击复制本机 IP", "本机 "));
     if (e) sub.push(`链式 · ${esc(e.label)}${e.tcp_ms ? " · 链路 " + Math.round(e.tcp_ms) + "ms" : ""}`);
+    else if (pending) sub.push(`默认落地 ${esc(pending.label || pending.host)} · 暂无当前配置的有效出口结果`);
     else if (localIp) sub.push("本机公网 IP · 点击可复制");
     else if (srv.public_ip_at) sub.push("本机公网 IP 读取失败 (回显服务不可达)");
     else sub.push(

@@ -1,6 +1,6 @@
 /** Read-only connection preview. Verification and edits reuse existing task flows. */
 import { $, esc, escAttr } from "../lib/dom.js";
-import { fmtTime, nodeStateText } from "../lib/format.js";
+import { fmtTime, nodeStateText, chainHealth, probeMatchesRouting } from "../lib/format.js";
 import { S } from "../lib/state.js";
 let selection = "";
 
@@ -14,10 +14,10 @@ export function connectionModel(dash, probeData, selected = "", now = Date.now()
   if (!hit) return { options, title: "尚未配置节点。", summary: "先在节点列表或链式连接中添加配置。", state: "unknown" };
   const n = hit.object;
   const chain = hit.kind === "chain" ? n : n.chain ? entries.find((e) => e.id === n.id || e.local_port === n.port) : entries.find((e) => e.enabled && e.default_out && n.service !== "hysteria2" && n.protocol !== "Hysteria 2");
-  const nodeProbe = (probeData?.nodes || []).find((p) => p.node === n.id);
+  const nodeProbe = (probeMatchesRouting(dash, probeData) ? probeData?.nodes || [] : []).find((p) => p.node === n.id);
   const p = hit.kind === "chain" ? n.last_probe : nodeProbe || (n.chain ? n.last_probe : null);
   const checked = hit.kind === "chain" || (!nodeProbe && n.chain) ? p?.ts : probeData?.checked_at;
-  const stale = !checked || now - checked > 300;
+  const stale = !checked || now - checked > 300 || ((hit.kind === "chain" || n.chain) && (hit.kind === "chain" ? n : chain)?.probe_current === false);
   const broken = !!chain && (chain.needs_repair === true || chain.pin_ok === false);
   const unavailable = hit.kind === "node" && ["failed", "inactive", "not-installed"].includes(n.service_state);
   const innerDown = !!chain && chain.transport === "hysteria2" && chain.hy_ready === false;
@@ -26,6 +26,11 @@ export function connectionModel(dash, probeData, selected = "", now = Date.now()
   else if (broken || unavailable || innerDown || p?.ok === false) { state = "failed"; title = "连接需要检查。"; }
   else if (p?.ok === true && p.probe_ok !== false && !stale) { state = "verified"; title = "探测已通过。"; }
   else if (p?.ok === true && p.probe_ok !== false) title = "上次探测已通过。";
+  if (hit.kind === "chain" || n.chain) {
+    const health = chainHealth(hit.kind === "chain" ? n : { ...chain, enabled: n.enabled }, now);
+    state = health.state;
+    title = health.state === "verified" ? "探测已通过。" : health.state === "off" ? "这条连接已停用。" : health.state === "failed" ? "连接需要检查。" : "连接，等待验证。";
+  }
   const issue = broken ? "落地端证书指纹需要修复，请重新配对后验证。" : innerDown ? "QUIC 内层进程尚未就绪，请检查链式连接。" : unavailable ? "节点服务当前不可用，请检查服务状态。" : "";
   return { options, ...hit, chain, issue, probe: p, checked, stale, state, title,
     summary: hit.kind === "chain" ? "正在查看落地端。实际出口由设备分流与默认出口共同决定。" : "正在查看节点。服务器探测结果不等于设备端的连接质量。" };
