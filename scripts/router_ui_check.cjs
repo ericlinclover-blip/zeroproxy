@@ -54,7 +54,7 @@ function makeMock() {
     mode: "tun",
     covered: "full",
     why: "",
-    client: "1.4.56",
+    client: "1.4.57",
     servers: [{ key: "hkk_i3_pub_8899", base: "https://hkk.i3.pub:8899", id: "dv056b52958542564a" }],
     log: "zeroproxy-agent: 配置已更新并重载",
     // 一键更新的模拟: 每问一次 update-log 就"长"一段, 最后一段带 EXIT=0。

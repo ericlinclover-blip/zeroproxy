@@ -35,12 +35,14 @@ async function reply(body, code, status = 200) {
     GLOBAL: {all:['DIRECT','node-a'], now:'DIRECT'},
     '🚀 节点选择': {all:['node-a','node-b'], now:'node-a'},
     'node-a': {type:'Trojan', history:[{delay:186}]},
-    'node-b': {type:'Hysteria2', history:[]},
+    'node-b': {type:'Hysteria2', alive:false, history:[{delay:0}]},
   };
   await reply({proxies}, 'loadProxies()');
   assert.equal(element('cur-node-title').textContent, 'node-a',
     'raw successful proxies must render the rule group even when GLOBAL precedes it');
   assert.match(element('nodes-container').innerHTML, /186 ms/);
+  assert.match(element('nodes-container').innerHTML, /探测失败/,
+    'a recorded zero-delay failure must not look like an untested node');
   assert.equal(element('rf-route').textContent, 'node-a');
   run("currentState.routing_mode = 'global'");
   await reply({ok:true,proxies}, 'loadProxies()');

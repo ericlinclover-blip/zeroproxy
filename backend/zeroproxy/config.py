@@ -159,6 +159,9 @@ DEFAULTS: dict = {
         "short_id": "",      # hex, 客户端 sid
         "dest": DEFAULT_REALITY_DEST,
         "server_name": DEFAULT_REALITY_SNI,
+        # 现代 REALITY 服务端要求混合 key_share；显式 False 留给旧内核兼容。
+        # 此键进入配置内容哈希，让旧设备在升级面板后能重新拉取修正后的订阅。
+        "support_x25519mlkem768": True,
     },
     # XHTTP 传输参数 (技术文档 §9): mode=auto 由两端协商
     "xhttp": {"path": XHTTP_PATH, "mode": "auto", "host": ""},

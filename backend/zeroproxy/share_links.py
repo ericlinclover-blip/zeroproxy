@@ -901,6 +901,7 @@ def _clash_proxy(state: dict, node_id: str) -> dict | None:
             "reality-opts": {
                 "public-key": _pbk(r["public_key"]),
                 "short-id": r["short_id"],
+                "support-x25519mlkem768": r.get("support_x25519mlkem768", True),
             },
         }
     if node_id == "vless-reality":
@@ -920,6 +921,9 @@ def _clash_proxy(state: dict, node_id: str) -> dict | None:
             "reality-opts": {
                 "public-key": _pbk(r["public_key"]),
                 "short-id": r["short_id"],
+                # Xray 26.11.9 要求混合 key_share；mihomo 1.19.32 默认会移除它。
+                # 老服务端可显式关闭，不能把产品版本号当作握手兼容性的证明。
+                "support-x25519mlkem768": r.get("support_x25519mlkem768", True),
             },
         }
     if node_id == "vless-xhttp":
@@ -945,6 +949,7 @@ def _clash_proxy(state: dict, node_id: str) -> dict | None:
             "reality-opts": {
                 "public-key": _pbk(r["public_key"]),
                 "short-id": r["short_id"],
+                "support-x25519mlkem768": r.get("support_x25519mlkem768", True),
             },
         }
     if node_id == "vless-ws":

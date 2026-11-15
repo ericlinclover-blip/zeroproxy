@@ -510,8 +510,8 @@ function renderProxies(proxies) {
     const isActive = name === currentSelected;
     const history = info.history || [];
     const lastDelay = history.length ? history[history.length - 1].delay : null;
-    const delayText = lastDelay ? `${lastDelay} ms` : '测速';
-    const delayClass = !lastDelay ? 'none' : lastDelay < 120 ? 'good' : lastDelay < 260 ? 'mid' : 'bad';
+    const delayText = lastDelay > 0 ? `${lastDelay} ms` : lastDelay === 0 ? '探测失败' : '测速';
+    const delayClass = lastDelay === null ? 'none' : lastDelay <= 0 ? 'bad' : lastDelay < 120 ? 'good' : lastDelay < 260 ? 'mid' : 'bad';
     const proto = info.type || 'Proxy';
 
     return `
@@ -562,7 +562,7 @@ function renderProxies(proxies) {
       try {
         const res = await call('test-delay', { name: nodeName });
         const delay = res.delay || 0;
-        el.textContent = delay > 0 ? `${delay} ms` : '超时';
+        el.textContent = delay > 0 ? `${delay} ms` : '探测失败';
         el.className = 'node-ping ' + (delay <= 0 ? 'bad' : delay < 120 ? 'good' : delay < 260 ? 'mid' : 'bad');
       } catch (err) {
         el.textContent = '失败';
@@ -585,10 +585,10 @@ if ($('btn-ping-all')) {
       try {
         const res = await call('test-delay', { name: nodeName });
         const delay = res.delay || 0;
-        el.textContent = delay > 0 ? `${delay} ms` : '超时';
+        el.textContent = delay > 0 ? `${delay} ms` : '探测失败';
         el.className = 'node-ping ' + (delay <= 0 ? 'bad' : delay < 120 ? 'good' : delay < 260 ? 'mid' : 'bad');
       } catch (err) {
-        el.textContent = '超时';
+        el.textContent = '探测失败';
         el.className = 'node-ping bad';
       }
     }
