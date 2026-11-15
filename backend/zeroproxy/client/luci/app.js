@@ -85,7 +85,7 @@ function renderField(state) {
   } else if (!proxiesData) {
     $('rf-route').textContent = '等待代理组回报';
   } else {
-    const key = Object.keys(proxiesData).find((k)=>k.includes('节点选择') || k==='GLOBAL') || Object.keys(proxiesData)[0];
+    const key = primaryProxyGroup(proxiesData);
     $('rf-route').textContent = (proxiesData[key] || {}).now || '尚未选择';
   }
 }
@@ -133,7 +133,13 @@ async function call(path, body) {
   } catch (e) {
     const error = new Error('路由器返回了无法解析的内容 (uhttpd 的 CGI 可能没生效)'); error.status=res.status; throw error;
   }
-  if (!res.ok || !data.ok) { const error = new Error(data.error || '操作失败'); error.status = res.status; throw error; }
+  // CGI 与 zpcore 的这两个接口透传 mihomo JSON，没有统一的 ok 字段。
+  // 只对已知结构兼容；鉴权失败、显式错误及其他操作仍需正常成功响应。
+  const rawReply = data && data.ok === undefined && !data.error && (
+    path === 'proxies' && data.proxies && typeof data.proxies === 'object' && !Array.isArray(data.proxies) ||
+    path === 'test-delay' && typeof data.delay === 'number' && Number.isFinite(data.delay) && data.delay >= 0
+  );
+  if (!res.ok || !data || (data.ok !== true && !rawReply)) { const error = new Error(data && data.error || '操作失败'); error.status = res.status; throw error; }
   return data;
 }
 
@@ -459,12 +465,17 @@ async function loadProxies() {
   } finally { routeReadBusy = false; }
 }
 
+function primaryProxyGroup(proxies) {
+  const keys = Object.keys(proxies).filter((key) => Array.isArray(proxies[key] && proxies[key].all));
+  if (currentState && currentState.routing_mode === 'global' && keys.includes('GLOBAL')) return 'GLOBAL';
+  return keys.find((key) => key.includes('节点选择')) || keys.find((key) => key === 'GLOBAL') || keys[0];
+}
+
 function renderProxies(proxies) {
   const container = $('nodes-container');
   if (!container) return;
 
-  // 找主策略组 (优先找 🚀 节点选择 或 GLOBAL)
-  const groupKey = Object.keys(proxies).find((k) => k.includes('节点选择') || k === 'GLOBAL') || Object.keys(proxies)[0];
+  const groupKey = primaryProxyGroup(proxies);
   const group = proxies[groupKey];
 
   if (!group || !group.all || !group.all.length) {
@@ -489,7 +500,7 @@ function renderProxies(proxies) {
     $('cur-node-title').textContent = currentSelected || '自动选择';
   }
 
-  const signature = JSON.stringify(proxies);
+  const signature = JSON.stringify([groupKey, proxies]);
   if (signature === lastProxySignature) return;
   lastProxySignature = signature;
 
@@ -552,7 +563,7 @@ function renderProxies(proxies) {
         const res = await call('test-delay', { name: nodeName });
         const delay = res.delay || 0;
         el.textContent = delay > 0 ? `${delay} ms` : '超时';
-        el.className = 'node-ping ' + (delay > 0 && delay < 120 ? 'good' : delay < 260 ? 'mid' : 'bad');
+        el.className = 'node-ping ' + (delay <= 0 ? 'bad' : delay < 120 ? 'good' : delay < 260 ? 'mid' : 'bad');
       } catch (err) {
         el.textContent = '失败';
         el.className = 'node-ping bad';
@@ -575,7 +586,7 @@ if ($('btn-ping-all')) {
         const res = await call('test-delay', { name: nodeName });
         const delay = res.delay || 0;
         el.textContent = delay > 0 ? `${delay} ms` : '超时';
-        el.className = 'node-ping ' + (delay > 0 && delay < 120 ? 'good' : delay < 260 ? 'mid' : 'bad');
+        el.className = 'node-ping ' + (delay <= 0 ? 'bad' : delay < 120 ? 'good' : delay < 260 ? 'mid' : 'bad');
       } catch (err) {
         el.textContent = '超时';
         el.className = 'node-ping bad';

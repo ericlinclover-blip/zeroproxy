@@ -7,6 +7,13 @@ ZP_VERSION="__ZP_CLIENT_VERSION__"
 # 症状是变量为空、URL 变成 http:///connections、然后静默显示"没有连接")。
 ZP_MIXED=7890
 ZP_API=127.0.0.1:9090
+# URL 路径中的空格必须是 %20，不能用查询表单的 +；按字节编码也覆盖中文和 emoji。
+uri_component() {
+    printf '%s\n' "$1" | LC_ALL=C awk '
+        BEGIN { for (i = 1; i < 256; i++) hex[sprintf("%c", i)] = sprintf("%%%02X", i) }
+        { if (NR > 1) printf "%%0A"; for (i = 1; i <= length($0); i++) printf "%s", hex[substr($0, i, 1)] }
+    '
+}
 # doctor 的"入口连通性"要照着配置里每个节点去连 —— 同一个坑: 这个路径也得在这里定义。
 ZP_CONF="$ZP_DIR/config.yaml"
 SERVERS="$ZP_DIR/servers"
@@ -1257,16 +1264,13 @@ EOF
         _grp="${2:-GLOBAL}"
         _node="$3"
         [ -n "$_node" ] || { echo "用法: zeroproxy select-node <策略组> <节点名>"; exit 2; }
-        _enc="$(printf '%s' "$_grp" | tr ' ' '+')"
+        _enc="$(uri_component "$_grp")"
         _body="{\"name\":\"$(printf '%s' "$_node" | sed 's/"/\\"/g')\"}"
         _rc=1
         if command -v curl >/dev/null 2>&1; then
             _code="$(curl -s -m 3 -o /dev/null -w "%{http_code}" -X PUT -H "Content-Type: application/json" -d "$_body" "http://127.0.0.1:9090/proxies/$_enc" 2>/dev/null)"
             if [ "$_code" = "204" ] || [ "$_code" = "200" ]; then
                 _rc=0
-            elif [ "$_grp" != "GLOBAL" ]; then
-                _code2="$(curl -s -m 3 -o /dev/null -w "%{http_code}" -X PUT -H "Content-Type: application/json" -d "$_body" "http://127.0.0.1:9090/proxies/GLOBAL" 2>/dev/null)"
-                [ "$_code2" = "204" ] || [ "$_code2" = "200" ] && _rc=0
             fi
         fi
         if [ "$_rc" = "0" ]; then
@@ -1279,7 +1283,7 @@ EOF
     test-delay)
         _node="$2"
         [ -n "$_node" ] || { echo "用法: zeroproxy test-delay <节点名>"; exit 2; }
-        _enc="$(printf '%s' "$_node" | tr ' ' '+')"
+        _enc="$(uri_component "$_node")"
         _res=""
         if command -v curl >/dev/null 2>&1; then
             _res="$(curl -s -m 4 "http://127.0.0.1:9090/proxies/$_enc/delay?timeout=2500&url=http://www.gstatic.com/generate_204" 2>/dev/null)"

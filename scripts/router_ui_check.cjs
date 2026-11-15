@@ -54,7 +54,7 @@ function makeMock() {
     mode: "tun",
     covered: "full",
     why: "",
-    client: "1.4.55",
+    client: "1.4.56",
     servers: [{ key: "hkk_i3_pub_8899", base: "https://hkk.i3.pub:8899", id: "dv056b52958542564a" }],
     log: "zeroproxy-agent: 配置已更新并重载",
     // 一键更新的模拟: 每问一次 update-log 就"长"一段, 最后一段带 EXIT=0。
@@ -237,9 +237,9 @@ function makeMock() {
           if (state.updAt > 0 && state.updAt < UPD_LOG.length - 1) state.updAt += 1;
           return json(res, { ok: true, message: UPD_LOG[state.updAt] });
         }
-        if (action === "proxies") return json(res, {ok:true,proxies:{"🚀 节点选择":{all:["香港 Reality","日本 QUIC"],now:state.selected || "香港 Reality"},"香港 Reality":{type:"VLESS",history:[{delay:42}]},"日本 QUIC":{type:"Hysteria2",history:[]}}});
-        if (action === "select-node") { state.selected=payload.name; return json(res,{ok:true}); }
-        if (action === "test-delay") return json(res,{ok:true,delay:42});
+        if (action === "proxies") return json(res, {proxies:{GLOBAL:{all:["DIRECT","香港 Reality"],now:state.globalSelected || "DIRECT"},"🚀 节点选择":{all:["香港 Reality","日本 QUIC"],now:state.selected || "香港 Reality"},"香港 Reality":{type:"VLESS",history:[{delay:42}]},"日本 QUIC":{type:"Hysteria2",history:[]}}});
+        if (action === "select-node") { state.selectedGroup=payload.group; if(payload.group==='GLOBAL')state.globalSelected=payload.name;else state.selected=payload.name; return json(res,{ok:true}); }
+        if (action === "test-delay") return json(res,{delay:42});
         if (action === "mode") { state.routing_mode=payload.mode; return json(res,{ok:true}); }
         if (action === "clients") return json(res,{ok:true,clients:[{name:"客厅的电视与媒体设备",ip:"2001:db8:abcd:1234::100",mac:"AA:BB:CC:DD:EE:FF"}]});
         if (action === "doctor") return json(res,{ok:true,message:"模拟诊断完成"});
@@ -649,9 +649,15 @@ async function main() {
     check("状态轮询保留接入草稿和焦点",await page.inputValue('#url')==='https://draft.example.com/c/unfinished' && await page.evaluate(()=>document.activeElement.id)==='url');
     await page.locator('[data-sync]').first().focus();await page.evaluate(()=>load());
     check("来源未变化时不重建操作按钮",await page.evaluate(()=>document.activeElement.hasAttribute('data-sync')));
+    check("全局模式读取 GLOBAL 而非规则组",await page.locator('#cur-node-title').innerText()==='DIRECT');
+    await go('dashboard');await page.click('#mode-rule');
+    await page.waitForFunction(()=>document.getElementById('mode-rule').getAttribute('aria-pressed')==='true');
+    await go('nodes');await page.locator('[data-ping="日本 QUIC"]').click();
+    await page.waitForFunction(()=>document.querySelector('[data-ping="日本 QUIC"]').textContent==='42 ms');
+    check("原始 delay 响应无需 ok 字段即可测速",true);
     await page.locator('[data-select="日本 QUIC"]').click();
     await page.waitForFunction(()=>document.getElementById('rf-route').textContent==='日本 QUIC');
-    check("切换路线后画布使用实际组选中结果",server.zpState.selected==='日本 QUIC');
+    check("切换路线后画布使用实际组选中结果",server.zpState.selected==='日本 QUIC' && server.zpState.selectedGroup==='🚀 节点选择');
     await go('dashboard');server.zpState.mode='redirect';server.zpState.covered='lan_tcp';server.zpState.ipv6='0';await page.evaluate(()=>load());
     check("REDIRECT 明确仅局域网 TCP 且 IPv6 未接管",/仅局域网 TCP/.test(await page.locator('#rf-coverage').innerText()) && /未接管/.test(await page.locator('#rf-ipv6').innerText()));
     server.zpState.mode='none';server.zpState.covered='full';await page.evaluate(()=>load());
