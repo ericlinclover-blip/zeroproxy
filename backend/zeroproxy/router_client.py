@@ -174,7 +174,8 @@ from .config import paths
 #:         ⑥ ZeroProxy Doctor 真机体检、基准测速 (Bench) 与快照还原比对 (Revert) Web 化集成。
 #: 1.4.52: 路由器连接场域配套界面、真实 WAN 分向计数、接管范围与状态恢复。
 #: 1.4.53: LuCI 宿主主题适配、紧凑布局与自动承载高度。
-SCRIPT_VERSION = "1.4.53"
+#: 1.4.54: 内页接管嵌入适配，兼容 LuCI 缓存的旧承载页与首访初始化。
+SCRIPT_VERSION = "1.4.54"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"

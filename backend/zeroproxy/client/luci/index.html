@@ -875,6 +875,29 @@ html[data-embedded="1"] body { min-height:0; padding:0 2px 12px; font-family:var
   [data-embedded="1"] .btn { min-height:44px; }
   [data-embedded="1"] .rf-topology::before { border-color:var(--accent); }
 }
+
+/* A compact route strip leaves room for controls inside the LuCI viewport. */
+[data-embedded="1"] .rf-inspector { gap:10px; }
+[data-embedded="1"] .rf-inspector h3 { font-size:18px; }
+[data-embedded="1"] .rf-inspector dl { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px 14px; }
+[data-embedded="1"] .rf-inspector dl > div { flex-direction:column; gap:3px; padding-bottom:6px; }
+[data-embedded="1"] .rf-inspector dt { font-size:10px; }
+[data-embedded="1"] .rf-inspector dd { text-align:left; font-size:11px; }
+[data-embedded="1"] .rf-actions { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
+[data-embedded="1"] .rf-actions .btn { min-height:36px; padding:6px 8px; font-size:11px; white-space:normal; }
+@media(min-width:601px) {
+  [data-embedded="1"] .rf-canvas h2 { font-size:22px; margin:16px 0 8px; }
+  [data-embedded="1"] .rf-topology { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:16px; height:auto; min-height:0; margin:24px 0 12px; }
+  [data-embedded="1"] .rf-wires { display:none; }
+  [data-embedded="1"] .rf-topology::before { content:""; position:absolute; left:5px; right:calc(33.333% - 12px); top:5px; border-top:1px solid var(--accent); }
+  [data-embedded="1"] .rf-hop { position:relative; left:auto; top:auto; width:auto; padding:18px 0 0; min-width:0; }
+  [data-embedded="1"] .rf-hop i { top:0; }
+  [data-embedded="1"] .rf-hop strong { font-size:14px; }
+  [data-embedded="1"] .rf-bottom { margin-top:auto; padding-top:14px; }
+}
+@media(max-width:600px) {
+  [data-embedded="1"] .rf-actions .btn { min-height:44px; }
+}
 </style>
 </head>
 <body>

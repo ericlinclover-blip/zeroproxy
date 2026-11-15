@@ -54,7 +54,7 @@ function makeMock() {
     mode: "tun",
     covered: "full",
     why: "",
-    client: "1.4.53",
+    client: "1.4.54",
     servers: [{ key: "hkk_i3_pub_8899", base: "https://hkk.i3.pub:8899", id: "dv056b52958542564a" }],
     log: "zeroproxy-agent: 配置已更新并重载",
     // 一键更新的模拟: 每问一次 update-log 就"长"一段, 最后一段带 EXIT=0。
@@ -103,13 +103,16 @@ function makeMock() {
     const authed = /sysauth/.test(req.headers.cookie || "");
     if (url.pathname === '/luci-host') {
       res.writeHead(200, {'Content-Type':'text/html; charset=utf-8'});
-      const wrapper=JSON.stringify(fs.readFileSync(path.join(LUCi_DIR,'status.js'),'utf8'));
+      const legacy = url.searchParams.has('legacy');
+      const oldWrapper = "return view.extend({render:function(){return E('iframe',{src:'/cgi-bin/zeroproxy',style:'width:100%;height:78vh;border:0;border-radius:10px;background:transparent',title:'ZeroProxy'});}});";
+      const wrapper=JSON.stringify(legacy ? oldWrapper : fs.readFileSync(path.join(LUCi_DIR,'status.js'),'utf8'));
       res.end(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>
         :root{--primary:#5e72e4;--surface:#fff;--host-bg:#f4f5f7;--host-text:#454a54}*{box-sizing:border-box}body{margin:0;background:var(--host-bg);color:var(--host-text);font:14px/1.5 system-ui,sans-serif}body[data-theme=dark]{--surface:#252932;--host-bg:#171b22;--host-text:#e4e7ef;--primary:#93a7ff}.sidebar{position:fixed;inset:0 auto 0 0;width:210px;background:var(--surface);padding:24px 16px}.sidebar h1{color:var(--primary);font-size:24px;margin:0 0 36px}.sidebar a{display:block;padding:14px;margin:4px 0}.sidebar .active{background:var(--primary);color:white;border-radius:5px}.topbar{height:70px;margin-left:210px;background:var(--primary)}main{margin-left:210px;padding:20px}#host-panel{background:var(--surface);padding:16px;border-radius:8px;min-width:0}footer{margin:20px;color:var(--primary);font-size:12px;text-align:right}@media(max-width:700px){.sidebar{display:none}.topbar,main{margin-left:0}main{padding:12px}#host-panel{padding:10px}.topbar{height:48px}}
-      </style></head><body><aside class="sidebar"><h1>GL · OpenWrt</h1><a>首页</a><a>状态</a><a>网络</a><a class="active">服务 / ZeroProxy</a><a>系统</a></aside><header class="topbar"></header><main><section id="host-panel"></section><footer>LuCI / 主题嵌入测试环境</footer></main><script>
+        body{height:100vh;overflow:hidden}.main{margin-left:210px;height:100vh;overflow:hidden}.main-right{height:100%;overflow:auto}.main .topbar,.main main{margin-left:0}@media(max-width:700px){.main{margin-left:0}}${legacy ? 'iframe{height:78vh!important;max-height:78vh!important}' : ''}
+      </style></head><body><aside class="sidebar"><h1>GL · OpenWrt</h1><a>首页</a><a>状态</a><a>网络</a><a class="active">服务 / ZeroProxy</a><a>系统</a></aside><div class="main"><div class="main-right"><header class="topbar"></header><main id="maincontent"><section id="host-panel" class="container"><div id="view"></div></section><footer>LuCI / 主题嵌入测试环境</footer></main></div></div><script>
       const wrapper=new Function('view','E',${wrapper});
       const view=wrapper({extend:obj=>obj},(tag,attrs)=>{const el=document.createElement(tag);for(const [k,v] of Object.entries(attrs))el.setAttribute(k,v);return el;});
-      document.getElementById('host-panel').appendChild(view.render());
+      document.getElementById('view').appendChild(view.render());
       </script></body></html>`); return;
     }
     if (url.pathname.startsWith("/cgi-bin/")) {
@@ -701,6 +704,10 @@ async function main() {
     check('嵌入页跟随宿主白底与蓝色强调',details.bg==='rgb(255, 255, 255)'&&details.accent.replaceAll(' ','')==='rgb(94,114,228)',JSON.stringify(details));
     check('嵌入工作区使用紧凑标题',details.heading<=22);
     check('嵌入页跟随系统主题且不提供冲突的独立开关',!(await embedded.locator('#router-theme').isVisible()));
+    check('首次进入网络页就初始化紧凑标题',await embedded.locator('#router-heading').innerText()==='网络接管');
+    check('桌面连接视图保持紧凑',await embedded.locator('#router-field').evaluate(el=>el.getBoundingClientRect().height)<360);
+    await frame.evaluate(()=>{const extra=document.createElement('div');extra.id='resize-fixture';extra.style.height='600px';document.getElementById('tab-dashboard').appendChild(extra);});
+    await host.waitForFunction(()=>{const f=document.querySelector('iframe');return Math.abs(f.getBoundingClientRect().height-f.contentDocument.body.getBoundingClientRect().height)<=4;});
     const longHeight=await host.locator('iframe').evaluate(el=>el.getBoundingClientRect().height);
     await embedded.locator('[data-tab="nodes"]').click();
     await embedded.locator('[data-select]').first().waitFor();
@@ -758,6 +765,34 @@ async function main() {
     await embedded.locator('[data-select]').first().waitFor();
     check('节点接口恢复后重新读取实际选组',!(await embedded.locator('#cur-node-title').innerText()).includes('未知'));
     await host.close();
+    const legacy=await ctx.newPage();
+    legacy.on('pageerror',e=>errors.push(e.message));
+    await legacy.setViewportSize({width:1728,height:1028});
+    await legacy.goto(`http://127.0.0.1:${PORT}/luci-host?legacy=1`);
+    const oldFrame=legacy.frameLocator('iframe');
+    await oldFrame.locator('#sub').filter({hasText:'内核运行中'}).waitFor();
+    await legacy.waitForFunction(()=>document.querySelector('iframe').contentDocument.documentElement.dataset.hostBridge==='child');
+    const legacySize=await legacy.evaluate(()=>{const f=document.querySelector('iframe');return{height:f.getBoundingClientRect().height,body:f.contentDocument.body.getBoundingClientRect().height,viewport:innerHeight,priority:f.style.getPropertyPriority('height'),src:f.getAttribute('src'),max:getComputedStyle(f).maxHeight};});
+    check('缓存的旧 78vh 承载页也由内页自动修复',legacySize.src==='/cgi-bin/zeroproxy'&&legacySize.height>legacySize.viewport*.78+50&&Math.abs(legacySize.height-legacySize.body)<=4,JSON.stringify(legacySize));
+    check('宿主强制高度与上限不会再裁切内容',legacySize.priority==='important'&&legacySize.max==='none');
+    check('旧外框下首访标题仍初始化正确',await oldFrame.locator('#router-heading').innerText()==='网络接管');
+    await legacy.evaluate(()=>{const shell=document.querySelector('.main-right');shell.scrollTop=shell.scrollHeight;});
+    check('真实样式的外层滚动区域能到达内页底部',await legacy.evaluate(()=>{const f=document.querySelector('iframe'),shell=document.querySelector('.main-right');const foot=f.contentDocument.querySelector('.router-footer').getBoundingClientRect();const y=f.getBoundingClientRect().top+foot.bottom;return y<=shell.getBoundingClientRect().bottom&&y>0;}));
+    await legacy.evaluate(()=>document.querySelector('.main-right').scrollTop=0);
+    await legacy.screenshot({path:path.join(SHOT_DIR,'router-luci-legacy-fixed.png'),fullPage:true});
+    await oldFrame.locator('[data-tab="logs"]').click();
+    await legacy.waitForFunction(()=>{const f=document.querySelector('iframe');return Math.abs(f.getBoundingClientRect().height-f.contentDocument.body.getBoundingClientRect().height)<=4;});
+    check('旧承载页下切换短页面同样可以缩回',await legacy.locator('iframe').evaluate(el=>el.getBoundingClientRect().height)<legacySize.height);
+    await legacy.evaluate(()=>document.body.dataset.theme='dark');
+    await legacy.waitForFunction(()=>document.querySelector('iframe').contentDocument.documentElement.dataset.theme==='dark');
+    check('旧承载页也能跟随真实宿主主题',true);
+    await Promise.all([
+      legacy.waitForResponse(r=>r.url().includes('file=app.js')),
+      legacy.evaluate(()=>document.querySelector('iframe').contentWindow.location.reload()),
+    ]);
+    await legacy.waitForFunction(()=>{const f=document.querySelector('iframe');return f.contentDocument.documentElement.dataset.hostBridge==='child'&&f.contentDocument.documentElement.dataset.theme==='dark'&&Math.abs(f.getBoundingClientRect().height-f.contentDocument.body.getBoundingClientRect().height)<=4;});
+    check('仅重载内页后仍可重新建立宿主适配',await oldFrame.locator('#router-heading').innerText()==='维护与日志');
+    await legacy.close();
 
     // 浏览器自己会请求 /favicon.ico 之类, 那是模拟器的事, 不算页面问题
     const real = errors.filter((e) => !/favicon|404 \(Not Found\)/.test(e));
