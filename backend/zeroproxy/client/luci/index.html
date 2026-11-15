@@ -820,7 +820,7 @@ pre { background:var(--card-sub); border-radius:6px; font-size:12px; }.upd { bor
 
 /* LuCI owns the shell, palette and scrolling. The standalone theme stays local. */
 html[data-embedded="1"] { --bg:#fff; --card:#fff; --card-sub:#f6f7f9; --card-hover:#f0f3fa; --text:#303640; --sub:#566170; --muted:#566170; --border:#d9dee7; --border-soft:#edf0f4; --accent:#5e72e4; --accent-soft:#eef0fc; --boost:#5e72e4; --boost-soft:#eef0fc; --field:#f6f7f9; --field-ink:#303640; --field-muted:#566170; --lime:#5e72e4; --accent-ink:#fff; }
-html[data-embedded="1"] body { min-height:0; padding:0 2px 12px; font-family:var(--host-font,system-ui,sans-serif); background:var(--bg); }
+html[data-embedded="1"] body { min-height:0; padding:24px 32px 32px; font-family:var(--host-font,system-ui,sans-serif); background:var(--bg); }
 [data-embedded="1"] .app-wrap { max-width:none; gap:12px; }
 [data-embedded="1"] .header-card { padding:8px 0 12px; gap:10px; }
 [data-embedded="1"] .brand-icon { width:26px; height:26px; font-size:16px; background:var(--accent); color:var(--accent-ink); }
@@ -874,6 +874,14 @@ html[data-embedded="1"] body { min-height:0; padding:0 2px 12px; font-family:var
   [data-embedded="1"] .rf-hop strong { font-size:16px; }
   [data-embedded="1"] .btn { min-height:44px; }
   [data-embedded="1"] .rf-topology::before { border-color:var(--accent); }
+}
+
+/* One shared gutter keeps the header, workspaces and footer off the host edges. */
+@media(max-width:1024px) {
+  html[data-embedded="1"] body { padding:20px 24px 28px; }
+}
+@media(max-width:600px) {
+  html[data-embedded="1"] body { padding:16px max(16px,env(safe-area-inset-right)) 24px max(16px,env(safe-area-inset-left)); }
 }
 
 /* A compact route strip leaves room for controls inside the LuCI viewport. */

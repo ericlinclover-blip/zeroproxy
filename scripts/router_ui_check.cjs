@@ -54,7 +54,7 @@ function makeMock() {
     mode: "tun",
     covered: "full",
     why: "",
-    client: "1.4.54",
+    client: "1.4.55",
     servers: [{ key: "hkk_i3_pub_8899", base: "https://hkk.i3.pub:8899", id: "dv056b52958542564a" }],
     log: "zeroproxy-agent: 配置已更新并重载",
     // 一键更新的模拟: 每问一次 update-log 就"长"一段, 最后一段带 EXIT=0。
@@ -108,7 +108,7 @@ function makeMock() {
       const wrapper=JSON.stringify(legacy ? oldWrapper : fs.readFileSync(path.join(LUCi_DIR,'status.js'),'utf8'));
       res.end(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>
         :root{--primary:#5e72e4;--surface:#fff;--host-bg:#f4f5f7;--host-text:#454a54}*{box-sizing:border-box}body{margin:0;background:var(--host-bg);color:var(--host-text);font:14px/1.5 system-ui,sans-serif}body[data-theme=dark]{--surface:#252932;--host-bg:#171b22;--host-text:#e4e7ef;--primary:#93a7ff}.sidebar{position:fixed;inset:0 auto 0 0;width:210px;background:var(--surface);padding:24px 16px}.sidebar h1{color:var(--primary);font-size:24px;margin:0 0 36px}.sidebar a{display:block;padding:14px;margin:4px 0}.sidebar .active{background:var(--primary);color:white;border-radius:5px}.topbar{height:70px;margin-left:210px;background:var(--primary)}main{margin-left:210px;padding:20px}#host-panel{background:var(--surface);padding:16px;border-radius:8px;min-width:0}footer{margin:20px;color:var(--primary);font-size:12px;text-align:right}@media(max-width:700px){.sidebar{display:none}.topbar,main{margin-left:0}main{padding:12px}#host-panel{padding:10px}.topbar{height:48px}}
-        body{height:100vh;overflow:hidden}.main{margin-left:210px;height:100vh;overflow:hidden}.main-right{height:100%;overflow:auto}.main .topbar,.main main{margin-left:0}@media(max-width:700px){.main{margin-left:0}}${legacy ? 'iframe{height:78vh!important;max-height:78vh!important}' : ''}
+        body{height:100vh;overflow:hidden}.main{margin-left:210px;height:100vh;overflow:hidden}.main-right{height:100%;overflow:auto}.main .topbar,.main main{margin-left:0}@media(max-width:700px){.main{margin-left:0}}${legacy ? '#host-panel{padding:0}iframe{height:78vh!important;max-height:78vh!important}' : ''}
       </style></head><body><aside class="sidebar"><h1>GL · OpenWrt</h1><a>首页</a><a>状态</a><a>网络</a><a class="active">服务 / ZeroProxy</a><a>系统</a></aside><div class="main"><div class="main-right"><header class="topbar"></header><main id="maincontent"><section id="host-panel" class="container"><div id="view"></div></section><footer>LuCI / 主题嵌入测试环境</footer></main></div></div><script>
       const wrapper=new Function('view','E',${wrapper});
       const view=wrapper({extend:obj=>obj},(tag,attrs)=>{const el=document.createElement(tag);for(const [k,v] of Object.entries(attrs))el.setAttribute(k,v);return el;});
@@ -745,6 +745,13 @@ async function main() {
         await host.waitForFunction(()=>{const f=document.querySelector('iframe');return Math.abs(f.getBoundingClientRect().height-f.contentDocument.body.getBoundingClientRect().height)<=4;});
         const spill=await frame.evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1);
         check(`LuCI ${width}px / ${tab} 无内部横向溢出`,spill);
+        const spacing=await frame.evaluate(()=>{
+          const rect=el=>el.getBoundingClientRect();const main=rect(document.querySelector('.app-wrap')),foot=rect(document.querySelector('.router-footer'));
+          const body=document.body,style=getComputedStyle(body);
+          return{width:innerWidth,left:main.left,right:innerWidth-main.right,top:main.top,bottom:parseFloat(style.paddingBottom),footerLeft:foot.left,footerRight:innerWidth-foot.right};
+        });
+        const gutter=spacing.width<=600?16:spacing.width<=1024?24:32;
+        check(`LuCI ${width}px / ${tab} 四周留白与页脚对齐`,spacing.left>=gutter&&spacing.right>=gutter&&spacing.top>=16&&spacing.bottom>=24&&Math.abs(spacing.left-spacing.footerLeft)<1&&Math.abs(spacing.right-spacing.footerRight)<1,JSON.stringify(spacing));
       }
     }
     await embedded.locator('[data-tab="nodes"]').click();
