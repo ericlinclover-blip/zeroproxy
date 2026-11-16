@@ -75,10 +75,11 @@ button.field-hop:hover strong { color:var(--lime); }
 .field-hop strong { display:block; font-size:18px; font-weight:500; margin:7px 0 3px; overflow-wrap:anywhere; }
 .field-hop small { color:var(--field-muted); font:10px var(--mono); display:block; overflow-wrap:anywhere; }
 .hop-index { font:9px var(--mono); letter-spacing:1px; color:var(--field-muted); }
-.field-dot { position:absolute; top:0; left:0; width:10px; height:10px; border-radius:50%; background:var(--field); border:2px solid var(--lime); box-shadow:0 0 0 5px #d4f56a14; }
-.hop-device { left:8.1%; top:65.2%; }
-.hop-entry { left:40%; top:30.4%; }
-.hop-exit { left:72%; top:56.5%; width:28%; }
+.field-dot { position:absolute; top:0; left:0; transform:translate(-50%,-50%); width:10px; height:10px; border-radius:50%; background:var(--field); border:2px solid var(--lime); box-shadow:0 0 0 5px #d4f56a14; }
+/* Anchor circle centers to the exact SVG points in its 800 × 230 viewBox. */
+.hop-device { left:calc(100% * 65 / 800); top:calc(100% * 150 / 230); }
+.hop-entry { left:calc(100% * 320 / 800); top:calc(100% * 70 / 230); }
+.hop-exit { left:calc(100% * 570 / 800); top:calc(100% * 130 / 230); width:28%; }
 .field-bottom { display:flex; justify-content:space-between; gap:20px; color:var(--field-muted); font-size:10px; margin-top:16px; }
 .field-bottom a { color:var(--lime); white-space:nowrap; text-decoration:none; }
 .field-canvas :focus-visible { outline-color:var(--lime); }
@@ -178,12 +179,12 @@ button.field-hop:hover strong { color:var(--lime); }
   .field-summary { font-size:12px; }
   .field-topology { height:270px; min-height:270px; flex:none; margin:24px 0 16px; }
   .field-wires { display:none; }
-  .field-topology::before { content:""; position:absolute; left:6px; top:10px; bottom:25px; border-left:1px dashed #7e8f5a; }
+  .field-topology::before { content:""; position:absolute; left:calc(13px / 2); top:calc(6px + 13px / 2); bottom:calc(100% - 184px - 6px - 13px / 2); transform:translateX(-50%); border-left:1px dashed #7e8f5a; }
   [data-state="verified"] .field-topology::before { border-left:2px solid var(--lime); }
   [data-state="failed"] .field-topology::before { border-color:#f19582; }
   .field-hop,.hop-exit { position:absolute; left:0; width:100%; padding:0 0 0 32px; min-height:68px; }
   .hop-device { top:0; }.hop-entry { top:88px; }.hop-exit { top:184px; }
-  .field-dot { top:6px; width:13px; height:13px; }
+  .field-dot { top:6px; transform:none; width:13px; height:13px; }
   .field-hop strong { font-size:18px; margin:3px 0; }
   .field-hop small { font-size:10px; }
   .field-bottom { margin-top:12px; font-size:10px; }
@@ -257,13 +258,12 @@ dialog.modal-mask:not([open]) { display:none; }
   .field-metrics { gap:8px; }
   .field-metrics strong { font-size:12px; }
   .field-canvas h2 { font-size:30px; margin-top:22px; }
-  .field-topology::before { bottom:42px; }
 }
 
 .field-wires .wire-device { stroke:var(--field-muted); opacity:.5; stroke-dasharray:3 6; }
 @media (max-width:600px) {
   #connection-field .field-topology::before { border-left:1px dashed #7e8f5a; }
-  .field-topology::after { content:""; position:absolute; left:6px; top:94px; height:96px; border-left:1px dashed #7e8f5a; pointer-events:none; }
+  .field-topology::after { content:""; position:absolute; left:calc(13px / 2); top:calc(88px + 6px + 13px / 2); height:96px; transform:translateX(-50%); border-left:1px dashed #7e8f5a; pointer-events:none; }
   [data-state="verified"] .field-topology::after { border-left:2px solid var(--lime); }
   [data-state="failed"] .field-topology::after { border-color:#f19582; }
 }

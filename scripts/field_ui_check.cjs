@@ -17,6 +17,39 @@ fs.mkdirSync(SHOTS, { recursive: true });
 let logs='', browser;
 let count=0;
 function check(name, ok, detail='') { if(!ok) throw new Error(name+' '+detail); count++; console.log('✓ '+name); }
+async function measureTopologyAlignment(page) {
+  return page.evaluate(() => {
+    const topology = document.querySelector('.field-topology');
+    const rect = topology.getBoundingClientRect();
+    const dots = ['device', 'entry', 'exit'].map(name => {
+      const r = document.querySelector(`#field-${name} .field-dot`).getBoundingClientRect();
+      return { name, x:r.left+r.width/2, y:r.top+r.height/2 };
+    });
+    const svg = topology.querySelector('svg');
+    let anchors, mode, overlay;
+    if (getComputedStyle(svg).display !== 'none') {
+      mode = 'curve';
+      const device = svg.querySelector('.wire-device'), main = svg.querySelector('.wire-main');
+      const point = (path, distance) => path.getPointAtLength(distance).matrixTransform(path.getScreenCTM());
+      anchors = [point(device,0), point(main,0), point(main,main.getTotalLength())];
+    } else {
+      mode = 'vertical';
+      const line = getComputedStyle(topology,'::before'), size = getComputedStyle(topology);
+      const scaleX = rect.width/parseFloat(size.width), scaleY = rect.height/parseFloat(size.height);
+      const shift = line.transform === 'none' ? 0 : new DOMMatrix(line.transform).m41;
+      const x = rect.left+(parseFloat(line.left)+shift+parseFloat(line.borderLeftWidth)/2)*scaleX;
+      anchors = [{ x, y:rect.top+parseFloat(line.top)*scaleY }, {x,y:dots[1].y}, { x, y:rect.bottom-parseFloat(line.bottom)*scaleY }];
+      const main = getComputedStyle(topology,'::after');
+      const mainShift = main.transform === 'none' ? 0 : new DOMMatrix(main.transform).m41;
+      const mainX = rect.left+(parseFloat(main.left)+mainShift+parseFloat(main.borderLeftWidth)/2)*scaleX;
+      const mainY = rect.top+parseFloat(main.top)*scaleY;
+      overlay = [{x:mainX,y:mainY}, {x:mainX,y:mainY+parseFloat(main.height)*scaleY}];
+    }
+    const errors = dots.map((dot,i)=>({name:dot.name,dx:dot.x-anchors[i].x,dy:dot.y-anchors[i].y}));
+    if (overlay) errors.push(...dots.slice(1).map((dot,i)=>({name:'main-'+dot.name,dx:dot.x-overlay[i].x,dy:dot.y-overlay[i].y})));
+    return { mode, maxError:Math.max(...errors.flatMap(p=>[Math.abs(p.dx),Math.abs(p.dy)])), errors };
+  });
+}
 (async()=>{
   PORT = await new Promise((resolve,reject)=>{
     const probe=net.createServer();probe.once('error',reject);
@@ -111,9 +144,42 @@ server.stdout.on('data', d=>logs+=d); server.stderr.on('data',d=>logs+=d);
       check(`${width}px / ${key} 无横向溢出`,spill.scroll<=spill.view+1,JSON.stringify(spill)+" "+JSON.stringify(await page.evaluate(()=>[...document.querySelectorAll("body *")].filter(e=>{const r=e.getBoundingClientRect();return r.width>0&&r.right>innerWidth+1;}).map(e=>({tag:e.tagName,id:e.id,cls:e.className,right:e.getBoundingClientRect().right,html:e.parentElement.outerHTML.slice(0,1000)})).slice(0,15))));
     }
     await page.locator('[data-workspace="network"]').click();
+    const alignment = await measureTopologyAlignment(page);
+    check(`${width}px / 路线圆心与主线精确对齐`,alignment.maxError<=0.1,JSON.stringify(alignment));
     await page.screenshot({path:path.join(SHOTS,`network-${width}.png`),fullPage:true});
     if(width===390)await page.locator("#connection-field").screenshot({path:path.join(SHOTS,"connection-field-mobile.png")});
   }
+  let maximumAlignmentError = 0;
+  for (const dpr of [1,2]) {
+    const context = await browser.newContext({deviceScaleFactor:dpr, viewport:{width:1440,height:1000}, storageState:await page.context().storageState()});
+    const probe = await context.newPage();
+    try {
+      await probe.goto(base);await probe.waitForSelector('#view-dash:not(.hidden)');
+      await probe.locator('[data-workspace="network"]').click();
+      for (const width of [2560,1440,1024,821,820,601,600,390,320]) {
+        await probe.setViewportSize({width,height:1000});
+        for (const zoom of [1,1.25,2]) {
+          await probe.evaluate(value=>{document.documentElement.style.zoom=String(value);},zoom);
+          let worst = 0;
+          for (const state of ['unknown','verified','failed','off']) {
+            await probe.locator('#connection-field').evaluate((el,value)=>el.dataset.state=value,state);
+            const alignment = await measureTopologyAlignment(probe);
+            worst = Math.max(worst,alignment.maxError);
+          }
+          maximumAlignmentError = Math.max(maximumAlignmentError,worst);
+          check(`${width}px / DPR ${dpr} / CSS 缩放 ${zoom*100}% / 四种状态圆心对齐`,worst<=0.1,`最大误差 ${worst.toFixed(4)}px`);
+        }
+      }
+      await probe.evaluate(()=>{document.documentElement.style.zoom='1';document.querySelector('#connection-field').dataset.state='verified';});
+      await probe.setViewportSize({width:1440,height:1000});
+      await probe.evaluate(()=>{document.documentElement.dir='rtl';});
+      const rtlAlignment = await measureTopologyAlignment(probe);
+      check(`RTL / DPR ${dpr} / 路线圆心对齐`,rtlAlignment.maxError<=0.1,JSON.stringify(rtlAlignment));
+      await probe.evaluate(()=>{document.documentElement.removeAttribute('dir');});
+      await probe.locator('#connection-field').screenshot({path:path.join(SHOTS,`alignment-desktop-dpr${dpr}.png`)});
+    } finally { await context.close(); }
+  }
+  console.log(`路线几何最大误差 ${maximumAlignmentError.toFixed(4)} CSS px`);
   const originalEntries = await page.evaluate(() => structuredClone(dash.chain.entries));
   await page.evaluate(() => {
     dash.chain.entries = [{id:"ui-repair",label:"更新配对验证",host:"exit.example.com",port:8447,local_port:8446,transport:"reality",enabled:true,pin_ok:true,last_probe:{}}];
