@@ -167,14 +167,18 @@ export function renderNodes() {
       el.disabled = true;
       try {
         const steps = await settleApply(
-          await api(`/api/nodes/${el.dataset.node}/toggle`, { method: "POST" })
+          await api(`/api/nodes/${el.dataset.node}/enabled`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ enabled: el.checked, expected_revision: S.dash.configuration_revision || "" }),
+          })
         );
         const failed = steps.filter((s) => !s.ok);
         toast(failed.length ? `已应用, 但 ${failed.length} 步告警: ${failed[0].name}`
                             : "已热更新, 订阅内容已刷新");
       } catch (e) {
         el.disabled = false;
-        toast("操作失败: " + e.message);
+        el.checked = !!S.dash.nodes.find((node) => node.id === el.dataset.node)?.enabled;
+        toast("操作结果: " + e.message, { kind: "error" });
       }
     })
   );
@@ -239,6 +243,7 @@ function bindIpCopy(root) {
 }
 
 export function renderKpis() {
+  document.dispatchEvent(new CustomEvent("zp:proof-updated"));
   if (!S.dash) return;
   const nodes = S.dash.nodes || [];
   const on = nodes.filter((n) => n.enabled).length;

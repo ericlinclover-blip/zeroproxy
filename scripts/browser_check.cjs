@@ -1139,11 +1139,11 @@ async function main() {
     // 这个页面只有"已经初始化过"的人才会看到 (没初始化的走初始化页), 所以副标题里
     // 再写一句"ZeroProxy 已初始化"是废话; 真正要说的情况由 #login-hint 按需显示
     const loginHero = await page.evaluate(() => {
-      const el = document.querySelector("#view-login .hero");
+      const el = document.querySelector("#view-login .auth-heading");
       return { text: el.innerText.replace(/\s+/g, " ").trim(), ps: el.querySelectorAll("p").length };
     });
-    check("登录页不再有「已初始化」这种废话副标题",
-      loginHero.ps === 0 && !/已初始化/.test(loginHero.text), loginHero.text);
+    check("登录页提供登录说明且不重复初始化状态",
+      loginHero.ps === 1 && !/已初始化/.test(loginHero.text), loginHero.text);
     // 继续用同一套凭据登录, 后面的检查 (深浅色 / 控制台) 仍要有仪表盘
     await page.fill("#login-pass", "s3cretpass");
     await page.click("#btn-login");

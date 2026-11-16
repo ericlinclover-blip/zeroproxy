@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import os
 
-from . import config, geodata
+from . import config, geodata, device_credentials
 from .config import XHTTP_PATH, WS_PATH, paths
 
 
@@ -476,6 +476,23 @@ def build_xray_config(state: dict) -> dict:
                 "outboundTag": f"chain-out-{entry['id']}",
             }
         )
+    # Add independent identities to ordinary and chain-entry client-facing
+    # inbounds only. Chain-exit service credentials remain isolated.
+    client_tags = set(config.XRAY_NODE_IDS) | {chain_node_id(entry) for entry in entries}
+    for inbound in cfg["inbounds"]:
+        if inbound["tag"] not in client_tags:
+            continue
+        users = inbound.get("settings", {}).get("clients", [])
+        for device in device_credentials.active(state):
+            credentials = device["dataplane"]
+            if inbound["protocol"] == "vless":
+                user = {"id": credentials["uuid"], "flow": users[0].get("flow", "") if users else ""}
+            elif inbound["protocol"] == "trojan":
+                user = {"password": credentials["trojan_password"]}
+            else:
+                continue
+            user["email"] = device["id"]
+            users.append(user)
     return cfg
 
 

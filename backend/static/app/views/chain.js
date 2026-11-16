@@ -145,14 +145,14 @@ function chainExitCard(d, ex, c) {
         开启后本机会多一个<b>专用入站</b> (独立凭据, 与订阅里那份互不影响), 供另一台机器把本机当出口用。
         客户端最终看到的出口 IP 就是这台服务器。</div>
       <div class="adv-grid">
-        <div class="field"><label>落地端口 (TCP)</label>
+        <div class="field"><label for="chain-exit-port">落地端口 (TCP)</label>
           <input class="mono" id="chain-exit-port" value="${ex.port || 8447}" inputmode="numeric"></div>
-        <div class="field"><label>名称 (给对方看, 可留空)</label>
+        <div class="field"><label for="chain-exit-label">名称 (给对方看, 可留空)</label>
           <input id="chain-exit-label" value="${escAttr(ex.label || "")}"
             placeholder="${escAttr(d.domain)}" spellcheck="false"></div>
       </div>
       <div class="adv-grid">
-        <div class="field"><label>内层 QUIC 端口 (UDP, 可留空)</label>
+        <div class="field"><label for="chain-exit-hyport">内层 QUIC 端口 (UDP, 可留空)</label>
           <input class="mono" id="chain-exit-hyport" value="${ex.hy_port || 8448}" inputmode="numeric"></div>
         <div class="field"><label>内层传输</label>
           <label class="chk m-0"><input type="checkbox" id="chain-exit-hy"
@@ -226,17 +226,17 @@ function chainPeerCard(d, entries) {
       <span class="note">已连接 ${entries.length} 条</span>
     </div>
     <div class="field mt-3">
-      <label>配对码 (在落地服务器面板「链式代理 → 落地端」里生成)</label>
+      <label for="chain-code">配对码 (在落地服务器面板「链式代理 → 落地端」里生成)</label>
       <textarea class="mono" id="chain-code" rows="3" spellcheck="false"
         placeholder="ZPC1~… 整段粘贴, 别只复制一部分"></textarea>
     </div>
     <div class="adv-grid">
-      <div class="field"><label>名称 (可留空, 默认用落地地址)</label>
+      <div class="field"><label for="chain-label">名称 (可留空, 默认用落地地址)</label>
         <input id="chain-label" placeholder="例如 美国落地" spellcheck="false"></div>
-      <div class="field"><label>本机对外端口 (留空自动分配)</label>
+      <div class="field"><label for="chain-local-port">本机对外端口 (留空自动分配)</label>
         <input class="mono" id="chain-local-port" placeholder="自动" inputmode="numeric"></div>
     </div>
-    <div class="field"><label>内层传输 (两台服务器之间那一跳)</label>
+    <div class="field"><label for="chain-transport">内层传输 (两台服务器之间那一跳)</label>
       <select id="chain-transport">
         <option value="reality">Reality / TCP (默认, 免证书抗封锁)</option>
         <option value="hysteria2" id="chain-transport-quic">QUIC / Hysteria 2 (UDP, 需实测线路表现)</option>

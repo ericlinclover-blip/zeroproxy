@@ -432,6 +432,9 @@ REV_FIELDS = (
 
 def config_rev(state: dict) -> str:
     payload = {key: state.get(key) for key in REV_FIELDS}
+    payload["device_templates"] = sorted((d.get("id", ""), d.get("template")) for d in items(state) if d.get("template"))
+    payload["device_credentials"] = sorted((d.get("id", ""), (d.get("dataplane") or {}).get("uuid", ""))
+                                           for d in items(state) if d.get("dataplane"))
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
@@ -443,6 +446,11 @@ def device_view(device: dict, *, now: int | None = None) -> dict:
     desired = bool(device.get("desired"))
     actual = bool(device.get("actual"))
     is_online = online(device, now)
+    report = device.get("report") or {}
+    covered = str(report.get("covered") or "").lower()
+    running = is_online and actual
+    managed = running and covered in {"full", "lan", "lan_tcp"}
+    override = str(report.get("override") or "").lower()
     return {
         "id": device.get("id", ""),
         "name": device.get("name", ""),
@@ -461,7 +469,11 @@ def device_view(device: dict, *, now: int | None = None) -> dict:
         # 开关点下去到设备回报之间是"同步中": 面板据此显示转圈而不是假装已生效
         "syncing": desired != actual and is_online,
         # 期望开、但设备自己也说开着 → 才是真的"已连接"
-        "connected": desired and actual,
+        "connected": desired and managed,
+        "running": running,
+        "taking_over": managed,
+        "control": "local" if override in {"on", "off"} else "panel",
+        "credentials_independent": bool(device.get("dataplane")),
         "template": device.get("template", ""),
         # 设备自己上报的最后一版 (旧客户端字段, 不代表已应用)
         "rev": device.get("rev", ""),
@@ -487,7 +499,9 @@ def view(state: dict, *, now: int | None = None) -> dict:
         "items": devices,
         "count": len(devices),
         "online": sum(1 for d in devices if d["online"]),
-        "on": sum(1 for d in devices if d["connected"]),
+        "on": sum(1 for d in devices if d["taking_over"]),
+        "running": sum(1 for d in devices if d["running"]),
+        "taking_over": sum(1 for d in devices if d["taking_over"]),
         "max": MAX_DEVICES,
         "kinds": list(KINDS),
         "pair_ttl": PAIR_TTL,

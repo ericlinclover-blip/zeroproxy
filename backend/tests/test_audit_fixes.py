@@ -209,7 +209,7 @@ def test_apply_and_expiry_cannot_enter_another_wg_transaction(client, configured
     assert outcomes and outcomes[0][0]['ok'] is False
 
 
-def test_failed_job_does_not_claim_completion():
+def test_failed_job_does_not_claim_completion(home):
     job_id, _ = routes._new_job(None, 1, 'validate')
     try:
         routes._finish_job(job_id, [{'name': 'validate', 'ok': False, 'detail': 'invalid'}])

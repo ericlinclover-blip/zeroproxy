@@ -122,11 +122,11 @@ function enabledView(wg) {
     <summary>端口 / 网段 / MTU / DNS / 混淆</summary>
     <div class="wg-form mt-2">
       <div class="field">
-        <label>监听端口 (UDP)</label>
+        <label for="wg-port">监听端口 (UDP)</label>
         <input id="wg-port" class="mono" inputmode="numeric" value="${escAttr(wg.port)}">
       </div>
       <div class="field">
-        <label>运行方式</label>
+        <label for="wg-mode">运行方式</label>
         <select id="wg-mode">
           <option value="auto" ${wg.mode === "auto" ? "selected" : ""}>自动 (内核优先, 失败退用户态)</option>
           <option value="kernel" ${wg.mode === "kernel" ? "selected" : ""}>仅内核</option>
@@ -137,23 +137,23 @@ function enabledView(wg) {
         </div>
       </div>
       <div class="field">
-        <label>隧道网段${hasPeers ? " (有客户端时锁定)" : ""}</label>
+        <label for="wg-subnet">隧道网段${hasPeers ? " (有客户端时锁定)" : ""}</label>
         <input id="wg-subnet" class="mono" value="${escAttr(wg.subnet)}" ${hasPeers ? "disabled" : ""}>
       </div>
       <div class="field">
-        <label>MTU</label>
+        <label for="wg-mtu">MTU</label>
         <input id="wg-mtu" class="mono" inputmode="numeric" value="${escAttr(wg.mtu)}">
       </div>
       <div class="field">
-        <label>DNS (逗号分隔, 留空不下发)</label>
+        <label for="wg-dns">DNS (逗号分隔, 留空不下发)</label>
         <input id="wg-dns" class="mono" value="${escAttr(wg.dns || "")}" placeholder="1.1.1.1, 8.8.8.8">
       </div>
       <div class="field">
-        <label>Endpoint (留空 = 面板域名)</label>
+        <label for="wg-endpoint">Endpoint (留空 = 面板域名)</label>
         <input id="wg-endpoint" class="mono" value="${escAttr(wg.endpoint_input || "")}" placeholder="${escAttr(wg.endpoint_host || "wg.example.com")}">
       </div>
       <div class="field">
-        <label>Keepalive (秒)</label>
+        <label for="wg-keepalive">Keepalive (秒)</label>
         <input id="wg-keepalive" class="mono" inputmode="numeric" value="${escAttr(wg.keepalive)}">
       </div>
     </div>
@@ -178,23 +178,23 @@ function enabledView(wg) {
       ${awg.enabled ? `
         <div class="wg-form mt-2">
           <div class="field">
-            <label>H1 (握手发起 Header)</label>
+            <label for="wg-awg-h1">H1 (握手发起 Header)</label>
             <input id="wg-awg-h1" class="mono" inputmode="numeric" value="${escAttr(awg.h1 || 0)}">
           </div>
           <div class="field">
-            <label>H2 (握手响应 Header)</label>
+            <label for="wg-awg-h2">H2 (握手响应 Header)</label>
             <input id="wg-awg-h2" class="mono" inputmode="numeric" value="${escAttr(awg.h2 || 0)}">
           </div>
           <div class="field">
-            <label>H3 (Cookie Header)</label>
+            <label for="wg-awg-h3">H3 (Cookie Header)</label>
             <input id="wg-awg-h3" class="mono" inputmode="numeric" value="${escAttr(awg.h3 || 0)}">
           </div>
           <div class="field">
-            <label>H4 (传输数据 Header)</label>
+            <label for="wg-awg-h4">H4 (传输数据 Header)</label>
             <input id="wg-awg-h4" class="mono" inputmode="numeric" value="${escAttr(awg.h4 || 0)}">
           </div>
           <div class="field">
-            <label>Jc (前置垃圾包数)</label>
+            <label for="wg-awg-jc">Jc (前置垃圾包数)</label>
             <input id="wg-awg-jc" class="mono" inputmode="numeric" value="${escAttr(awg.jc ?? 4)}">
           </div>
           <div class="field">
@@ -449,23 +449,23 @@ async function saveSettings(wg, btn) {
     toast("没有需要修改的内容");
     return;
   }
-  await applyAction(
+  const saved = await applyAction(
     "POST", "/api/wireguard/settings", payload, btn, "应用中…", "WireGuard 设置已应用"
   );
-  clearDraft("#wg-port, #wg-subnet, #wg-mtu, #wg-dns, #wg-endpoint, #wg-keepalive, #wg-awg-h1, #wg-awg-h2, #wg-awg-h3, #wg-awg-h4, #wg-awg-jc, #wg-awg-s1, #wg-awg-s2");
+  if (saved) clearDraft("#wg-port, #wg-subnet, #wg-mtu, #wg-dns, #wg-endpoint, #wg-keepalive, #wg-awg-h1, #wg-awg-h2, #wg-awg-h3, #wg-awg-h4, #wg-awg-jc, #wg-awg-s1, #wg-awg-s2");
 }
 
 function addPeer(wg) {
   openConfirm({
     title: "添加 WireGuard 设备",
     html: `
-      <label>设备名</label>
+      <label for="wg-new-name">设备名</label>
       <input id="wg-new-name" maxlength="40" placeholder="例如 iPhone / MacBook" autocomplete="off">
-      <label class="mt-2">有效期</label>
+      <label class="mt-2" for="wg-new-expires">有效期</label>
       <select id="wg-new-expires">
         ${EXPIRES.map(([d, t]) => `<option value="${d}">${t}</option>`).join("")}
       </select>
-      <label class="mt-2">AllowedIPs (客户端把哪些流量塞进隧道)</label>
+      <label class="mt-2" for="wg-new-mode">AllowedIPs (客户端把哪些流量塞进隧道)</label>
       <select id="wg-new-mode">
         <option value="0.0.0.0/0">全流量 (0.0.0.0/0)</option>
         <option value="vpn">只走隧道网段 (${esc(wg.subnet)})</option>
@@ -514,11 +514,11 @@ function editPeer(wg, id) {
   openConfirm({
     title: `编辑「${peer.name}」`,
     html: `
-      <label>设备名</label>
+      <label for="wg-edit-name">设备名</label>
       <input id="wg-edit-name" maxlength="40" value="${escAttr(peer.name)}">
-      <label class="mt-2">剩余有效期 (天, 0 = 永久)</label>
+      <label class="mt-2" for="wg-edit-days">剩余有效期 (天, 0 = 永久)</label>
       <input id="wg-edit-days" class="mono" inputmode="numeric" value="${days}">
-      <label class="mt-2">AllowedIPs</label>
+      <label class="mt-2" for="wg-edit-allowed">AllowedIPs</label>
       <input id="wg-edit-allowed" class="mono" value="${escAttr(peer.allowed_ips)}">
       <div class="muted fs-xs mt-1">多个网段用逗号分隔；这是客户端侧路由，不是服务端 ACL。</div>
       <label class="chk mt-2"><input type="checkbox" id="wg-edit-compat" ${peer.compat ? "checked" : ""}>

@@ -4,25 +4,42 @@
 //:   业务失败 → 有 HTTP 状态码 + 中文 error, 照实报给用户;
 //:   连接中断 → fetch 抛错 / 502 / 504, 属于"重启内核的副作用", 该自动重连。
 export async function api(path, opts = {}) {
-  let res;
+  const longWrite = opts.method && opts.method !== "GET" && /^\/api\/(wireguard|renew|repair)/.test(path);
+  const { timeoutMs = longWrite ? 240000 : 30000, signal, ...options } = opts;
+  if (path === "/api/settings" && typeof options.body === "string" && S.dash?.configuration_revision) {
+    const payload = JSON.parse(options.body);
+    options.body = JSON.stringify({ expected_revision: S.dash.configuration_revision, ...payload });
+  }
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (signal?.aborted) abort();
+  signal?.addEventListener("abort", abort, { once: true });
+  const timer = setTimeout(abort, timeoutMs);
   try {
-    res = await fetch(path, { credentials: "same-origin", ...opts });
+    const res = await fetch(path, { credentials: "same-origin", ...options, signal: controller.signal });
+    const body = await res.json().catch((err) => {
+      if (controller.signal.aborted) throw err;
+      return null;
+    });
+    if (!res.ok) {
+      const e = new Error(body?.error || `HTTP ${res.status}`);
+      e.status = res.status;
+      e.dropped = res.status === 502 || res.status === 504;
+      e.body = body || {};
+      throw e;
+    }
+    if (body === null) throw new Error("面板返回了无法解析的内容");
+    return body;
   } catch (err) {
-    const e = new Error("与面板的连接中断 (重启内核时会短暂断开)");
+    if (err.status || (err instanceof Error && !controller.signal.aborted && err.message === "面板返回了无法解析的内容")) throw err;
+    const e = new Error(controller.signal.aborted ? "请求超时或已取消，操作结果待确认" : "与面板的连接中断，操作结果待确认");
     e.dropped = true;
+    e.unknown = true;
     throw e;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", abort);
   }
-  const body = await res.json().catch(() => null);
-  if (!res.ok) {
-    const e = new Error((body && body.error) || `HTTP ${res.status}`);
-    e.status = res.status;
-    // 502/504 = 上游(面板)正在重启, 和"网络断了"同样处理
-    e.dropped = res.status === 502 || res.status === 504;
-    e.body = body || {};
-    throw e;
-  }
-  if (body === null) throw new Error("面板返回了无法解析的内容");
-  return body;
 }
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -57,17 +74,16 @@ export function markDisconnected(msg) {
   st.innerHTML = `<span class="dot other"></span>${msg || "连接中断, 正在重连…"}`;
 }
 
-/** 重启内核会掐断"走本机链路上网"的浏览器请求 —— 但面板那边已经把活干完了。
- *  这里等连接回来、用 /api/dashboard 对齐真实状态, 并回答"界面变了没有":
- *  true=变了 (操作确实生效), false=没变 (没生效/本就是空操作), null=一直没连上。 */
-export async function syncAfterDrop(before, tries = 10, delay = 1200) {
+/** Reconnect and refresh observations. Only an operation-specific predicate
+ * may confirm success; changed telemetry is never evidence of completion. */
+export async function syncAfterDrop(verify, tries = 10, delay = 1200) {
   for (let i = 0; i < tries; i++) {
     await sleep(delay);
     try {
       S.dash = await api("/api/dashboard");
       redrawDash(true);
       show("view-dash");
-      return JSON.stringify(S.dash) !== before;
+      return typeof verify === "function" ? !!verify(S.dash) : false;
     } catch (e) { /* 隧道/面板还没回来, 继续等 */ }
   }
   markDisconnected("连接中断 — 稍后会自动重试, 期间状态可能不是最新的");

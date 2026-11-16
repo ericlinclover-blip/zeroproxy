@@ -378,7 +378,16 @@ after = json.load(open(sys.argv[2], encoding="utf-8"))
 # 生成**一对合法密钥 (wireguard.py 只在无效/为空时生成, 不会覆盖已有密钥)。所以这里
 # 允许 wireguard.server_private_key / server_public_key 从 "" 变成一对合法的 32 字节
 # base64 密钥; 其它任何字段变化仍然算失败。
-strip = lambda d: {k: v for k, v in d.items() if k not in ("steps", "updated_at")}
+# Application verification metadata is intentionally refreshed during upgrade.
+# Validate its exact schema, then compare all business fields unchanged.
+runtime = after.get("runtime") or {}
+assert set(runtime) <= {"applied_revision", "credentials_revision", "status", "rollback_state", "error", "checked_at", "verification"}
+assert runtime.get("status") == "applied" and not runtime.get("error"), runtime
+assert runtime.get("verification") == "dry-run", runtime
+assert len(runtime.get("applied_revision", "")) == 24, runtime
+assert len(runtime.get("credentials_revision", "")) == 24, runtime
+assert runtime.get("checked_at", 0) > 0, runtime
+strip = lambda d: {k: v for k, v in d.items() if k not in ("steps", "updated_at", "runtime")}
 b, a = strip(before), strip(after)
 LENIENT_WG = ("wireguard.server_private_key", "wireguard.server_public_key")
 
@@ -417,7 +426,7 @@ if wg_ok:
     print("    (允许的惰性生成: " + ", ".join(wg_ok) + " — 空 → 合法密钥)")
 PY
 then
-  ok "state.json 的密钥 / 令牌 / 节点配置原样保留 (只有 steps 进度与 WireGuard 惰性生成的密钥变化)"
+  ok "state.json 的密钥 / 令牌 / 节点配置原样保留 (仅进度/验证元数据与 WireGuard 惰性生成变化)"
 else
   bad "state.json 的关键字段被改动"
 fi

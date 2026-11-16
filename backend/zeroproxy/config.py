@@ -12,6 +12,7 @@ rename」原子替换, 断电/崩溃不会留下半个 JSON。
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import copy
 import json
 import os
@@ -898,3 +899,27 @@ def audit_query(
             "log": audit_log_path() if int(state.get("audit_dropped") or 0) else "",
         },
     }
+
+
+RUNTIME_FIELDS = ("domain", "uuid", "ports", "reality", "xhttp", "nodes", "chain",
+                  "trojan_password", "hysteria_password", "hysteria_hopping", "hysteria_ports",
+                  "hysteria_masquerade", "geodata", "wireguard", "cert")
+
+
+def configuration_revision(state: dict) -> str:
+    """Stable desired configuration identity, not a telemetry/dashboard fingerprint."""
+    payload = copy.deepcopy({key: state.get(key) for key in RUNTIME_FIELDS})
+    geo = payload.get("geodata")
+    if isinstance(geo, dict):
+        for key in ("updated_at", "last_attempt", "last_error", "last_check"):
+            geo.pop(key, None)
+    chain = payload.get("chain") or {}
+    for entry in chain.get("entries") or []:
+        if isinstance(entry, dict):
+            for key in ("last_probe", "last_error", "checked_at"):
+                entry.pop(key, None)
+    payload["device_credentials"] = sorted(
+        [(d.get("id"), d.get("dataplane")) for d in (state.get("devices") or {}).get("items", [])
+         if isinstance(d, dict) and not d.get("deleted") and d.get("dataplane")], key=lambda item: str(item[0]))
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()[:24]

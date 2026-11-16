@@ -10,6 +10,7 @@
 import { $, esc, escAttr, toast, copyText } from "../lib/dom.js";
 import { api } from "../lib/api.js";
 import { S } from "../lib/state.js";
+import { settleApply } from "../lib/jobs.js";
 import { openConfirm, openQr } from "../lib/dialog.js";
 
 /** 当前 tab / 本页的临时状态 (不放进 S.dash: 它属于视图, 不属于服务器数据) */
@@ -31,7 +32,7 @@ export function renderClients(dash) {
   const nav = $("#nav-clients");
   if (nav) nav.textContent = dev.count ? `${dev.on}/${dev.count}` : "—";
   $("#client-count").textContent = dev.count
-    ? `${dev.on} 台已连接 · 共 ${dev.count} 台`
+    ? `${dev.on} 台已接管 · ${dev.online || 0} 台在线 · 共 ${dev.count} 台`
     : "还没有客户端";
 
   document.querySelectorAll("[data-client-tab]").forEach((btn) => {
@@ -52,16 +53,17 @@ function statusPill(d) {
   // 面板改不动它 —— 这时显示"同步中…"会让人以为再等等就好, 而其实要回路由器上
   // 执行 zeroproxy local-auto 才会交回面板。
   const override = String((d.report || {}).override || "").toLowerCase();
-  if ((override === "on" || override === "off") && (override === "on") !== !!d.desired) {
+  if ((override === "on" || override === "off")) {
     const want = override === "on" ? "开" : "关";
     return `<span class="pill warn" title="这台路由器在面板不可达时被本机设成了「${want}」。面板的开关现在改不动它, 直到在路由器上执行 zeroproxy local-auto"><i class="dot warn"></i>本机覆盖 (${want})</span>`;
   }
   if (d.syncing) return `<span class="pill warn"><i class="dot warn"></i>同步中…</span>`;
-  if (!d.connected) return `<span class="pill other"><i class="dot other"></i>已关闭</span>`;
+  if (!d.actual) return `<span class="pill other"><i class="dot other"></i>已关闭</span>`;
   // "内核在跑" ≠ "流量被接管": 真机 8.45 上内核启动成功, 但 tun 建不出来、tproxy 也
   // 没有, 局域网里一台设备都没被接管 —— 面板当时还是绿的。设备把现场验过的覆盖范围
   // 一起报上来 (report.covered), 这里据此把话说细。
   const cov = coveredOf(d);
+  if (!["full", "lan", "lan_tcp", "none"].includes(cov)) return `<span class="pill warn"><i class="dot warn"></i>接管范围未知</span>`;
   if (cov === "none") return `<span class="pill bad"><i class="dot err"></i>未接管</span>`;
   if (cov === "lan_tcp") return `<span class="pill warn"><i class="dot warn"></i>已连接 (仅 TCP)</span>`;
   return `<span class="pill ok"><i class="dot running"></i>已连接</span>`;
@@ -268,7 +270,7 @@ function routerTab(dash, routers) {
         <button class="btn small" data-copy-cmd="${escAttr(updateCmd)}">复制</button>
       </div>
     </div>
-    ${pairInfo ? pairCard() : ""}`;
+    ${pairInfo ? pairCard(dash) : ""}`;
 }
 
 function deviceCard(d) {
@@ -282,11 +284,20 @@ function deviceCard(d) {
         ${statusPill(d)}
       </div>
       <div class="dev-sub">${esc(meta || "已接入")}${d.online ? ` · ${ago(d.last_seen)}同步` : ` · 最后在线 ${ago(d.last_seen)}`}</div>
+      <details class="client-help mt-2" id="device-details-${escAttr(d.id)}"><summary>状态与同步详情</summary>
+        <dl class="device-facts">
+          <div><dt>控制权</dt><dd>${d.control === "local" || ["on", "off"].includes(String(d.report?.override)) ? "本机覆盖 · 在路由器执行 zeroproxy local-auto 交还面板" : "面板管理"}</dd></div>
+          <div><dt>期望 / 回报</dt><dd>${d.desired ? "开启" : "关闭"} / ${!d.online ? "离线，等待回报" : d.actual ? "运行" : "停止"}</dd></div>
+          <div><dt>下载 / 应用版本</dt><dd>${esc(d.downloaded_rev || "未知")} / ${esc(d.applied_rev || "未知")}</dd></div>
+          <div><dt>设备说明</dt><dd>${esc(d.report?.why || "暂无错误回报；接管状态不等于实际出网验证")}</dd></div>
+        </dl>
+      </details>
       <div class="dev-tags">
         <span class="tag-chip">分流 · ${esc(tpl)}</span>
-        <span class="tag-chip">${d.actual ? "内核运行中" : "内核已停止"}</span>
+        <span class="tag-chip">${!d.online ? "运行状态待更新" : d.actual ? "内核运行中" : "内核已停止"}</span>
         ${coverageChip(d)}
         ${versionChip(d)}
+        <span class="tag-chip">${d.credentials_independent ? "独立数据面凭据" : "共享节点凭据"}</span>
         ${d.version ? `<span class="tag-chip">客户端 v${esc(d.version)}</span>` : ""}
       </div>
       ${d.ui ? `
@@ -298,18 +309,19 @@ function deviceCard(d) {
     </div>
     <div class="dev-switch">
       <label class="bigswitch" title="${d.desired ? "点击关闭全屋代理" : "点击开启全屋代理"}">
-        <input type="checkbox" data-dev-toggle="${escAttr(d.id)}" ${d.desired ? "checked" : ""}>
+        <input type="checkbox" aria-label="${escAttr(d.name || "路由器")} 全屋代理" data-dev-toggle="${escAttr(d.id)}" ${d.desired ? "checked" : ""}>
         <span class="track"><span class="knob"></span></span>
       </label>
       <div class="dev-switch-label">全屋代理</div>
     </div>
     <div class="dev-actions">
       <label class="dev-tpl">
-        <select data-dev-tpl="${escAttr(d.id)}">
+        <select aria-label="设备分流模板" data-dev-tpl="${escAttr(d.id)}">
           ${Object.entries(TPL_LABEL).map(([v, t]) =>
             `<option value="${escAttr(v)}" ${(d.template || "") === v ? "selected" : ""}>${esc(t)}</option>`).join("")}
         </select>
       </label>
+      ${!d.credentials_independent ? `<button class="btn ghost small" data-dev-credentials="${escAttr(d.id)}">启用独立凭据</button>` : ""}
       <button class="btn ghost small" data-dev-rename="${escAttr(d.id)}">改名</button>
       <button class="btn ghost small danger" data-dev-remove="${escAttr(d.id)}">移除</button>
     </div>
@@ -379,33 +391,28 @@ function pairCard(dash) {
 
 /* ---------------- 手机 / 电脑 */
 
+export const CLIENT_APPS = [
+  { id: "shadowrocket", kind: "phone", name: "iOS · Shadowrocket", format: "base64", tip: "在订阅中添加链接，再更新订阅。" },
+  { id: "sfa", kind: "phone", name: "Android · sing-box", format: "singbox", tip: "导入远程配置，使用 sing-box JSON。", scheme: "sing-box://import-remote-profile?url=" },
+  { id: "v2rayng", kind: "phone", name: "Android · v2rayNG", format: "base64", tip: "添加订阅分组，粘贴链接后更新。" },
+  { id: "clash-verge", kind: "desktop", name: "Windows · Clash Verge Rev", format: "clash", tip: "在订阅中导入 Clash YAML。", scheme: "clash://install-config?url=" },
+  { id: "mihomo", kind: "desktop", name: "macOS · Mihomo Party", format: "clash", tip: "在订阅中导入 Clash YAML。", scheme: "clash://install-config?url=" },
+  { id: "singbox-linux", kind: "desktop", name: "Linux · sing-box", format: "singbox", tip: "下载 JSON 配置，先执行 sing-box check 校验。" },
+];
+
 function mobileTab(dash, kind) {
-  const sub = (dash.subscription_formats || {}).base64 || "";
-  const clash = (dash.subscription_formats || {}).clash || "";
-  const rows = kind === "phone"
-    ? [["iOS · Shadowrocket", "App Store 搜索 Shadowrocket, 扫码即导入", sub],
-       ["Android · sing-box / v2rayNG", "应用商店或 GitHub 下载, 扫码即导入", sub]]
-    : [["Windows · Clash Verge Rev", "下载后点「订阅」粘贴下面的地址", clash],
-       ["macOS · Mihomo Party", "下载后导入订阅链接", clash],
-       ["Linux · sing-box", "保存订阅文件后直接加载", clash]];
-  return `
-  <div class="client-hint">
-    手机 / 电脑端用现成的客户端导入订阅即可 —— 订阅地址恒定不变, 面板上换节点 / 改分流会自动生效。
-  </div>
-  <div class="dev-grid">
-    ${rows.map(([name, tip, url]) => `
-      <div class="mini-card">
-        <b>${esc(name)}</b>
-        <div class="muted fs-xs mt-1">${esc(tip)}</div>
-        <div class="mini-actions">
-          <button class="btn ghost small" data-sub-qr="${escAttr(url)}">二维码</button>
-          <button class="btn ghost small" data-sub-copy="${escAttr(url)}">复制订阅</button>
-        </div>
-      </div>`).join("")}
-  </div>
-  <div class="muted fs-xs mt-3">
-    路由器端是唯一"全自动"的形态: 装一次, 全屋生效, 之后连开关都不用点。
-  </div>`;
+  return `<div class="client-hint">选择正在使用的客户端，导入对应格式。面板变更后需在客户端更新并应用订阅；面板无法确认外部客户端是否在线。</div>
+  <div class="dev-grid">${CLIENT_APPS.filter((app) => app.kind === kind).map((app) => {
+    const url = dash.subscription_formats?.[app.format] || "";
+    return `<div class="mini-card"><b>${esc(app.name)}</b>
+      <div class="muted fs-xs mt-1">${esc(app.tip)}</div>
+      <div class="mini-actions">
+        <button class="btn ghost small" data-sub-qr="${escAttr(url)}" data-sub-format="${app.format}">二维码</button>
+        <button class="btn ghost small" data-sub-copy="${escAttr(url)}">复制订阅</button>
+        ${app.format === "singbox" ? `<a class="btn ghost small" href="${escAttr(url)}" download="zeroproxy-singbox.json">下载 JSON</a>` : ""}
+        ${app.scheme ? `<a class="btn ghost small" href="${escAttr(app.scheme + encodeURIComponent(url))}">导入客户端</a>` : ""}
+      </div><div class="muted fs-xs mt-2">${esc(app.format)} · 导入后连接节点并打开目标网站验证。</div></div>`;
+  }).join("")}</div>`;
 }
 
 /* ---------------- 事件绑定 ---------------- */
@@ -432,7 +439,7 @@ function bind(dash, routers) {
   });
   document.querySelectorAll("[data-sub-qr]").forEach((el) => {
     el.onclick = () => {
-      const fmt = el.dataset.subQr === (dash.subscription_formats || {}).base64 ? "base64" : "clash";
+      const fmt = el.dataset.subFormat || "base64";
       const q = `format=${encodeURIComponent(fmt)}`;
       openQr({
         title: "订阅二维码",
@@ -456,12 +463,24 @@ function bind(dash, routers) {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ template: el.value }),
         });
-        toast("分流模板已更新, 路由器将于 15 秒内生效");
+        toast("服务器已保存，等待路由器下载并应用配置");
         await refreshDevices();
       } catch (e) {
         toast(e.message || "修改失败");
       }
     };
+  });
+  document.querySelectorAll("[data-dev-credentials]").forEach((el) => {
+    el.onclick = () => openConfirm({
+      title: "为设备启用独立代理凭据？", okLabel: "启用并应用",
+      html: "这会更新服务器认证配置，可能短暂中断代理连接。设备下次同步会收到独立凭据；应用后应确认设备已更新。设备此前缓存的共享凭据仍需单独轮换才能撤销。",
+      onOk: async () => {
+        try {
+          await settleApply(await api(`/api/devices/${encodeURIComponent(el.dataset.devCredentials)}/credentials`, { method: "POST" }));
+          toast("独立凭据已应用，等待设备更新配置后验证出网");
+        } catch (e) { toast("启用失败: " + e.message); }
+      },
+    });
   });
   document.querySelectorAll("[data-dev-rename]").forEach((el) => {
     el.onclick = () => renameDevice(el.dataset.devRename);
@@ -574,7 +593,7 @@ function renameDevice(id) {
   const item = (S.dash.devices.items || []).find((d) => d.id === id);
   openConfirm({
     title: "重命名设备",
-    html: `<label>设备名</label><input id="dev-rename-input" value="${escAttr(item ? item.name : "")}" maxlength="40">`,
+    html: `<label for="dev-rename-input">设备名</label><input id="dev-rename-input" value="${escAttr(item ? item.name : "")}" maxlength="40">`,
     okLabel: "保存",
     onOk: async () => {
       const value = ($("#dev-rename-input") || {}).value || "";
@@ -598,13 +617,15 @@ function removeDevice(id) {
   const item = (S.dash.devices.items || []).find((d) => d.id === id);
   openConfirm({
     title: "移除这台设备？",
-    html: `<b>${esc(item ? item.name : "")}</b> 会立刻失去访问权限, 上面正在运行的代理随之失效。<br>
+    html: `<b>${esc(item ? item.name : "")}</b> 将失去配置同步与管理权限。已缓存的代理配置可能仍能使用，需要轮换节点凭据才能彻底撤销访问。<br>
+           ${item?.credentials_independent ? "独立授权移除后会重新应用服务器配置，可能短暂中断其他代理连接。<br>" : ""}
            <span class="muted">设备上的程序不会自动卸载 —— 需要在路由器上执行 <code class="mono">zeroproxy uninstall</code> 才会清干净。</span>`,
     okLabel: "移除",
     onOk: async () => {
       try {
-        await api(`/api/devices/${encodeURIComponent(id)}`, { method: "DELETE" });
-        toast("已移除");
+        const result = await api(`/api/devices/${encodeURIComponent(id)}`, { method: "DELETE" });
+        if (result.job || result.steps) await settleApply(result);
+        toast(result.notice || "已移除设备管理权限；缓存配置的代理访问尚未撤销", { kind: "notice", persistent: true });
         await refreshDevices();
       } catch (e) {
         toast(e.message || "移除失败");

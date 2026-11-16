@@ -1497,273 +1497,68 @@ _UNLOCK_CACHE: dict = {"data": None, "at": 0.0}
 _UNLOCK_LOCK = threading.Lock()
 
 
+SERVICE_ENDPOINTS = (
+    ("OpenAI API", "ai", "https://api.openai.com/v1/models"),
+    ("Claude API", "ai", "https://api.anthropic.com"),
+    ("Google Gemini API", "ai", "https://generativelanguage.googleapis.com"),
+    ("Netflix", "media", "https://www.netflix.com/title/70143836"),
+    ("YouTube Premium", "media", "https://www.youtube.com/premium"),
+    ("Google 服务", "web", "https://www.google.com/ncr"),
+)
+
+
+def _endpoint_evidence(name: str, category: str, target: str, timeout: float) -> dict:
+    result = {"name": name, "category": category, "target": target,
+              "location": "server-direct", "status": "unknown", "ok": None,
+              "http_status": None, "checked_at": int(time.time())}
+    try:
+        req = urllib.request.Request(target, headers={"User-Agent": "ZeroProxy-Probe/2.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            code = response.getcode()
+            result["final_url"] = response.geturl()
+    except urllib.error.HTTPError as exc:
+        code = exc.code
+    except Exception as exc:
+        result["detail"] = f"未取得 HTTP 响应 ({exc.__class__.__name__})；请检查 DNS、TLS 或网络连接"
+        return result
+    result["http_status"] = code
+    if 200 <= code < 400:
+        result.update(status="reachable", ok=True, detail=f"HTTP {code}：端点可达；不证明账号可用、播放权限或完整服务解锁")
+    elif code == 401:
+        result.update(status="auth_required", ok=None, detail="HTTP 401：端点要求身份验证；未验证实际服务使用")
+    elif code == 403:
+        result.update(status="restricted", ok=False, detail="HTTP 403：访问被拒绝，可能涉及地区、权限或站点防护；不能单凭状态码确定原因")
+    elif code == 429:
+        result.update(status="rate_limited", ok=None, detail="HTTP 429：请求受到限流，稍后重试")
+    elif code >= 500:
+        result.update(status="error", ok=None, detail=f"HTTP {code}：目标服务错误，稍后重试")
+    else:
+        result.update(status="unknown", ok=None, detail=f"HTTP {code}：已收到响应，但不足以判断服务可用性")
+    return result
+
+
 def unlock_probe(timeout: float = 4.0, force: bool = False) -> dict:
-    """探测服务器出口对主流 AI 服务 (OpenAI / Claude / Gemini) 与流媒体 (Netflix / YouTube / Google) 的解锁状态及纯净度。
-
-    离线测试环境 (ZP_PUBLIC_IP=0) 自动返回模拟测试结果，杜绝拖出外网。
-    """
+    """Direct server HTTP evidence; never a claim about a device's selected route."""
     now = time.time()
+    simulated = not public_ip_enabled()
     with _UNLOCK_LOCK:
-        if not force and _UNLOCK_CACHE["data"] and (now - _UNLOCK_CACHE["at"] < 60.0):
-            return dict(_UNLOCK_CACHE["data"])
-
-    if not public_ip_enabled():
-        mock_result = {
-            "checked_at": int(now),
-            "ip": "198.51.100.1",
-            "region": "US · United States",
-            "items": [
-                {"name": "OpenAI / ChatGPT", "category": "ai", "ok": True, "detail": "可用 (未限制)"},
-                {"name": "Claude (Anthropic)", "category": "ai", "ok": True, "detail": "可用"},
-                {"name": "Google Gemini", "category": "ai", "ok": True, "detail": "可用"},
-                {"name": "Netflix", "category": "media", "ok": True, "detail": "原生完整片库解锁"},
-                {"name": "YouTube Premium", "category": "media", "ok": True, "detail": "支持购买 (US)"},
-                {"name": "Google 服务", "category": "ip", "ok": True, "detail": "原生国际 IP (未送中)"},
-            ],
-            "summary": "全部 AI 与流媒体测试通过",
-        }
-        with _UNLOCK_LOCK:
-            _UNLOCK_CACHE["data"] = mock_result
-            _UNLOCK_CACHE["at"] = now
-        return mock_result
-
-    from concurrent.futures import ThreadPoolExecutor
-
-    def _test_openai() -> dict:
-        try:
-            req = urllib.request.Request(
-                "https://api.openai.com/v1/models",
-                headers={"User-Agent": "ZeroProxy-Probe/1.0", "Accept": "*/*"},
-            )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                status = resp.getcode()
-                return {
-                    "name": "OpenAI / ChatGPT",
-                    "category": "ai",
-                    "ok": True,
-                    "detail": f"可用 (HTTP {status})",
-                }
-        except urllib.error.HTTPError as exc:
-            if exc.code == 401:
-                return {
-                    "name": "OpenAI / ChatGPT",
-                    "category": "ai",
-                    "ok": True,
-                    "detail": "可用 (端点开放, 需密钥)",
-                }
-            if exc.code == 403:
-                return {
-                    "name": "OpenAI / ChatGPT",
-                    "category": "ai",
-                    "ok": False,
-                    "detail": "地区受限 (403 阻断)",
-                }
-            return {
-                "name": "OpenAI / ChatGPT",
-                "category": "ai",
-                "ok": False,
-                "detail": f"HTTP {exc.code}",
-            }
-        except Exception as exc:
-            return {
-                "name": "OpenAI / ChatGPT",
-                "category": "ai",
-                "ok": False,
-                "detail": f"连接超时: {exc.__class__.__name__}",
-            }
-
-    def _test_claude() -> dict:
-        try:
-            req = urllib.request.Request(
-                "https://api.anthropic.com",
-                headers={"User-Agent": "Mozilla/5.0 ZeroProxy/2.0", "Accept": "*/*"},
-            )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return {"name": "Claude (Anthropic)", "category": "ai", "ok": True, "detail": "可用"}
-        except urllib.error.HTTPError as exc:
-            if exc.code in (401, 404, 405):
-                return {
-                    "name": "Claude (Anthropic)",
-                    "category": "ai",
-                    "ok": True,
-                    "detail": "可用 (开放访问)",
-                }
-            if exc.code == 403:
-                return {
-                    "name": "Claude (Anthropic)",
-                    "category": "ai",
-                    "ok": False,
-                    "detail": "Cloudflare / 地区拦截 (403)",
-                }
-            return {
-                "name": "Claude (Anthropic)",
-                "category": "ai",
-                "ok": False,
-                "detail": f"HTTP {exc.code}",
-            }
-        except Exception as exc:
-            return {
-                "name": "Claude (Anthropic)",
-                "category": "ai",
-                "ok": False,
-                "detail": f"连接失败: {exc.__class__.__name__}",
-            }
-
-    def _test_gemini() -> dict:
-        try:
-            req = urllib.request.Request(
-                "https://generativelanguage.googleapis.com",
-                headers={"User-Agent": "ZeroProxy-Probe/1.0", "Accept": "*/*"},
-            )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return {"name": "Google Gemini", "category": "ai", "ok": True, "detail": "可用"}
-        except urllib.error.HTTPError as exc:
-            if exc.code in (400, 404, 403):
-                return {
-                    "name": "Google Gemini",
-                    "category": "ai",
-                    "ok": exc.code != 403,
-                    "detail": "可用" if exc.code != 403 else "受限 (403)",
-                }
-            return {
-                "name": "Google Gemini",
-                "category": "ai",
-                "ok": False,
-                "detail": f"HTTP {exc.code}",
-            }
-        except Exception as exc:
-            return {
-                "name": "Google Gemini",
-                "category": "ai",
-                "ok": False,
-                "detail": f"连接失败: {exc.__class__.__name__}",
-            }
-
-    def _test_netflix() -> dict:
-        try:
-            req = urllib.request.Request(
-                "https://www.netflix.com/title/70143836",
-                headers={"User-Agent": "Mozilla/5.0 ZeroProxy/2.0"},
-            )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                code = resp.getcode()
-                if code == 200:
-                    return {
-                        "name": "Netflix",
-                        "category": "media",
-                        "ok": True,
-                        "detail": "完整片库解锁 (原生支持)",
-                    }
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                try:
-                    req_orig = urllib.request.Request(
-                        "https://www.netflix.com/title/80018499",
-                        headers={"User-Agent": "Mozilla/5.0"},
-                    )
-                    with urllib.request.urlopen(req_orig, timeout=timeout) as r2:
-                        if r2.getcode() == 200:
-                            return {
-                                "name": "Netflix",
-                                "category": "media",
-                                "ok": True,
-                                "detail": "仅支持自制剧 (Originals Only)",
-                            }
-                except Exception:
-                    pass
-                return {
-                    "name": "Netflix",
-                    "category": "media",
-                    "ok": False,
-                    "detail": "仅自制剧或地区受限",
-                }
-            return {
-                "name": "Netflix",
-                "category": "media",
-                "ok": False,
-                "detail": f"受限 (HTTP {exc.code})",
-            }
-        except Exception as exc:
-            return {
-                "name": "Netflix",
-                "category": "media",
-                "ok": False,
-                "detail": f"检测超时: {exc.__class__.__name__}",
-            }
-
-    def _test_google_ncr() -> dict:
-        try:
-            req = urllib.request.Request(
-                "https://www.google.com/ncr",
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-            )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                final_url = resp.geturl()
-                if "google.com.hk" in final_url or "google.cn" in final_url:
-                    return {
-                        "name": "Google 服务",
-                        "category": "ip",
-                        "ok": False,
-                        "detail": "被重定向至香港 (被送中)",
-                    }
-                return {
-                    "name": "Google 服务",
-                    "category": "ip",
-                    "ok": True,
-                    "detail": "原生国际 IP (未送中)",
-                }
-        except Exception as exc:
-            return {
-                "name": "Google 服务",
-                "category": "ip",
-                "ok": False,
-                "detail": f"检测失败: {exc.__class__.__name__}",
-            }
-
-    def _test_yt_premium() -> dict:
-        try:
-            req = urllib.request.Request(
-                "https://www.youtube.com/premium",
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-            )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                body = resp.read(8192).decode("utf-8", "replace")
-                m = re.search(r'"countryCode":\s*"([A-Z]{2})"', body)
-                loc = f" [{m.group(1)}]" if m else ""
-                return {
-                    "name": "YouTube Premium",
-                    "category": "media",
-                    "ok": True,
-                    "detail": f"支持购买{loc}",
-                }
-        except Exception as exc:
-            return {
-                "name": "YouTube Premium",
-                "category": "media",
-                "ok": False,
-                "detail": f"检测失败: {exc.__class__.__name__}",
-            }
-
-    tasks = [_test_openai, _test_claude, _test_gemini, _test_netflix, _test_yt_premium, _test_google_ncr]
-    items = []
-    with ThreadPoolExecutor(max_workers=min(len(tasks), 6)) as pool:
-        futures = [pool.submit(t) for t in tasks]
-        for f in futures:
-            try:
-                items.append(f.result())
-            except Exception as exc:
-                items.append({"name": "未知测试", "category": "other", "ok": False, "detail": str(exc)})
-
-    pip = public_ip().get("ip") or "未知"
-    ok_count = sum(1 for item in items if item.get("ok"))
-    res = {
-        "checked_at": int(time.time()),
-        "ip": pip,
-        "items": items,
-        "summary": f"{ok_count}/{len(items)} 项服务检测通过",
-    }
+        cached = _UNLOCK_CACHE["data"]
+        if not force and cached and cached.get("simulated") == simulated and now - _UNLOCK_CACHE["at"] < 60:
+            return dict(cached)
+    if simulated:
+        items = [{"name": name, "category": category, "target": target,
+                  "location": "server-direct", "status": "unknown", "ok": None,
+                  "http_status": None, "checked_at": int(now),
+                  "detail": "本地离线模式未执行网络检查"}
+                 for name, category, target in SERVICE_ENDPOINTS]
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            items = list(pool.map(lambda entry: _endpoint_evidence(*entry, timeout), SERVICE_ENDPOINTS))
+    count = sum(item["status"] == "reachable" for item in items)
+    res = {"checked_at": int(now), "ip": "未知" if simulated else public_ip().get("ip") or "未知",
+           "items": items, "location": "server-direct", "simulated": simulated,
+           "summary": "本地离线模式：未执行网络检查" if simulated else f"{count}/{len(items)} 个端点可达；仅服务器直连证据，不代表客户端路线或服务解锁"}
     with _UNLOCK_LOCK:
-        _UNLOCK_CACHE["data"] = res
-        _UNLOCK_CACHE["at"] = time.time()
+        _UNLOCK_CACHE.update(data=res, at=time.time())
     return res
-

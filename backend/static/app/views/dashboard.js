@@ -10,6 +10,7 @@ import { readToken, rememberToken } from "../lib/bootstrap.js";
 import { snapshotDraftInputs, restoreDraftInputs } from "../lib/drafts.js";
 import { openQr, SUB_FMT_LABEL } from "../lib/dialog.js";
 import { S, setDashRenderers, pollInterval } from "../lib/state.js";
+import { resumeApplyJobs, renderTaskHistory } from "../lib/jobs.js";
 import { initWorkspace } from "./workspace.js";
 import { renderAudit } from "./audit.js";
 import { renderNodes, renderKpis, renderDashboardBanner, runProbe } from "./status.js";
@@ -26,6 +27,7 @@ export async function loadDash(quiet) {
     S.dash = await api("/api/dashboard");
     renderDash(quiet);
     show("view-dash");
+    resumeApplyJobs(S.dash.recent_jobs);
   } catch (e) {
     if (!e.dropped && e.status === 401) {
       show("view-login");
@@ -101,10 +103,32 @@ export function renderDash(quiet) {
   renderAudit(S.dash.audit, S.dash.audit_facets, S.dash.audit_stats, S.dash.audit_more);
   renderKpis();
   renderDashboardBanner();
+  renderNetworkSummary();
+  renderTaskHistory(S.dash.recent_jobs, S.dash.runtime);
   if (!S.updateInfo) loadUpdate(false);
   else renderUpdate();
   if (!quiet) { $("#diag-list").innerHTML = ""; $("#diag-actions").classList.add("hidden"); }
   restoreDraftInputs(drafts);
+}
+
+export function renderNetworkSummary() {
+  if (!S.dash || !$("#summary-health")) return;
+  const nodes = (S.dash.nodes || []).filter((n) => n.enabled);
+  const data = S.probeData;
+  const fresh = data?.checked_at && Date.now() / 1000 - data.checked_at <= 300 &&
+    (!data.chain_revision || data.chain_revision === S.dash.chain?.probe_revision);
+  const results = fresh ? (data.nodes || []).filter((p) => nodes.some((n) => n.id === p.node)) : [];
+  const verified = results.filter((p) => p.ok === true && p.kind === "deep").length;
+  const failed = results.filter((p) => p.ok === false).length;
+  $("#summary-health").textContent = !nodes.length ? "没有启用的节点" : failed ? `${failed} 条路线检查失败` : verified ? `${verified} 条路线通过服务器出网检查` : "设备端出网尚未验证";
+  $("#summary-proof").textContent = fresh ? `服务器检查 · ${new Date(data.checked_at * 1000).toLocaleTimeString("zh-CN")} · 不代表设备端结果` : "无近期出网证据；可先检查当前路线";
+  const ds = S.dash.devices || {};
+  const needs = (ds.items || []).filter((d) => !d.online || d.syncing || d.report?.covered === "none" || String(d.report?.ipv6) === "0" || (d.downloaded_rev && d.downloaded_rev !== d.applied_rev)).length;
+  $("#summary-devices").textContent = `${ds.online || 0} 台在线 / ${ds.count || 0} 台已登记`;
+  $("#summary-device-note").textContent = needs ? `${needs} 台需核对离线、接管或应用状态` : "外部手机/电脑客户端无法由面板确认在线";
+  const next = $("#summary-next");
+  next.href = !ds.count || needs ? "#sec-clients" : failed ? "#diag-card" : "#connection-field";
+  next.textContent = !ds.count ? "连接第一台设备" : needs ? "查看需要处理的设备" : failed ? "定位失败步骤" : "检查当前路线";
 }
 
 function revealBlocks() {
@@ -190,3 +214,5 @@ export async function boot() {
 }
 
 setDashRenderers(renderDash, loadDash);
+
+document.addEventListener("zp:proof-updated", renderNetworkSummary);

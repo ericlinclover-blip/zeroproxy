@@ -27,7 +27,8 @@ export function renderApplyStrip(st) {
     return;
   }
   box.classList.remove("hidden");
-  const running = st.state === "running";
+  box.dataset.jobId = st.id || "";
+  const running = st.state === "running" || st.state === "queued";
   const stepFails = ((st.steps || []).filter((s) => !s.ok)).length;
   const bad = !running && (st.state === "failed" || !!st.error || stepFails > 0);
   const geo = st.kind === "geodata";
@@ -67,6 +68,7 @@ export async function watchApply(job) {
   let last = job;
   renderApplyStrip(job);
   const budgetMs = job.kind === "geodata" ? 480000 : 120000;
+  const started = Date.now();
   let elapsed = 0;
   const fastPoll = 100;  // 快速轮询: 前 2 秒
   const normalPoll = 400;
@@ -75,30 +77,47 @@ export async function watchApply(job) {
     // 动态决定轮询间隔
     const pollInterval = elapsed < 2000 ? fastPoll : normalPoll;
     await sleep(pollInterval);
-    elapsed += pollInterval;
+    elapsed = Date.now() - started;
 
     try {
-      last = await api(`/api/apply/job?id=${encodeURIComponent(job.id)}`);
+      last = await api(`/api/apply/job?id=${encodeURIComponent(job.id)}`, { timeoutMs: Math.min(10000, Math.max(1, budgetMs - elapsed)) });
     } catch (e) {
-      if (e.status === 404 || e.status === 401) break;
+      if (e.status === 404 || e.status === 401) {
+        last = { ...last, state: "unknown", error: e.status === 401 ? "会话已失效，请登录后核对任务结果" : "任务记录不可用，请核对实际状态" };
+        break;
+      }
       continue;
     }
-    if (last.state !== "running") break;
+    if (!["running", "queued"].includes(last.state)) break;
     renderApplyStrip(last);
   }
-  renderApplyStrip(last);
+  if (["running", "queued"].includes(last.state)) last = { ...last, state: "unknown", error: "尚未取得任务完成结果，请刷新面板确认实际状态" };
   S.lastApplyJob = last;
-  if (last.state === "running") {
-    throw new Error("尚未取得任务完成结果，请刷新面板确认实际状态");
-  }
-  if (last.state !== "running") setTimeout(() => renderApplyStrip(null), 4000);
+  renderApplyStrip(last);
+  assertApplyResult(last);
+  setTimeout(() => {
+    const box = $("#apply-strip");
+    if (box?.dataset.jobId === String(last.id) && box.dataset.state === "good") renderApplyStrip(null);
+  }, 4000);
   return last.steps || [];
+}
+
+/** One result contract for asynchronous and synchronous operations. */
+export function assertApplyResult(result) {
+  const failed = (result?.steps || []).find((step) => !step.ok);
+  if (result?.ok === false || result?.error || failed || ["failed", "unknown", "interrupted"].includes(result?.state)) {
+    const error = new Error(result.error || failed?.detail || result.detail || "配置未能应用");
+    error.result = result;
+    error.unknown = ["unknown", "interrupted"].includes(result.state);
+    throw error;
+  }
 }
 
 /** 只等后台任务 (响应不是完整仪表盘时用, 如 /api/renew)。 */
 export async function awaitJob(body) {
   S.lastApplyJob = null;
-  if (!body || !body.job) return (body && body.steps) || [];
+  if (!body || !body.job) { assertApplyResult(body); return body?.steps || []; }
+  recovered.add(body.job.id);
   S.applyJobId = body.job.id;
   S.applyJobWait = watchApply(body.job);
   try {
@@ -123,6 +142,33 @@ export async function settleApply(body) {
   return steps;
 }
 
+export function renderTaskHistory(jobs = [], runtime = {}) {
+  const box = $("#task-history");
+  if (!box) return;
+  const status = { done: "已完成", running: "执行中", queued: "排队中", failed: "失败", interrupted: "结果待确认", unknown: "结果待确认" };
+  const summary = $("#runtime-status");
+  const matches = runtime.applied_revision && runtime.applied_revision === S.dash?.configuration_revision;
+  summary.textContent = `${runtime.verification === "dry-run" ? "本地演练记录" : "服务器配置记录"} · ${matches && runtime.status === "applied" ? "期望与应用版本一致" : runtime.status === "failed" ? "上次应用失败，需核对运行状态" : "应用版本待核对"}`;
+  box.innerHTML = jobs.length ? jobs.map((job) => `<details id="task-${esc(job.id)}" class="task-record"><summary>${esc(status[job.state] || "结果待确认")} · ${esc(job.kind || "apply")} · ${esc(job.current || "配置任务")}</summary><p>${esc(job.error || "未记录错误")}</p><p class="mono">期望版本 ${esc(job.desired_revision || "未记录")} / 应用版本 ${esc(job.applied_revision || "未记录")}</p></details>`).join("") : '<p class="muted">本会话还没有后台任务记录。</p>';
+}
+
+const recovered = new Set();
+export function resumeApplyJobs(jobs = []) {
+  if (S.applyJobWait) return;
+  const job = jobs.find((item) => !recovered.has(item.id));
+  if (!job) return;
+  recovered.add(job.id);
+  if (["failed", "unknown", "interrupted"].includes(job.state)) {
+    renderApplyStrip(job);
+    toast(job.error || "上次操作需要核对结果", { kind: "error" });
+  } else if (["running", "queued"].includes(job.state)) {
+    awaitJob({ job }).then(async () => {
+      S.dash = await api("/api/dashboard"); redrawDash(true);
+      toast("后台任务已完成，已核对最新状态");
+    }).catch((error) => toast(error.message, { kind: "error" }));
+  }
+}
+
 /* 改动类接口的统一入口 */
 export async function applyAction(method, path, payload, btn, busyText, okText) {
   await waitPendingApply();
@@ -130,6 +176,7 @@ export async function applyAction(method, path, payload, btn, busyText, okText) 
   const before = S.dash ? JSON.stringify(S.dash) : "";
   if (btn) { btn.disabled = true; if (busyText) btn.textContent = busyText; }
   S.opBusy += 1;
+  let succeeded = false;
   try {
     const opts = { method };
     if (payload !== undefined) {
@@ -137,6 +184,7 @@ export async function applyAction(method, path, payload, btn, busyText, okText) 
       opts.body = JSON.stringify(payload);
     }
     const steps = await settleApply(await api(path, opts));
+    succeeded = true;
     const failed = steps.filter((s) => !s.ok);
     if (S.lastApplyJob && S.lastApplyJob.state === "failed") {
       toast("应用失败: " + (S.lastApplyJob.error || "后台任务异常"));
@@ -152,9 +200,9 @@ export async function applyAction(method, path, payload, btn, busyText, okText) 
       markDisconnected("重启内核中, 正在确认结果…");
       const changed = await syncAfterDrop(before);
       if (changed === true) toast("已应用 (重启内核时连接短暂中断, 已自动恢复)");
-      else if (changed === false) toast("连接已恢复, 但界面没有变化 — 需要的话请再点一次");
+      else if (changed === false) toast("连接已恢复，操作结果待确认。请核对目标状态，勿重复提交", { kind: "error" });
     } else {
-      toast("操作失败: " + e.message);
+      toast("操作失败: " + e.message, { kind: "error" });
       redrawDash(true);
     }
   } finally {
@@ -164,4 +212,5 @@ export async function applyAction(method, path, payload, btn, busyText, okText) 
     btn.disabled = false;
     if (busyText) btn.textContent = original;
   }
+  return succeeded;
 }

@@ -140,6 +140,7 @@ async function main() {
     await page.click("#btn-setup");
     await page.waitForSelector("#view-dash:not(.hidden)", { timeout: 60000 });
 
+    await page.locator('[data-workspace="devices"]').click();
     check("侧栏出现「客户端」入口", (await page.locator('#dash-nav a[href="#sec-clients"]').count()) === 1);
     check("客户端卡片默认停在路由器 tab", await page.locator('#client-tabs .tab.on[data-client-tab="router"]').count() === 1);
     check("空状态先介绍价值" , /全屋|每台设备/.test(await page.locator("#client-body").innerText()));
@@ -194,6 +195,7 @@ async function main() {
       method: "POST",
       body: JSON.stringify({
         device: device.id, k: device.secret, actual: true, version: "1.0.0",
+        report: { covered: "full", mode: "tun" },
         // 真机上这份地址由 agent 每轮心跳上报 (带界面令牌) —— 面板据此给一个"点一下就能进"
         // 的入口, 新用户不必回终端敲 zeroproxy ui 抄一条长地址
         ui: "http://192.168.8.1/cgi-bin/zeroproxy?k=" + "ab12".repeat(8),

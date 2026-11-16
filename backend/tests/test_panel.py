@@ -4812,10 +4812,9 @@ def test_background_apply_does_not_hold_the_config_lock(client, configured, monk
 
     def fake_reapply(state, progress=None):
         # 这里如果能拿到 config.LOCK, 说明长耗时的 apply 已经不在锁内
-        acquired = config.LOCK.acquire(blocking=False)
-        seen["free"] = acquired
-        if acquired:
-            config.LOCK.release()
+        # Another request may legitimately hold the short state lock. Check this
+        # worker's ownership instead of racing unrelated dashboard reads.
+        seen["free"] = not config.lock_held_here()
         return [{"name": "stub", "ok": True, "detail": "", "ms": 0}]
 
     monkeypatch.setattr(zp_apply, "reapply", fake_reapply)
@@ -4867,7 +4866,7 @@ def test_unlock_probe_endpoint(client, configured):
     assert "summary" in res
     assert len(res["items"]) >= 5
     names = [item["name"] for item in res["items"]]
-    assert "OpenAI / ChatGPT" in names
+    assert "OpenAI API" in names
     assert "Netflix" in names
 
 

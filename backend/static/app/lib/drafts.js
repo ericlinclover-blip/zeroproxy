@@ -4,13 +4,15 @@
  * 会在下一次刷新被服务器值覆盖 —— 填到一半的内容几分钟后自己变回去。
  * 这里在重渲染前把"正在编辑的输入"记下来, 重渲染后原样放回 (含光标位置),
  * 直到用户提交为止。 */
-const DRAFT_KEY_ATTRS = ["data-port-node", "data-node", "data-chain-toggle"];
+const DRAFT_KEY_ATTRS = ["data-port-node", "data-node", "data-chain-toggle", "data-dev-toggle", "data-dev-tpl", "data-dev-rename", "data-dev-remove", "data-field-node", "data-chain-probe", "data-wg-edit", "data-wg-rotate", "data-wg-delete", "data-copy", "data-qr"];
+let focusKey = "";
+let openDetails = [];
 
 export function inputKey(el) {
   if (el.id) return "#" + el.id;
   for (const attr of DRAFT_KEY_ATTRS) {
     const value = el.getAttribute(attr);
-    if (value) return `[${attr}="${value}"]`;
+    if (value) return `[${attr}="${CSS.escape(value)}"]`;
   }
   return "";
 }
@@ -23,6 +25,8 @@ export function isDraftInput(el) {
 }
 
 export function snapshotDraftInputs() {
+  focusKey = document.activeElement?.closest("#view-dash") ? inputKey(document.activeElement) : "";
+  openDetails = [...document.querySelectorAll("#view-dash details[id]")].map((el) => [el.id, el.open]);
   const drafts = [];
   document.querySelectorAll("#view-dash input, #view-dash textarea").forEach((el) => {
     if (!isDraftInput(el)) return;
@@ -38,16 +42,21 @@ export function snapshotDraftInputs() {
 }
 
 export function restoreDraftInputs(drafts) {
+  for (const [id, open] of openDetails) { const el = document.getElementById(id); if (el) el.open = open; }
   drafts.forEach((d) => {
     const el = document.querySelector(d.key);
     if (!el || !isDraftInput(el)) return;
     if (el.value !== d.value) el.value = d.value;
     el.dataset.draft = "1";          // 还没提交 → 下次刷新继续保护
     if (d.focused) {
-      el.focus();
+      el.focus({ preventScroll: true });
       try { if (d.start != null) el.setSelectionRange(d.start, d.end); } catch (e) { /* 忽略 */ }
     }
   });
+  // Never move focus out of an open dialog or another control focused during rendering.
+  if (focusKey && !document.querySelector("dialog[open]") && document.activeElement === document.body) {
+    document.querySelector(focusKey)?.focus({ preventScroll: true });
+  }
 }
 
 document.addEventListener("input", (e) => {

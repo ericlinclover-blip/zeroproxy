@@ -212,7 +212,7 @@ function renderRouting(d) {
           body: JSON.stringify({ template: sel.value }),
         })
       );
-      toast("分流模板已切换, 订阅即刻生效");
+      toast("分流模板已保存到订阅，客户端更新并应用后生效");
     } catch (e) {
       sel.value = previous;
       showDesc();
@@ -266,20 +266,30 @@ function renderRouting(d) {
           proxy: getLines("cr-proxy"),
         },
       };
-      try {
-        await api("/api/settings", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-        toast("自定义分流规则已更新并即刻生效");
-        for (const id of Object.keys(mapIds)) {
-          const el = $("#" + id);
-          if (el) delete el.dataset.dirty;
-        }
-      } catch (e) {
-        toast("保存失败: " + e.message);
-      }
+      const ordered = ["block", "landing", "ai", "streaming", "proxy", "direct"];
+      const seen = new Map(), conflicts = [];
+      ordered.forEach((kind) => payload.custom_rules[kind].forEach((target) => {
+        const normalized = target.trim().toLowerCase().replace(/\.$/, "");
+        if (seen.has(normalized) && seen.get(normalized) !== kind) conflicts.push(`${target}: ${seen.get(normalized)} → ${kind}`);
+        else seen.set(normalized, kind);
+      }));
+      openConfirm({ title: "确认分流规则影响", okLabel: "保存到订阅",
+        html: `<p>作用范围：Clash / sing-box 订阅及路由器下次下载的配置，不代表设备已立即应用。性能模式使用统一代理组。</p>
+          <p>自定义规则优先级：拦截 → 落地 → AI → 流媒体 → 代理 → 直连。实际还受系统基础防护及客户端选组影响。</p>
+          <p>${ordered.map((kind) => `${esc(kind)} ${payload.custom_rules[kind].length} 条`).join(" · ")}</p>
+          ${conflicts.length ? `<p class="note">发现重复目标，较早匹配的规则优先：${conflicts.slice(0, 20).map(esc).join("；")}</p>` : "<p>未发现跨分组的相同目标；子域名和 CIDR 包含关系请用规则预估核对。</p>"}`,
+        onOk: async () => {
+          btnSaveCr.disabled = true;
+          try {
+            const response = await api("/api/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+            S.dash = response;
+            for (const id of Object.keys(mapIds)) { const el = $("#" + id); if (el) { delete el.dataset.dirty; delete el.dataset.draft; } }
+            redrawDash(true);
+            toast("自定义分流规则已保存，等待客户端更新并应用");
+          } catch (e) { toast("保存失败: " + e.message); }
+          finally { if (document.body.contains(btnSaveCr)) btnSaveCr.disabled = false; }
+        },
+      });
     };
   }
 
@@ -540,6 +550,17 @@ async function saveAdvanced() {
     toast("没有需要修改的内容");
     return;
   }
+  payload.expected_revision = S.dash.configuration_revision || "";
+  openConfirm({ title: "确认服务器配置变更", okLabel: "应用并验证",
+    html: `<p>将重新生成并校验服务器配置，必要时重载服务，可能短暂中断代理连接。</p>
+      <p>${payload.ports ? `端口调整：${Object.entries(payload.ports).map(([key, value]) => `${esc(key)} → ${esc(value)}`).join("；")}` : "未调整节点端口。"}</p>
+      <p>失败会显示具体步骤与运行回退结果；客户端需要更新订阅才能使用新端口。</p>`,
+    onOk: () => commitAdvanced(payload),
+  });
+}
+
+async function commitAdvanced(payload) {
+  const btn = $("#btn-save-adv");
   btn.disabled = true;
   btn.textContent = "应用中…";
   try {
@@ -665,7 +686,7 @@ export function renderSystem(d) {
       html: `<div class="qr-sub">备份包含 <b>Reality 私钥 / WireGuard 私钥与 PSK / 管理员密码哈希 /
         订阅令牌 / 链式凭据</b> —— 拿到它等价于拿到这台服务器的 root。<br><br>
         建议设置一个口令加密导出 (AES-GCM); 口令不会被面板保存, 恢复时必须输入同一个。</div>
-        <div class="field mt-3"><label>加密口令 (留空 = 明文导出, 不推荐)</label>
+        <div class="field mt-3"><label for="backup-pass">加密口令 (留空 = 明文导出, 不推荐)</label>
           <input type="password" id="backup-pass" autocomplete="new-password"
             placeholder="留空则导出明文 JSON"></div>
         <div class="note">明文备份请只落在本机安全位置; 加密备份忘记口令将无法恢复。</div>`,
@@ -690,7 +711,7 @@ export function renderSystem(d) {
           节点开关 / 端口 / <b>密钥</b> / 管理员口令都会被备份里的内容替换。<br><br>
           恢复后会按备份重新生成全部配置并热重载; 订阅地址也会跟着变成备份里的那一个
           —— 客户端需要重新导入订阅。</div>
-          <div class="field mt-3"><label>备份口令 (明文备份留空)</label>
+          <div class="field mt-3"><label for="restore-pass">备份口令 (明文备份留空)</label>
             <input type="password" id="restore-pass" autocomplete="current-password"
               placeholder="加密导出时设置的口令"></div>`,
         onOk: async () => {

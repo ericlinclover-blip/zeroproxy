@@ -2962,7 +2962,8 @@ def test_heartbeat_reports_state_and_returns_desired(client, configured):
     item = client.get("/api/devices").json()["devices"]["items"][0]
     assert item["online"] is True
     assert item["actual"] is True
-    assert item["connected"] is True
+    assert item["connected"] is False  # kernel report alone does not prove traffic coverage
+    assert item["running"] is True
     assert item["syncing"] is False
 
 

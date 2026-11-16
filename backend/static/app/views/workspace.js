@@ -4,11 +4,11 @@ import { openDialog, closeDialog } from "../lib/dialog.js";
 import { S } from "../lib/state.js";
 
 const WORKSPACES = {
-  network: { title: "你的连接，尽在此处。", description: "从入口到出口，沿着路径管理你的网络。", ids: ["connection-field", "sec-nodes", "sec-traffic", "chain-intro"] },
+  network: { title: "你的连接，尽在此处。", description: "从入口到出口，沿着路径管理你的网络。", ids: ["network-summary", "connection-field", "sec-nodes", "sec-traffic", "chain-intro"] },
   devices: { title: "让每台设备，就位。", description: "接入设备、导入订阅，核对实际应用状态。", ids: ["sec-clients", "sec-subs", "sec-wireguard"] },
   routing: { title: "每一程，都有方向。", description: "调整分流与防护，保存后核对配置应用结果。", ids: ["sec-adv"] },
   diagnostics: { title: "找到连接的断点。", description: "服务状态、深度握手与出口检测，分别提供证据。", ids: ["diag-card", "unlock-card"] },
-  maintenance: { title: "照顾网络的每一天。", description: "管理系统、账号、备份、操作记录与更新。", ids: ["sec-sys", "sec-panel", "sec-audit", "update-card"] },
+  maintenance: { title: "照顾网络的每一天。", description: "管理系统、账号、备份、操作记录与更新。", ids: ["sec-sys", "sec-tasks", "sec-panel", "sec-audit", "update-card"] },
 };
 let current = "network";
 let initialized = false;
@@ -87,8 +87,8 @@ function renderFind() {
     ["chain-intro", "链式代理 · 落地与默认出口"], ["sec-clients", "设备 · 路由器、手机、电脑"],
     ["sec-subs", "订阅 · Clash / sing-box"], ["sec-wireguard", "WireGuard / AWG"],
     ["sec-traffic", "流量统计"], ["sec-adv", "分流 · 高级设置 · 广告防护"],
-    ["diag-card", "一键诊断与修复"], ["unlock-card", "出口质量与解锁检测"],
-    ["sec-sys", "系统 · 备份与恢复"], ["sec-panel", "面板设置 · 管理员与域名"],
+    ["diag-card", "一键诊断与修复"], ["unlock-card", "目标服务端点检查"],
+    ["sec-sys", "系统 · 备份与恢复"], ["sec-tasks", "配置版本 · 任务记录 · 失败详情"], ["sec-panel", "面板设置 · 管理员与域名"],
     ["sec-audit", "操作记录"], ["update-card", "程序更新"],
     ...(S.dash?.nodes || []).map((n) => ["sec-nodes", n.name]),
     ...((S.dash?.chain || {}).entries || []).map((e) => ["chain-intro", e.label || e.host]),

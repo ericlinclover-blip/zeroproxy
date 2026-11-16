@@ -15,7 +15,7 @@ import re
 
 import yaml
 
-from . import config
+from . import config, device_credentials
 from .config import paths
 
 #: `listen` 的合法形态: `[地址]:端口[,端口...]` (端口跳跃是逗号分隔的多端口)。
@@ -79,6 +79,9 @@ def build_hysteria_config(state: dict) -> str:
         "MASQUERADE": masquerade,
     }.items():
         conf = conf.replace(f"@{key}@", value)
+    if device_credentials.active(state):
+        auth = yaml.safe_dump({"auth": {"type": "command", "command": os.path.join(paths()["hysteria_dir"], "auth.py")}}, sort_keys=False)
+        conf = conf.replace('auth:\n  type: password\n  password: "' + state["hysteria_password"].replace("\\", "\\\\").replace('"', '\\"') + '"\n', auth)
     return conf
 
 
@@ -119,10 +122,16 @@ def validate(config_text: str) -> list[str]:
     if not isinstance(auth, dict):
         problems.append("缺少 auth 段")
     else:
-        if str(auth.get("type") or "") != "password":
-            problems.append("auth.type 必须是 password")
-        if not str(auth.get("password") or "").strip():
-            problems.append("auth.password 为空")
+        kind = str(auth.get("type") or "")
+        if kind == "password":
+            if not str(auth.get("password") or "").strip():
+                problems.append("auth.password 为空")
+        elif kind == "command":
+            expected = os.path.join(paths()["hysteria_dir"], "auth.py")
+            if auth.get("command") != expected:
+                problems.append("auth.command 必须指向本机设备认证程序")
+        else:
+            problems.append("auth.type 必须是 password 或 command")
 
     tls = data.get("tls")
     if not isinstance(tls, dict):
@@ -150,4 +159,5 @@ def write_hysteria_config(state: dict) -> None:
     """原子落盘 Hysteria 2 配置 (写一半的 YAML 会让 hysteria2 起不来)。"""
     p = paths()
     os.makedirs(p["hysteria_dir"], exist_ok=True)
+    device_credentials.write_hysteria_auth(state)
     config.atomic_write_text(p["hysteria_config"], build_hysteria_config(state), mode=0o600)

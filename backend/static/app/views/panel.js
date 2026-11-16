@@ -8,7 +8,7 @@ import { $, esc, escAttr, toast } from "../lib/dom.js";
 import { openConfirm } from "../lib/dialog.js";
 import { api, sleep, markDisconnected } from "../lib/api.js";
 import { S, reloadDash, redrawDash } from "../lib/state.js";
-import { renderApplyStrip, waitPendingApply } from "../lib/jobs.js";
+import { renderApplyStrip, waitPendingApply, assertApplyResult } from "../lib/jobs.js";
 
 /** 把用户可能粘进来的整条地址收敛成主机名 (与后端 _normalize_domain 同一套规则)。 */
 function normalizeDomain(raw) {
@@ -37,16 +37,16 @@ function accountCard(d) {
   return `<div class="card">
     <div class="row-between">
       <span class="badge vless">管理员账号</span>
-      <button class="btn ghost small" id="btn-logout-others" title="把所有已登录的设备踢下线">退出其他设备</button>
+      <button class="btn ghost small" id="btn-logout-others" title="把所有已登录的设备踢下线">退出所有设备</button>
     </div>
-    <div class="field mt-3"><label>用户名</label>
+    <div class="field mt-3"><label for="acct-user">用户名</label>
       <input id="acct-user" value="${escAttr(d.admin_user || "")}" spellcheck="false" autocomplete="username"></div>
-    <div class="field"><label>当前密码 (改任何一项都要先验证)</label>
+    <div class="field"><label for="acct-now">当前密码 (改任何一项都要先验证)</label>
       <input type="password" id="acct-now" autocomplete="current-password" placeholder="当前登录密码"></div>
     <div class="adv-grid">
-      <div class="field"><label>新密码 (留空则不改)</label>
+      <div class="field"><label for="acct-new">新密码 (留空则不改)</label>
         <input type="password" id="acct-new" autocomplete="new-password" placeholder="至少 6 位"></div>
-      <div class="field"><label>确认新密码</label>
+      <div class="field"><label for="acct-new2">确认新密码</label>
         <input type="password" id="acct-new2" autocomplete="new-password" placeholder="再输一遍"></div>
     </div>
     <div class="note">改密码会把<b>其它设备</b>踢下线 (当前这台保持登录)。节点凭据 (UUID / Trojan 与 Hysteria 口令)
@@ -79,6 +79,7 @@ function bindAccount(d) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ current_password: current, username, new_password: next || null }),
       });
+      ["#acct-now", "#acct-new", "#acct-new2"].forEach((id) => { $(id).value = ""; delete $(id).dataset.draft; });
       S.dash = res;
       redrawDash(true);        // 整个仪表盘重画: 侧栏的管理员名也跟着换
       toast(res.detail || "已保存" + (res.kicked ? ` (注销其它设备 ${res.kicked} 个)` : ""));
@@ -119,9 +120,9 @@ function domainCard(d) {
     <div class="note mt-3 mb-3">
       换域名会<b>重新签发证书、重写 nginx / xray 配置并热重载</b>, 完成后自动把你带到新地址。<br>
       前提: 新域名的 A 记录已经指向本机, 并且 80 端口能从公网访问 (Let's Encrypt 要验证)。
-      任何一步失败都会<b>整份回滚</b>, 面板仍留在原地址。
+      失败会尝试恢复原域名与配置，回滚结果会单独显示。
     </div>
-    <div class="field"><label>新域名</label>
+    <div class="field"><label for="dom-new">新域名</label>
       <input id="dom-new" placeholder="proxy2.example.com" spellcheck="false" autocapitalize="off"></div>
     <div class="note">换完之后: 订阅地址与节点地址都会变成新域名 (客户端重新导入订阅即可);
       已经发给别的机器的链式配对码里写的是旧域名, 需要在「链式代理」里重新生成。</div>
@@ -150,7 +151,7 @@ function bindDomain(d) {
           <div class="ustep"><span class="n">2</span><span class="uname">重写 nginx / xray 配置</span>
             <span class="udetail">新域名的证书、订阅地址、节点地址一起换</span></div>
           <div class="ustep"><span class="n">3</span><span class="uname">热重载并验证新域名</span>
-            <span class="udetail">验证不过就整份回滚, 面板留在原地址</span></div>
+            <span class="udetail">验证失败尝试回滚，并核对恢复结果</span></div>
           <div class="ustep"><span class="n">4</span><span class="uname">自动跳转到新地址</span>
             <span class="udetail">已登录状态一起带过去, 不用重新输密码</span></div>
         </div>
@@ -173,10 +174,12 @@ async function deployDomain(next) {
   S.opBusy += 1;
   try {
     const res = await api("/api/domain", {
+      timeoutMs: 360000,
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ domain: next }),
     });
+    assertApplyResult(res);
     target = (res.redirect || {}).url || fallbackUrl;
     handoff = (res.redirect || {}).handoff || "";
     const verdict = await watchDomainJob(res.job);
@@ -186,9 +189,14 @@ async function deployDomain(next) {
       return;
     }
   } catch (e) {
-    // 请求本身断了通常意味着 nginx 已经切到新域名 (老地址必然要断), 不是失败。
-    // 继续按"新地址是否可达"来判断, 别在这里就宣布失败。
-    markDisconnected("正在切到新域名…");
+    if (!e.dropped) {
+      toast("域名部署未完成: " + e.message, { kind: "error" });
+      await reloadDash(true);
+      const current = $("#btn-dom-save");
+      if (current) { current.disabled = false; current.textContent = "更换域名并部署"; }
+      return;
+    }
+    markDisconnected("连接中断，正在核对新入口…");
   } finally {
     S.opBusy -= 1;   // 失败提前 return 时也要还回去, 否则自动刷新再也回不来
   }
@@ -212,10 +220,11 @@ async function watchDomainJob(job) {
   renderApplyStrip(job);
   let missed = 0;
   // 一步 certbot 最长 300 秒, 再留一点余量
-  for (let waited = 0; waited < 360000; waited += 600) {
+  const deadline = Date.now() + 360000;
+  while (Date.now() < deadline) {
     await sleep(600);
     try {
-      last = await api(`/api/apply/job?id=${encodeURIComponent(job.id)}`);
+      last = await api(`/api/apply/job?id=${encodeURIComponent(job.id)}`, { timeoutMs: Math.max(1, Math.min(10000, deadline - Date.now())) });
       missed = 0;
     } catch (e) {
       if (e.status === 404 || e.status === 401) break;
@@ -251,21 +260,28 @@ async function jumpTo(target, handoff, username) {
   if (username) q.set("user", username);
   const query = q.toString();
   const url = query ? `${target}${target.includes("?") ? "&" : "?"}${query}` : target;
-  if (hint) hint.textContent = `部署完成 —— 正在跳转到 ${target}`;
-  toast("域名已更换, 正在跳转到新地址…");
-  for (let i = 0; i < 40; i += 1) {          // 最多等 ~60 秒
-    if (await reachable(target)) break;
+  if (hint) hint.textContent = `正在验证新入口 ${target}`;
+  const deadline = Date.now() + 60000;
+  while (Date.now() < deadline) {
+    if (await reachable(target, Math.min(5000, deadline - Date.now()))) {
+      if (hint) hint.textContent = `新入口可达，正在跳转到 ${target}`;
+      location.replace(url);
+      return;
+    }
     await sleep(1500);
   }
-  setTimeout(() => location.replace(url), 1000);
+  if (hint) hint.textContent = `未能确认新入口，请保留本页并核对域名、证书与部署结果：${target}`;
+  toast("新入口尚未验证可达，已保留当前页面，请核对部署结果", { kind: "error" });
 }
 
 /** 新地址通不通 (no-cors: 只关心网络层有没有响应, 不需要读内容)。 */
-async function reachable(target) {
+async function reachable(target, timeoutMs = 5000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    await fetch(target + "api/status", { mode: "no-cors", cache: "no-store" });
+    await fetch(target + "api/status", { mode: "no-cors", cache: "no-store", signal: controller.signal });
     return true;
   } catch (e) {
     return false;
-  }
+  } finally { clearTimeout(timer); }
 }

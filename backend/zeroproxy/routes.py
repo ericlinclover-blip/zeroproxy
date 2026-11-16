@@ -16,7 +16,6 @@ import hashlib
 import hmac
 import io
 import ipaddress
-import itertools
 import json
 import os
 import re
@@ -48,6 +47,7 @@ from . import (
     crypto,
     dae_config,
     devices,
+    device_credentials,
     geodata,
     router_client,
     services,
@@ -383,9 +383,55 @@ def _reapply(state: dict, request: Request | None = None) -> list[dict]:
 # `ZP_APPLY_ASYNC=0` 可退回同步返回 (测试 / 本地排查用)。
 _APPLY_JOBS: dict[str, dict] = {}
 _APPLY_JOBS_LOCK = threading.Lock()
-_APPLY_SEQ = itertools.count(1)
 #: 最多留几份任务记录 (前端轮询按 id 取; 留够"刚点完那几秒"就够用了)
 _APPLY_JOB_KEEP = 8
+
+
+def _job_owner(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest() if token else ""
+
+
+def _persist_jobs_locked(home: str) -> None:
+    records = []
+    for job in _APPLY_JOBS.values():
+        if job.get("home") == home:
+            records.append({key: value for key, value in job.items() if key not in {"token", "home"}})
+    records.sort(key=lambda item: item.get("started_at", 0))
+    config.atomic_write_text(os.path.join(home, "data", "apply-jobs.json"),
+                             json.dumps(records[-32:], ensure_ascii=False), mode=0o600)
+
+
+def _recover_jobs_locked() -> None:
+    home = paths()["home"]
+    try:
+        with open(os.path.join(home, "data", "apply-jobs.json"), encoding="utf-8") as fh:
+            records = json.load(fh)
+    except (OSError, ValueError):
+        return
+    if not isinstance(records, list):
+        return
+    changed = False
+    for record in records[-32:]:
+        if not isinstance(record, dict) or not isinstance(record.get("id"), str):
+            continue
+        if record["id"] in _APPLY_JOBS:
+            continue
+        record.update(home=home, token="")
+        if record.get("state") in {"running", "queued"}:
+            record.update(state="interrupted", error="面板进程已重启，任务结果待确认；请核对实际状态，不会自动重复执行", finished_at=time.time())
+            changed = True
+        _APPLY_JOBS[record["id"]] = record
+    if changed:
+        _persist_jobs_locked(home)
+
+
+def _recent_jobs(request: Request) -> list[dict]:
+    owner = _job_owner(request.cookies.get(SESSION_COOKIE) or "")
+    with _APPLY_JOBS_LOCK:
+        _recover_jobs_locked()
+        jobs = [job for job in _APPLY_JOBS.values()
+                if job.get("home") == paths()["home"] and job.get("owner") == owner]
+        return [_job_snapshot(job) for job in sorted(jobs, key=lambda x: x["started_at"], reverse=True)[:8]]
 
 
 def _apply_async_enabled() -> bool:
@@ -405,6 +451,8 @@ def _job_snapshot(job: dict) -> dict:
         "current": job.get("current", ""),
         "steps": job.get("steps", []),
         "error": job.get("error", ""),
+        "desired_revision": job.get("desired_revision", ""),
+        "applied_revision": job.get("applied_revision", ""),
         "elapsed_ms": int(max(0.0, float(end or time.time()) - started) * 1000) if started else 0,
     }
 
@@ -414,6 +462,7 @@ def _job_update(job_id: str, **fields) -> None:
         job = _APPLY_JOBS.get(job_id)
         if job is not None:
             job.update(fields)
+            _persist_jobs_locked(job.get("home") or paths()["home"])
 
 
 def _new_job(
@@ -421,9 +470,12 @@ def _new_job(
 ) -> tuple[str, dict]:
     """登记一个后台任务, 返回 (id, 快照)。所有长耗时闭环共用这张表。"""
     with _APPLY_JOBS_LOCK:
-        job_id = str(next(_APPLY_SEQ))
+        _recover_jobs_locked()
+        job_id = uuid_mod.uuid4().hex
         job = {
             "id": job_id,
+            "home": paths()["home"],
+            "owner": _job_owner((request.cookies.get(SESSION_COOKIE) if request is not None else "") or ""),
             "kind": kind,
             "state": "running",
             "index": 0,
@@ -437,6 +489,7 @@ def _new_job(
             "token": (request.cookies.get(SESSION_COOKIE) if request is not None else "") or "",
         }
         _APPLY_JOBS[job_id] = job
+        _persist_jobs_locked(job["home"])
         return job_id, job
 
 
@@ -465,6 +518,8 @@ def _finish_job(job_id: str, steps: list[dict], error: str = "") -> None:
         stale = sorted(finished, key=lambda k: _APPLY_JOBS[k]["started_at"])[:-_APPLY_JOB_KEEP]
         for key in stale:
             _APPLY_JOBS.pop(key, None)
+        if job is not None:
+            _persist_jobs_locked(job.get("home") or paths()["home"])
 
 
 def _running_job(request: Request | None, kind: str | None = None) -> dict | None:
@@ -486,7 +541,7 @@ def _running_job(request: Request | None, kind: str | None = None) -> dict | Non
 #: 串行化"改配置 → 重启服务"这条闭环。它以前是靠 config.locked() 全程持有的,
 #: 但那样会让 2-4 秒的 systemctl 重启把登录 / 心跳 / 订阅全部堵在锁外 (P2-2)。
 #: 单独一把进程内锁既保证同一时刻只有一次闭环, 又不阻塞其它 state 读写。
-_APPLY_RUN_LOCK = threading.Lock()
+_APPLY_RUN_LOCK = threading.RLock()
 
 
 def _run_apply_job(job_id: str, after=None, on_result=None) -> None:
@@ -497,12 +552,14 @@ def _run_apply_job(job_id: str, after=None, on_result=None) -> None:
         try:
             with config.locked():
                 state = load_state()
+            _job_update(job_id, desired_revision=config.configuration_revision(state))
             steps = apply.reapply(
                 state,
                 progress=lambda index, total, name: _job_update(
                     job_id, index=index + 1, total=total, current=name
                 ),
             )
+            _job_update(job_id, applied_revision=(state.get("runtime") or {}).get("applied_revision", ""))
             if after is not None:
                 steps.extend(after())
         except Exception as exc:  # noqa: BLE001
@@ -558,12 +615,15 @@ def apply_job(id: str, request: Request):
     `load_state()` 就会排队等它跑完, 进度条也就白做了。鉴权改为"必须是发起
     这个任务的那个会话" —— 令牌本身就是登录时发的那个。
     """
+    if not _require_auth(load_state(), request):
+        return _err("未登录", 401)
     with _APPLY_JOBS_LOCK:
+        _recover_jobs_locked()
         job = _APPLY_JOBS.get(str(id))
         if job is None:
             return _err("任务不存在或已过期", 404)
         token = request.cookies.get(SESSION_COOKIE) or ""
-        if job.get("token") and job["token"] != token:
+        if job.get("owner") and job["owner"] != _job_owner(token):
             return _err("未登录", 401)
         return _job_snapshot(job)
 
@@ -740,6 +800,7 @@ def setup(payload: SetupIn, request: Request):
             actor=username,
         )
         state["steps"] = steps
+        apply.record_runtime(state, steps)
         save_state(state)
         body = _dashboard_body(state, request)
         body["steps"] = steps
@@ -1201,6 +1262,9 @@ def _dashboard_body(state: dict, request: Request, traffic: dict | None = None) 
         "system": _system_view(state),
         # 数据指纹: 前端据此判断"这次轮询有没有实际变化", 无变化则拉长自动刷新间隔
         "fingerprint": _dash_fingerprint(state),
+        "configuration_revision": config.configuration_revision(state),
+        "runtime": {**(state.get("runtime") or {}), "can_restore": os.path.isfile(os.path.join(paths()["data_dir"], "runtime-last-good.json"))},
+        "recent_jobs": _recent_jobs(request),
     }
 
 
@@ -1282,6 +1346,63 @@ def audit_clear(request: Request):
 
 # ---------------------------------------------------------------- 配置修改
 
+class NodeEnabledIn(BaseModel):
+    enabled: bool
+    expected_revision: str = ""
+
+
+@router.post("/api/apply/rollback")
+def restore_last_good(request: Request):
+    with _APPLY_RUN_LOCK:
+        with config.locked():
+            state = load_state()
+            if not _require_auth(state, request):
+                return _err("未登录", 401)
+            try:
+                with open(os.path.join(paths()["data_dir"], "runtime-last-good.json"), encoding="utf-8") as fh:
+                    good = json.load(fh)
+            except (OSError, ValueError):
+                return _err("没有可恢复的成功配置，请先运行诊断", 409)
+            if not isinstance(good, dict):
+                return _err("恢复快照无效，请通过服务器终端检查", 409)
+            for key in config.RUNTIME_FIELDS:
+                if key in good:
+                    state[key] = copy.deepcopy(good[key])
+            config.audit(state, "runtime_restore", "恢复最近一次成功配置，保留账号、会话和设备注册", actor=_client_ip(request))
+            save_state(state)
+        steps = apply.reapply(state)
+        with config.locked():
+            body = _dashboard_body(load_state(), request)
+        body.update(steps=steps, ok=not apply.failures(steps))
+        return body
+
+
+@router.post("/api/nodes/{node_id}/enabled")
+def set_node_enabled(node_id: str, payload: NodeEnabledIn, request: Request):
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        entry = share_links.chain_entry_of(state, node_id) if node_id.startswith("chain-") else None
+        if node_id not in NODE_IDS and entry is None:
+            return _err("未知节点", 404)
+        current = bool(entry.get("enabled", True)) if entry is not None else bool(state["nodes"].get(node_id, True))
+        if current == payload.enabled:
+            body = _dashboard_body(state, request)
+            body["steps"] = []
+            return body
+        if payload.expected_revision and payload.expected_revision != config.configuration_revision(state):
+            return _err("配置已被其他操作修改，请刷新并核对后重试", 409)
+        if entry is not None:
+            entry.update(enabled=payload.enabled, last_probe={})
+            if not payload.enabled:
+                entry["default_out"] = False
+        else:
+            state["nodes"][node_id] = payload.enabled
+        config.audit(state, "toggle_node", f"{node_id}={'on' if payload.enabled else 'off'}", actor=_client_ip(request))
+        return _landing_body(state, request)
+
+
 @router.post("/api/nodes/{node_id}/toggle")
 def toggle_node(node_id: str, request: Request):
     is_chain = node_id.startswith("chain-")
@@ -1342,6 +1463,7 @@ def toggle_hopping(request: Request):
 
 
 class SettingsIn(BaseModel):
+    expected_revision: str = ""
     reality_sni: str | None = None
     masquerade_url: str | None = None
     ports: dict[str, int] | None = None
@@ -1375,6 +1497,9 @@ def update_settings(payload: SettingsIn, request: Request):
         state = load_state()
         if not _require_auth(state, request):
             return _err("未登录", 401)
+
+        if payload.expected_revision and payload.expected_revision != config.configuration_revision(state):
+            return _err("配置已被其他操作修改，请刷新并核对后重试", 409)
 
         if payload.reality_sni is not None:
             if not _SNI_RE.match(payload.reality_sni.strip().lower()):
@@ -2285,7 +2410,9 @@ def _diagnose(state: dict) -> list[dict]:
     checks: list[dict] = []
 
     def add(name: str, ok: bool, detail: str, fixable: bool = False) -> None:
-        checks.append({"name": name, "ok": bool(ok), "detail": detail, "fixable": fixable})
+        stage = "configuration" if "配置" in name or "GeoIP" in name or "入站" in name else "tls" if "证书" in name else "ingress"
+        checks.append({"name": name, "ok": bool(ok), "detail": detail, "fixable": fixable,
+                       "stage": stage, "next_step": ("预览修复计划，应用后重新检查" if fixable else "核对目标地址、DNS 与防火墙后重试")})
 
     prod = services.is_prod()
 
@@ -2477,8 +2604,11 @@ def repair(request: Request):
         config.audit(state, "repair", actor=_client_ip(request))
         save_state(state)
     # 落地 + 复检都是秒级 (<2-4 秒重启 + 诊断探测): 锁内跑等于把全站按住。
-    steps = _reapply(state, request)
-    checks = _diagnose(state)
+    with _APPLY_RUN_LOCK:
+        with config.locked():
+            state = load_state()
+        steps = _reapply(state, request)
+        checks = _diagnose(state)
     with config.locked():
         fresh = load_state()
         fresh["steps"] = steps
@@ -3178,7 +3308,7 @@ def _domain_preflight(new_domain: str, current: str) -> tuple[bool, str]:
 
 
 def _domain_pipeline(new_domain: str, progress=None) -> tuple[list[dict], str]:
-    """换域名的完整闭环。返回 (步骤, 错误)。错误非空 = 已回滚, 域名保持原样。"""
+    """换域名的完整闭环。返回 (步骤, 错误)；失败时分别报告部署与运行回退结果。"""
     steps: list[dict] = []
     total = 1 + len(apply.STEP_NAMES) + 1
 
@@ -3197,69 +3327,62 @@ def _domain_pipeline(new_domain: str, progress=None) -> tuple[list[dict], str]:
         )
     record("申请 TLS 证书", True, detail)
 
-    # ---- 2) 提交: 写域名 + 重生成配置 + 热重载 (任一步失败都整份退回) ----
-    with config.locked():
-        state = load_state()
-        old_domain = (state.get("domain") or "").strip()
-        old_cert = copy.deepcopy(state.get("cert") or {})
-        state["domain"] = new_domain
-        state["cert"] = cert_state
-        save_state(state)
-    # 落地闭环在锁外跑, 并与其它闭环共用同一把串行锁 —— 否则并发的 /api/apply
-    # 会同时重启服务 / 各写一份配置 (这条以前既不持 _APPLY_RUN_LOCK 又在锁内跑)。
+    # Lock order: apply -> short configuration transaction. Keep verification and
+    # compensation in the same interval so another apply cannot slip between them.
     with _APPLY_RUN_LOCK:
+        with config.locked():
+            state = load_state()
+            old_domain = (state.get("domain") or "").strip()
+            old_cert = copy.deepcopy(state.get("cert") or {})
+            state["domain"] = new_domain
+            state["cert"] = cert_state
+            save_state(state)
         landed = apply.reapply(
             state,
             progress=lambda index, _t, name: (
-                progress(1 + index + 1, total, name) if progress is not None else None
+                progress(index + 2, total, name) if progress is not None else None
             ),
         )
-    steps.extend(landed)
-    failed = apply.failures(landed)
-    if failed:
-        reason = f"{failed[0]['name']}: {failed[0]['detail']}"
-        steps.extend(_rollback_domain(old_domain, old_cert))
-        return steps, f"配置落地失败 ({reason}) —— 已回滚, 面板仍在 {old_domain}"
-
-    # ---- 3) 验证: 新域名上真的能打开面板吗 (证书受信任 + DNS + 端口) ----
-    if services.is_prod():
-        reachable, why = services.probe_public_panel(new_domain, 443, timeout=15)
-        if not reachable:
-            with config.locked():
-                steps.extend(_rollback_domain(old_domain, old_cert))
-            return steps, f"新域名访问不通 ({why}) —— 已回滚, 面板仍在 {old_domain}"
-        record("验证新域名", True, why)
-    else:
-        record("验证新域名", True, "跳过 (非生产环境, 无 nginx / 公网入口)")
-
-    with config.locked():
-        fresh = load_state()
-        fresh["steps"] = steps
-        save_state(fresh)
+        steps.extend(landed)
+        failed = apply.failures(landed)
+        reason = f"配置落地失败 ({failed[0]['name']}: {failed[0]['detail']})" if failed else ""
+        if not reason and services.is_prod():
+            reachable, why = services.probe_public_panel(new_domain, 443, timeout=15)
+            if not reachable:
+                reason = f"新域名访问不通 ({why})"
+            else:
+                record("验证新域名", True, why)
+        elif not reason:
+            record("验证新域名", True, "跳过 (非生产环境, 无 nginx / 公网入口)")
+        if reason:
+            rolled = _rollback_domain(old_domain, old_cert)
+            steps.extend(rolled)
+            result = (f"已回滚, 面板仍在 {old_domain}" if all(x["ok"] for x in rolled)
+                      else "回滚未完成，请通过原入口或服务器终端检查诊断")
+            return steps, f"{reason} —— {result}"
+        with config.locked():
+            fresh = load_state()
+            fresh["steps"] = steps
+            save_state(fresh)
     return steps, ""
 
 
 def _rollback_domain(old_domain: str, old_cert: dict) -> list[dict]:
-    """把域名 / 证书 / 配置退回换域名之前的样子 (调用方必须已持有配置锁)。"""
-    state = load_state()
-    state["domain"] = old_domain
-    state["cert"] = old_cert
-    save_state(state)
+    """Restore the domain without holding config.locked() across service operations."""
     with _APPLY_RUN_LOCK:
-        reverted = apply.reapply(state)
-    ok = not apply.failures(reverted)
-    return [
-        {
-            "name": "回滚到原域名",
-            "ok": ok,
-            "detail": (
-                f"域名 / 证书 / 配置已退回 {old_domain or '(IP 访问)'}"
-                if ok
-                else f"回滚后仍有步骤告警, 请到「诊断」看详情: {apply.failures(reverted)[0]['name']}"
-            ),
-            "ms": 0,
-        }
-    ]
+        with config.locked():
+            state = load_state()
+            state["domain"] = old_domain
+            state["cert"] = old_cert
+            save_state(state)
+        try:
+            reverted = apply.reapply(state)
+            ok = not apply.failures(reverted)
+            detail = (f"域名 / 证书 / 配置已退回 {old_domain or '(IP 访问)'}" if ok else
+                      f"回滚未完成，请检查诊断: {apply.failures(reverted)[0]['name']}")
+        except Exception as exc:
+            ok, detail = False, f"回滚异常，请通过服务器终端恢复: {type(exc).__name__}: {exc}"
+    return [{"name": "回滚到原域名", "ok": ok, "detail": detail, "ms": 0}]
 
 
 def _run_domain_job(job_id: str, new_domain: str) -> None:
@@ -3336,6 +3459,13 @@ def _change_domain_impl(payload: DomainIn, request: Request):
             return _err("请输入域名 (示例: proxy.example.com) —— 换域名要的是能签证书的域名")
         if new_domain == current:
             return _err("与当前域名相同, 无需更换")
+        with _APPLY_JOBS_LOCK:
+            running_elsewhere = any(job.get("kind") == "domain" and job.get("state") == "running"
+                                    and job.get("home") == paths()["home"]
+                                    and job.get("owner") != _job_owner(request.cookies.get(SESSION_COOKIE) or "")
+                                    for job in _APPLY_JOBS.values())
+        if running_elsewhere:
+            return _err("已有其他会话的换域名任务在进行中，请等它结束", 409)
         running = _running_job(request, kind="domain")
         if running is not None:
             body = _dashboard_body(state, request)
@@ -3616,7 +3746,7 @@ def subscribe(token: str, request: Request, format: str = "base64", rules: str =
     ):
         return _err("无效订阅", 404)
     # rules 参数可对单个客户端覆盖分流模板 (?rules=smart|global|direct)
-    body, media_type = share_links.subscription_body(state, format, rules)
+    body, media_type = share_links.subscription_body(apply.subscription_state(state), format, rules)
     headers = {
         # 客户端按此周期自动刷新订阅 (小时), 节点启停/端口变更自动同步
         "profile-update-interval": "12",
@@ -4512,6 +4642,22 @@ def device_update(device_id: str, payload: DevicePatchIn, request: Request):
         return {"device": devices.device_view(device)}
 
 
+@router.post("/api/devices/{device_id}/credentials")
+def device_enable_credentials(device_id: str, request: Request):
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        device = devices.find(state, device_id)
+        if device is None:
+            return _err("设备不存在", 404)
+        if device.get("dataplane") and (state.get("runtime") or {}).get("credentials_revision") == device_credentials.revision(state):
+            return _dashboard_body(state, request)
+        device_credentials.enable(device)
+        config.audit(state, "device_credentials", f"{device_id}: 启用独立数据面凭据", actor=_client_ip(request))
+        return _landing_body(state, request)
+
+
 @router.delete("/api/devices/{device_id}")
 def device_delete(device_id: str, request: Request):
     """移除设备 = 立刻吊销它手里的 secret (那台机器无法再同步配置与心跳)。"""
@@ -4522,15 +4668,19 @@ def device_delete(device_id: str, request: Request):
         device = devices.find(state, device_id)
         if device is None:
             return _err("设备不存在", 404)
+        independent = bool(device.get("dataplane"))
         name = device.get("name", "")
         devices.remove(state, device_id)
         config.audit(state, "device_remove", f"{name} ({device_id})")
         save_state(state)
-        return {
+        body = _landing_body(state, request) if independent else {}
+        body.update({
             "removed": device_id,
             "devices": devices.view(state),
-            "notice": "设备凭据已吊销。若该设备非受控或疑似泄露，建议在「设置」中重置节点密码/UUID以彻底切断其已缓存的数据面代理访问。",
-        }
+            "notice": ("独立数据面授权已移除，请核对配置应用结果；已有连接可能在内核重载时断开。曾持有共享凭据的设备仍需轮换共享凭据。" if independent else
+                       "设备管理凭据已吊销；缓存的共享代理配置仍可能可用，需要重置节点密码/UUID（轮换共享凭据）以撤销访问。"),
+        })
+        return body
 
 
 # ---------------------------------------------------------------- 设备侧接口
@@ -4579,6 +4729,8 @@ def client_perf_config(request: Request, id: str = "", k: str = "", lan: str = "
         device = devices.find(state, id)
         if not devices.check_secret(device, _device_secret(request, k)):
             return _err("设备凭据无效", 403)
+        if device.get("dataplane") and (state.get("runtime") or {}).get("credentials_revision") != device_credentials.revision(state):
+            return _err("独立代理授权尚未确认应用，请等待服务器任务完成后重试", 503)
         # 接口名只允许 [A-Za-z0-9._-]: 它会原样进配置文件, 不接受任何别的字符。
         ifaces = ",".join(
             part for part in (chunk.strip() for chunk in (lan or "").split(","))
@@ -4586,10 +4738,10 @@ def client_perf_config(request: Request, id: str = "", k: str = "", lan: str = "
         )[:120]
         # `?tpl=` 会原样进配置头部那行注释; 以前直接拼用户输入, 换行就能注入配置行
         # (P3-16)。这里走 share_links 的白名单 (template_of), 未知值回退面板默认。
-        template = share_links.template_of(state, (tpl or "").strip().lower())
+        template = share_links.template_of(state, (device.get("template") or tpl or "").strip().lower())
         try:
             body, skipped = dae_config.render(
-                state,
+                device_credentials.subscription_state(apply.subscription_state(state), device),
                 share_links.panel_base_url(request, state),
                 lan_interface=ifaces or "br-lan",
                 template=template,
@@ -5092,6 +5244,8 @@ def client_subscription(
         device = devices.find(state, device_id)
         if not devices.check_secret(device, _device_secret(request, k)):
             return _err("设备凭据无效", 403)
+        if device.get("dataplane") and (state.get("runtime") or {}).get("credentials_revision") != device_credentials.revision(state):
+            return _err("独立代理授权尚未确认应用，请等待服务器任务完成后重试", 503)
         # 设备自己的模板覆盖优先于全局设置
         tpl = (device or {}).get("template") or ""
         fmt = (format or "clash").strip().lower()
@@ -5101,9 +5255,9 @@ def client_subscription(
         ):
             fmt = "clash"
         body, media_type = share_links.subscription_body(
-            state,
+            device_credentials.subscription_state(apply.subscription_state(state), device),
             fmt,
-            rules or tpl,
+            tpl or rules,
             router=True,
             device=str(device.get("name") or ""),
             prefix=(prefix or "").strip()[:40],
@@ -5182,7 +5336,7 @@ def client_report(payload: DeviceReportIn, request: Request):
             "downloaded_rev": device.get("downloaded_rev", ""),
             "applied_rev": device.get("applied_rev", ""),
             "name": device["name"],
-            "template": share_links.template_of(state),
+            "template": (device.get("template") or share_links.template_of(state)),
             # 面板看到的这台设备的公网地址。设备端拿它做一件事: 判断"性能模式的出口探针
             # 是不是其实从本机直连出去的" —— 那条心跳是直连 (分流规则里面板域名走 direct),
             # 所以这个值就是本机 WAN 的出口地址。相等 = 探针没走代理 (见 README 8.86)。

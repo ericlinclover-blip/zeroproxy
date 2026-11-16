@@ -23,12 +23,22 @@ export function applyWidths(root) {
   });
 }
 
-export function toast(msg) {
+export function toast(msg, options = {}) {
   const t = $("#toast");
   t.textContent = msg;
   t.classList.add("show");
   clearTimeout(t._h);
-  t._h = setTimeout(() => t.classList.remove("show"), 2400);
+  const persistent = options.persistent || options.kind === "error" || /失败|未完成|待确认|无法|未能|还没|未取得/.test(msg);
+  if (persistent) {
+    const box = $("#operation-notice");
+    if (box) {
+      box.classList.remove("hidden");
+      $("#operation-notice-text").textContent = msg;
+      $("#notice-dismiss").onclick = () => box.classList.add("hidden");
+      $("#notice-copy").onclick = () => copyText($("#operation-notice-text").textContent);
+    }
+  }
+  t._h = setTimeout(() => t.classList.remove("show"), persistent ? 8000 : 2400);
 }
 
 export async function copyText(text) {
@@ -47,6 +57,12 @@ export async function copyText(text) {
 export function show(id) {
   ["view-setup", "view-login", "view-dash"].forEach((v) => $("#" + v).classList.add("hidden"));
   $("#" + id).classList.remove("hidden");
+  document.body.dataset.view = id;
+  const skip = $(".skip-link");
+  if (skip) {
+    skip.href = id === "view-dash" ? "#workspace-title" : id === "view-setup" ? "#setup-title" : "#login-title";
+    skip.textContent = id === "view-dash" ? "跳到工作区" : "跳到表单";
+  }
   // 视图一旦选好, 首屏那句"正在连接面板…"就撤掉 (它在等 /api/status 的那段时间里顶着)
   const boot = $("#bootNote");
   if (boot) boot.classList.add("hidden");

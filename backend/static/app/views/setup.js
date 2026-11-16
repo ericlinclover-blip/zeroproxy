@@ -10,7 +10,9 @@ import { S, reloadDash } from "../lib/state.js";
 import { renderSteps } from "../lib/render.js";
 
 /* ---------------- 部署 ---------------- */
-$("#btn-setup").onclick = async () => {
+$("#setup-form").onsubmit = async (event) => {
+  event.preventDefault();
+  if ($("#btn-setup").disabled) return;
   const payload = {
     domain: $("#in-domain").value.trim(),
     username: $("#in-user").value.trim(),
@@ -24,14 +26,22 @@ $("#btn-setup").onclick = async () => {
   prog.innerHTML = "";
   const btn = $("#btn-setup");
   btn.disabled = true;
-  btn.textContent = "部署中, 证书申请约需 30-60 秒…";
+  $("#setup-fields").disabled = true;
+  $("#setup-form").setAttribute("aria-busy", "true");
+  setSetupStep(1);
+  btn.textContent = "正在部署…";
+  $("#setup-status").textContent = "正在申请证书并生成配置，请保持页面打开。通常需要 30–60 秒。";
   $("#setup-bar").classList.remove("hidden");
   try {
     const res = await api("/api/setup", {
+      timeoutMs: 360000,
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
+    $("#setup-form").removeAttribute("aria-busy");
+    $("#setup-status").textContent = "部署结果如下。";
+    setSetupStep(2);
     renderSteps(res.steps || [], prog);
     prog.classList.remove("hidden");
     $("#setup-bar").classList.add("hidden");
@@ -50,7 +60,7 @@ $("#btn-setup").onclick = async () => {
       // 不再假装成功: 失败步骤留在页面上, 让用户先看到再进面板
       btn.textContent = "完成 (有步骤失败)";
       errBox.textContent =
-        `有 ${failed.length} 步失败: ${failed[0].name} — ${failed[0].detail}` +
+        (failed.length ? `有 ${failed.length} 步失败: ${failed[0].name} — ${failed[0].detail}` : "服务端未能完成部署，请查看诊断结果。") +
         "\n面板已进入仪表盘, 可用「一键诊断」/「一键修复」重试。";
       errBox.classList.remove("hidden");
       toast(`部署完成但有 ${failed.length} 步失败`);
@@ -84,7 +94,12 @@ $("#btn-setup").onclick = async () => {
     errBox.textContent = "部署失败: " + e.message;
     errBox.classList.remove("hidden");
     btn.disabled = false;
-    btn.textContent = "一键生成";
+    btn.textContent = "重试部署";
+    $("#setup-fields").disabled = false;
+    $("#setup-form").removeAttribute("aria-busy");
+    $("#setup-status").textContent = "部署未完成。请检查错误提示后重试。";
+    setSetupStep(0);
+    errBox.focus();
   }
 };
 
@@ -95,7 +110,7 @@ export function showSetupHandoff(dest, user, seconds, opts = {}) {
   const url = `${String(dest.url || "").replace(/\/+$/, "")}/?user=${encodeURIComponent(user || "")}`;
   const total = Number(seconds) > 0 ? Number(seconds) : 3;
   const note = opts.note || `该地址用的是真实证书, 不会再报"不安全"; 用户名已预填, 输入密码即可登录。`;
-  const stay = opts.stay === false ? "" : `<button class="btn ghost small" id="handoff-stay">留在本页</button>`;
+  const stay = opts.stay === false ? "" : `<button type="button" class="btn ghost small" id="handoff-stay">留在本页</button>`;
   const box = $("#setup-done");
   box.classList.remove("hidden");
   box.innerHTML = `
@@ -106,7 +121,7 @@ export function showSetupHandoff(dest, user, seconds, opts = {}) {
     <div class="hint-box">
       <div id="handoff-count">正在跳转到 <b>${esc(url)}</b> · ${total} 秒</div>
       <div class="row center mt-3">
-        <button class="btn small" id="handoff-go">立即前往</button>
+        <button type="button" class="btn small" id="handoff-go">立即前往</button>
         ${stay}
       </div>
       <div class="muted fs-sm mt-2">${note}</div>
@@ -130,23 +145,60 @@ export function showSetupHandoff(dest, user, seconds, opts = {}) {
 }
 
 /* ---------------- 登录 ---------------- */
-$("#btn-login").onclick = async () => {
+function setSetupStep(index) {
+  document.querySelectorAll(".auth-steps li").forEach((step, i) => {
+    if (i === index) step.setAttribute("aria-current", "step");
+    else step.removeAttribute("aria-current");
+  });
+}
+
+document.querySelectorAll("[data-password]").forEach((button) => {
+  button.onclick = () => {
+    const input = document.getElementById(button.dataset.password);
+    const visible = input.type === "password";
+    input.type = visible ? "text" : "password";
+    button.textContent = visible ? "隐藏" : "显示";
+    button.setAttribute("aria-pressed", String(visible));
+    button.setAttribute("aria-label", `${visible ? "隐藏" : "显示"}${input.id === "in-pass" ? "管理员" : ""}密码`);
+  };
+});
+["keydown", "keyup"].forEach((type) => $("#login-pass").addEventListener(type, (event) => {
+  $("#login-caps").classList.toggle("hidden", !event.getModifierState("CapsLock"));
+}));
+$("#login-pass").addEventListener("blur", () => $("#login-caps").classList.add("hidden"));
+
+$("#login-form").onsubmit = async (event) => {
+  event.preventDefault();
+  const btn = $("#btn-login");
+  if (btn.disabled) return;
   const errBox = $("#login-err");
   errBox.classList.add("hidden");
+  btn.disabled = true;
+  btn.textContent = "正在登录…";
+  $("#login-form").setAttribute("aria-busy", "true");
   try {
     await api("/api/login", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username: $("#login-user").value.trim(), password: $("#login-pass").value }),
     });
+    $("#login-pass").value = "";
+    $("#login-pass").type = "password";
+    const toggle = document.querySelector('[data-password="login-pass"]');
+    toggle.textContent = "显示";
+    toggle.setAttribute("aria-pressed", "false");
+    toggle.setAttribute("aria-label", "显示密码");
     reloadDash();
   } catch (e) {
     errBox.textContent = e.message;
     errBox.classList.remove("hidden");
+    errBox.focus();
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '登录面板 <span aria-hidden="true">↗</span>';
+    $("#login-form").removeAttribute("aria-busy");
   }
 };
-$("#in-pass").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#btn-setup").click(); });
-$("#login-pass").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#btn-login").click(); });
 $("#btn-logout").onclick = async () => {
   await api("/api/logout", { method: "POST" });
   S.dash = null;

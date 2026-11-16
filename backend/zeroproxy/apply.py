@@ -32,6 +32,7 @@ from . import (
     chain,
     chain_quic,
     config,
+    device_credentials,
     crypto,
     hysteria_config,
     nginx_config,
@@ -691,6 +692,7 @@ def _snapshot_generated_files() -> dict[str, tuple[str, int] | None]:
     p = paths()
     names = {p[key] for key in ("xray_config", "hysteria_config", "nginx_home", "nginx_etc")}
     names.update(value for key, value in p.items() if key.startswith("wireguard_") and key != "wireguard_dir")
+    names.update(os.path.join(p["hysteria_dir"], name) for name in ("auth.py", "auth.json"))
     snapshot = {}
     for name in names:
         try:
@@ -846,9 +848,64 @@ def _reapply_locked(state: dict, timeout: int = 0, progress=None) -> list[dict]:
             state.clear()
             state.update(copy.deepcopy(baseline))
             break
+    rollback_state = "not-needed"
+    if (failures(steps) and any(step.get("abort") and step.get("files_restored") for step in steps)
+            and (baseline.get("runtime") or {}).get("status") == "applied"):
+        rollback_state = "unchanged"
+    if failures(steps) and not any(step.get("abort") for step in steps):
+        # Services may already have switched: restore the prior files and verify
+        # the old desired ports, without overwriting the user's failed draft.
+        rollback_state = "unavailable"
+        good_path = os.path.join(paths()["data_dir"], "runtime-last-good.json")
+        try:
+            with open(good_path, encoding="utf-8") as fh:
+                good = json.load(fh)
+            recovery = config.state_from({**state, **good})
+            errors = _restore_generated_files(previous_files)
+            if errors:
+                raise RuntimeError("; ".join(errors))
+            ok, detail = restart_services(recovery, 180, changed=set(before))
+            if ok:
+                ok, detail = verify_listeners(recovery, 12)
+            rollback_state = "restored" if ok else "failed"
+            steps.append({"name": "恢复上次运行配置", "ok": ok, "detail": detail, "ms": 0})
+        except (OSError, ValueError, RuntimeError) as exc:
+            steps.append({"name": "恢复上次运行配置", "ok": False,
+                          "detail": f"未能确认运行回退，请通过服务器终端检查: {exc}", "ms": 0})
+            rollback_state = "failed"
     state["steps"] = steps
+    record_runtime(state, steps, rollback_state)
     _save_merged(state, baseline)
     return steps
+
+
+def record_runtime(state: dict, steps: list[dict], rollback_state: str = "not-needed") -> None:
+    """Record successful configuration independently from telemetry and drafts."""
+    revision = config.configuration_revision(state)
+    runtime = copy.deepcopy(state.get("runtime") or {})
+    if not failures(steps):
+        runtime.update(applied_revision=revision, credentials_revision=device_credentials.revision(state), status="applied", rollback_state="not-needed", error="", checked_at=int(time.time()))
+        # This snapshot is intentionally separate from desired state and contains
+        # credentials. It is local-only, atomic and mode 0600.
+        good = {key: copy.deepcopy(state.get(key)) for key in config.RUNTIME_FIELDS}
+        config.atomic_write_text(os.path.join(paths()["data_dir"], "runtime-last-good.json"),
+                                 json.dumps(good, ensure_ascii=False), mode=0o600)
+    else:
+        runtime.update(status="failed", rollback_state=rollback_state, error=failures(steps)[0].get("detail", "应用失败"),
+                       checked_at=int(time.time()))
+    runtime["verification"] = "server" if services.is_prod() else "dry-run"
+    state["runtime"] = runtime
+
+def subscription_state(state: dict) -> dict:
+    runtime = state.get("runtime") or {}
+    if runtime.get("status") != "failed" or runtime.get("rollback_state") not in {"restored", "unchanged"}:
+        return state
+    try:
+        with open(os.path.join(paths()["data_dir"], "runtime-last-good.json"), encoding="utf-8") as fh:
+            good = json.load(fh)
+        return config.state_from({**state, **good})
+    except (OSError, ValueError):
+        return state
 
 
 def failures(steps: list[dict]) -> list[dict]:
