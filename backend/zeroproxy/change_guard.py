@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 import time
 import uuid
 
@@ -24,10 +25,25 @@ def active(state: dict) -> bool:
 def authorize_write(state: dict, path: str, method: str) -> None:
     if method in {'GET', 'HEAD', 'OPTIONS'} or not active(state):
         return
-    allowed = {'/api/login', '/api/logout', '/api/logout-all', '/api/session/handoff', '/api/routing/analyze'}
+    allowed = {'/api/login', '/api/logout', '/api/logout-all', '/api/session/handoff', '/api/routing/analyze', '/api/backup'}
     if path in allowed or path.startswith('/api/changes/') or path.endswith('/diagnose'):
         return
     raise ChangeBusy('有网络变更等待确认或回滚，请先保留或撤销该变更')
+
+
+def request_keys(path: str, method: str) -> tuple[str, list[str]] | None:
+    """Only explicit network mutations can opt into the confirmation protocol."""
+    if method not in {'POST', 'DELETE'}:
+        return None
+    if re.fullmatch(r'/api/nodes/[^/]+/(enabled|toggle)', path):
+        return 'nodes', ['nodes', 'chain']
+    if path == '/api/hysteria/hopping':
+        return 'hopping', ['hysteria_hopping', 'hysteria_ports']
+    if path == '/api/chain/exit' or re.fullmatch(r'/api/chain/entries(?:/[^/]+(?:/pair)?)?', path):
+        return 'chain', ['chain']
+    if path == '/api/wireguard/settings' or re.fullmatch(r'/api/wireguard/peers(?:/[^/]+(?:/rotate)?)?', path):
+        return 'wireguard', ['wireguard']
+    return None
 
 
 def fingerprint(state: dict, keys: list[str]) -> str:

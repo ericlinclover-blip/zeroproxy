@@ -140,8 +140,14 @@ def _wg_transaction(fn):
         try:
             with wireguard.operation():
                 return fn(*args, **kwargs)
-        except (wireguard.OperationBusy, ValueError) as exc:
-            return _err(str(exc), 409)
+        except Exception as exc:
+            request = kwargs.get("request") or next((arg for arg in args if isinstance(arg, Request)), None)
+            identity = getattr(request.state, "network_change_id", "") if request is not None else ""
+            if identity:
+                change_guard.finish(identity, [], f"WireGuard 事务异常: {type(exc).__name__}: {exc}")
+            if isinstance(exc, (wireguard.OperationBusy, ValueError)):
+                return _err(str(exc), 409)
+            raise
     return wrapped
 
 
@@ -262,6 +268,16 @@ def _require_auth(state: dict, request: Request) -> bool:
     authenticated = _session_of(state, request) is not None
     if authenticated:
         change_guard.authorize_write(state, request.url.path, request.method)
+        spec = change_guard.request_keys(request.url.path, request.method)
+        if spec and request.headers.get("x-zp-confirm"):
+            if request.headers["x-zp-confirm"] != "90":
+                raise change_guard.ChangeBusy("不支持的确认时限，请刷新页面后重试")
+            revision = request.headers.get("x-zp-revision")
+            if revision and revision != config.configuration_revision(state):
+                raise change_guard.ChangeBusy("配置已被其他操作修改，请刷新并核对后重试")
+            if not getattr(request.state, "network_change_id", ""):
+                request.state.network_before = {key: copy.deepcopy(state.get(key)) for key in spec[1]}
+                request.state.network_kind = spec[0]
     return authenticated
 
 
@@ -640,12 +656,38 @@ def apply_job(id: str, request: Request):
         return _job_snapshot(job)
 
 
+def _arm_request_change(state: dict, request: Request) -> str:
+    before = getattr(request.state, "network_before", None)
+    identity = getattr(request.state, "network_change_id", "")
+    if identity or before is None:
+        return identity
+    keys = [key for key in before if state.get(key) != before[key]]
+    if not keys:
+        return ""
+    identity = change_guard.begin(state, before, request.state.network_kind, keys)
+    request.state.network_change_id = identity
+    return identity
+
+
 def _landing_body(state: dict, request: Request, after=None, on_result=None) -> dict:
     """改配置后的统一回执: 仪表盘数据 + 同步步骤 / 后台任务描述。
 
     同步模式 (ZP_APPLY_ASYNC=0) 里 `steps` 是完整的七步结果; 异步模式里
     `steps` 为空数组、`job` 有值, 前端据此轮询进度 —— 两种形状前端都认。
     """
+    identity = _arm_request_change(state, request)
+    if identity:
+        previous_result = on_result
+        def on_result(steps, error):
+            extra = []
+            try:
+                if previous_result is not None:
+                    extra = previous_result(steps, error)
+            except Exception as exc:
+                change_guard.finish(identity, steps, f"补偿异常: {type(exc).__name__}: {exc}")
+                raise
+            change_guard.finish(identity, [*steps, *extra], error)
+            return extra
     steps, job = _reapply_job(state, request, after=after, on_result=on_result)
     if on_result is not None:
         state = load_state()
@@ -1756,7 +1798,7 @@ def analyze_routing(payload: RuleAnalysisIn, request: Request):
 
 
 def rollback_network_change(identity: str | None = None, force: bool = False) -> list[dict]:
-    with _APPLY_RUN_LOCK:
+    with _APPLY_RUN_LOCK, wireguard.operation():
         with config.locked():
             state = load_state()
             pending = state.get("pending_change") or {}
@@ -1768,11 +1810,12 @@ def rollback_network_change(identity: str | None = None, force: bool = False) ->
                 return []
             if pending.get("state") not in change_guard.ACTIVE | {"rollback_failed"}:
                 raise ValueError("当前没有可回滚的临时变更")
-            expected = pending.get("restore_target") if pending.get("state") in {"rolling_back", "rollback_failed"} else pending.get("target")
+            expected = (pending.get("restore_target") or pending.get("target")) if pending.get("state") in {"rolling_back", "rollback_failed"} else pending.get("target")
             actual = change_guard.fingerprint(state, pending["keys"])
             baseline = change_guard.fingerprint(pending["before"], pending["keys"])
             if expected and actual not in {expected, baseline}:
                 pending.update(state="rollback_failed", error="配置已发生其他变化，未覆盖；请通过诊断或服务器终端恢复")
+                config.audit(state, "network_rollback_failed", f"{pending['id']}: {pending['error']}")
                 save_state(state)
                 return [{"name": "限时回滚", "ok": False, "detail": pending["error"]}]
             for key, value in pending["before"].items():
@@ -1793,7 +1836,7 @@ def rollback_network_change(identity: str | None = None, force: bool = False) ->
                 current.update(state="rollback_failed" if error else "rolled_back", error=error)
                 if not error:
                     current["before"] = {}
-                config.audit(fresh, "network_rollback", f"{change_id}: " + (error or "已恢复并验证旧配置"))
+                config.audit(fresh, "network_rollback_failed" if error else "network_rollback", f"{change_id}: " + (error or "已恢复并验证旧配置"))
                 save_state(fresh)
         return steps + [{"name": "限时回滚", "ok": not error, "detail": error or "已恢复并验证旧配置"}]
 
@@ -1831,7 +1874,7 @@ def cancel_network_change(identity: str, request: Request):
         return _err("未登录", 401)
     try:
         steps = rollback_network_change(identity, force=True)
-    except ValueError as exc:
+    except (ValueError, wireguard.OperationBusy) as exc:
         return _err(str(exc), 409)
     body = _dashboard_body(load_state(), request)
     body.update(steps=steps, ok=not apply.failures(steps))
@@ -2147,9 +2190,12 @@ def chain_entry_add(payload: ChainEntryIn, request: Request):
         def after_landing() -> list[dict]:
             return [
                 {
-                    "name": "链路测试 (真实出口往返)",
-                    # 环境不支持探测不算失败 (与 apply 里"跳过"步骤的约定一致)
-                    "ok": bool(probe.get("ok")) or not probe_ran,
+                    "name": "强制添加链路 (出网未验证)" if payload.force and probe_ran and not probe.get("ok") else "链路测试 (真实出口往返)",
+                    # An explicitly accepted probe failure is a warning, not a service-apply failure.
+                    "ok": bool(probe.get("ok")) or not probe_ran or bool(payload.force),
+                    "probe_observation": True,
+                    "probe_ok": bool(probe.get("ok")),
+                    "warning": bool(payload.force and probe_ran and not probe.get("ok")),
                     "detail": probe.get("detail") or "",
                     "ms": int(probe.get("ms") or 0),
                     "skipped": not probe_ran,
@@ -4038,6 +4084,9 @@ def _wg_text_response(text: str, filename: str, inline: bool = False) -> Respons
 
 def _wg_reply(state: dict, request: Request, steps: list[dict]) -> dict:
     """只保存步骤；WireGuard 事务已提交，回执不再写回旧配置。"""
+    identity = getattr(request.state, "network_change_id", "")
+    if identity:
+        change_guard.finish(identity, steps)
     with config.locked():
         fresh = load_state()
         fresh["steps"] = steps
@@ -4239,6 +4288,7 @@ def wireguard_settings(payload: WireGuardSettingsIn, request: Request):
 
         wireguard.validate_settings(state)
         # 锁内只落"期望状态"; sync() (apt/systemctl/等 wg0) 放到锁外执行 (P2-2)
+        _arm_request_change(state, request)
         save_state(state)
     fresh, steps, ok = _wg_sync_and_persist(
         state,
@@ -4284,6 +4334,7 @@ def wireguard_peer_add(payload: WireGuardPeerIn, request: Request):
         except ValueError as exc:
             return _err(str(exc))
         wireguard.validate_settings(state)
+        _arm_request_change(state, request)
         save_state(state)
     fresh, steps, _ok = _wg_sync_and_persist(
         state,
@@ -4353,6 +4404,7 @@ def wireguard_peer_update(peer_id: str, payload: WireGuardPeerPatch, request: Re
         if not changed:
             return _err("没有需要修改的内容")
         wireguard.validate_settings(state)
+        _arm_request_change(state, request)
         save_state(state)
     fresh, steps, _ok = _wg_sync_and_persist(
         state,
@@ -4383,6 +4435,7 @@ def wireguard_peer_delete(peer_id: str, request: Request):
         if peer is None:
             return _err("客户端不存在", 404)
         wireguard.validate_settings(state)
+        _arm_request_change(state, request)
         save_state(state)
     fresh, steps, _ok = _wg_sync_and_persist(
         state,
@@ -4408,6 +4461,7 @@ def wireguard_peer_rotate(peer_id: str, request: Request):
         if peer is None:
             return _err("客户端不存在", 404)
         wireguard.validate_settings(state)
+        _arm_request_change(state, request)
         save_state(state)
     fresh, steps, _ok = _wg_sync_and_persist(
         state,

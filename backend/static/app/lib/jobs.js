@@ -169,6 +169,12 @@ export function resumeApplyJobs(jobs = []) {
   }
 }
 
+export function confirmationNotice(message) {
+  return S.dash?.pending_change?.state === "awaiting_confirmation"
+    ? `${message}；当前为临时配置，请在顶部倒计时内测试并保留变更，超时自动回滚`
+    : message;
+}
+
 /* 改动类接口的统一入口 */
 export async function applyAction(method, path, payload, btn, busyText, okText) {
   await waitPendingApply();
@@ -192,7 +198,7 @@ export async function applyAction(method, path, payload, btn, busyText, okText) 
       toast(
         failed.length
           ? `已应用, 但有 ${failed.length} 步告警: ${failed[0].name}`
-          : (okText || "已应用, 订阅内容已刷新")
+          : confirmationNotice(okText || "已应用, 订阅内容已刷新")
       );
     }
   } catch (e) {

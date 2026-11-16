@@ -120,7 +120,7 @@ def _wireguard_once() -> None:
     with wireguard.operation():
         with config.locked():
             state = config.load_state()
-            if not state.get("configured") or not wireguard.enabled(state):
+            if not state.get("configured") or change_guard.active(state) or not wireguard.enabled(state):
                 return
             before = copy.deepcopy(state["wireguard"])
             if not wireguard.reap_expired(state):

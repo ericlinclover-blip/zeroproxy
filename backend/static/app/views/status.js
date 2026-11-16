@@ -11,7 +11,7 @@ import {
 import { api } from "../lib/api.js";
 import { openQr } from "../lib/dialog.js";
 import { S } from "../lib/state.js";
-import { settleApply } from "../lib/jobs.js";
+import { settleApply, confirmationNotice } from "../lib/jobs.js";
 import { renderField } from "./field.js";
 import { renderBanner } from "../lib/render.js";
 
@@ -174,7 +174,7 @@ export function renderNodes() {
         );
         const failed = steps.filter((s) => !s.ok);
         toast(failed.length ? `已应用, 但 ${failed.length} 步告警: ${failed[0].name}`
-                            : "已热更新, 订阅内容已刷新");
+                            : confirmationNotice("已热更新, 订阅内容已刷新"));
       } catch (e) {
         el.disabled = false;
         el.checked = !!S.dash.nodes.find((node) => node.id === el.dataset.node)?.enabled;

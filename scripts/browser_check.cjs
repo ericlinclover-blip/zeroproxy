@@ -272,7 +272,15 @@ async function main() {
     const certText = await page.locator("#sys-grid").innerText();
     check("证书卡片", certText.includes("TLS 证书"), certText.split("\n").slice(0, 4).join(" "));
 
+    const confirmPendingChange = async () => {
+      await page.waitForFunction(() => !window.dash?.pending_change || window.dash.pending_change.state !== "applying", {}, { timeout: 30000 });
+      if (await page.evaluate(() => window.dash?.pending_change?.state === "awaiting_confirmation")) {
+        await page.click("[data-change-confirm]");
+        await page.waitForFunction(() => window.dash.pending_change.state === "confirmed");
+      }
+    };
     const goWorkspace = async (key) => {
+      await confirmPendingChange();
       await page.locator(`[data-workspace="${key}"]`).click();
     };
     check("五个工作区导航就绪", await page.locator("#dash-nav a").count() === 5);
@@ -315,6 +323,7 @@ async function main() {
     check("节点卡自己的状态灯也一起熄灭, 文案是「已停用」",
       /off/.test(offState.cardDot) && offState.cardTxt === "已停用",
       `${offState.cardDot} · ${offState.cardTxt}`);
+    await confirmPendingChange();
     await page.locator("#node-grid .node-card").first().locator(".switch .slider").click();
     await page.waitForTimeout(1200);
     const enabledLabels = await page.locator("#node-grid .switch input:checked").count();
@@ -513,11 +522,14 @@ async function main() {
     await page.click("#adv-hopping");
     await page.waitForFunction(() => dash && dash.hysteria_hopping === false, { timeout: 30000 });
     check("关掉端口跳跃可写入状态", await page.evaluate(() => dash.hysteria_hopping) === false, "");
+    await confirmPendingChange();
     await page.click("#adv-hopping");
     await page.waitForFunction(() => dash && dash.hysteria_hopping === true, { timeout: 30000 });
     const hopAfter = await page.evaluate(() => dash.hysteria_ports);
     check("重新打开后区间跟着主端口走",
       hopAfter.length === 3 && hopAfter[0] === 30001 && hopAfter[2] === 32001, hopAfter.join(" / "));
+
+    await confirmPendingChange();
 
     // 备份改 POST (旧版是 GET: 有副作用, 也没法把口令/加密选择放进请求头)。
     // 明文导出仍返回 JSON; 加密导出 (encrypt=1 + X-ZP-Passphrase) 返回二进制 .enc。
@@ -842,6 +854,7 @@ async function main() {
     await page.fill("#chain-exit-label", "香港落地");
     await page.click("#btn-chain-exit-gen");
     await page.waitForSelector("#chain-exit-code", { timeout: 30000 });
+    await confirmPendingChange();
     const exitCard = await page.evaluate(() => ({
       code: document.querySelector("#chain-exit-code").textContent.trim(),
       text: document.querySelector("#chain-exit-card").innerText,
@@ -943,6 +956,7 @@ async function main() {
     await page.locator("#confirm-mask .modal").screenshot({ path: path.join(SHOT_DIR, "chain-confirm.png") });
     await page.click("#confirm-ok");
     await page.waitForSelector("#chain-entries .chain-entry", { timeout: 40000 });
+    await confirmPendingChange();
     const entryCard = await page.evaluate(() => {
       const card = document.querySelector("#chain-entries .chain-entry");
       const text = card.innerText;
@@ -1024,8 +1038,9 @@ async function main() {
       /主力节点/.test(defaultConfirm) && /改道/.test(defaultConfirm), defaultConfirm.slice(0, 50));
     await page.click("#confirm-ok");
     await page.waitForFunction(
-      () => /默认出口/.test(document.querySelector("#chain-entries").innerText), { timeout: 30000 });
+      () => window.dash?.chain?.entries?.some((entry) => entry.default_out), { timeout: 30000 });
     check("默认出口标记上卡片", /默认出口/.test(await page.locator("#chain-entries").innerText()), "");
+    await confirmPendingChange();
 
     // 测速 (落地端是测试网段, 必然不通 → 卡片上要显示"不通"而不是假装成功)
     const [probeResp] = await Promise.all([
@@ -1122,6 +1137,7 @@ async function main() {
       && (await page.locator("#node-grid .node-card").count()) === 5, "");
     const clashAfter = await (await page.request.get(`${base}${chainSubPath}?format=clash`)).text();
     check("断开后订阅里不再有这个节点", !/ZeroProxy 链式/.test(clashAfter), "");
+    await confirmPendingChange();
 
     await page.click("#btn-logout");
     await page.waitForSelector("#view-login:not(.hidden)", { timeout: 15000 });
@@ -1256,7 +1272,7 @@ async function main() {
       `${await page.locator("#audit-list .audit-row").count()} 条`);
     const auditText = (await page.locator("#audit-list").innerText()).trim();
     check("动作显示成「中文名 + 代号」而不是一串英文",
-      /初始化部署/.test(auditText) && /setup/.test(auditText), auditText.split("\n").slice(0, 2).join(" / "));
+      /保留网络变更/.test(auditText) && /network_confirm/.test(auditText), auditText.split("\n").slice(0, 2).join(" / "));
     check("记录按天分组", (await page.locator("#audit-list .audit-day").count()) > 0,
       (await page.locator("#audit-list .audit-day").first().innerText()).trim());
 

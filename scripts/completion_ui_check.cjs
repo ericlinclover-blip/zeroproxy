@@ -22,7 +22,7 @@ const check = (name, ok, detail='') => { console.log(`${ok?'✓':'✗'} ${name}$
   await jsonPost('/api/settings',{reality_sni:'www.example.org',require_confirmation:true});
   await page.evaluate(async()=>{await window.loadDash(true);});
   await page.waitForSelector('#network-change-panel:not(.hidden) [data-change-confirm]:not([hidden])');
-  check('高级设置提供服务端限时确认',(await page.locator('[data-change-text]').innerText()).includes('临时配置已应用'));
+  check('高级设置提供服务端限时确认',(await page.locator('[data-change-text]').innerText()).includes('临时高级设置配置已应用'));
   await page.click('[data-change-confirm]');
   await page.waitForFunction(()=>document.querySelector('[data-change-text]').textContent==='已保留网络变更。');
   check('确认后展示已保留',true);

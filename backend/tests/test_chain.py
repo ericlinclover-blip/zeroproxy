@@ -323,7 +323,7 @@ def test_entry_probe_gate_and_force(client, configured, monkeypatch):
     assert forced.status_code == 200, forced.text
     entry = forced.json()["chain"]["entries"][0]
     assert entry["last_probe"]["ok"] is False
-    assert any(s["name"].startswith("链路测试") and s["ok"] is False for s in forced.json()["steps"])
+    assert any(s.get("probe_observation") and s.get("probe_ok") is False and s.get("warning") for s in forced.json()["steps"])
 
     # 环境不允许探测 (没有 xray 二进制) 时不该拦住用户
     other = _fake_code(config.load_state(), host="198.51.100.7", label="备用")

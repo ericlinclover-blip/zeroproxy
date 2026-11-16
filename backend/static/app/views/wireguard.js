@@ -11,7 +11,7 @@ import { api } from "../lib/api.js";
 import { S } from "../lib/state.js";
 import { fmtBytes, fmtTime } from "../lib/format.js";
 import { openConfirm, openQr } from "../lib/dialog.js";
-import { applyAction, settleApply } from "../lib/jobs.js";
+import { applyAction, settleApply, confirmationNotice } from "../lib/jobs.js";
 import { clearDraft } from "../lib/drafts.js";
 
 const EXPIRES = [
@@ -47,7 +47,7 @@ export function renderWireguard(dash) {
       ? `${wg.enabled_count} 台启用 · ${wg.online_count} 台在线`
       : "未启用";
   }
-  box.innerHTML = wg.enabled ? enabledView(wg) : disabledView(wg);
+  box.innerHTML = `<p class="note">设置和设备授权临时应用 90 秒；请测试后在顶部保留变更。未确认的删除或轮换会恢复旧授权。</p>` + (wg.enabled ? enabledView(wg) : disabledView(wg));
   bind(wg);
 }
 
@@ -311,7 +311,7 @@ function bind(wg) {
   if (disable) {
     disable.onclick = () => openConfirm({
       title: "停用 WireGuard？",
-      html: `所有已下发的 <code class="mono">.conf</code> 会立刻失效（接口 wg0 被拆除）。<br>
+      html: `所有已下发的 <code class="mono">.conf</code> 将暂时无法连接（接口 wg0 被拆除）。请在 90 秒内确认，超时恢复接口。<br>
              <span class="muted">客户端配置不会被删除，重新启用后原配置可以继续用。</span>`,
       okLabel: "停用",
       onOk: () => applyAction(
@@ -362,7 +362,7 @@ function bind(wg) {
       if (!peer) return;
       openConfirm({
         title: `轮换「${peer.name}」的密钥？`,
-        html: `<b>旧配置会立刻失效</b>，这台设备需要重新扫码或导入新的 .conf。<br>
+        html: `<b>旧配置会暂时失效</b>，这台设备需要导入新的 .conf 测试。请在 90 秒内保留变更，超时恢复旧密钥。<br>
                <span class="muted">已经连上的隧道会在下一次握手时断开。</span>`,
         okLabel: "轮换",
         onOk: async () => {
@@ -371,7 +371,7 @@ function bind(wg) {
               method: "POST",
             });
             await settleApply(body);
-            toast("密钥已轮换，旧配置已失效");
+            toast(confirmationNotice("密钥已轮换，旧配置已失效"));
             if (body.config) showConfigQr(peer.name, body.config, peer.id);
           } catch (e) {
             toast("轮换失败: " + e.message);
@@ -386,7 +386,7 @@ function bind(wg) {
       if (!peer) return;
       openConfirm({
         title: `删除「${peer.name}」？`,
-        html: `这台设备的 WireGuard 访问权限会立刻被撤销。删除后地址会被回收，
+        html: `这台设备的 WireGuard 访问权限将暂停。请在 90 秒内确认删除，超时恢复旧授权。确认后地址会被回收，
                下次添加设备可能用到同一个地址。`,
         okLabel: "删除",
         onOk: async () => {
@@ -394,7 +394,7 @@ function bind(wg) {
             await settleApply(
               await api(`/api/wireguard/peers/${encodeURIComponent(peer.id)}`, { method: "DELETE" })
             );
-            toast("已删除");
+            toast(confirmationNotice("已删除"));
           } catch (e) {
             toast("删除失败: " + e.message);
           }
@@ -490,7 +490,7 @@ function addPeer(wg) {
           body: JSON.stringify({ name, allowed_ips: allowed, expires_days: days, compat }),
         });
         await settleApply(body);
-        toast("设备已添加");
+        toast(confirmationNotice("设备已添加"));
         if (body.peer_id && body.config) {
           const peer = ((S.dash || {}).wireguard || {}).peers || [];
           const item = peer.find((p) => p.id === body.peer_id);
@@ -535,7 +535,7 @@ function editPeer(wg, id) {
       );
       if (body && body.config && compat !== before) {
         showConfigQr(name || peer.name, body.config, id);
-        toast("兼容模式已更新，请用新配置重新导入路由器");
+        toast(confirmationNotice("兼容模式已更新，请用新配置重新导入路由器"));
       }
     },
   });
@@ -551,7 +551,7 @@ async function updatePeer(id, payload, btn, busyText) {
       body: JSON.stringify(payload),
     });
     await settleApply(body);
-    toast("已更新");
+    toast(confirmationNotice("已更新"));
     return body;
   } catch (e) {
     toast("更新失败: " + e.message);

@@ -10,6 +10,14 @@ export async function api(path, opts = {}) {
     const payload = JSON.parse(options.body);
     options.body = JSON.stringify({ expected_revision: S.dash.configuration_revision, expected_settings_revision: S.dash.settings_revision, ...payload });
   }
+  if (options.method && ["POST", "DELETE"].includes(options.method.toUpperCase()) &&
+      (/^\/api\/nodes\/[^/]+\/(enabled|toggle)$/.test(path) || path === "/api/hysteria/hopping" ||
+       path === "/api/chain/exit" || /^\/api\/chain\/entries(?:\/[^/]+(?:\/pair)?)?$/.test(path) ||
+       path === "/api/wireguard/settings" || /^\/api\/wireguard\/peers(?:\/[^/]+(?:\/rotate)?)?$/.test(path))) {
+    options.headers = new Headers(options.headers || {});
+    options.headers.set("X-ZP-Confirm", "90");
+    if (S.dash?.configuration_revision) options.headers.set("X-ZP-Revision", S.dash.configuration_revision);
+  }
   const controller = new AbortController();
   const abort = () => controller.abort();
   if (signal?.aborted) abort();

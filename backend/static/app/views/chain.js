@@ -8,7 +8,7 @@ import { fmtTime, chainHealth } from "../lib/format.js";
 import { openConfirm, openQr } from "../lib/dialog.js";
 import { api, markDisconnected, syncAfterDrop } from "../lib/api.js";
 import { S } from "../lib/state.js";
-import { waitPendingApply, settleApply, applyAction } from "../lib/jobs.js";
+import { waitPendingApply, settleApply, applyAction, confirmationNotice } from "../lib/jobs.js";
 
 /* ---------------- 链式代理 ----------------
  * 两台机器各装一份本程序, 接成一条链 (入口 → 落地):
@@ -213,7 +213,7 @@ function chainExitCard(d, ex, c) {
     </div>`
     }
     <div class="note">配对码等同凭据: 谁拿到都能把本机当出口用, 别公开发布; 万一泄露点「重新生成」即可
-      (旧码立即作废, 你自己的订阅完全不受影响)。对方连不上, 多半是云安全组没放行
+      (旧码暂时停用；90 秒内确认后保留新码，超时恢复旧授权)。对方连不上, 多半是云安全组没放行
       <span class="mono">${ex.port}/tcp</span>${ex.hy_enabled ? ` 或 <span class="mono">${ex.hy_port}/udp</span>` : ""}。</div>
   </div>`;
 }
@@ -392,16 +392,16 @@ function bindChainExit(ex) {
       title: "重新生成配对码?",
       okLabel: "重新生成 (旧的作废)",
       html: `<div class="qr-sub">已经连上本机的入口服务器会<b>立刻断链</b>,
-        需要拿新配对码重新连接一次。<br>本机自己的订阅凭据 / 节点 / 客户端配置完全不受影响。</div>`,
+        需要拿新配对码重新连接一次。请在 90 秒内确认保留，超时会恢复旧凭据。<br>本机自己的订阅凭据 / 节点 / 客户端配置完全不受影响。</div>`,
       onOk: () => applyAction("POST", "/api/chain/exit", { action: "rotate" }, $("#btn-chain-exit-rotate"), "生成中…"),
     });
   $("#btn-chain-exit-off").onclick = () =>
     openConfirm({
       title: "关闭落地端?",
       okLabel: "关闭 (配对码作废)",
-      html: `<div class="qr-sub">本机的落地入站会下线, 配对码同时作废;
+      html: `<div class="qr-sub">本机的落地入站会下线, 配对码暂时停用;
         已连接的入口服务器那条链会不通。<br>随时可以再点「生成配对码」重新开启 —— 端口沿用原来的,
-        凭据会重新生成 (旧配对码永久失效, 不会复活)。</div>`,
+        凭据会重新生成 (确认保留后旧配对码失效；超时回滚会恢复旧授权)。</div>`,
       onOk: () => applyAction("POST", "/api/chain/exit", { action: "disable" }, $("#btn-chain-exit-off"), "关闭中…"),
     });
 }
@@ -431,7 +431,7 @@ async function connectChain(force) {
       res = await fetch("/api/chain/entries", {
         method: "POST",
         credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", "X-ZP-Confirm": "90", "X-ZP-Revision": S.dash?.configuration_revision || "" },
         body: JSON.stringify(payload),
       });
     } catch (err) {
@@ -469,13 +469,13 @@ async function connectChain(force) {
     $("#chain-local-port").value = "";
     $("#chain-default-out").checked = false;
     const steps = await settleApply(body);
-    const probe = steps.find((s) => s.name.indexOf("链路测试") === 0) || {};
+    const probe = steps.find((s) => s.probe_observation || s.name.indexOf("链路测试") === 0) || {};
     if (probe.skipped) {
-      toast("已添加; 本机缺少 xray 二进制, 没能做链路测试 —— 可稍后点「测速」复验");
-    } else if (probe.ok === false) {
-      toast("已添加, 但链路测试没通过: " + String(probe.detail || "").slice(0, 60));
+      toast(confirmationNotice("已添加; 本机缺少 xray 二进制, 没能做链路测试 —— 可在保留变更后点「测速」复验"));
+    } else if (probe.probe_ok === false || probe.ok === false) {
+      toast(confirmationNotice("已添加, 但链路测试没通过: " + String(probe.detail || "").slice(0, 60)));
     } else {
-      toast("链路已接通, 订阅里已多出这个节点");
+      toast(confirmationNotice("链路已接通, 订阅里已多出这个节点"));
     }
   } catch (e) {
     toast("连接失败: " + e.message);
@@ -624,7 +624,7 @@ function bindChainEntries(entries) {
         title: `断开「${entry.label || entry.host}」?`,
         okLabel: "断开并删除",
         html: `<div class="qr-sub">本机的链式入站 / 出站 / 路由规则都会删掉,
-          订阅里这个节点同时消失。<br>落地端服务器上的凭据不受影响 (需要时重新贴一次配对码即可)。</div>`,
+          订阅里这个节点同时消失。请在 90 秒内确认删除，超时会恢复条目。<br>落地端服务器上的凭据不受影响 (需要时重新贴一次配对码即可)。</div>`,
         onOk: () => applyAction("DELETE", `/api/chain/entries/${el.dataset.chainDel}`, undefined, el, "断开中…"),
       });
     })

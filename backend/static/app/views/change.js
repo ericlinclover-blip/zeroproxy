@@ -22,7 +22,8 @@ export function renderChangePanel() {
   deadline = Date.now() + change.remaining * 1000;
   const tick = () => {
     const remaining = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
-    const texts = { applying: "网络变更正在应用；验证成功后开始确认倒计时。", awaiting_confirmation: `临时配置已应用：请测试连接，${remaining} 秒内保留变更；超时将自动恢复旧配置。`, rollback_pending: "应用失败，正在等待自动回滚。", rolling_back: "正在恢复并验证旧配置…", rolled_back: "临时变更已回滚，已恢复并验证旧配置。", confirmed: "已保留网络变更。", rollback_failed: `自动回滚未完成：${change.error || "请查看诊断并重试回滚"}` };
+    const label = { nodes: "节点", chain: "链路", wireguard: "WireGuard", hopping: "端口跳跃", settings: "高级设置", domain: "域名" }[change.kind] || "网络";
+    const texts = { applying: "网络变更正在应用；验证成功后开始确认倒计时。", awaiting_confirmation: `临时${label}配置已应用：请测试连接，${remaining} 秒内保留变更；超时将自动恢复旧配置。`, rollback_pending: "应用失败，正在等待自动回滚。", rolling_back: "正在恢复并验证旧配置…", rolled_back: "临时变更已回滚，已恢复并验证旧配置。", confirmed: "已保留网络变更。", rollback_failed: `自动回滚未完成：${change.error || "请查看诊断并重试回滚"}` };
     box.querySelector("[data-change-text]").textContent = texts[change.state] || change.state;
     const confirm = box.querySelector("[data-change-confirm]"), rollback = box.querySelector("[data-change-rollback]");
     confirm.hidden = change.state !== "awaiting_confirmation";
