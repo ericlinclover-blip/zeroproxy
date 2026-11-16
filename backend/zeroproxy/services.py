@@ -772,7 +772,11 @@ def xray_config_test() -> tuple[bool, str]:
     ok, out = run(
         [binary, "-test", "-c", paths()["xray_config"]], timeout=60, env=xray_env()
     )
-    return ok, " ".join(out.split())[:200]
+    summary = " ".join(out.split())
+    if not ok:
+        # Nested Xray errors put the useful cause last; callers may truncate the result.
+        summary = summary.rsplit(" > ", 1)[-1].split("Failed to start:", 1)[-1].strip()
+    return ok, summary[:200] if ok else summary[-600:]
 
 
 # ---------------------------------------------------------------- 连通性探测
