@@ -153,7 +153,7 @@ function bindDomain(d) {
           <div class="ustep"><span class="n">3</span><span class="uname">热重载并验证新域名</span>
             <span class="udetail">验证失败尝试回滚，并核对恢复结果</span></div>
           <div class="ustep"><span class="n">4</span><span class="uname">自动跳转到新地址</span>
-            <span class="udetail">已登录状态一起带过去, 不用重新输密码</span></div>
+            <span class="udetail">登录状态会带过去；请在新入口 90 秒内点击「保留变更」，超时自动回滚</span></div>
         </div>
         <div class="confirm-keep">不会动的部分: 节点密钥 / 客户端凭据 / 端口设置 / 订阅令牌本身
           (只是订阅地址里的域名变了)。</div>`,
@@ -177,7 +177,7 @@ async function deployDomain(next) {
       timeoutMs: 360000,
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ domain: next }),
+      body: JSON.stringify({ domain: next, require_confirmation: true, confirmation_timeout: 90 }),
     });
     assertApplyResult(res);
     target = (res.redirect || {}).url || fallbackUrl;

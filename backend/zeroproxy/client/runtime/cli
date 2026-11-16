@@ -370,10 +370,12 @@ sniffed_hosts() {
 tcp_once() {
     _th="$1"; _tp="$2"
     if command -v curl >/dev/null 2>&1; then
+        _turl_host="$_th"
+        case "$_turl_host" in *:*) case "$_turl_host" in \[*\]) ;; *) _turl_host="[$_turl_host]" ;; esac ;; esac
         # --noproxy '*': 不让环境里的 *_proxy 变量把这几个探测改道 —— 探测必须量的是
         # "这台机器自己到入口的那一跳", 被代理变量接走就什么都没测到。
         _tc="$(curl -sk --noproxy '*' -o /dev/null -m 4 --connect-timeout 2 -w '%{time_connect}' \
-            "https://$_th:$_tp/" 2>/dev/null)"
+            "https://$_turl_host:$_tp/" 2>/dev/null)"
         _trc=$?
         if [ -n "$_tc" ] && awk -v t="$_tc" 'BEGIN{exit !(t+0 > 0)}' 2>/dev/null; then
             printf 'ok'
@@ -836,7 +838,48 @@ revert_report() {
     return 0
 }
 
+# Fixed probes only. All network operations are bounded; no raw payload is reported.
+doctor_json() {
+    _dg_device=unknown; _dg_dns=unknown; _dg_takeover=unknown
+    _dg_entry=unknown; _dg_exit=unknown; _dg_target=unknown
+    _dg_mode="$(zp_live_mode 2>/dev/null)"
+    if [ "$(running)" = yes ] || [ "$_dg_mode" = ebpf ]; then _dg_device=passed; else _dg_device=failed; fi
+    if command -v timeout >/dev/null 2>&1 && command -v nslookup >/dev/null 2>&1; then
+        if timeout 5 nslookup www.cloudflare.com 127.0.0.1 >/dev/null 2>&1; then _dg_dns=passed; else _dg_dns=failed; fi
+    fi
+    _dg_packets=0; _dg_dns_packets=0
+    if [ "$_dg_mode" = "$(sed -n 's/^chosen=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)" ]; then
+        set -- $(datapath_packets)
+        _dg_packets="${1:-0}"; _dg_dns_packets="${2:-0}"
+    fi
+    case "$_dg_packets" in ''|*[!0-9]*) _dg_packets=0 ;; esac
+    case "$_dg_dns_packets" in ''|*[!0-9]*) _dg_dns_packets=0 ;; esac
+    if [ "$_dg_packets" -gt 0 ] 2>/dev/null; then _dg_takeover=observed; fi
+    if [ "$_dg_mode" = none ]; then _dg_takeover=failed; fi
+    _dg_endpoint="$(entry_endpoints | head -n1)"
+    if [ -n "$_dg_endpoint" ]; then
+        _dg_host="${_dg_endpoint%:*}"; _dg_port="${_dg_endpoint##*:}"
+        case "$(tcp_once "$_dg_host" "$_dg_port")" in
+            ok) _dg_entry=observed ;; timeout|refused|err) _dg_entry=failed ;;
+        esac
+    fi
+    _dg_http=0
+    if [ "$_dg_mode" != ebpf ] && command -v curl >/dev/null 2>&1; then
+        _dg_http="$(curl --silent --noproxy '' --proxy "http://127.0.0.1:$ZP_MIXED" --max-time 8 --connect-timeout 3 -o /dev/null -w '%{http_code}' https://www.gstatic.com/generate_204 2>/dev/null)"
+        _dg_rc=$?
+        case "$_dg_http" in ''|*[!0-9]*) _dg_http=0 ;; esac
+        if [ "$_dg_rc" = 0 ] && [ "$_dg_http" = 204 ]; then
+            _dg_exit=observed; _dg_target=passed
+        else _dg_target=failed; fi
+    fi
+    printf '{"device":"%s","dns":"%s","takeover":"%s","entry":"%s","exit":"%s","target":"%s","packets":%s,"dns_packets":%s,"http_status":%s}\n' \
+        "$_dg_device" "$_dg_dns" "$_dg_takeover" "$_dg_entry" "$_dg_exit" "$_dg_target" "$_dg_packets" "$_dg_dns_packets" "$(printf '%s' "$_dg_http" | awk '{printf "%d", $0+0}')"
+}
+
 case "${1:-status}" in
+    doctor-json)
+        doctor_json
+        ;;
     doctor)
         # 真机体检: 逐项问"到底行不行", 每项给证据 (判据与输出格式在 doctor() 里)
         doctor

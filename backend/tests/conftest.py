@@ -51,6 +51,7 @@ os.environ.setdefault("ZP_SUPPLY_VERIFY", "0")
 # 测试里必须同步执行 —— 后台线程活过用例就会踩到下一个用例的 $ZP_HOME
 # (每个用例一个临时目录), 所以默认关掉; 专门验证后台任务的用例自己打开。
 os.environ.setdefault("ZP_APPLY_ASYNC", "0")
+os.environ.setdefault("ZP_CHANGE_GUARD_AUTO", "0")
 
 DOMAIN = "proxy.example.com"
 USERNAME = "admin"

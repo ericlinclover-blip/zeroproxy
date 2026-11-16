@@ -23,7 +23,9 @@ let coreTimer = null;     // "准备内核"期间的轮询定时器
 const KIND_LABEL = { router: "路由器", phone: "手机", desktop: "电脑" };
 const TPL_LABEL = { "": "跟随面板", smart: "智能分流", global: "全局代理", direct: "全部直连" };
 
+let diagnosticTimer, diagnosticPolling = false;
 export function renderClients(dash) {
+  scheduleDiagnostics();
   const box = $("#client-body");
   if (!box || !dash) return;
   const dev = dash.devices || { items: [], count: 0, online: 0, on: 0 };
@@ -273,6 +275,31 @@ function routerTab(dash, routers) {
     ${pairInfo ? pairCard(dash) : ""}`;
 }
 
+const diagnosticLabels = { device: "设备进程", dns: "本机 DNS", takeover: "接管计数", entry: "首个 TCP 入口", exit: "本机代理响应", target: "固定 HTTPS 目标" };
+function scheduleDiagnostics() {
+  clearTimeout(diagnosticTimer);
+  if (!(S.dash?.devices?.items || []).some((d) => d.diagnostic?.state === "queued")) return;
+  diagnosticTimer = setTimeout(async () => {
+    if (diagnosticPolling) return scheduleDiagnostics();
+    diagnosticPolling = true;
+    try {
+      const data = await api("/api/devices");
+      S.dash.devices = data.devices;
+      if (!document.activeElement?.matches("input, textarea, select")) renderClients(S.dash);
+    } catch (e) { /* Retry until the server marks the request expired. */ }
+    finally { diagnosticPolling = false; scheduleDiagnostics(); }
+  }, 3000);
+}
+function diagnosticCard(d) {
+  const result = d.diagnostic;
+  if (!result) return "";
+  const stateLabel = { queued: "等待设备执行（最多 120 秒）", expired: "已超时，请确认设备在线后重试", completed: "设备已回报" };
+  const statusLabel = { passed: "通过", failed: "失败", unknown: "未验证", observed: "有观测证据" };
+  return `<div class="note" data-device-diagnostic="${escAttr(d.id)}"><b>分阶段诊断 · ${esc(stateLabel[result.state] || result.state)}</b>
+    ${result.checked_at ? `<p>${esc(new Date(result.checked_at * 1000).toLocaleString())}${result.stale ? " · 结果已过期，请重新诊断" : ""}</p>` : ""}
+    ${result.state === "completed" ? `<dl class="device-facts">${Object.entries(diagnosticLabels).map(([key, label]) => `<div><dt>${esc(label)}</dt><dd>${esc(statusLabel[result.stages?.[key]] || "未验证")}</dd></div>`).join("")}</dl><p>数据包 ${result.packets ?? "未知"} · DNS 包 ${result.dns_packets ?? "未知"} · HTTP ${result.http_status ?? "未知"}</p>` : ""}
+    <p>入口只测 TCP 连通；计数是累计观测。本机代理探针不代表 LAN 终端已接管，性能模式的 HTTPS 探针仍需设备现场验证。</p></div>`;
+}
 function deviceCard(d) {
   const tpl = TPL_LABEL[d.template ?? ""] || d.template || "跟随面板";
   const meta = [d.os, d.arch, d.ip].filter(Boolean).join(" · ");
@@ -292,6 +319,7 @@ function deviceCard(d) {
           <div><dt>设备说明</dt><dd>${esc(d.report?.why || "暂无错误回报；接管状态不等于实际出网验证")}</dd></div>
         </dl>
       </details>
+      ${diagnosticCard(d)}
       <div class="dev-tags">
         <span class="tag-chip">分流 · ${esc(tpl)}</span>
         <span class="tag-chip">${!d.online ? "运行状态待更新" : d.actual ? "内核运行中" : "内核已停止"}</span>
@@ -322,6 +350,7 @@ function deviceCard(d) {
         </select>
       </label>
       ${!d.credentials_independent ? `<button class="btn ghost small" data-dev-credentials="${escAttr(d.id)}">启用独立凭据</button>` : ""}
+      <button class="btn ghost small" data-dev-diagnose="${escAttr(d.id)}" ${String(d.report?.diagnostics) !== "1" || d.diagnostic?.state === "queued" ? "disabled" : ""}>${String(d.report?.diagnostics) !== "1" ? "升级客户端后诊断" : d.diagnostic?.state === "queued" ? "诊断排队中…" : "分阶段诊断"}</button>
       <button class="btn ghost small" data-dev-rename="${escAttr(d.id)}">改名</button>
       <button class="btn ghost small danger" data-dev-remove="${escAttr(d.id)}">移除</button>
     </div>
@@ -481,6 +510,18 @@ function bind(dash, routers) {
         } catch (e) { toast("启用失败: " + e.message); }
       },
     });
+  });
+  document.querySelectorAll("[data-dev-diagnose]").forEach((el) => {
+    el.onclick = async () => {
+      el.disabled = true;
+      try {
+        const result = await api(`/api/devices/${encodeURIComponent(el.dataset.devDiagnose)}/diagnose`, { method: "POST" });
+        const item = (S.dash.devices.items || []).find((d) => d.id === el.dataset.devDiagnose);
+        if (item) item.diagnostic = result;
+        renderClients(S.dash);
+        toast("已排队，将在设备下一次心跳执行固定诊断");
+      } catch (e) { el.disabled = false; toast(e.message); }
+    };
   });
   document.querySelectorAll("[data-dev-rename]").forEach((el) => {
     el.onclick = () => renameDevice(el.dataset.devRename);

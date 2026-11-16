@@ -4,7 +4,7 @@
  * 会在下一次刷新被服务器值覆盖 —— 填到一半的内容几分钟后自己变回去。
  * 这里在重渲染前把"正在编辑的输入"记下来, 重渲染后原样放回 (含光标位置),
  * 直到用户提交为止。 */
-const DRAFT_KEY_ATTRS = ["data-port-node", "data-node", "data-chain-toggle", "data-dev-toggle", "data-dev-tpl", "data-dev-rename", "data-dev-remove", "data-field-node", "data-chain-probe", "data-wg-edit", "data-wg-rotate", "data-wg-delete", "data-copy", "data-qr"];
+const DRAFT_KEY_ATTRS = ["data-port-node", "data-node", "data-chain-toggle", "data-dev-toggle", "data-dev-tpl", "data-dev-rename", "data-dev-remove", "data-dev-diagnose", "data-field-node", "data-chain-probe", "data-wg-edit", "data-wg-rotate", "data-wg-delete", "data-copy", "data-qr"];
 let focusKey = "";
 let openDetails = [];
 

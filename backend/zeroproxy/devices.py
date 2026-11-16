@@ -30,6 +30,7 @@ import re
 import secrets
 import time
 from urllib.parse import urlsplit
+from . import device_diagnostics
 
 #: 配对码有效期 (30 分钟)。安装命令会出现在终端回滚、聊天记录、截图里, 所以它必须是
 #: 一次性的; 有效期只是给"复制命令 → 去路由器粘贴"这段操作留出余量。
@@ -473,6 +474,7 @@ def device_view(device: dict, *, now: int | None = None) -> dict:
         "running": running,
         "taking_over": managed,
         "control": "local" if override in {"on", "off"} else "panel",
+        "diagnostic": device_diagnostics.view(device, now),
         "credentials_independent": bool(device.get("dataplane")),
         "template": device.get("template", ""),
         # 设备自己上报的最后一版 (旧客户端字段, 不代表已应用)

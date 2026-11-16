@@ -923,3 +923,8 @@ def configuration_revision(state: dict) -> str:
          if isinstance(d, dict) and not d.get("deleted") and d.get("dataplane")], key=lambda item: str(item[0]))
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(blob.encode()).hexdigest()[:24]
+
+
+def settings_revision(state: dict) -> str:
+    payload = [configuration_revision(state), state.get("routing") or {}]
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:24]

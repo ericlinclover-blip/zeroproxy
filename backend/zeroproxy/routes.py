@@ -43,6 +43,9 @@ from . import (
     apply,
     chain,
     chain_quic,
+    change_guard,
+    device_diagnostics,
+    rule_analysis,
     config,
     crypto,
     dae_config,
@@ -256,7 +259,10 @@ def _session_of(state: dict, request: Request) -> str | None:
 
 
 def _require_auth(state: dict, request: Request) -> bool:
-    return _session_of(state, request) is not None
+    authenticated = _session_of(state, request) is not None
+    if authenticated:
+        change_guard.authorize_write(state, request.url.path, request.method)
+    return authenticated
 
 
 def _issue_session(state: dict, request: Request, response: Response) -> None:
@@ -601,9 +607,15 @@ def _reapply_job(
     # 先把这次改动落盘再放任务: 后台线程是从磁盘读最新 state 的 (load_state),
     # 不先存的话这次改的节点开关 / 链式条目就白改了。
     save_state(state)
-    threading.Thread(
-        target=_run_apply_job, args=(job_id, after, on_result), name=f"zp-apply-{job_id}", daemon=True
-    ).start()
+    try:
+        threading.Thread(
+            target=_run_apply_job, args=(job_id, after, on_result), name=f"zp-apply-{job_id}", daemon=True
+        ).start()
+    except Exception:
+        if on_result is not None:
+            on_result([], "配置任务启动失败")
+        _finish_job(job_id, [], "配置任务启动失败")
+        raise
     return [], _job_snapshot(job)
 
 
@@ -1263,6 +1275,8 @@ def _dashboard_body(state: dict, request: Request, traffic: dict | None = None) 
         # 数据指纹: 前端据此判断"这次轮询有没有实际变化", 无变化则拉长自动刷新间隔
         "fingerprint": _dash_fingerprint(state),
         "configuration_revision": config.configuration_revision(state),
+        "settings_revision": config.settings_revision(state),
+        "pending_change": change_guard.view(state),
         "runtime": {**(state.get("runtime") or {}), "can_restore": os.path.isfile(os.path.join(paths()["data_dir"], "runtime-last-good.json"))},
         "recent_jobs": _recent_jobs(request),
     }
@@ -1464,6 +1478,9 @@ def toggle_hopping(request: Request):
 
 class SettingsIn(BaseModel):
     expected_revision: str = ""
+    expected_settings_revision: str = ""
+    require_confirmation: bool = False
+    confirmation_timeout: int = 90
     reality_sni: str | None = None
     masquerade_url: str | None = None
     ports: dict[str, int] | None = None
@@ -1500,6 +1517,12 @@ def update_settings(payload: SettingsIn, request: Request):
 
         if payload.expected_revision and payload.expected_revision != config.configuration_revision(state):
             return _err("配置已被其他操作修改，请刷新并核对后重试", 409)
+
+        if payload.expected_settings_revision and payload.expected_settings_revision != config.settings_revision(state):
+            return _err("分流或服务器配置已被其他操作修改，请重新分析后保存", 409)
+        if payload.require_confirmation and not 30 <= payload.confirmation_timeout <= 300:
+            return _err("确认时限应在 30–300 秒之间", 400)
+        before = copy.deepcopy(state)
 
         if payload.reality_sni is not None:
             if not _SNI_RE.match(payload.reality_sni.strip().lower()):
@@ -1705,7 +1728,114 @@ def update_settings(payload: SettingsIn, request: Request):
                 out.append({"name": name, "ok": True, "detail": detail, "ms": 0})
             return out
 
-        return _landing_body(state, request, after=open_moved_ports)
+        callback = None
+        if payload.require_confirmation:
+            identity = change_guard.begin(state, before, "settings",
+                ["ports", "reality", "hysteria_masquerade", "hysteria_ports", "geodata", "routing"], payload.confirmation_timeout)
+            def callback(steps, error):
+                change_guard.finish(identity, steps, error)
+                return []
+        return _landing_body(state, request, after=open_moved_ports, on_result=callback)
+
+
+class RuleAnalysisIn(BaseModel):
+    custom_rules: dict[str, list[str]]
+
+
+@router.post("/api/routing/analyze")
+def analyze_routing(payload: RuleAnalysisIn, request: Request):
+    state = load_state()
+    if not _require_auth(state, request):
+        return _err("未登录", 401)
+    try:
+        result = rule_analysis.analyze(payload.custom_rules, share_links.custom_rules_of(state), share_links.normalize_target)
+    except ValueError as exc:
+        return _err(str(exc), 400)
+    result["settings_revision"] = config.settings_revision(state)
+    return result
+
+
+def rollback_network_change(identity: str | None = None, force: bool = False) -> list[dict]:
+    with _APPLY_RUN_LOCK:
+        with config.locked():
+            state = load_state()
+            pending = state.get("pending_change") or {}
+            if identity and identity != pending.get("id"):
+                raise ValueError("变更不存在或已被替换")
+            if not force and not change_guard.due(state):
+                return []
+            if pending.get("state") in {"confirmed", "rolled_back"}:
+                return []
+            if pending.get("state") not in change_guard.ACTIVE | {"rollback_failed"}:
+                raise ValueError("当前没有可回滚的临时变更")
+            expected = pending.get("restore_target") if pending.get("state") in {"rolling_back", "rollback_failed"} else pending.get("target")
+            actual = change_guard.fingerprint(state, pending["keys"])
+            baseline = change_guard.fingerprint(pending["before"], pending["keys"])
+            if expected and actual not in {expected, baseline}:
+                pending.update(state="rollback_failed", error="配置已发生其他变化，未覆盖；请通过诊断或服务器终端恢复")
+                save_state(state)
+                return [{"name": "限时回滚", "ok": False, "detail": pending["error"]}]
+            for key, value in pending["before"].items():
+                state[key] = copy.deepcopy(value)
+            pending.update(state="rolling_back", restore_target=change_guard.fingerprint(state, pending["keys"]))
+            save_state(state)
+            change_id = pending["id"]
+        try:
+            steps = apply.reapply(state)
+            failed = apply.failures(steps)
+            error = failed[0].get("detail", "回滚未完成") if failed else ""
+        except Exception as exc:
+            steps, error = [], f"回滚异常: {type(exc).__name__}: {exc}"
+        with config.locked():
+            fresh = load_state()
+            current = fresh.get("pending_change") or {}
+            if current.get("id") == change_id:
+                current.update(state="rollback_failed" if error else "rolled_back", error=error)
+                if not error:
+                    current["before"] = {}
+                config.audit(fresh, "network_rollback", f"{change_id}: " + (error or "已恢复并验证旧配置"))
+                save_state(fresh)
+        return steps + [{"name": "限时回滚", "ok": not error, "detail": error or "已恢复并验证旧配置"}]
+
+
+@router.get("/api/changes/{identity}")
+def network_change_status(identity: str, request: Request):
+    state = load_state()
+    if not _require_auth(state, request):
+        return _err("未登录", 401)
+    view = change_guard.view(state)
+    if not view or view["id"] != identity:
+        return _err("变更不存在", 404)
+    return view
+
+
+@router.post("/api/changes/{identity}/confirm")
+def confirm_network_change(identity: str, request: Request):
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        try:
+            change_guard.confirm(state, identity)
+        except ValueError as exc:
+            return _err(str(exc), 409)
+        save_state(state)
+        body = _dashboard_body(state, request)
+        body["steps"] = []
+        return body
+
+
+@router.post("/api/changes/{identity}/rollback")
+def cancel_network_change(identity: str, request: Request):
+    if not _require_auth(load_state(), request):
+        return _err("未登录", 401)
+    try:
+        steps = rollback_network_change(identity, force=True)
+    except ValueError as exc:
+        return _err(str(exc), 409)
+    body = _dashboard_body(load_state(), request)
+    body.update(steps=steps, ok=not apply.failures(steps))
+    return body
 
 
 @router.get("/api/routing/test")
@@ -3071,6 +3201,7 @@ def restore(request: Request, raw: bytes = Depends(_raw_request_body)):
         )
 
     restored = state_from(data)
+    restored.pop("pending_change", None)  # Imported backups must never resurrect a timed operation.
     if not restored.get("configured"):
         return _err("备份不是已初始化状态, 拒绝恢复")
     for key in ("uuid", "subscription_token", "domain"):
@@ -3156,6 +3287,8 @@ class AccountIn(BaseModel):
 
 
 class DomainIn(BaseModel):
+    require_confirmation: bool = False
+    confirmation_timeout: int = 90
     domain: str
 
 
@@ -3336,6 +3469,9 @@ def _domain_pipeline(new_domain: str, progress=None) -> tuple[list[dict], str]:
             old_cert = copy.deepcopy(state.get("cert") or {})
             state["domain"] = new_domain
             state["cert"] = cert_state
+            pending = state.get("pending_change") or {}
+            if pending.get("kind") == "domain" and pending.get("state") == "applying":
+                pending["target"] = change_guard.fingerprint(state, pending["keys"])
             save_state(state)
         landed = apply.reapply(
             state,
@@ -3385,7 +3521,7 @@ def _rollback_domain(old_domain: str, old_cert: dict) -> list[dict]:
     return [{"name": "回滚到原域名", "ok": ok, "detail": detail, "ms": 0}]
 
 
-def _run_domain_job(job_id: str, new_domain: str) -> None:
+def _run_domain_job(job_id: str, new_domain: str, identity: str = "") -> None:
     steps: list[dict] = []
     error = ""
     try:
@@ -3400,6 +3536,8 @@ def _run_domain_job(job_id: str, new_domain: str) -> None:
             steps.append(record)
     except Exception as exc:  # noqa: BLE001 — 后台任务不能把异常吞成"静默失败"
         error = f"{type(exc).__name__}: {exc}"
+    if identity:
+        change_guard.finish(identity, steps, error)
     _finish_job(job_id, steps, error)
 
 
@@ -3478,6 +3616,13 @@ def _change_domain_impl(payload: DomainIn, request: Request):
 
     with config.locked():
         state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        if state.get("domain") != current:
+            return _err("预检期间域名已变化，请刷新后重试", 409)
+        if payload.require_confirmation and not 30 <= payload.confirmation_timeout <= 300:
+            return _err("确认时限应在 30–300 秒之间", 400)
+        identity = change_guard.begin(state, state, "domain", ["domain", "cert"], payload.confirmation_timeout) if payload.require_confirmation else ""
         handoff = _issue_handoff(state, request)
         config.audit(
             state, "domain_change", f"{current} → {new_domain}", actor=_client_ip(request)
@@ -3485,7 +3630,11 @@ def _change_domain_impl(payload: DomainIn, request: Request):
         save_state(state)
 
     if not _apply_async_enabled():
-        return _domain_change_sync(new_domain, request, handoff)
+        body = _domain_change_sync(new_domain, request, handoff)
+        if identity:
+            change_guard.finish(identity, body.get("steps", []), "" if body.get("ok") else body.get("detail", "部署失败"))
+            body["pending_change"] = change_guard.view(load_state())
+        return body
 
     job_id, job = _new_job(
         request, 1 + len(apply.STEP_NAMES) + 1, "申请 TLS 证书", kind="domain"
@@ -3493,11 +3642,13 @@ def _change_domain_impl(payload: DomainIn, request: Request):
     try:
         threading.Thread(
             target=_run_domain_job,
-            args=(job_id, new_domain),
+            args=(job_id, new_domain, identity),
             name=f"zp-domain-{job_id}",
             daemon=True,
         ).start()
     except Exception:
+        if identity:
+            change_guard.finish(identity, [], "换域名任务启动失败")
         _finish_job(job_id, [], "换域名任务启动失败")
         raise
     with config.locked():
@@ -4406,6 +4557,7 @@ class DeviceReportIn(BaseModel):
     # 路由器端管理界面的地址 (带界面令牌) —— 面板拿它给用户一个"点一下就能进"的入口
     ui: str = ""
     report: dict | None = None
+    diagnostic: dict | None = None
     set_desired: bool | None = None
 
 
@@ -5284,6 +5436,23 @@ def client_subscription(
     )
 
 
+@router.post("/api/devices/{device_id}/diagnose")
+def diagnose_device(device_id: str, request: Request):
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        device = devices.find(state, device_id)
+        if device is None:
+            return _err("设备不存在", 404)
+        try:
+            result = device_diagnostics.start(device)
+        except ValueError as exc:
+            return _err(str(exc), 409)
+        save_state(state)
+        return result
+
+
 @router.post("/c/report")
 def client_report(payload: DeviceReportIn, request: Request):
     """设备心跳: 上报实际状态, 取回期望开关与配置版本。"""
@@ -5328,9 +5497,11 @@ def client_report(payload: DeviceReportIn, request: Request):
         if payload.healthy is not None:
             info["healthy"] = payload.healthy
         changed = devices.touch(state, device, info) or changed
+        changed = device_diagnostics.accept(device, payload.diagnostic) or changed
         if changed:
             save_state(state)
         return {
+            "diagnostic_request": device_diagnostics.request_id(device),
             "desired": bool(device["desired"]),
             "rev": devices.config_rev(state),
             "downloaded_rev": device.get("downloaded_rev", ""),

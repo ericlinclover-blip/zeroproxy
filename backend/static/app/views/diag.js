@@ -31,7 +31,7 @@ export function renderChecks(res) {
   S.diagRes = res;
   $("#btn-restore-runtime").disabled = !S.dash?.runtime?.can_restore;
   $("#diag-list").innerHTML =
-    `<div class="muted fs-sm mb-1">${esc(res.summary)} · 面板服务器检查</div><p class="note">设备 → DNS → 路由器接管需在设备端验证；以下只检查服务器入口、配置与链式落地。目标网站可另行运行端点检查。</p>` +
+    `<div class="muted fs-sm mb-1">${esc(res.summary)} · 面板服务器检查</div><p class="note">设备证据请到「设备」点击「分阶段诊断」（需升级客户端）；以下检查服务器入口、配置与链式落地。LAN 终端接管仍需现场验证。</p>` +
     (res.checks || [])
       .map(
         (c) => `<div class="check">
@@ -85,7 +85,13 @@ $("#btn-export-diag").onclick = () => {
     version: S.pageVersion || "unknown", scope: "server-checks",
     counts: { total: (S.diagRes.checks || []).length, passed: (S.diagRes.checks || []).filter((c) => c.ok).length },
     checks: (S.diagRes.checks || []).map((c, index) => ({ index: index + 1, stage: c.stage || "server", passed: !!c.ok, fixable: !!c.fixable })),
-    boundaries: ["device-egress-unverified", "device-dns-unverified"] };
+    devices: (S.dash?.devices?.items || []).filter((d) => d.diagnostic).map((d, index) => ({
+      index: index + 1, state: d.diagnostic.state, checked_at: d.diagnostic.checked_at,
+      stale: !!d.diagnostic.stale, scope: d.diagnostic.scope || "router-proxy",
+      stages: Object.fromEntries(["device", "dns", "takeover", "entry", "exit", "target"].map((key) => [key,
+        ["passed", "failed", "observed", "unknown"].includes(d.diagnostic.stages?.[key]) ? d.diagnostic.stages[key] : "unknown"])),
+    })),
+    boundaries: ["lan-egress-unverified", "protocol-handshake-unverified"] };
   const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }));
   const a = document.createElement("a"); a.href = url; a.download = "zeroproxy-diagnostic-summary.json"; a.click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);

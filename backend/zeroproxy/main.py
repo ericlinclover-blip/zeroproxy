@@ -23,7 +23,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from . import __version__, chain_quic, config, geodata, routes, services, wireguard
+from . import __version__, chain_quic, change_guard, config, geodata, routes, services, wireguard
 
 #: GeoIP 数据自动更新的检查间隔 (6 小时检查一次; 是否真的下载由 TTL 决定)
 GEODATA_CHECK_INTERVAL = 6 * 3600
@@ -49,7 +49,7 @@ def _geodata_once() -> None:
     """
     with config.locked():
         state = config.load_state()
-        if not state.get("configured") or not geodata.wants_update(state):
+        if not state.get("configured") or change_guard.active(state) or not geodata.wants_update(state):
             return
         version_before = int(state.get("updated_at") or 0)
     if not geodata.UPDATE_LOCK.acquire(blocking=False):
@@ -60,6 +60,8 @@ def _geodata_once() -> None:
         geodata.UPDATE_LOCK.release()
     with config.locked():
         fresh = config.load_state()
+        if change_guard.active(fresh):
+            return
         # 若下载期间 state 被修改过 (updated_at 变了), merge_result 会基于
         # 时间戳比较保护目标数据 — 确保下载期间的用户操作不被覆盖
         geodata.merge_result(fresh, state, ok)
@@ -144,10 +146,26 @@ def _wireguard_loop(stop: threading.Event) -> None:
             pass
 
 
+def _change_guard_loop(stop: threading.Event, home: str) -> None:
+    if os.environ.get("ZP_CHANGE_GUARD_AUTO", "1") == "0":
+        return
+    while not stop.wait(1):
+        if config.paths()["home"] != home:
+            return
+        try:
+            if change_guard.due(config.load_state()):
+                routes.rollback_network_change()
+        except Exception:
+            # A transient disk/service error must not disable the watchdog.
+            continue
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     """后台维护任务: GeoIP/GeoSite 自动更新 + 链式内层 QUIC 进程看门。"""
     stop = threading.Event()
+    guard = threading.Thread(target=_change_guard_loop, args=(stop, config.paths()["home"]), daemon=True, name="zp-change-guard")
+    guard.start()
     worker = threading.Thread(target=_geodata_loop, args=(stop,), daemon=True, name="zp-geodata")
     worker.start()
     # 链式内层 QUIC (Hysteria 2) 的进程由面板托管: systemd 重启面板会把子进程一起
@@ -170,6 +188,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         stop.set()
+        guard.join(timeout=2)
         # 面板托管的链式内层 QUIC (Hysteria 2) 子进程: 退出时一并收掉 ——
         # 否则开发环境 Ctrl-C / 重启面板会留下孤儿 hysteria 进程 (P3-6)。
         # stop_all 是幂等的 (第二次调用时 _PROCS 已空), systemd 场景重复调用也安全。
@@ -373,6 +392,10 @@ def create_app() -> FastAPI:
         # 未认证端点不返回 home 绝对路径 (P3-10); 面板设置卡片用的路径由
         # 已认证的仪表盘数据里给。
         return {"name": "ZeroProxy", "version": __version__}
+
+    @app.exception_handler(change_guard.ChangeBusy)
+    async def change_busy_handler(request: Request, exc: change_guard.ChangeBusy):
+        return JSONResponse({"error": str(exc)}, status_code=409)
 
     @app.exception_handler(config.StateError)
     async def state_error_handler(request: Request, exc: config.StateError):

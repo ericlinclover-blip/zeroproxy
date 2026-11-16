@@ -266,18 +266,21 @@ function renderRouting(d) {
           proxy: getLines("cr-proxy"),
         },
       };
-      const ordered = ["block", "landing", "ai", "streaming", "proxy", "direct"];
-      const seen = new Map(), conflicts = [];
-      ordered.forEach((kind) => payload.custom_rules[kind].forEach((target) => {
-        const normalized = target.trim().toLowerCase().replace(/\.$/, "");
-        if (seen.has(normalized) && seen.get(normalized) !== kind) conflicts.push(`${target}: ${seen.get(normalized)} → ${kind}`);
-        else seen.set(normalized, kind);
-      }));
+      btnSaveCr.disabled = true;
+      let analysis;
+      try {
+        analysis = await api("/api/routing/analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      } catch (e) { toast("规则分析失败: " + e.message); return; }
+      finally { btnSaveCr.disabled = false; }
+      payload.custom_rules = analysis.rules;
+      payload.expected_settings_revision = analysis.settings_revision;
+      const labels = { duplicate: "目标重复", shadowed: "后者被完全覆盖", overlap: "部分重叠，交集按前者执行" };
       openConfirm({ title: "确认分流规则影响", okLabel: "保存到订阅",
-        html: `<p>作用范围：Clash / sing-box 订阅及路由器下次下载的配置，不代表设备已立即应用。性能模式使用统一代理组。</p>
-          <p>自定义规则优先级：拦截 → 落地 → AI → 流媒体 → 代理 → 直连。实际还受系统基础防护及客户端选组影响。</p>
-          <p>${ordered.map((kind) => `${esc(kind)} ${payload.custom_rules[kind].length} 条`).join(" · ")}</p>
-          ${conflicts.length ? `<p class="note">发现重复目标，较早匹配的规则优先：${conflicts.slice(0, 20).map(esc).join("；")}</p>` : "<p>未发现跨分组的相同目标；子域名和 CIDR 包含关系请用规则预估核对。</p>"}`,
+        html: `<p>作用范围：订阅及路由器下次下载的配置；设备更新并应用后生效。</p>
+          <p>优先级：拦截 → 落地 → AI → 流媒体 → 代理 → 直连。</p>
+          <p>新增 ${analysis.changes.added} 条，移除 ${analysis.changes.removed} 条；关联 ${analysis.total_conflicts} 对规则。</p>
+          ${analysis.conflicts.length ? `<ul>${analysis.conflicts.map((c) => `<li>${esc(labels[c.kind])}：${esc(c.earlier.group)} / ${esc(c.earlier.target)} → ${esc(c.later.group)} / ${esc(c.later.target)}</li>`).join("")}</ul>` : "<p>未发现自定义域名或 IP 网段间的重复、包含和重叠。</p>"}
+          ${analysis.details_truncated ? "<p>关联较多，仅展示前 200 对。</p>" : ""}<p class="note">${esc(analysis.limits)}</p>`,
         onOk: async () => {
           btnSaveCr.disabled = true;
           try {
@@ -551,10 +554,13 @@ async function saveAdvanced() {
     return;
   }
   payload.expected_revision = S.dash.configuration_revision || "";
+  payload.expected_settings_revision = S.dash.settings_revision || "";
+  payload.require_confirmation = true;
+  payload.confirmation_timeout = 90;
   openConfirm({ title: "确认服务器配置变更", okLabel: "应用并验证",
     html: `<p>将重新生成并校验服务器配置，必要时重载服务，可能短暂中断代理连接。</p>
       <p>${payload.ports ? `端口调整：${Object.entries(payload.ports).map(([key, value]) => `${esc(key)} → ${esc(value)}`).join("；")}` : "未调整节点端口。"}</p>
-      <p>失败会显示具体步骤与运行回退结果；客户端需要更新订阅才能使用新端口。</p>`,
+      <p>应用后请在 90 秒内测试并点击「保留变更」，超时自动回滚。客户端需要更新订阅才能使用新端口。</p>`,
     onOk: () => commitAdvanced(payload),
   });
 }
@@ -575,7 +581,7 @@ async function commitAdvanced(payload) {
     clearDraft("#adv-sni, #adv-masq, [data-port-node]");
     const failed = steps.filter((s) => !s.ok);
     toast(failed.length ? `已应用, 但 ${failed.length} 步告警: ${failed[0].name}`
-                        : "设置已应用, 订阅内容已刷新");
+                        : "临时设置已应用，请在顶部倒计时内确认保留");
   } catch (e) {
     toast("保存失败: " + e.message);
   }

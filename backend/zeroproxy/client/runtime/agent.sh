@@ -633,7 +633,7 @@ report_fields_json() {
             fi
         done
     fi
-    printf '{"mode":"%s","covered":"%s","why":"%s","client":"%s","override":"%s","ipv6":"%s","mtu":"%s","offload":"%s","bench_direct":"%s","bench_proxy":"%s"}' \
+    printf '{"mode":"%s","covered":"%s","why":"%s","client":"%s","override":"%s","ipv6":"%s","mtu":"%s","offload":"%s","bench_direct":"%s","bench_proxy":"%s","diagnostics":1}' \
         "$DP_REPORT" "$COV_REPORT" "$(json_escape "$_why")" "$ZP_VERSION" "$OVERRIDE" \
         "$_ipv6" "$_mtu" "$(json_escape "$_offload")" "$_bench_direct" "$_bench_proxy"
 }
@@ -772,6 +772,8 @@ while true; do
         # 代理真的在提供 (core/dae 在跑) 时为 true —— 不拿"配置写好了"冒充健康。
         [ -n "$APPLIED_REV" ] && BODY="$BODY"',"applied_rev":"'"$APPLIED_REV"'"'
         if proxy_up; then BODY="$BODY"',"healthy":true'; fi
+        _dg_file="$ZP_DIR/diagnostic-$(key_of "$_b").json"
+        if [ -s "$_dg_file" ]; then BODY="$BODY"',"diagnostic":'"$(cat "$_dg_file")"; fi
         BODY="$BODY"',"report":'"$(report_fields_json)"'}'
         RESP="$(http_post "$_b/c/report" "$BODY" "$_k" || true)"
         if [ -z "$RESP" ]; then
@@ -780,6 +782,14 @@ while true; do
         fi
         # 修复4: 只要有一台成功应答, 就标记面板可达
         RESP_OK=1
+        _dg_id="$(json_get "$RESP" diagnostic_request)"
+        case "$_dg_id" in ''|*[!0-9a-f]*) _dg_id='' ;; esac
+        if [ "${#_dg_id}" = 32 ] && [ "$_dg_id" != "$(json_get "$(cat "$_dg_file" 2>/dev/null)" id)" ]; then
+            # Only the fixed local diagnostic command is supported, never a remote command/URL.
+            _dg_evidence="$(zeroproxy doctor-json 2>/dev/null)" || _dg_evidence='{}'
+            [ -n "$_dg_evidence" ] || _dg_evidence='{}'
+            (umask 077; printf '{"id":"%s","evidence":%s}\n' "$_dg_id" "$_dg_evidence" > "$_dg_file.tmp" && mv "$_dg_file.tmp" "$_dg_file")
+        fi
         _d="$(json_get_bool "$RESP" desired)"
         [ -n "$_d" ] || _d=true
         [ "$_d" = "false" ] && DESIRED_ALL="false"

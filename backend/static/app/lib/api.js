@@ -8,7 +8,7 @@ export async function api(path, opts = {}) {
   const { timeoutMs = longWrite ? 240000 : 30000, signal, ...options } = opts;
   if (path === "/api/settings" && typeof options.body === "string" && S.dash?.configuration_revision) {
     const payload = JSON.parse(options.body);
-    options.body = JSON.stringify({ expected_revision: S.dash.configuration_revision, ...payload });
+    options.body = JSON.stringify({ expected_revision: S.dash.configuration_revision, expected_settings_revision: S.dash.settings_revision, ...payload });
   }
   const controller = new AbortController();
   const abort = () => controller.abort();

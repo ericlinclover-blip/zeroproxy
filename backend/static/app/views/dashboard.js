@@ -11,6 +11,7 @@ import { snapshotDraftInputs, restoreDraftInputs } from "../lib/drafts.js";
 import { openQr, SUB_FMT_LABEL } from "../lib/dialog.js";
 import { S, setDashRenderers, pollInterval } from "../lib/state.js";
 import { resumeApplyJobs, renderTaskHistory } from "../lib/jobs.js";
+import { renderChangePanel } from "./change.js";
 import { initWorkspace } from "./workspace.js";
 import { renderAudit } from "./audit.js";
 import { renderNodes, renderKpis, renderDashboardBanner, runProbe } from "./status.js";
@@ -104,6 +105,7 @@ export function renderDash(quiet) {
   renderKpis();
   renderDashboardBanner();
   renderNetworkSummary();
+  renderChangePanel();
   renderTaskHistory(S.dash.recent_jobs, S.dash.runtime);
   if (!S.updateInfo) loadUpdate(false);
   else renderUpdate();
