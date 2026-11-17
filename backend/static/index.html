@@ -237,12 +237,12 @@
         <span class="grow"></span>
         <span class="muted fs-xs" id="client-count">—</span>
       </div>
-      <div class="tabs" id="client-tabs">
-        <button class="tab on" data-client-tab="router"><span>📶</span> 路由器</button>
-        <button class="tab" data-client-tab="phone"><span>📱</span> 手机</button>
-        <button class="tab" data-client-tab="desktop"><span>💻</span> 电脑</button>
+      <div class="tabs" id="client-tabs" role="tablist" aria-label="客户端设备类型">
+        <button type="button" class="tab on" id="client-tab-router" role="tab" aria-selected="true" aria-controls="client-body" data-client-tab="router"><span aria-hidden="true">📶</span> 路由器</button>
+        <button type="button" class="tab" id="client-tab-phone" role="tab" aria-selected="false" aria-controls="client-body" tabindex="-1" data-client-tab="phone"><span aria-hidden="true">📱</span> 手机</button>
+        <button type="button" class="tab" id="client-tab-desktop" role="tab" aria-selected="false" aria-controls="client-body" tabindex="-1" data-client-tab="desktop"><span aria-hidden="true">💻</span> 电脑</button>
       </div>
-      <div id="client-body"></div>
+      <div id="client-body" role="tabpanel" aria-labelledby="client-tab-router"></div>
     </section>
 
     <section class="card reveal" id="sec-wireguard">

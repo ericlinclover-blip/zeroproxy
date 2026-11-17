@@ -42,15 +42,38 @@ export function toast(msg, options = {}) {
 }
 
 export async function copyText(text) {
+  if (typeof text !== "string" || !text) {
+    toast("没有可复制的内容，请刷新后重试", { kind: "error" });
+    return false;
+  }
   try {
     await navigator.clipboard.writeText(text);
-    toast("已复制");
   } catch (e) {
+    const focused = document.activeElement;
     const ta = document.createElement("textarea");
-    ta.value = text; document.body.appendChild(ta);
-    ta.select(); document.execCommand("copy"); ta.remove();
-    toast("已复制");
+    ta.value = text;
+    ta.readOnly = true;
+    ta.tabIndex = -1;
+    ta.setAttribute("aria-label", "待复制内容");
+    ta.style.position = "fixed";
+    ta.style.insetInlineStart = "-10000px";
+    let copied = false;
+    try {
+      (document.querySelector("dialog[open]") || document.body).appendChild(ta);
+      ta.select();
+      copied = document.execCommand("copy");
+    } catch (error) { /* Report failure below; never claim an unverified copy. */ }
+    finally {
+      ta.remove();
+      if (focused?.isConnected) focused.focus({ preventScroll: true });
+    }
+    if (!copied) {
+      toast("复制失败，请手动选择并复制内容", { kind: "error" });
+      return false;
+    }
   }
+  toast("已复制");
+  return true;
 }
 
 /* ---------------- 视图路由 ---------------- */

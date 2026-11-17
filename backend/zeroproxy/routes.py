@@ -1270,6 +1270,7 @@ def _dashboard_body(state: dict, request: Request, traffic: dict | None = None) 
             "base64": sub,
             "clash": f"{sub}?format=clash",
             "singbox": f"{sub}?format=singbox",
+            "singbox_android": f"{sub}?format=singbox&client=android",
         },
         "deep_links": share_links.deep_links(sub),
         "cert": _cert_view(state),
@@ -3945,7 +3946,7 @@ def geodata_force_check(request: Request):
 # ---------------------------------------------------------------- 订阅 / 二维码
 
 @router.get("/sub/{token}")
-def subscribe(token: str, request: Request, format: str = "base64", rules: str = ""):
+def subscribe(token: str, request: Request, format: str = "base64", rules: str = "", client: str = ""):
     state = load_state()
     # 先按字节比: hmac.compare_digest 对**非 ASCII 的 str** 会抛 TypeError
     # (`/sub/中文` 就是一个 500)。encode 之后长度不同也不会漏出异常。
@@ -3955,7 +3956,13 @@ def subscribe(token: str, request: Request, format: str = "base64", rules: str =
     ):
         return _err("无效订阅", 404)
     # rules 参数可对单个客户端覆盖分流模板 (?rules=smart|global|direct)
-    body, media_type = share_links.subscription_body(apply.subscription_state(state), format, rules)
+    if client not in ("", "android") or (client == "android" and not share_links.is_singbox_format(format)):
+        return _err("不支持的客户端配置组合", 400)
+    effective = apply.subscription_state(state)
+    if client == "android":
+        body, media_type = share_links.singbox_android_profile(effective, rules), "application/json; charset=utf-8"
+    else:
+        body, media_type = share_links.subscription_body(effective, format, rules)
     headers = {
         # 客户端按此周期自动刷新订阅 (小时), 节点启停/端口变更自动同步
         "profile-update-interval": "12",
@@ -3966,6 +3973,9 @@ def subscribe(token: str, request: Request, format: str = "base64", rules: str =
         headers["subscription-userinfo"] = userinfo
     if format.lower() in ("clash", "mihomo", "yaml", "yml"):
         headers["content-disposition"] = 'attachment; filename="zeroproxy.yaml"'
+    elif share_links.is_singbox_format(format):
+        filename = "zeroproxy-android.json" if client == "android" else "zeroproxy-singbox.json"
+        headers["content-disposition"] = f'attachment; filename="{filename}"'
     return Response(body, media_type=media_type, headers=headers)
 
 
@@ -4013,14 +4023,18 @@ def qr(node_id: str, request: Request, size: int = 8, img: str = "png"):
 
 
 @router.get("/api/subscription/qr")
-def subscription_qr(request: Request, size: int = 8, format: str = "base64", img: str = "png"):
+def subscription_qr(request: Request, size: int = 8, format: str = "base64", img: str = "png", client: str = ""):
     """订阅二维码 (前端卡片上的「二维码」按钮; 之前误把 URL 当图片地址)。"""
     state = load_state()
     if not _require_auth(state, request):
         return _err("未登录", 401)
+    if client not in ("", "android") or (client == "android" and not share_links.is_singbox_format(format)):
+        return _err("不支持的客户端配置组合", 400)
     url = share_links.subscription_url(request, state)
     if (format or "base64").lower() != "base64":
         url = f"{url}?format={format}"
+    if client == "android":
+        url += "&client=android"
     return _qr_response(url, size, img)
 
 

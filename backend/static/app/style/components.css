@@ -725,6 +725,33 @@ dialog.modal-mask::backdrop { background: transparent; }
 .mini-card b { font-size: 13px; }
 .mini-actions { display: flex; gap: 8px; margin-top: 10px; }
 
+/* Subscription cards adapt to their content, including enlarged button text. */
+#client-tabs { flex-wrap: wrap; }
+#client-tabs .tab { min-height:44px; }
+.client-app-grid { grid-template-columns:repeat(auto-fit,minmax(min(280px,100%),1fr)); }
+.client-app-card { min-width:0; display:flex; flex-direction:column; gap:12px; }
+.client-app-heading { display:flex; flex-direction:column; align-items:flex-start; gap:6px; }
+.client-app-heading b { overflow-wrap:anywhere; }
+.client-app-format { font-size:var(--fs-xs); color:var(--sub); }
+.client-app-tip { margin:0; color:var(--sub); font-size:var(--fs-sm); }
+.client-app-actions { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); margin-block-start:auto; gap:8px; }
+.client-app-card .client-app-actions > .btn {
+  display:inline-flex; align-items:center; justify-content:center;
+  min-width:0; min-height:44px; white-space:normal; overflow-wrap:anywhere;
+  text-align:center; text-decoration:none;
+}
+.client-app-actions > :last-child:nth-child(odd) { grid-column:1/-1; }
+.client-app-guide { color:var(--sub); font-size:var(--fs-xs); }
+.client-app-guide summary { cursor:pointer; padding-block:4px; }
+.client-app-guide ol { margin:8px 0 0; padding-inline-start:20px; }
+.client-app-guide li { overflow-wrap:anywhere; margin-block:6px; }
+.client-app-unavailable { margin:0; color:var(--err); font-size:var(--fs-sm); }
+@supports (grid-template-rows:subgrid) {
+  .client-app-card { display:grid; grid-template-rows:subgrid; grid-row:span 4; }
+  .client-app-actions { align-self:start; margin-block-start:0; }
+  .client-app-guide { align-self:end; }
+}
+
 /* ---------- WireGuard ----------
    每台设备一张卡: 名字 / 隧道地址 / 握手与流量 / 操作。沿用 dev-card 的视觉语言,
    但它是"独立凭据"而不是路由器设备, 所以单独一组类名, 不与 device 状态混淆。 */

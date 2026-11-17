@@ -1797,6 +1797,35 @@ def router_skeleton(
     )
 
 
+def singbox_android_profile(state: dict, template: str | None = None) -> str:
+    """SFA >=1.14 VPN profile; Android owns the TUN interface and permissions."""
+    profile = json.loads(singbox_profile(state, template, next_gen=True))
+    profile["inbounds"] = [{
+        "type": "tun", "tag": "tun-in", "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+        "mtu": 1500, "auto_route": True, "stack": "system",
+    }]
+    dns_rules = [{"domain_suffix": ["lan", "local", "home.arpa"], "server": "local-dns"}]
+    if template_of(state, template) in ("smart", "precision"):
+        dns_rules.append({"domain_suffix": list(CN_DIRECT_DOMAINS), "server": "local-dns"})
+        dns_rules.append({"rule_set": [tag for tag, _ in CN_RULE_SETS], "server": "local-dns"})
+    profile["dns"] = {
+        "servers": [{"type": "local", "tag": "local-dns"},
+                    {"type": "https", "tag": "proxy-dns", "server": "1.1.1.1", "path": "/dns-query", "detour": G_SELECT}],
+        "rules": dns_rules,
+        "final": "local-dns" if template_of(state, template) == "direct" else "proxy-dns",
+        "strategy": "prefer_ipv4",
+    }
+    # Node hostnames bootstrap through Android's local resolver, not their own tunnel.
+    profile["route"]["default_domain_resolver"] = "local-dns"
+    profile["route"]["rules"].insert(1, {"protocol": "dns", "action": "hijack-dns"})
+    return json.dumps(profile, ensure_ascii=False, indent=2)
+
+
+def is_singbox_format(fmt: str) -> bool:
+    return (fmt or "").lower() in {"singbox", "sing-box", "singbox-json", "json",
+                                  "singbox-next", "singbox14", "singbox-1.14", "singbox-new"}
+
+
 def subscription_body(
     state: dict,
     fmt: str = "base64",
@@ -1917,10 +1946,12 @@ def deep_links(sub_url: str) -> dict[str, str]:
     """
     clash_url = f"{sub_url}?format=clash"
     singbox_url = f"{sub_url}?format=singbox"
+    android_url = f"{singbox_url}&client=android"
     sr_payload = base64.urlsafe_b64encode(sub_url.encode("utf-8")).decode("ascii").rstrip("=")
     return {
         "clash": f"clash://install-config?url={quote(clash_url, safe='')}&name=ZeroProxy",
         "singbox": f"sing-box://import-remote-profile?url={quote(singbox_url, safe='')}#ZeroProxy",
+        "singbox_android": f"sing-box://import-remote-profile?url={quote(android_url, safe='')}#ZeroProxy",
         "shadowrocket": f"shadowrocket://add/sub://{sr_payload}?title=ZeroProxy",
         "surge": f"surge:///install-config?url={quote(clash_url, safe='')}&name=ZeroProxy",
         "quantumultx": f"quantumult-x:///add-resource?remote-resource={quote(sub_url, safe='')}",

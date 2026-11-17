@@ -15,6 +15,7 @@ import { openConfirm, openQr } from "../lib/dialog.js";
 
 /** 当前 tab / 本页的临时状态 (不放进 S.dash: 它属于视图, 不属于服务器数据) */
 let tab = "router";
+let bodySignature = "";
 let pairInfo = null;      // 刚生成的配对码 (含命令与有效期)
 let busy = false;         // 生成命令 / 切换开关期间禁用按钮
 let syncTimers = {};      // device_id -> 轮询定时器
@@ -35,16 +36,37 @@ export function renderClients(dash) {
   if (nav) nav.textContent = dev.count ? `${dev.on}/${dev.count}` : "—";
   $("#client-count").textContent = dev.count
     ? `${dev.on} 台已接管 · ${dev.online || 0} 台在线 · 共 ${dev.count} 台`
-    : "还没有客户端";
+    : "尚未登记路由器";
+  if (tab !== "router") $("#client-count").textContent = "订阅导入 · 在线状态由客户端查看";
 
   document.querySelectorAll("[data-client-tab]").forEach((btn) => {
-    btn.classList.toggle("on", btn.dataset.clientTab === tab);
+    const selected = btn.dataset.clientTab === tab;
+    btn.classList.toggle("on", selected);
+    btn.setAttribute("aria-selected", String(selected));
+    btn.tabIndex = selected ? 0 : -1;
     btn.onclick = () => { tab = btn.dataset.clientTab; renderClients(S.dash); };
+    btn.onkeydown = (event) => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      const tabs = [...document.querySelectorAll("#client-tabs [data-client-tab]")];
+      const direction = getComputedStyle($("#client-tabs")).direction === "rtl" ? -1 : 1;
+      const step = (event.key === "ArrowRight" ? 1 : -1) * direction;
+      const next = event.key === "Home" ? tabs[0] : event.key === "End" ? tabs[tabs.length - 1]
+        : tabs[(tabs.indexOf(btn) + step + tabs.length) % tabs.length];
+      next.click(); next.focus();
+    };
   });
 
+  box.setAttribute("aria-labelledby", `client-tab-${tab}`);
+  const signature = tab === "router" ? "" : JSON.stringify([tab, dash.subscription_formats, dash.deep_links]);
+  const focusedId = box.contains(document.activeElement) ? document.activeElement.id : "";
   if (tab === "router") box.innerHTML = routerTab(dash, routers);
-  else box.innerHTML = mobileTab(dash, tab);
+  else if (signature !== bodySignature) box.innerHTML = mobileTab(dash, tab);
+  bodySignature = signature;
   bind(dash, routers);
+  if (focusedId && document.activeElement === document.body) {
+    document.getElementById(focusedId)?.focus({ preventScroll: true });
+  }
 }
 
 /* ---------------- 路由器 */
@@ -426,26 +448,33 @@ function pairCard(dash) {
 /* ---------------- 手机 / 电脑 */
 
 export const CLIENT_APPS = [
-  { id: "shadowrocket", kind: "phone", name: "iOS · Shadowrocket", format: "base64", tip: "在订阅中添加链接，再更新订阅。" },
-  { id: "sfa", kind: "phone", name: "Android · sing-box", format: "singbox", tip: "导入远程配置，使用 sing-box JSON。", scheme: "sing-box://import-remote-profile?url=" },
-  { id: "v2rayng", kind: "phone", name: "Android · v2rayNG", format: "base64", tip: "添加订阅分组，粘贴链接后更新。" },
-  { id: "clash-verge", kind: "desktop", name: "Windows · Clash Verge Rev", format: "clash", tip: "在订阅中导入 Clash YAML。", scheme: "clash://install-config?url=" },
-  { id: "mihomo", kind: "desktop", name: "macOS · Mihomo Party", format: "clash", tip: "在订阅中导入 Clash YAML。", scheme: "clash://install-config?url=" },
-  { id: "singbox-linux", kind: "desktop", name: "Linux · sing-box", format: "singbox", tip: "下载 JSON 配置，先执行 sing-box check 校验。" },
+  { id: "shadowrocket", kind: "phone", name: "iOS · Shadowrocket", format: "base64", tip: "添加订阅地址，更新节点后连接。", steps: ["在 Shadowrocket 的订阅管理中添加复制的地址，或扫描订阅二维码。", "更新订阅，选择节点并打开连接；首次连接允许系统添加 VPN。", "打开目标网站验证；之后在客户端更新订阅以同步面板变更。"] },
+  { id: "sfa", kind: "phone", name: "Android · sing-box", format: "singbox", profile: "singbox_android", client: "android", download: true, importKey: "singbox_android", tip: "适用于 sing-box for Android 1.14+，使用手机 VPN 配置。", steps: ["添加远程配置并粘贴订阅地址，也可尝试“导入客户端”。", "更新配置后选择并启动，按系统提示允许 VPN 连接。", "打开目标网站验证；仅导入配置不会自动连接。"] },
+  { id: "v2rayng", kind: "phone", name: "Android · v2rayNG", format: "base64", tip: "添加订阅分组，更新节点后启动连接。", steps: ["在订阅分组设置中添加复制的订阅地址，或扫描订阅二维码。", "更新当前分组，选择节点并启动；首次连接允许 VPN。", "打开目标网站验证；面板变更后重新更新订阅。"] },
+  { id: "clash-verge", kind: "desktop", name: "Windows · Clash Verge Rev", format: "clash", importKey: "clash", tip: "导入远程订阅，选中配置并开启系统代理或 TUN。", steps: ["在订阅页粘贴地址并导入，也可尝试“导入客户端”。", "选中该配置与节点，再开启系统代理；需要全局接管时使用客户端的 TUN。", "打开目标网站验证；若导入未唤起程序，使用复制的地址手动添加。"] },
+  { id: "mihomo", kind: "desktop", name: "macOS · Mihomo Party", format: "clash", importKey: "clash", tip: "导入远程订阅，选中配置并开启系统代理或 TUN。", steps: ["在订阅页粘贴地址并导入，也可尝试“导入客户端”。", "选中配置与节点，再开启系统代理或客户端的 TUN。", "导入链接会唤起已注册的兼容客户端；若没有打开，请手动添加订阅地址。"] },
+  { id: "singbox-linux", kind: "desktop", name: "Linux · sing-box", format: "singbox", download: true, tip: "提供本机 HTTP/SOCKS 代理配置，监听 127.0.0.1:2080。", steps: ["下载 JSON，执行 sing-box check -c zeroproxy-singbox.json 校验。", "执行 sing-box run -c zeroproxy-singbox.json 启动，并保持进程运行。", "将浏览器或应用代理设为 HTTP/SOCKS 127.0.0.1:2080；该配置不会自动接管整机。"] },
 ];
 
+const CLIENT_FORMATS = { base64: "通用订阅 · Base64", clash: "Clash YAML", singbox: "sing-box JSON" };
 function mobileTab(dash, kind) {
   return `<div class="client-hint">选择正在使用的客户端，导入对应格式。面板变更后需在客户端更新并应用订阅；面板无法确认外部客户端是否在线。</div>
-  <div class="dev-grid">${CLIENT_APPS.filter((app) => app.kind === kind).map((app) => {
-    const url = dash.subscription_formats?.[app.format] || "";
-    return `<div class="mini-card"><b>${esc(app.name)}</b>
-      <div class="muted fs-xs mt-1">${esc(app.tip)}</div>
-      <div class="mini-actions">
-        <button class="btn ghost small" data-sub-qr="${escAttr(url)}" data-sub-format="${app.format}">二维码</button>
-        <button class="btn ghost small" data-sub-copy="${escAttr(url)}">复制订阅</button>
-        ${app.format === "singbox" ? `<a class="btn ghost small" href="${escAttr(url)}" download="zeroproxy-singbox.json">下载 JSON</a>` : ""}
-        ${app.scheme ? `<a class="btn ghost small" href="${escAttr(app.scheme + encodeURIComponent(url))}">导入客户端</a>` : ""}
-      </div><div class="muted fs-xs mt-2">${esc(app.format)} · 导入后连接节点并打开目标网站验证。</div></div>`;
+  <div class="dev-grid client-app-grid">${CLIENT_APPS.filter((app) => app.kind === kind).map((app) => {
+    const url = dash.subscription_formats?.[app.profile || app.format] || "";
+    const deep = dash.deep_links?.[app.importKey] || "";
+    const importUrl = /^(clash:\/\/install-config\?|sing-box:\/\/import-remote-profile\?)/.test(deep) ? deep : "";
+    const label = `client-app-${app.id}`;
+    return `<article class="mini-card client-app-card" data-client-app="${app.id}" aria-labelledby="${label}">
+      <div class="client-app-heading"><b id="${label}">${esc(app.name)}</b><span class="client-app-format">${CLIENT_FORMATS[app.format]}</span></div>
+      <div><p class="client-app-tip">${esc(app.tip)}</p>${url ? "" : '<p class="client-app-unavailable" role="status">订阅尚未就绪，请刷新面板后重试。</p>'}</div>
+      <div class="mini-actions client-app-actions">
+        <button type="button" class="btn primary small" id="client-copy-${app.id}" data-sub-copy="${escAttr(url)}" aria-label="复制订阅：${escAttr(app.name)}"${url ? "" : " disabled"}>复制订阅</button>
+        <button type="button" class="btn ghost small" id="client-qr-${app.id}" data-sub-qr="${escAttr(url)}" data-sub-format="${app.format}" data-sub-client="${app.client || ""}" data-sub-name="${escAttr(app.name)}" aria-label="二维码：${escAttr(app.name)}"${url ? "" : " disabled"}>二维码</button>
+        ${url && importUrl ? `<a class="btn ghost small" id="client-import-${app.id}" data-client-import href="${escAttr(importUrl)}" aria-label="导入客户端：${escAttr(app.name)}">导入客户端</a>` : ""}
+        ${url && app.download ? `<a class="btn ghost small" id="client-download-${app.id}" href="${escAttr(url)}" download="${app.client === "android" ? "zeroproxy-android.json" : "zeroproxy-singbox.json"}" aria-label="下载 JSON：${escAttr(app.name)}">下载 JSON</a>` : ""}
+      </div>
+      <details class="client-app-guide" id="client-guide-${app.id}"><summary id="client-guide-toggle-${app.id}">使用步骤</summary><ol>${app.steps.map((step) => `<li>${esc(step)}</li>`).join("")}</ol></details>
+    </article>`;
   }).join("")}</div>`;
 }
 
@@ -465,7 +494,13 @@ function bind(dash, routers) {
   if (coreRefresh) coreRefresh.onclick = () => { refreshDevices().catch(() => {}); };
 
   document.querySelectorAll("[data-sub-copy]").forEach((el) => {
-    el.onclick = () => copyText(el.dataset.subCopy);
+    el.onclick = async () => {
+      if (el.disabled) return;
+      el.disabled = true;
+      el.setAttribute("aria-busy", "true");
+      try { await copyText(el.dataset.subCopy); }
+      finally { el.disabled = false; el.removeAttribute("aria-busy"); }
+    };
   });
   // 更新命令也是"复制走的东西" —— 面板上不再把它铺成正文 (那是一堵 shell 墙)
   document.querySelectorAll("[data-copy-cmd]").forEach((el) => {
@@ -474,15 +509,24 @@ function bind(dash, routers) {
   document.querySelectorAll("[data-sub-qr]").forEach((el) => {
     el.onclick = () => {
       const fmt = el.dataset.subFormat || "base64";
-      const q = `format=${encodeURIComponent(fmt)}`;
+      const params = new URLSearchParams({ format: fmt });
+      if (el.dataset.subClient) params.set("client", el.dataset.subClient);
+      const q = params.toString();
       openQr({
-        title: "订阅二维码",
-        sub: "用对应客户端的扫码导入功能扫描",
+        title: `${el.dataset.subName || "客户端"} · 订阅二维码`,
+        sub: "使用该客户端的订阅扫码功能；扫码后仍需更新配置并连接",
         link: el.dataset.subQr,
         svg: `/api/subscription/qr?img=svg&${q}`,
         png: `/api/subscription/qr?size=8&${q}`,
         file: `zeroproxy-sub-${fmt}.png`,
       });
+    };
+  });
+
+  document.querySelectorAll("[data-client-import]").forEach((el) => {
+    el.onclick = (event) => {
+      if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+      toast("正在请求打开兼容客户端；若未打开，请复制订阅手动导入");
     };
   });
 
