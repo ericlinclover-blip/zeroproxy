@@ -109,16 +109,64 @@ provider_keys() {
     printf '%s' "$_out"
 }
 
-# proxy-providers 段落 (YAML, 缩进两格)
+# Each panel owns its revision; files are atomically replaced and contain no secrets.
+revision_read() {
+    cat "$ZP_DIR/revisions/$(key_of "$1").$2" 2>/dev/null | tr -d '\r\n'
+}
+revision_write() {
+    case "$3" in ''|*[!0-9a-f]*) return 1 ;; esac
+    [ "${#3}" = 16 ] || return 1
+    mkdir -p "$ZP_DIR/revisions" || return 1
+    (umask 077; printf '%s\n' "$3" > "$ZP_DIR/revisions/$(key_of "$1").$2.tmp" &&
+        mv "$ZP_DIR/revisions/$(key_of "$1").$2.tmp" "$ZP_DIR/revisions/$(key_of "$1").$2")
+}
+revision_vector() {
+    for _rv_file in $(server_files); do
+        _rv_base="$(field_of "$_rv_file" base)"
+        printf '%s:%s\n' "$(key_of "$_rv_base")" "$(revision_read "$_rv_base" "$1")"
+    done | cksum
+}
+revision_commit() {
+    for _rc_file in $(server_files); do
+        _rc_base="$(field_of "$_rc_file" base)"
+        _rc_rev="$(revision_read "$_rc_base" "$1")"
+        [ -z "$_rc_rev" ] || revision_write "$_rc_base" "$2" "$_rc_rev" || return 1
+    done
+}
+prepare_revisions() {
+    for _pr_file in $(server_files); do
+        _pr_base="$(field_of "$_pr_file" base)"
+        [ -z "$(revision_read "$_pr_base" desired)" ] || continue
+        _pr_id="$(field_of "$_pr_file" id)"
+        _pr_secret="$(field_of "$_pr_file" secret)"
+        _pr_body='{"device":"'"$_pr_id"'","k":"'"$_pr_secret"'"}'
+        _pr_response="$(http_post "$_pr_base/c/report" "$_pr_body" "$_pr_secret")" || return 1
+        revision_write "$_pr_base" desired "$(json_get "$_pr_response" rev)" || return 1
+    done
+}
+
+# Immutable provider snapshots let validation and rollback use the same bytes.
+# Heartbeats drive refresh for every panel, including secondary panels.
 providers_yaml() {
-    for _f in $(server_files); do
-        _b="$(field_of "$_f" base)"; _i="$(field_of "$_f" id)"; _k="$(field_of "$_f" secret)"
-        _key="$(key_of "$_b")"
-        printf '  %s:\n' "$_key"
-        printf '    type: http\n'
-        printf '    url: "%s/c/sub/%s?k=%s&format=provider"\n' "$_b" "$_i" "$_k"
-        printf '    interval: 3600\n'
-        printf '    path: ./providers/%s.yaml\n' "$_key"
+    for _pv_file in $(server_files); do
+        _pv_base="$(field_of "$_pv_file" base)"
+        _pv_id="$(field_of "$_pv_file" id)"
+        _pv_secret="$(field_of "$_pv_file" secret)"
+        _pv_key="$(key_of "$_pv_base")"
+        _pv_rev="$(revision_read "$_pv_base" desired)"
+        [ -n "$_pv_rev" ] || return 1
+        _pv_path="$ZP_DIR/providers/$_pv_key-$_pv_rev.yaml"
+        mkdir -p "$ZP_DIR/providers" || return 1
+        if [ ! -s "$_pv_path" ]; then
+            if ! (umask 077; http_get "$_pv_base/c/sub/$_pv_id?k=$_pv_secret&format=provider&expected_rev=$_pv_rev" > "$_pv_path.new"); then
+                rm -f "$_pv_path.new"; return 1
+            fi
+            grep -q '^proxies:' "$_pv_path.new" || { rm -f "$_pv_path.new"; return 1; }
+            mv "$_pv_path.new" "$_pv_path" || return 1
+        fi
+        printf '  %s:\n' "$_pv_key"
+        printf '    type: file\n'
+        printf '    path: ./providers/%s-%s.yaml\n' "$_pv_key" "$_pv_rev"
         printf '    health-check:\n      enable: true\n      url: http://www.gstatic.com/generate_204\n      interval: 300\n'
     done
 }
@@ -160,6 +208,7 @@ build_config() {
     [ -n "$_first" ] || return 1
     _b="$(field_of "$_first" base)"; _i="$(field_of "$_first" id)"; _k="$(field_of "$_first" secret)"
     _n="$(count_servers)"
+    if [ "$_n" -gt 1 ]; then prepare_revisions || return 1; fi
     # 没有分流数据库就不能要 geo 规则 (面板知道这件事, 会给一份降级配置)。判据必须是
     # 本机文件: 数据库在路由器上, 面板看不到它。
     _geo="1"; geo_ok || _geo="0"
@@ -172,11 +221,12 @@ build_config() {
     _dp="$(datapath_flag)"
     _ip6="$(ipv6_flag)"
     _mtu="$(tun_mtu_flag)"
+    _expected="$(revision_read "$_b" desired)"
     if [ "$_n" -le 1 ]; then
-        http_get "$_b/c/sub/$_i?k=$_k&format=clash&rules=smart&geo=$_geo&tproxy=$_tp&datapath=$_dp&ipv6=$_ip6&mtu=$_mtu"
+        http_get "$_b/c/sub/$_i?k=$_k&format=clash&geo=$_geo&tproxy=$_tp&datapath=$_dp&ipv6=$_ip6&mtu=$_mtu&expected_rev=$_expected"
         return $?
     fi
-    _skel="$(http_get "$_b/c/sub/$_i?k=$_k&format=skeleton&rules=smart&geo=$_geo&tproxy=$_tp&datapath=$_dp&ipv6=$_ip6&mtu=$_mtu")" || return 1
+    _skel="$(http_get "$_b/c/sub/$_i?k=$_k&format=skeleton&geo=$_geo&tproxy=$_tp&datapath=$_dp&ipv6=$_ip6&mtu=$_mtu&expected_rev=$_expected")" || return 1
     [ -n "$_skel" ] || return 1
     # provider 段落走临时文件而不是 `awk -v block=...`: -v 的值里带换行时, BSD awk
     # 直接报 "newline in string", busybox awk 的转义处理也不一致 (本机演练抓到的)。
@@ -444,6 +494,49 @@ local_api_ready() {
     fi
 }
 
+# API readiness and a live datapath are separate from configuration validation.
+wait_runtime() {
+    _runtime_wait=0
+    while [ "$_runtime_wait" -lt 15 ]; do
+        refresh_state
+        if local_api_ready && [ "$(actual_covered)" != "none" ]; then return 0; fi
+        sleep 1
+        _runtime_wait=$((_runtime_wait + 1))
+    done
+    return 1
+}
+
+# Only proxy/rule collections may use a controller reload. Listener, DNS and
+# datapath changes keep the restart path; unknown tools conservatively fall back.
+reload_safe() {
+    [ -s "$CONF.previous" ] || return 1
+    for _shape in "$CONF.previous" "$CONF"; do
+        (umask 077; awk '
+            /^[^[:space:]#][^:]*:/ {
+                skip = ($0 ~ /^(proxies|proxy-providers|proxy-groups|rules):/)
+            }
+            !skip && $0 !~ /^#/ {print}
+        ' "$_shape" > "$_shape.shape") || return 1
+    done
+    cmp -s "$CONF.previous.shape" "$CONF.shape"
+    _shape_rc=$?
+    rm -f "$CONF.previous.shape" "$CONF.shape"
+    return "$_shape_rc"
+}
+reload_running_config() {
+    command -v curl >/dev/null 2>&1 || return 1
+    # This is a fixed local path, never a panel-supplied command or URL.
+    _reload_code="$(curl -sS --connect-timeout 1 --max-time 8 -o /dev/null -w '%{http_code}' \
+        -X PUT -H 'Content-Type: application/json' \
+        --data '{"path":"/etc/zeroproxy/config.yaml"}' \
+        'http://127.0.0.1:9090/configs?force=false')" || return 1
+    [ "$_reload_code" = 204 ]
+}
+activate_config() {
+    if reload_safe && reload_running_config && wait_runtime; then return 0; fi
+    /etc/init.d/zeroproxy restart >/dev/null 2>&1 && wait_runtime
+}
+
 # ---------------------------------------------------------------- 修复1: switch_core 等 mihomo API 真正就绪再设 core.up
 # 原来的实现: start → sleep 2 → touch core.up
 # 问题: mihomo 从 start 到 API 9090 可用通常需要 3~8 秒, sleep 2 秒太短, 下一轮心跳
@@ -484,7 +577,7 @@ apply_config() {
     # 自动回到完整分流 —— 用户不用再登录路由器做任何事。
     ensure_geo >/dev/null 2>&1 || true
     # 原子替换: 新配置先落 .new, 校验通过才替换, 失败保留旧配置继续用。
-    build_config > "$CONF.new" 2>/dev/null || { rm -f "$CONF.new"; return 1; }
+    (umask 077; build_config > "$CONF.new") 2>/dev/null || { rm -f "$CONF.new"; return 1; }
     # 单服务器模式带内联 proxies, 多服务器模式带 proxy-providers —— 唯一共同的锚点是
     # 策略组, 所以用它判断"这看起来像一份配置"。
     grep -q '^proxy-groups:' "$CONF.new" || { rm -f "$CONF.new"; return 1; }
@@ -528,13 +621,30 @@ apply_config() {
         return 1
     fi
     mkdir -p "$ZP_DIR/providers"
-    mv "$CONF.new" "$CONF"
+    _was_running=0
+    core_up && _was_running=1
+    if [ -f "$CONF" ]; then cp "$CONF" "$CONF.previous" || return 1; fi
+    mv "$CONF.new" "$CONF" || return 1
     # 只在"该开"的时候重启内核。关闭状态下也重启的话, 内核会被反复拉起来又被下一轮
     # 心跳关掉 —— 真机日志里就是这样刷屏的 (面板上表现为"同步中"来回跳)。
-    if core_up; then
-        /etc/init.d/zeroproxy restart >/dev/null 2>&1 || true
+    APPLY_STATE=staged
+    if [ "$_was_running" = 1 ]; then
+        if activate_config; then
+            APPLY_STATE=running
+        else
+            if [ -f "$CONF.previous" ]; then
+                mv "$CONF.previous" "$CONF"
+                if /etc/init.d/zeroproxy restart >/dev/null 2>&1 && wait_runtime; then
+                    log "新配置运行失败，已恢复旧配置"
+                else
+                    rm -f "$ZP_DIR/core.up"
+                    log "新配置运行失败，旧配置恢复仍未就绪，请执行 doctor"
+                fi
+            fi
+            return 1
+        fi
     fi
-    log "配置已更新并重载"
+    log "配置已校验并保存 ($APPLY_STATE)"
     return 0
 }
 
@@ -673,11 +783,9 @@ caps_flag() {
 LAST_REV=""
 LAST_PULL=0
 FAILS=0
-#: "已应用版本" (面板的 applied_rev)。**只有 apply_config 成功** (配置校验通过 + 落盘)
-#: 才写它 —— 下载 ≠ 应用。面板据此区分"已下载未应用/已应用" (P2-9): 以前面板把
-#: "把订阅发给了设备"当成"设备已经在用", 于是升级后界面永远显示已应用。
-#: 落盘是为了 agent 重启后还能如实回答, 不必等下一次配置变更。
+# Aggregate identifiers are local only. Panel heartbeats always use their own revision.
 APPLIED_REV="$(cat "$ZP_DIR/applied.rev" 2>/dev/null | tr -d '\r\n')"
+APPLY_STATE=unknown
 # 修复3: 心跳状态机 —— 稳定/不稳定
 HEARTBEAT_STATE="unstable"  # unstable | stable
 # 稳定计数: 连续 N 轮无变更才进入稳定态
@@ -766,12 +874,12 @@ while true; do
         # actual = "这台机器现在真的在提供代理" —— 性能模式下 dae 在跑也算 (proxy_up)
         if proxy_up; then BODY="$BODY"',"actual":true'; else BODY="$BODY"',"actual":false'; fi
         [ -n "$UI_URL_REPORT" ] && BODY="$BODY"',"ui":"'"$UI_URL_REPORT"'"'
-        [ -n "$LAST_REV" ] && BODY="$BODY"',"rev":"'"$LAST_REV"'"'
-        # 已应用版本 + 数据面健康 (P2-9): 面板只在设备**显式**报这两个时才推进
-        # applied_rev (下载不算应用)。applied 由 apply_config 成功时写下; healthy 只在
-        # 代理真的在提供 (core/dae 在跑) 时为 true —— 不拿"配置写好了"冒充健康。
-        [ -n "$APPLIED_REV" ] && BODY="$BODY"',"applied_rev":"'"$APPLIED_REV"'"'
-        if proxy_up; then BODY="$BODY"',"healthy":true'; fi
+        _own_staged="$(revision_read "$_b" staged)"
+        _own_applied="$(revision_read "$_b" applied)"
+        [ -z "$_own_staged" ] || BODY="$BODY"',"staged_rev":"'"$_own_staged"'"'
+        [ -z "$_own_applied" ] || BODY="$BODY"',"applied_rev":"'"$_own_applied"'"'
+        # A process alone is not evidence that a newly downloaded config is running.
+        BODY="$BODY"',"healthy":false'
         _dg_file="$ZP_DIR/diagnostic-$(key_of "$_b").json"
         if [ -s "$_dg_file" ]; then BODY="$BODY"',"diagnostic":'"$(cat "$_dg_file")"; fi
         BODY="$BODY"',"report":'"$(report_fields_json)"'}'
@@ -793,8 +901,8 @@ while true; do
         _d="$(json_get_bool "$RESP" desired)"
         [ -n "$_d" ] || _d=true
         [ "$_d" = "false" ] && DESIRED_ALL="false"
-        # 配置版本取第一台能应答的 (配置内容各台不同, 用哪台的 rev 都只是"变了就重拉")
-        [ -z "$REV" ] && REV="$(json_get "$RESP" rev)"
+        _own_desired="$(json_get "$RESP" rev)"
+        revision_write "$_b" desired "$_own_desired" || true
         # 面板看到的本机公网地址 (那条心跳走直连)。性能模式的出口探针用它判断"是不是其实
         # 从本机直连出去的" —— 界面据此如实标注, 不把本机地址写成节点出口 (8.86)。
         _wip="$(json_get "$RESP" ip)"
@@ -804,6 +912,8 @@ while true; do
             umask 022
         fi
     done
+
+    REV="$(revision_vector desired)"
 
     # ---------------------------------------------------------------- 处理面板不可达
     if [ "$RESP_OK" = "0" ]; then
@@ -832,6 +942,7 @@ while true; do
         # 修复3: 面板不可达 → 不稳定态
         HEARTBEAT_STATE="unstable"
         STABLE_COUNT=0
+        [ -n "${RUN_ONCE:-}" ] && exit 0
         sleep "$SLEEP_UNSTABLE"
         SWITCH_PENDING=""
         continue
@@ -840,6 +951,7 @@ while true; do
     # ---------------------------------------------------------------- 面板可达, 处理指令
     FAILS=0
     DESIRED="$DESIRED_ALL"
+    case "$OVERRIDE" in on) DESIRED=true ;; off) DESIRED=false ;; esac
 
     # 性能模式先处理"面板要求关闭"这一条: 那一档下 mihomo 本来就是停的, 只停 mihomo 等于
     # 什么都没关 —— 面板上的总开关关掉就必须真的关掉 (把 dae 也退出来)。
@@ -856,7 +968,9 @@ while true; do
         if [ -z "$SWITCH_PENDING" ]; then
             SWITCH_PENDING="1"
             log "面板要求开启, 启动内核"
-            switch_core on
+            if switch_core on && wait_runtime; then
+                revision_commit staged applied
+            fi
         fi
     elif [ "$DESIRED" = "false" ] && proxy_up; then
         if [ -z "$SWITCH_PENDING" ]; then
@@ -874,13 +988,11 @@ while true; do
             LAST_REV="$REV"
             LAST_PULL="$_now"
             _config_changed=1
-            # 配置已校验通过并落盘 —— 这才是"已应用"。下次心跳把它显式报给面板
-            # (applied_rev), 面板才把设备卡从"已下载未应用"推进到"已应用" (P2-9)。
-            if [ -n "$REV" ]; then
+            revision_commit desired staged
+            if [ "$APPLY_STATE" = running ]; then
+                revision_commit staged applied
                 APPLIED_REV="$REV"
-                umask 077
-                printf '%s\n' "$APPLIED_REV" > "$ZP_DIR/applied.rev" 2>/dev/null || true
-                umask 022
+                (umask 077; printf '%s\n' "$APPLIED_REV" > "$ZP_DIR/applied.rev")
             fi
         fi
     fi

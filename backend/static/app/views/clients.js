@@ -231,7 +231,11 @@ function ago(ts) {
 function versionChip(d) {
   const downloaded = String(d.downloaded_rev || "");
   const applied = String(d.applied_rev || "");
+  const staged = String(d.staged_rev || "");
   const short = (v) => esc(v.slice(0, 8));
+  if (staged && staged !== applied && !d.actual) {
+    return `<span class="badge hysteria" title="配置已校验保存，启动并确认运行后才标记应用">已暂存，等待启用</span>`;
+  }
   if (downloaded && (!applied || downloaded !== applied)) {
     const why = applied
       ? `面板已让设备下载 v${short(downloaded)}, 设备上一次回报应用的是 v${short(applied)}`
@@ -316,6 +320,7 @@ function deviceCard(d) {
           <div><dt>控制权</dt><dd>${d.control === "local" || ["on", "off"].includes(String(d.report?.override)) ? "本机覆盖 · 在路由器执行 zeroproxy local-auto 交还面板" : "面板管理"}</dd></div>
           <div><dt>期望 / 回报</dt><dd>${d.desired ? "开启" : "关闭"} / ${!d.online ? "离线，等待回报" : d.actual ? "运行" : "停止"}</dd></div>
           <div><dt>下载 / 应用版本</dt><dd>${esc(d.downloaded_rev || "未知")} / ${esc(d.applied_rev || "未知")}</dd></div>
+          <div><dt>已暂存版本</dt><dd>${esc(d.staged_rev || "未知")}</dd></div>
           <div><dt>设备说明</dt><dd>${esc(d.report?.why || "暂无错误回报；接管状态不等于实际出网验证")}</dd></div>
         </dl>
       </details>

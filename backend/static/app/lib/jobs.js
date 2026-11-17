@@ -1,8 +1,8 @@
 /** 后台落地闭环 + 改动类接口的统一入口。
  *
  *  改动:
- *    1) 自适应轮询间隔: 前 2s 用 100ms 快速采样（用户刚点击，急于看进度），
- *       之后退回 400ms，避免不必要的 HTTP 请求。
+ *    1) 自适应轮询间隔: 前 2s 用 250ms 快速采样（用户刚点击，急于看进度），
+ *       之后退回 1–2s，避免不必要的 HTTP 请求。
  *    2) 进度条更新用 CSS class 切换代替 innerHTML 重建，减少 DOM 重排。
  */
 import { $, esc, toast, applyWidths } from "./dom.js";
@@ -63,19 +63,17 @@ export function renderApplyStrip(st) {
   }
 }
 
-/** 自适应轮询后台任务: 前 2s 用 100ms 快速采样, 之后 400ms。 */
+/** 自适应轮询后台任务: 前 2s 用 250ms 快速采样, 之后 400ms。 */
 export async function watchApply(job) {
   let last = job;
   renderApplyStrip(job);
   const budgetMs = job.kind === "geodata" ? 480000 : 120000;
   const started = Date.now();
   let elapsed = 0;
-  const fastPoll = 100;  // 快速轮询: 前 2 秒
-  const normalPoll = 400;
 
   while (elapsed < budgetMs) {
     // 动态决定轮询间隔
-    const pollInterval = elapsed < 2000 ? fastPoll : normalPoll;
+    const pollInterval = elapsed < 2000 ? 250 : elapsed < 15000 ? 1000 : 2000;
     await sleep(pollInterval);
     elapsed = Date.now() - started;
 

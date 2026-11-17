@@ -32,6 +32,17 @@ from urllib.parse import quote, urlsplit
 
 import yaml
 
+
+class _ClashDumper(yaml.SafeDumper):
+    def represent_mapping(self, tag, mapping, flow_style=None):
+        node = super().represent_mapping(tag, mapping, flow_style)
+        # YAML implementations disagree on unquoted hex strings like 12345e67.
+        # Preserve the original short ID instead of letting Go decode a float.
+        for key, value in node.value:
+            if key.value == "short-id":
+                value.style = "'"
+        return node
+
 from . import config
 from .config import WS_PATH, XHTTP_PATH
 
@@ -1402,7 +1413,7 @@ def clash_profile(
         head.append("# 分流依赖客户端 geo 数据; 已内置 geox-url 镜像, 首次导入会自动下载")
     if skipped:
         head.append(f"# 本客户端不支持的节点已跳过: {', '.join(skipped)} (请用 sing-box / 单节点链接)")
-    body = yaml.safe_dump(profile, allow_unicode=True, sort_keys=False, default_flow_style=False)
+    body = yaml.dump(profile, Dumper=_ClashDumper, allow_unicode=True, sort_keys=False, default_flow_style=False)
     return "\n".join(head) + "\n" + body
 
 
@@ -1760,7 +1771,7 @@ def provider_profile(state: dict, prefix: str = "") -> str:
         "# 本文件只含节点; 规则 / DNS / tun 由路由器侧的骨架提供",
         f"# 节点名前缀: {_comment_safe(label) or '(无)'}",
     ]
-    body = yaml.safe_dump({"proxies": proxies}, allow_unicode=True, sort_keys=False)
+    body = yaml.dump({"proxies": proxies}, Dumper=_ClashDumper, allow_unicode=True, sort_keys=False)
     return "\n".join(head) + "\n" + body
 
 

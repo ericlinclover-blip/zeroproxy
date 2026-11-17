@@ -179,12 +179,12 @@ from .config import paths
 #: 1.4.56: 修复节点/测速原始响应兼容、主代理组选择及节点名 URL 路径编码。
 #: 1.4.57: 区分已失败与未测速节点；配套面板启用现代 REALITY 混合握手。
 #: 1.4.58: 区分 TLS 握手与证书验证错误，隔离性能日志函数，明确系统日志快照语义。
-SCRIPT_VERSION = "1.4.59"
+SCRIPT_VERSION = "1.4.60"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"
 #: 才暴露出来。要升级: 改这里 → 面板重新生成 → 路由器重跑一次安装命令。
-CORE_VERSION = os.environ.get("ZP_CORE_VERSION", "v1.19.32")
+CORE_VERSION = os.environ.get("ZP_CORE_VERSION", "v1.19.34")
 
 #: CPU 架构 → mihomo release 资产后缀。
 #: armv6 有独立构建 (mihomo-linux-armv6-*), 老款百兆路由 (bcm27xx / arm1176) 直接用它;
@@ -484,7 +484,7 @@ def core_sha256(path: str) -> str:
 # 摘要:
 #
 #   * mihomo / dae: 固定值 —— 逐资产取自对应 GitHub release 发布页的官方 digest
-#     (v1.19.32 / v2.1.1, 2026-10 核对)。反代只能骗传输, 骗不了发布页上的期望值;
+#     (v1.19.34 / v2.1.1；mihomo 于 2026-11-17 核对)。反代只能骗传输, 骗不了发布页上的期望值;
 #     版本一换就必须同步改表, 表里没有的版本走"警告 + 记录", 不假装校验过。
 #   * zpcore: 仓库里的 client/agent/dist/SHA256SUMS (scripts/build-agent.sh 生成),
 #     没有网络依赖 —— 它是我们自己的产物, 摘要跟着制品一起进仓库。
@@ -493,23 +493,23 @@ def core_sha256(path: str) -> str:
 #
 # 不一致就**拒绝下发**: 路由器端看到的是"面板还没准备好", 而不是一份被替换过的 root 二进制。
 PINNED_SHA256: dict[str, str] = {
-    # ---- mihomo v1.19.32 (CORE_VERSION) · 官方 release 页面的 sha256 digest ----
-    "mihomo-linux-arm64-v1.19.32.gz":
-        "9dd862e28b46ff7d775f169cceebc28deccaa0a9e804237d421cd2571e0caba0",
-    "mihomo-linux-armv6-v1.19.32.gz":
-        "efa575b877b1c177e261492f994e4ec0d9bd6b92deed2015e25612396a9ce487",
-    "mihomo-linux-armv7-v1.19.32.gz":
-        "f622cbe903ba1a11d30e9071d1c5373929c675b854856ff3e7f977255a25bb66",
-    "mihomo-linux-amd64-v1-v1.19.32.gz":
-        "306f81e723e60ce6b828899a6fe83e1d00e9ecefb2dc8d4d849312a5bc00efdc",
-    "mihomo-linux-mips-softfloat-v1.19.32.gz":
-        "8b6c0e437ca388d7849db5343ef24304a9b4cf63f12e926eb75d4c7251cd6ab1",
-    "mihomo-linux-mipsle-softfloat-v1.19.32.gz":
-        "69b10ecd1db5244ab2bf1fac3c629a2e0f9b19f84728fe51b043a9767832d38c",
-    "mihomo-linux-mips64-v1.19.32.gz":
-        "992fba903e55c1d9ac60c88356744eec059e9568d5743374f6c2edfd784a4321",
-    "mihomo-linux-mips64le-v1.19.32.gz":
-        "f692484a0e924acaf603a58502d66c930a9d592dd36e310990591da81da9035b",
+    # ---- mihomo v1.19.34 (CORE_VERSION) · 官方 release 页面的 sha256 digest ----
+    "mihomo-linux-arm64-v1.19.34.gz":
+        "daaf78a6240a282cdfd75bcbf98fe321f6bd52765cc29e79f344191198f0b50f",
+    "mihomo-linux-armv6-v1.19.34.gz":
+        "f94f85f14056b5e2cfcea6faf40236dd4f2b785f8780ed4cf91eb56379ba8f2d",
+    "mihomo-linux-armv7-v1.19.34.gz":
+        "aa5e51572e29ce22ace7b6e28e611e1f1f635210d76420d161ce12a5431bf93e",
+    "mihomo-linux-amd64-v1-v1.19.34.gz":
+        "0c07340a01408d033dda4088ea2a4c1e4d82aeed7b2f84f7c046e93b6ff3290c",
+    "mihomo-linux-mips-softfloat-v1.19.34.gz":
+        "e6c5ccba9ff1a6e20e313d13b0d36c1b322ed51de91ba771e77a962d3c8ac915",
+    "mihomo-linux-mipsle-softfloat-v1.19.34.gz":
+        "b34bbb86196c32915abf4a5b361c11218ea1da4344a353768f570e79f69d2c04",
+    "mihomo-linux-mips64-v1.19.34.gz":
+        "452ad7b5d426d7e262f186ca2b459cb245a75404c88285e7acdd557820992af2",
+    "mihomo-linux-mips64le-v1.19.34.gz":
+        "106ff2e95a8e3a0debfa8a96d0baa3d98f44ad826918c6a8e5a17aaf5c05dd06",
     # ---- dae v2.1.1 (PERF_VERSION) · 官方 release 页面的 sha256 digest ----
     "dae-linux-arm64.tar.xz":
         "bd84b6770cb335b8a45d8b1e16a95f68cf940b3edaaeeb449c187ce4b1058d0b",
@@ -565,7 +565,7 @@ def sha256_hex(data: bytes) -> str:
 #: 替换了)" —— 新版本永远取不到, 而且和真投毒长得一模一样。现在按"这一档没有可信锚点"
 #: 处理 (如实记日志), 完整性交给体积 + Content-Length 闸门。
 PINNED_PERF_VERSION = "v2.1.1"
-PINNED_CORE_VERSION = "v1.19.32"
+PINNED_CORE_VERSION = "v1.19.34"
 
 
 def expected_sha256(asset: str) -> str:

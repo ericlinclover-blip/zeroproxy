@@ -23,9 +23,26 @@ import { loadUpdate, renderUpdate } from "./update.js";
 import { renderPanel } from "./panel.js";
 
 /* ---------------- 仪表盘 ---------------- */
+let loading = false;
+function scheduleDash(interval) {
+  clearTimeout(S.refreshTimer);
+  S.refreshTimer = setTimeout(() => {
+    if (!S.dash) return;
+    if (S.opBusy || S.applyJobId) { scheduleDash(1000); return; }
+    loadDash(true);
+  }, document.hidden ? Math.max(interval, 60000) : interval);
+}
+
 export async function loadDash(quiet) {
+  if (loading) return;
+  loading = true;
+  clearTimeout(S.refreshTimer);
+  const epoch = S.dashEpoch;
   try {
-    S.dash = await api("/api/dashboard");
+    const body = await api("/api/dashboard");
+    // A response begun before a write cannot replace its newer result or drafts.
+    if (epoch !== S.dashEpoch) { scheduleDash(1000); return; }
+    S.dash = body;
     renderDash(quiet);
     show("view-dash");
     resumeApplyJobs(S.dash.recent_jobs);
@@ -40,14 +57,14 @@ export async function loadDash(quiet) {
     if (alive === false) { show("view-login"); return; }
     setTimeout(() => { if (S.dash && !S.opBusy) loadDash(true); else if (!S.dash) boot(); }, 1200);
     return;
+  } finally {
+    loading = false;
   }
-  clearInterval(S.refreshTimer);
+  clearTimeout(S.refreshTimer);
   // 智能轮询: 操作期间 10s, 正常 20s, 连续无变化 60s
   const fp = S.dash && S.dash.fingerprint;
   const interval = pollInterval(fp, S.opBusy > 0 || S.applyJobId);
-  S.refreshTimer = setInterval(() => {
-    if (S.dash && !S.opBusy && !S.applyJobId) loadDash(true);
-  }, interval);
+  scheduleDash(interval);
   if (!S.probeRan) { S.probeRan = true; runProbe(false); }
 }
 
@@ -94,14 +111,15 @@ export function renderDash(quiet) {
     })
   );
 
-  renderTraffic(S.dash.traffic);
-  renderAdvanced(S.dash);
-  renderChain(S.dash);
-  renderClients(S.dash);
-  renderWireguard(S.dash);
-  renderSystem(S.dash);
-  renderPanel(S.dash);
-  renderAudit(S.dash.audit, S.dash.audit_facets, S.dash.audit_stats, S.dash.audit_more);
+  const visible = (id) => !quiet || !$("#" + id)?.classList.contains("workspace-hidden");
+  if (visible("sec-traffic")) renderTraffic(S.dash.traffic);
+  if (visible("sec-adv")) renderAdvanced(S.dash);
+  if (visible("chain-intro")) renderChain(S.dash);
+  if (visible("sec-clients")) renderClients(S.dash);
+  if (visible("sec-wireguard")) renderWireguard(S.dash);
+  if (visible("sec-sys")) renderSystem(S.dash);
+  if (visible("sec-panel")) renderPanel(S.dash);
+  if (visible("sec-audit")) renderAudit(S.dash.audit, S.dash.audit_facets, S.dash.audit_stats, S.dash.audit_more);
   renderKpis();
   renderDashboardBanner();
   renderNetworkSummary();
@@ -218,3 +236,9 @@ export async function boot() {
 setDashRenderers(renderDash, loadDash);
 
 document.addEventListener("zp:proof-updated", renderNetworkSummary);
+
+// Refresh a newly revealed workspace from the latest snapshot before interaction.
+document.addEventListener("zp:workspace-changed", () => renderDash(true));
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && S.dash && !S.opBusy && !S.applyJobId) loadDash(true);
+});

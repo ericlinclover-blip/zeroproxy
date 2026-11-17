@@ -983,7 +983,7 @@ def test_core_status_hands_the_router_a_usable_mirror_table(client, configured, 
     assert urls, res
     assert urls[0].startswith("https://github.i3.pub/"), "自建镜像应该排第一"
     assert all(u.endswith(router_client.asset_name("arm64")) for u in urls), urls
-    assert res["direct"].endswith("/mihomo-linux-arm64-v1.19.32.gz")
+    assert res["direct"].endswith("/" + router_client.asset_name("arm64"))
     assert res["prefer"] in ("panel", "mirror", "auto")
     # 没缓存时不谎报大小/摘要; 缓存之后两个都要给 (路由器据此校验镜像)
     assert "sha256" not in res and "size" not in res

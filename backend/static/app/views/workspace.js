@@ -15,6 +15,7 @@ let initialized = false;
 
 export function activateWorkspace(key, focus = false) {
   if (!WORKSPACES[key]) key = "network";
+  const changed = current !== key;
   current = key;
   const group = WORKSPACES[key];
   Object.entries(WORKSPACES).forEach(([name, value]) => value.ids.forEach((id) => {
@@ -30,6 +31,7 @@ export function activateWorkspace(key, focus = false) {
   $("#workspace-description").textContent = group.description;
   document.title = `ZeroProxy · ${{ network: "网络", devices: "设备", routing: "分流", diagnostics: "诊断", maintenance: "维护" }[key]}`;
   if (focus) $("#workspace-title").focus({ preventScroll: true });
+  if (changed) document.dispatchEvent(new Event("zp:workspace-changed"));
 }
 
 export function revealWorkspaceFor(el) {

@@ -62,6 +62,30 @@ const check = (name, ok, detail='') => { console.log(`${ok?'✓':'✗'} ${name}$
   const widths=[1440,820,390,320];
   for(const width of widths){await page.setViewportSize({width,height:1000});for(const workspace of ['network','devices','routing','diagnostics','maintenance']){await page.click(`[data-workspace="${workspace}"]`);check(`${width}px ${workspace} 页面不横向溢出`,await evaluate(()=>document.documentElement.scrollWidth<=innerWidth+1));}}
   await page.setViewportSize({width:1440,height:1000});await page.click('[data-workspace="network"]');
+  // A refresh started before a write must not overwrite the operation's result.
+  let oldRefresh;
+  const refreshSeen = new Promise(resolve => oldRefresh = resolve);
+  let releaseRefresh;
+  const refreshGate = new Promise(resolve => releaseRefresh = resolve);
+  await page.route('**/api/dashboard', async route => {
+    oldRefresh(); await refreshGate;
+    await route.fulfill({json:{...original,domain:'stale.example.com'}});
+  });
+  await page.evaluate(()=>{window.pendingRefresh=window.loadDash(true);});
+  await refreshSeen;
+  await evaluate(async()=>{
+    const {S}=await import(new URL('lib/state.js',document.querySelector('script[type=module]').src));
+    S.dashEpoch+=1; window.dash={...window.dash,domain:'new.example.com'};
+  });
+  releaseRefresh();
+  await evaluate(()=>window.pendingRefresh);
+  check('旧轮询响应不能覆盖操作后的新状态',await evaluate(()=>window.dash.domain==='new.example.com'));
+  await page.unroute('**/api/dashboard');
+  await evaluate(()=>{window.dash.devices={items:[{id:'staged-router',name:'staged',kind:'router',desired:false,actual:false,online:true,staged_rev:'aaaaaaaaaaaaaaaa',downloaded_rev:'aaaaaaaaaaaaaaaa',report:{covered:'none'}}],count:1,on:0,online:1};window.renderDash(true);});
+  await page.click('[data-workspace="devices"]');
+  await page.click('[data-client-tab="router"]');
+  check('关闭状态显示已暂存等待启用',(await page.locator('#client-body').innerText()).includes('已暂存，等待启用'));
+  await page.click('[data-workspace="network"]');
   const shot=process.env.ZP_SHOT_DIR||path.join(os.tmpdir(),'zp-audit-shots');fs.mkdirSync(shot,{recursive:true});await page.screenshot({path:path.join(shot,'audit-network.png'),fullPage:true});
   check('没有未处理的页面异常',errors.length===0,errors.join('; '));
   console.log('交互审计浏览器回归全部通过');

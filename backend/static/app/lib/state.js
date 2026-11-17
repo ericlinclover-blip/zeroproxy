@@ -6,6 +6,7 @@
  */
 export const S = {
   dash: null,
+  dashEpoch: 0,
   refreshTimer: null,
   revealed: false,
   bootstrapToken: "",

@@ -4,6 +4,7 @@
 //:   业务失败 → 有 HTTP 状态码 + 中文 error, 照实报给用户;
 //:   连接中断 → fetch 抛错 / 502 / 504, 属于"重启内核的副作用", 该自动重连。
 export async function api(path, opts = {}) {
+  if (opts.method && opts.method.toUpperCase() !== "GET") S.dashEpoch += 1;
   const longWrite = opts.method && opts.method !== "GET" && /^\/api\/(wireguard|renew|repair)/.test(path);
   const { timeoutMs = longWrite ? 240000 : 30000, signal, ...options } = opts;
   if (path === "/api/settings" && typeof options.body === "string" && S.dash?.configuration_revision) {

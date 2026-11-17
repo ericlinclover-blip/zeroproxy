@@ -266,6 +266,10 @@ def touch(state: dict, device: dict, info: dict) -> bool:
         changed = True
     # 已应用版本: 只认设备的**显式**上报 (applied_rev, 或 healthy + rev), 不再由
     # "下载了" 或 "心跳带了个 rev" 推断 (P2-9)。
+    staged = str(info.get("staged_rev") or "").strip()[:32]
+    if staged and device.get("staged_rev") != staged:
+        device["staged_rev"] = staged
+        changed = True
     applied = str(info.get("applied_rev") or "").strip()[:32]
     if not applied and info.get("healthy") is True:
         applied = str(info.get("rev") or "").strip()[:32]
@@ -476,6 +480,7 @@ def device_view(device: dict, *, now: int | None = None) -> dict:
         "control": "local" if override in {"on", "off"} else "panel",
         "diagnostic": device_diagnostics.view(device, now),
         "credentials_independent": bool(device.get("dataplane")),
+        "staged_rev": str(device.get("staged_rev") or ""),
         "template": device.get("template", ""),
         # 设备自己上报的最后一版 (旧客户端字段, 不代表已应用)
         "rev": device.get("rev", ""),

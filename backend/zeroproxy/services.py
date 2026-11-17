@@ -584,9 +584,21 @@ def _cert_not_after(cert_file: str) -> int:
 #: 不能跨过前端 20 秒采样窗口: 累计值不前进会让速率曲线先平后尖。
 _stats_cache: dict = {}
 _STATS_TTL = 5
+_stats_read_lock = threading.Lock()
 
 
 def xray_stats(state: dict) -> Optional[dict]:
+    # Collapse concurrent subprocess reads; an in-flight sample is unavailable,
+    # rather than making a configuration response wait behind telemetry I/O.
+    if not _stats_read_lock.acquire(blocking=False):
+        return None
+    try:
+        return _read_xray_stats(state)
+    finally:
+        _stats_read_lock.release()
+
+
+def _read_xray_stats(state: dict) -> Optional[dict]:
     """通过本机 Stats API 读取流量统计。
 
     返回 {"uplink", "downlink", "total", "by_node"} (字节); 未安装 xray /
@@ -598,11 +610,14 @@ def xray_stats(state: dict) -> Optional[dict]:
     if binary is None:
         return None
     api_port = int(state["ports"].get("api", 10085))
-    cache_key = (binary, api_port, tuple(sorted(traffic_tags(state))))
+    cache_key = (paths()["home"], binary, api_port, tuple(sorted(traffic_tags(state))))
     now = int(time.time())
     cached = _stats_cache.get(cache_key)
     if cached and (now - cached.get("ts", 0)) < _STATS_TTL:
         return cached.get("data")
+    # Cache failures too, so repeated page requests cannot spawn a probe storm.
+    _stats_cache.clear()
+    _stats_cache[cache_key] = {"data": None, "ts": now}
 
     # 先做一次 0.4s 的 TCP 预检: 端口没开时 `xray api` 自己要等 2-3 秒才报错,
     # 而仪表盘每次渲染都会调这里 (20s 轮询), 不预检会白白拖慢整个面板。
@@ -611,7 +626,7 @@ def xray_stats(state: dict) -> Optional[dict]:
     addr = f"127.0.0.1:{api_port}"
     ok, out = run(
         [binary, "api", "statsquery", f"--server={addr}", "-pattern", ""],
-        timeout=20,
+        timeout=3,
         env=xray_env(),
     )
     if not ok:

@@ -984,10 +984,11 @@ def _port_for(state: dict, node_id: str) -> int:
         return 0
 
 
-def _node_view(state: dict, traffic: dict | None) -> dict:
+def _node_view(state: dict, traffic: dict | None, states: dict | None = None) -> dict:
     nodes = state.get("nodes", {})
     links = share_links.share_links(state)
-    states = {name: services.service_state(name) for name in ("xray", "hysteria2", "nginx")}
+    if states is None:
+        states = {name: services.service_state(name) for name in ("xray", "hysteria2", "nginx")}
     by_node = (traffic or {}).get("by_node", {})
     out = []
     for meta in NODES:
@@ -1253,6 +1254,12 @@ def _dashboard_body(state: dict, request: Request, traffic: dict | None = None) 
     base = share_links.panel_base_url(request, state)
     # 面板首屏要的只有"最近这几条 + 各分类的条数", 更早的走 /api/audit 按需拉
     audit = config.audit_query(state, limit=20)
+    system = _system_view(state)
+    states = {name: system[name]["state"] for name in ("xray", "hysteria2", "nginx")}
+    device_view = devices.view(state)
+    observations = [(d["id"], d["online"], d["actual"], d.get("applied_rev"), d.get("report"))
+                    for d in device_view["items"]]
+    observed_fingerprint = hashlib.sha256(json.dumps([states, observations], sort_keys=True).encode()).hexdigest()[:16]
     return {
         "configured": state["configured"],
         "domain": state["domain"],
@@ -1266,7 +1273,7 @@ def _dashboard_body(state: dict, request: Request, traffic: dict | None = None) 
         },
         "deep_links": share_links.deep_links(sub),
         "cert": _cert_view(state),
-        "nodes": _node_view(state, traffic),
+        "nodes": _node_view(state, traffic, states),
         "routing": {
             "template": share_links.template_of(state),
             "custom_rules": share_links.custom_rules_of(state),
@@ -1295,7 +1302,7 @@ def _dashboard_body(state: dict, request: Request, traffic: dict | None = None) 
         "geodata": geodata.status(state),
         "chain": _chain_view(state),
         # 客户端设备 (路由器/手机/电脑) + 路由器安装脚本的元信息
-        "devices": devices.view(state),
+        "devices": device_view,
         # 原生 WireGuard 入站 (官方客户端 .conf / 二维码 / 一次性链接)
         "wireguard": wireguard.view(state),
         # update_command 一起带上: 面板上那条"固定的更新命令"必须与生成安装命令的
@@ -1313,9 +1320,10 @@ def _dashboard_body(state: dict, request: Request, traffic: dict | None = None) 
         "audit_facets": audit["facets"],
         "audit_stats": audit["stats"],
         "audit_more": audit["has_more"],
-        "system": _system_view(state),
+        "system": system,
+        "observed_at": int(time.time()),
         # 数据指纹: 前端据此判断"这次轮询有没有实际变化", 无变化则拉长自动刷新间隔
-        "fingerprint": _dash_fingerprint(state),
+        "fingerprint": _dash_fingerprint(state) + ":" + observed_fingerprint,
         "configuration_revision": config.configuration_revision(state),
         "settings_revision": config.settings_revision(state),
         "pending_change": change_guard.view(state),
@@ -1343,8 +1351,12 @@ def dashboard(request: Request):
             return _err("未登录", 401)
         if _clean_sessions(state):
             save_state(state)
-        body = _dashboard_body(state, request)
-        body["steps"] = state.get("steps", [])
+    # Collect subprocess/filesystem observations outside the configuration lock.
+    body = _dashboard_body(state, request)
+    body["steps"] = state.get("steps", [])
+    with config.locked():
+        if not _require_auth(load_state(), request):
+            return _err("未登录", 401)
     return body
 
 
@@ -4602,6 +4614,7 @@ class DeviceReportIn(BaseModel):
     rev: str = ""
     #: 设备显式上报"这份配置我已应用(校验 + 重载)成功"的版本 (P2-9)
     applied_rev: str = ""
+    staged_rev: str = ""
     #: 设备明确回报数据面健康时, 它当前生效的 `rev` 才视为已应用
     healthy: bool | None = None
     version: str = ""
@@ -4796,7 +4809,7 @@ def device_core_prepare(arch: str, request: Request):
 def device_proxy(device_id: str, payload: DeviceProxyIn, request: Request):
     """全屋代理总开关。
 
-    只改"期望状态"并立刻落盘: 设备下一轮心跳 (≤15s) 就会拿到它并执行。
+    只改"期望状态"并立刻落盘: 设备下一轮心跳（稳定时最长 30 秒，另加网络请求耗时）会拿到它并执行。
     面板显示的开关颜色取自设备回报的 actual, 所以这里不假装已经生效 ——
     前端会把 desired != actual 的那段时间显示成"同步中"。
     """
@@ -5421,6 +5434,7 @@ def client_subscription(
     datapath: str = "",
     ipv6: int = 0,
     mtu: int = 1500,
+    expected_rev: str = "",
 ):
     """设备专属订阅。设备不该拿到主订阅令牌, 所以它走自己的凭据。
 
@@ -5450,6 +5464,11 @@ def client_subscription(
         device = devices.find(state, device_id)
         if not devices.check_secret(device, _device_secret(request, k)):
             return _err("设备凭据无效", 403)
+        if expected_rev and expected_rev != devices.config_rev(state):
+            return _err("配置版本已变化，请等待下一轮同步", 409)
+        effective = apply.subscription_state(state)
+        if expected_rev and expected_rev != devices.config_rev(effective):
+            return _err("服务器仍在使用上次成功配置，请等待修复完成", 503)
         if device.get("dataplane") and (state.get("runtime") or {}).get("credentials_revision") != device_credentials.revision(state):
             return _err("独立代理授权尚未确认应用，请等待服务器任务完成后重试", 503)
         # 设备自己的模板覆盖优先于全局设置
@@ -5461,7 +5480,7 @@ def client_subscription(
         ):
             fmt = "clash"
         body, media_type = share_links.subscription_body(
-            device_credentials.subscription_state(apply.subscription_state(state), device),
+            device_credentials.subscription_state(effective, device),
             fmt,
             tpl or rules,
             router=True,
@@ -5548,6 +5567,8 @@ def client_report(payload: DeviceReportIn, request: Request):
             info["rev"] = payload.rev
         if payload.applied_rev:
             info["applied_rev"] = payload.applied_rev
+        if payload.staged_rev:
+            info["staged_rev"] = payload.staged_rev
         if payload.healthy is not None:
             info["healthy"] = payload.healthy
         changed = devices.touch(state, device, info) or changed
