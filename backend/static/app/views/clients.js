@@ -19,6 +19,8 @@ let bodySignature = "";
 let pairInfo = null;      // 刚生成的配对码 (含命令与有效期)
 let busy = false;         // 生成命令 / 切换开关期间禁用按钮
 let syncTimers = {};      // device_id -> 轮询定时器
+const syncGenerations = {};
+const pendingToggles = new Set();
 let coreTimer = null;     // "准备内核"期间的轮询定时器
 
 const KIND_LABEL = { router: "路由器", phone: "手机", desktop: "电脑" };
@@ -72,7 +74,11 @@ export function renderClients(dash) {
 /* ---------------- 路由器 */
 
 function statusPill(d) {
-  if (!d.online) return `<span class="pill other"><i class="dot other"></i>离线</span>`;
+  if (!d.running && d.installation?.status === "running") return `<span class="pill warn"><i class="dot warn"></i>正在安装</span>`;
+  if (!d.running && d.installation?.status === "failed") return `<span class="pill bad"><i class="dot err"></i>安装未完成</span>`;
+  if (d.connection_state === "waiting") return `<span class="pill other"><i class="dot other"></i>等待首次心跳</span>`;
+  if (!d.online) return `<span class="pill other" title="控制通道已失联，代理的当前运行状态待确认"><i class="dot other"></i>控制通道离线</span>`;
+  if (d.state_fresh === false) return `<span class="pill warn"><i class="dot warn"></i>等待状态回报</span>`;
   // 本机覆盖优先说。面板不可达时用户能在路由器上直接开关 (zeroproxy on|off), 那之后
   // 面板改不动它 —— 这时显示"同步中…"会让人以为再等等就好, 而其实要回路由器上
   // 执行 zeroproxy local-auto 才会交回面板。
@@ -122,7 +128,7 @@ function coveredOf(d) {
 function coverageChip(d) {
   const r = d.report || {};
   const cov = coveredOf(d);
-  if (!d.online || !d.actual || !cov) return "";
+  if (!d.online || d.state_fresh === false || !d.actual || !cov) return "";
   const why = r.why ? ` title="${escAttr(r.why)}"` : "";
   // 覆盖范围是 none 时**不挂模式标签**: "TUN · 未接管" 自相矛盾 (真机截图里就是这么显示
   // 的), 而它正是这一整套改动要消灭的那种"看起来接管了"。要说就说一句"未接管"。
@@ -304,7 +310,11 @@ function routerTab(dash, routers) {
 const diagnosticLabels = { device: "设备进程", dns: "本机 DNS", takeover: "接管计数", entry: "首个 TCP 入口", exit: "本机代理响应", target: "固定 HTTPS 目标" };
 function scheduleDiagnostics() {
   clearTimeout(diagnosticTimer);
-  if (!(S.dash?.devices?.items || []).some((d) => d.diagnostic?.state === "queued")) return;
+  const items = S.dash?.devices?.items || [];
+  const pairing = (S.dash?.devices?.pairing_sessions || []).find((p) => p.code === pairInfo?.code);
+  const paired = items.find((d) => d.id === pairing?.device_id);
+  const waitingForInstall = pairInfo && pairInfo.expires_at * 1000 > Date.now() && paired?.installation?.status !== "completed";
+  if (!waitingForInstall && !items.some((d) => d.diagnostic?.state === "queued" || d.installation?.status === "running")) return;
   diagnosticTimer = setTimeout(async () => {
     if (diagnosticPolling) return scheduleDiagnostics();
     diagnosticPolling = true;
@@ -326,6 +336,19 @@ function diagnosticCard(d) {
     ${result.state === "completed" ? `<dl class="device-facts">${Object.entries(diagnosticLabels).map(([key, label]) => `<div><dt>${esc(label)}</dt><dd>${esc(statusLabel[result.stages?.[key]] || "未验证")}</dd></div>`).join("")}</dl><p>数据包 ${result.packets ?? "未知"} · DNS 包 ${result.dns_packets ?? "未知"} · HTTP ${result.http_status ?? "未知"}</p>` : ""}
     <p>入口只测 TCP 连通；计数是累计观测。本机代理探针不代表 LAN 终端已接管，性能模式的 HTTPS 探针仍需设备现场验证。</p></div>`;
 }
+function installationCard(d) {
+  const job = d.installation;
+  if (!job) return "";
+  const label = { running: "安装进行中", failed: "安装未完成", interrupted: "安装进度已中断", completed: "安装流程已完成" };
+  const elapsed = Math.max(0, Math.floor(Date.now() / 1000 - job.started_at));
+  const duration = elapsed < 60 ? `${elapsed} 秒` : `${Math.floor(elapsed / 60)} 分钟`;
+  return `<div class="note" data-installation="${escAttr(d.id)}" role="status" aria-live="polite"><b>${label[job.status] || "安装状态待更新"}</b> · ${esc(job.label || job.stage)}
+    ${job.status === "running" ? `<p>已用时 ${duration}。进度自动更新，可以保留此页面查看。</p>` : ""}
+    ${job.status === "failed" || job.status === "interrupted" ? `<p>${esc(job.error || "尚未收到新的安装进度，请检查路由器终端与连接。")}</p><p>在同一路由器重新执行安装命令可继续；恢复窗口过期后，可使用更新命令或重新生成安装命令。</p>` : ""}
+    ${job.status === "completed" ? "<p>请从局域网设备打开目标网站，确认实际出网；接管范围以设备回报为准。</p>" : ""}
+  </div>`;
+}
+
 function deviceCard(d) {
   const tpl = TPL_LABEL[d.template ?? ""] || d.template || "跟随面板";
   const meta = [d.os, d.arch, d.ip].filter(Boolean).join(" · ");
@@ -336,20 +359,23 @@ function deviceCard(d) {
         <b class="dev-name">${esc(d.name || "路由器")}</b>
         ${statusPill(d)}
       </div>
-      <div class="dev-sub">${esc(meta || "已接入")}${d.online ? ` · ${ago(d.last_seen)}同步` : ` · 最后在线 ${ago(d.last_seen)}`}</div>
+      <div class="dev-sub">${esc(meta || "已接入")}${d.connection_state === "waiting" ? " · 等待设备首次回报" : d.online ? ` · ${ago(d.control_seen || d.last_seen)}同步` : ` · 最后心跳 ${ago(d.control_seen || d.last_seen)}`}</div>
       <details class="client-help mt-2" id="device-details-${escAttr(d.id)}"><summary>状态与同步详情</summary>
         <dl class="device-facts">
+          <div><dt>控制通道</dt><dd>${d.online ? "心跳在线" : d.connection_state === "waiting" ? "等待首次心跳" : "已失联，当前代理状态待确认"}${d.control_seen ? ` · ${ago(d.control_seen)}` : ""}</dd></div>
+          <div><dt>状态可信度</dt><dd>${d.state_fresh === false ? "回报已过期，等待设备重新确认" : "以设备最近回报为准"}</dd></div>
           <div><dt>控制权</dt><dd>${d.control === "local" || ["on", "off"].includes(String(d.report?.override)) ? "本机覆盖 · 在路由器执行 zeroproxy local-auto 交还面板" : "面板管理"}</dd></div>
-          <div><dt>期望 / 回报</dt><dd>${d.desired ? "开启" : "关闭"} / ${!d.online ? "离线，等待回报" : d.actual ? "运行" : "停止"}</dd></div>
+          <div><dt>期望 / 回报</dt><dd>${d.desired ? "开启" : "关闭"} / ${!d.online || d.state_fresh === false ? "等待设备回报" : d.actual ? "运行" : "停止"}</dd></div>
           <div><dt>下载 / 应用版本</dt><dd>${esc(d.downloaded_rev || "未知")} / ${esc(d.applied_rev || "未知")}</dd></div>
           <div><dt>已暂存版本</dt><dd>${esc(d.staged_rev || "未知")}</dd></div>
           <div><dt>设备说明</dt><dd>${esc(d.report?.why || "暂无错误回报；接管状态不等于实际出网验证")}</dd></div>
         </dl>
       </details>
+      ${installationCard(d)}
       ${diagnosticCard(d)}
       <div class="dev-tags">
         <span class="tag-chip">分流 · ${esc(tpl)}</span>
-        <span class="tag-chip">${!d.online ? "运行状态待更新" : d.actual ? "内核运行中" : "内核已停止"}</span>
+        <span class="tag-chip">${!d.online || d.state_fresh === false ? "运行状态待更新" : d.actual ? "内核运行中" : "内核已停止"}</span>
         ${coverageChip(d)}
         ${versionChip(d)}
         <span class="tag-chip">${d.credentials_independent ? "独立数据面凭据" : "共享节点凭据"}</span>
@@ -364,7 +390,7 @@ function deviceCard(d) {
     </div>
     <div class="dev-switch">
       <label class="bigswitch" title="${d.desired ? "点击关闭全屋代理" : "点击开启全屋代理"}">
-        <input type="checkbox" aria-label="${escAttr(d.name || "路由器")} 全屋代理" data-dev-toggle="${escAttr(d.id)}" ${d.desired ? "checked" : ""}>
+        <input type="checkbox" aria-label="${escAttr(d.name || "路由器")} 全屋代理" data-dev-toggle="${escAttr(d.id)}" ${pendingToggles.has(d.id) ? "disabled" : ""} ${d.desired ? "checked" : ""}>
         <span class="track"><span class="knob"></span></span>
       </label>
       <div class="dev-switch-label">全屋代理</div>
@@ -436,11 +462,10 @@ function pairCard(dash) {
     ${coreRow(dash)}
     ${agentRow(dash)}
     <div class="muted fs-xs mt-2">
-      这一行<b>自带 5 次重试</b> (这条链路约四成连接会被丢, 只试一次等于白跑), 失败时下载
-      工具自己会把原因打在终端上 (连不上 / 证书 / 域名解析), 不会再是"什么都没发生"。
-      安装过程约 1 分钟 (含 20 MB 内核 + 4 MB 分流数据下载); 结束后终端会告诉你是 TUN
-      还是 tproxy 模式, 以及分流是否已就绪; 数据面的覆盖范围 (全屋 / 仅局域网 TCP) 会
-      跟着设备回报显示在卡片上。刷新本页即可看到设备卡片。
+      设备接入成功后，本页会自动显示安装阶段，无需手动刷新。路由器会先检查已有能力，
+      只安装缺失模块；内核与分流数据由面板缓存分发。基础代理完成自检后，再完善管理界面和性能模式。<br>
+      如果中断，在同一路由器重新执行原命令可继续；配对回执丢失可在 15 分钟恢复窗口内重试，
+      不会因此重复创建设备。下载工具的重试与具体失败原因仍会显示在终端。
     </div>
   </div>`;
 }
@@ -632,8 +657,9 @@ async function prepareCore(arch) {
   }, 3000);
 }
 
-async function refreshDevices() {
+async function refreshDevices(isCurrent = () => true) {
   const data = await api("/api/devices");
+  if (!isCurrent()) return null;
   S.dash.devices = data.devices;
   S.dash.client = data.client;
   renderClients(S.dash);
@@ -641,42 +667,62 @@ async function refreshDevices() {
 }
 
 async function toggleDevice(id, on) {
+  if (pendingToggles.has(id)) return;
+  pendingToggles.add(id);
+  const generation = (syncGenerations[id] || 0) + 1;
+  syncGenerations[id] = generation;
+  const isCurrent = () => syncGenerations[id] === generation;
+  clearTimeout(syncTimers[id]);
+  document.querySelectorAll("[data-dev-toggle]").forEach((el) => {
+    if (el.dataset.devToggle === id) el.disabled = true;
+  });
+  let saveConfirmed = false;
   try {
     await api(`/api/devices/${encodeURIComponent(id)}/proxy`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ on }),
     });
+    saveConfirmed = true;
   } catch (e) {
-    toast(e.message || "操作失败");
-    renderClients(S.dash);
-    return;
-  }
-  // 立刻把本地状态改成"同步中", 再短轮询等设备回报 —— 不做假绿: 变绿的条件是
-  // 设备真的回报了 actual == desired。
-  const item = (S.dash.devices.items || []).find((d) => d.id === id);
-  if (item) { item.desired = on; item.syncing = item.online; }
-  renderClients(S.dash);
-
-  clearInterval(syncTimers[id]);
-  let tries = 0;
-  syncTimers[id] = setInterval(async () => {
-    tries += 1;
-    let devices;
-    try {
-      devices = await refreshDevices();
-    } catch (e) {
+    if (!e.unknown && !e.dropped) {
+      pendingToggles.delete(id);
+      toast(e.message || "操作失败");
+      renderClients(S.dash);
       return;
     }
-    const now = (devices.items || []).find((d) => d.id === id);
-    if (!now || !now.online || now.actual === now.desired || tries >= 12) {
-      clearInterval(syncTimers[id]);
+    toast("连接中断，正在确认开关是否保存");
+  }
+  pendingToggles.delete(id);
+  const item = (S.dash.devices.items || []).find((d) => d.id === id);
+  if (item && saveConfirmed) { item.desired = on; item.syncing = item.online && item.control !== "local"; }
+  renderClients(S.dash);
+
+  // Schedule the next read after completion. Slow requests cannot overlap, and
+  // an earlier toggle's response cannot finish a newer toggle's synchronization.
+  const deadline = Date.now() + 90000;
+  const poll = async () => {
+    if (!isCurrent()) return;
+    let devices;
+    try { devices = await refreshDevices(isCurrent); } catch (e) { /* retry within deadline */ }
+    if (!isCurrent()) return;
+    const now = devices?.items?.find((d) => d.id === id);
+    if (now?.desired === on) saveConfirmed = true;
+    if (devices && (!now || (saveConfirmed && (!now.online || now.control === "local" ||
+        (now.state_fresh !== false && now.desired === on && now.actual === on))))) {
       delete syncTimers[id];
-      if (now && now.online && now.actual !== now.desired) {
-        toast("路由器还没按要求切换 —— 可在设备端执行 zeroproxy log 查看原因");
-      }
+      if (now?.control === "local") toast("路由器正在使用本机覆盖；执行 zeroproxy local-auto 后可恢复面板管理");
+      else if (now && !now.online) toast("开关已保存，等待路由器恢复心跳后确认");
+      return;
     }
-  }, 3000);
+    if (Date.now() >= deadline) {
+      delete syncTimers[id];
+      toast(saveConfirmed ? "开关已保存，尚未收到生效回报；请检查路由器连接和日志" : "尚未确认开关是否保存；请刷新设备状态后重试");
+      return;
+    }
+    syncTimers[id] = setTimeout(poll, 3000);
+  };
+  syncTimers[id] = setTimeout(poll, 3000);
 }
 
 function renameDevice(id) {

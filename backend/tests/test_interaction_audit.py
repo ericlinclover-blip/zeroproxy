@@ -65,6 +65,8 @@ def test_domain_does_not_claim_successful_rollback_on_rollback_failure(client, c
 def test_device_connection_requires_fresh_coverage(online, covered, actual, expected):
     view = devices.device_view({'desired': True, 'actual': actual,
                                'last_seen': 1000 if online else 1,
+                               'control_seen': 1000 if online else 1,
+                               'actual_at': 1000, 'report_at': 1000,
                                'report': {'covered': covered}}, now=1010)
     assert view['connected'] is expected
     assert view['taking_over'] is expected

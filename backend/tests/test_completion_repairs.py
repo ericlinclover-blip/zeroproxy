@@ -195,7 +195,14 @@ def test_applying_change_external_drift_is_never_overwritten(client, configured,
 
 def test_agent_executes_each_request_once_and_reports_result_next_heartbeat(tmp_path):
     source = (Path(__file__).resolve().parents[1] / 'zeroproxy/client/runtime/agent.sh').read_text()
-    segment = source[source.index('        _dg_file="$ZP_DIR/diagnostic-'):source.index('        _d="$(json_get_bool "$RESP" desired)"')]
+    import re
+    functions = '\n'.join(re.search(rf'^{name}\(\) \{{.*?^\}}', source, re.M | re.S).group(0)
+                          for name in ('diagnostic_payload', 'accept_diagnostic'))
+    segment = '''
+BODY="$BODY$(diagnostic_payload "$_b")"',"report":'"$(report_fields_json)"'}'
+RESP="$(http_post "$_b/c/report" "$BODY" "$_k")"
+accept_diagnostic "$_b" "$RESP"
+'''
     bin_dir=tmp_path/'bin';bin_dir.mkdir()
     command=bin_dir/'zeroproxy';command.write_text('#!/bin/sh\necho run >> "$ZP_DIR/invocations"\nprintf \'{"device":"passed"}\'\n');command.chmod(0o700)
     helper='''
@@ -207,7 +214,7 @@ _b=https://panel.invalid;_k=secret
 for REQUEST in aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 'invalid;command'; do
 BODY='{"device":"test"'
 '''
-    script='export ZP_DIR="'+str(tmp_path)+'"\n'+helper+segment+'\ndone\n'
+    script='export ZP_DIR="'+str(tmp_path)+'"\n'+functions+'\n'+helper+segment+'\ndone\n'
     result=subprocess.run(['sh','-c',script],env={**os.environ,'PATH':str(bin_dir)+':/usr/bin:/bin'},text=True,capture_output=True,timeout=5)
     assert result.returncode == 0, result.stderr
     assert (tmp_path/'invocations').read_text().splitlines() == ['run','run']

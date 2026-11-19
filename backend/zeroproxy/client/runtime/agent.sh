@@ -39,7 +39,7 @@ ZP_STATE="$ZP_DIR/.state"
 log() { logger -t zeroproxy-agent "$*"; }
 
 # 拼 JSON 字符串 (原因里可能有引号/反斜杠 —— 内核原话什么都可能有)
-json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\r\n'; }
+json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'; }
 
 # 内核现在**真的**接管到哪 (覆盖范围)。判据是 live.sh 的 zp_live_covered —— 与 CLI 的
 # status / doctor、本地界面 (zpcore) 是同一份, 不再各写一遍 (真机上已经漂过)。
@@ -763,6 +763,91 @@ caps_flag() {
     esac
 }
 
+installation_payload() {
+    _ir_key="$(key_of "$1")"
+    _ir_id="$(cat "$ZP_DIR/install-current-$_ir_key" 2>/dev/null)"
+    case "$_ir_id" in ''|*[!0-9a-f]*) return 0 ;; esac
+    [ "${#_ir_id}" = 32 ] || return 0
+    _ir_json="$(cat "$ZP_DIR/install-report-$_ir_key-$_ir_id.json" 2>/dev/null)" || return 0
+    _ir_stage="$(json_get "$_ir_json" stage)"
+    _ir_status="$(json_get "$_ir_json" status)"
+    _ir_seq="$(printf '%s' "$_ir_json" | sed -n 's/.*"seq"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)"
+    case "$_ir_stage" in paired|dependencies|core|runtime|controller|verify|ui|optional|ready) ;; *) return 0 ;; esac
+    case "$_ir_status" in failed|completed) ;; *) return 0 ;; esac
+    case "$_ir_seq" in ''|0*|*[!0-9]*) return 0 ;; esac
+    [ "${#_ir_seq}" -le 5 ] && [ "$_ir_seq" -ge 1 ] && [ "$_ir_seq" -le 10000 ] || return 0
+    _ir_error="$(json_escape "$(json_get "$_ir_json" error)")"
+    printf ',"installation":{"id":"%s","seq":%s,"stage":"%s","status":"%s","error":"%s"}'         "$_ir_id" "$_ir_seq" "$_ir_stage" "$_ir_status" "$_ir_error"
+}
+
+installation_ack() {
+    _ir_ack="$(json_get "$2" installation_ack)"
+    case "$_ir_ack" in ''|*[!0-9a-f]*) return 0 ;; esac
+    [ "${#_ir_ack}" = 32 ] || return 0
+    # The filename includes the attempt id: a delayed ack cannot remove a newer
+    # installer's receipt. Missing acknowledgements leave the receipt durable.
+    rm -f "$ZP_DIR/install-report-$(key_of "$1")-$_ir_ack.json"
+}
+
+diagnostic_payload() {
+    _dg_file="$ZP_DIR/diagnostic-$(key_of "$1").json"
+    if [ -s "$_dg_file" ]; then printf ',"diagnostic":%s' "$(cat "$_dg_file")"; fi
+}
+
+accept_diagnostic() {
+    _dg_file="$ZP_DIR/diagnostic-$(key_of "$1").json"
+    _dg_id="$(json_get "$2" diagnostic_request)"
+    case "$_dg_id" in ''|*[!0-9a-f]*) _dg_id='' ;; esac
+    if [ "${#_dg_id}" = 32 ] && [ "$_dg_id" != "$(json_get "$(cat "$_dg_file" 2>/dev/null)" id)" ]; then
+        # Only the fixed local diagnostic command is supported, never a remote command/URL.
+        _dg_evidence="$(zeroproxy doctor-json 2>/dev/null)" || _dg_evidence='{}'
+        [ -n "$_dg_evidence" ] || _dg_evidence='{}'
+        (umask 077; printf '{"id":"%s","evidence":%s}\n' "$_dg_id" "$_dg_evidence" > "$_dg_file.tmp" && mv "$_dg_file.tmp" "$_dg_file")
+    fi
+}
+
+# One private tmpfs spool per agent. Native transport owns all network deadlines;
+# reconciliation below only consumes validated replies, never partial stdout.
+exchange_panels() {
+    if [ -x "$ZP_DIR/zpcore" ] && "$ZP_DIR/zpcore" exchange --servers "$SERVERS" --spool "$EXCHANGE_DIR" --legacy-tls; then
+        if ls "$EXCHANGE_DIR"/*.tls >/dev/null 2>&1; then
+            zp_tls_warn "" "zpcore 证书校验失败"
+        fi
+        return 0
+    fi
+    # Compatibility for routers that have not received the new native binary yet.
+    # Subshells isolate http_post's globals and keep panels independent.
+    for _ex_file in $(server_files); do
+        (
+            _ex_name="$(basename "$_ex_file")"
+            _ex_base="$(field_of "$_ex_file" base)"
+            _ex_secret="$(field_of "$_ex_file" secret)"
+            _ex_reply="$(http_post "$_ex_base/c/report" "$(cat "$EXCHANGE_DIR/$_ex_name.request")" "$_ex_secret")" || exit 0
+            _ex_desired="$(json_get_bool "$_ex_reply" desired)"
+            _ex_rev="$(json_get "$_ex_reply" rev)"
+            case "$_ex_desired" in true|false) ;; *) exit 0 ;; esac
+            case "$_ex_rev" in ''|*[!0-9a-f]*) exit 0 ;; esac
+            [ "${#_ex_rev}" = 16 ] || exit 0
+            printf '%s' "$_ex_reply" > "$EXCHANGE_DIR/$_ex_name.response"
+        ) &
+    done
+    wait
+}
+
+# Preserve each panel's last explicit intent across partial outages and restarts.
+# In particular, an unavailable panel's OFF must never silently turn into ON.
+remember_control() {
+    case "$2" in true|false) ;; *) return 1 ;; esac
+    _ctl_path="$ZP_DIR/revisions/$(key_of "$1").control"
+    [ "$(cat "$_ctl_path" 2>/dev/null)" != "$2" ] || return 0
+    mkdir -p "$ZP_DIR/revisions" || return 1
+    (umask 077; printf '%s\n' "$2" > "$_ctl_path.tmp" && mv "$_ctl_path.tmp" "$_ctl_path")
+}
+
+retry_delay() {
+    case "$1" in 0|1) printf '5' ;; 2) printf '10' ;; 3) printf '20' ;; *) printf '30' ;; esac
+}
+
 # ---------------------------------------------------------------- 主循环: 心跳 + 配置拉取 + 状态切换
 #
 # 修复3: 心跳间隔自适应
@@ -863,8 +948,10 @@ while true; do
 
     # ---------------------------------------------------------------- 心跳上报 (多服务器)
     # 修复4: 多服务器心跳容错 —— 至少一台成功才算面板可达
-    FAILS=0
     RESP_OK=0
+    EXCHANGE_DIR="$(umask 077; mktemp -d /tmp/.zp-exchange.XXXXXX)" || exit 1
+    trap 'rm -rf "$EXCHANGE_DIR"; exit 0' INT TERM
+    trap 'rm -rf "$EXCHANGE_DIR"' EXIT
     for _f in $(server_files); do
         _b="$(field_of "$_f" base)"
         _i="$(field_of "$_f" id)"
@@ -880,26 +967,24 @@ while true; do
         [ -z "$_own_applied" ] || BODY="$BODY"',"applied_rev":"'"$_own_applied"'"'
         # A process alone is not evidence that a newly downloaded config is running.
         BODY="$BODY"',"healthy":false'
-        _dg_file="$ZP_DIR/diagnostic-$(key_of "$_b").json"
-        if [ -s "$_dg_file" ]; then BODY="$BODY"',"diagnostic":'"$(cat "$_dg_file")"; fi
+        BODY="$BODY$(diagnostic_payload "$_b")$(installation_payload "$_b")"
         BODY="$BODY"',"report":'"$(report_fields_json)"'}'
-        RESP="$(http_post "$_b/c/report" "$BODY" "$_k" || true)"
+        (umask 077; printf '%s' "$BODY" > "$EXCHANGE_DIR/$(basename "$_f").request")
+    done
+    exchange_panels
+    for _f in $(server_files); do
+        _b="$(field_of "$_f" base)"
+        RESP="$(cat "$EXCHANGE_DIR/$(basename "$_f").response" 2>/dev/null)"
         if [ -z "$RESP" ]; then
-            FAILS=$((FAILS + 1))
+            [ "$(cat "$ZP_DIR/revisions/$(key_of "$_b").control" 2>/dev/null)" != "false" ] || DESIRED_ALL=false
             continue
         fi
         # 修复4: 只要有一台成功应答, 就标记面板可达
         RESP_OK=1
-        _dg_id="$(json_get "$RESP" diagnostic_request)"
-        case "$_dg_id" in ''|*[!0-9a-f]*) _dg_id='' ;; esac
-        if [ "${#_dg_id}" = 32 ] && [ "$_dg_id" != "$(json_get "$(cat "$_dg_file" 2>/dev/null)" id)" ]; then
-            # Only the fixed local diagnostic command is supported, never a remote command/URL.
-            _dg_evidence="$(zeroproxy doctor-json 2>/dev/null)" || _dg_evidence='{}'
-            [ -n "$_dg_evidence" ] || _dg_evidence='{}'
-            (umask 077; printf '{"id":"%s","evidence":%s}\n' "$_dg_id" "$_dg_evidence" > "$_dg_file.tmp" && mv "$_dg_file.tmp" "$_dg_file")
-        fi
+        accept_diagnostic "$_b" "$RESP"
+        installation_ack "$_b" "$RESP"
         _d="$(json_get_bool "$RESP" desired)"
-        [ -n "$_d" ] || _d=true
+        remember_control "$_b" "$_d" || true
         [ "$_d" = "false" ] && DESIRED_ALL="false"
         _own_desired="$(json_get "$RESP" rev)"
         revision_write "$_b" desired "$_own_desired" || true
@@ -913,10 +998,13 @@ while true; do
         fi
     done
 
+    rm -rf "$EXCHANGE_DIR"
+    trap - EXIT INT TERM
     REV="$(revision_vector desired)"
 
     # ---------------------------------------------------------------- 处理面板不可达
     if [ "$RESP_OK" = "0" ]; then
+        FAILS=$((FAILS + 1))
         # 一台都没应答: 保持现状而不是把代理关掉 —— 断网时"维持可用"比"忠于面板"重要
         # (本机覆盖是唯一的例外: 那是用户**明确**表达的意图, 必须执行 —— 它存在的理由
         #  正是"面板挂了也要能开关"。)
@@ -943,7 +1031,7 @@ while true; do
         HEARTBEAT_STATE="unstable"
         STABLE_COUNT=0
         [ -n "${RUN_ONCE:-}" ] && exit 0
-        sleep "$SLEEP_UNSTABLE"
+        sleep "$(retry_delay "$FAILS")"
         SWITCH_PENDING=""
         continue
     fi

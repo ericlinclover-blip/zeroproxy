@@ -811,3 +811,109 @@ def test_luci_upgrade_refreshes_offline_wrapper_without_losing_previous_file(tmp
     assert (cached / "status.js").read_text(encoding="utf-8") == expected
     assert (cached / "menu.json").read_text(encoding="utf-8") == '{"custom":"preserve"}\n'
     assert not list(cached.glob("*.new.*"))
+
+
+def _control_loop_script(tmp_path):
+    """Run the shipped loop with network/data-plane adapters replaced by fixtures."""
+    source = _read(AGENT)
+    servers = tmp_path / 'servers'
+    servers.mkdir()
+    for name in ('one', 'two'):
+        (servers / f'{name}.json').write_text(json.dumps({'base': f'https://{name}', 'id': name, 'secret': 'secret'}))
+    functions = '\n'.join(_function(source, n) for n in (
+        'field_of', 'key_of', 'server_files', 'count_servers', 'remember_control',
+        'json_get', 'json_get_bool', 'retry_delay', 'diagnostic_payload', 'accept_diagnostic', 'installation_payload', 'installation_ack',
+    ))
+    prelude = f'''
+ZP_DIR={str(tmp_path)!r}
+SERVERS="$ZP_DIR/servers"
+ZP_VERSION=test
+LAST_REV=same
+LAST_PULL=$(date +%s)
+FAILS=0
+STABLE_COUNT=0
+STABLE_THRESHOLD=3
+SLEEP_STABLE=30
+SLEEP_UNSTABLE=5
+ROUND=0
+SWITCH_PENDING=''
+{functions}
+migrate_servers() {{ ROUND=$((ROUND + 1)); }}
+refresh_state() {{ :; }}
+ui_url() {{ :; }}
+zp_live_mode() {{ printf 'tun'; }}
+actual_covered() {{ printf 'full'; }}
+core_up() {{ return 1; }}
+proxy_up() {{ return 1; }}
+perf_intending() {{ return 1; }}
+report_fields_json() {{ printf '{{}}'; }}
+revision_read() {{ :; }}
+revision_write() {{ :; }}
+revision_vector() {{ printf 'same'; }}
+log() {{ printf '%s\\n' "$*"; }}
+switch_core() {{ printf 'SWITCH=%s\\n' "$1"; }}
+wait_runtime() {{ return 0; }}
+revision_commit() {{ :; }}
+apply_config() {{ return 0; }}
+'''
+    return prelude, source[source.index('while true; do'):]
+
+
+def test_agent_outage_backoff_counts_failed_rounds(tmp_path):
+    prelude, loop = _control_loop_script(tmp_path)
+    adapters = '''
+exchange_panels() { :; }
+sleep() { printf 'DELAY=%s\\n' "$1"; [ "$ROUND" -lt 4 ] || exit 0; }
+'''
+    result = subprocess.run(['sh', '-c', prelude + adapters + loop], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert re.findall(r'DELAY=(\d+)', result.stdout) == ['5', '10', '20', '30']
+    assert result.stdout.count('第 1 次') == 1
+    assert 'SWITCH=' not in result.stdout
+
+
+def test_agent_partial_outage_preserves_other_panels_off_intent(tmp_path):
+    prelude, loop = _control_loop_script(tmp_path)
+    adapters = '''
+remember_control https://two false
+exchange_panels() {
+    printf '%s' '{"desired":true,"rev":"0123456789abcdef"}' > "$EXCHANGE_DIR/one.json.response"
+}
+sleep() { exit 0; }
+'''
+    result = subprocess.run(['sh', '-c', prelude + adapters + loop], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert 'SWITCH=on' not in result.stdout
+
+
+def test_agent_resumes_after_offline_panel_explicitly_releases_off(tmp_path):
+    prelude, loop = _control_loop_script(tmp_path)
+    adapters = '''
+remember_control https://two false
+exchange_panels() {
+    printf '%s' '{"desired":true,"rev":"0123456789abcdef"}' > "$EXCHANGE_DIR/one.json.response"
+    if [ "$ROUND" -ge 2 ]; then
+        printf '%s' '{"desired":true,"rev":"0123456789abcdef"}' > "$EXCHANGE_DIR/two.json.response"
+    fi
+}
+sleep() { [ "$ROUND" -lt 2 ] || exit 0; }
+'''
+    result = subprocess.run(['sh', '-c', prelude + adapters + loop], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.count('SWITCH=on') == 1
+    assert (tmp_path / 'revisions' / 'two.control').read_text().strip() == 'true'
+
+
+def test_agent_recovery_resets_outage_backoff(tmp_path):
+    prelude, loop = _control_loop_script(tmp_path)
+    adapters = '''
+exchange_panels() {
+    if [ "$ROUND" -eq 3 ]; then
+        printf '%s' '{"desired":false,"rev":"0123456789abcdef"}' > "$EXCHANGE_DIR/one.json.response"
+    fi
+}
+sleep() { printf 'DELAY=%s\\n' "$1"; [ "$ROUND" -lt 5 ] || exit 0; }
+'''
+    result = subprocess.run(['sh', '-c', prelude + adapters + loop], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert re.findall(r'DELAY=(\d+)', result.stdout) == ['5', '10', '5', '5', '10']

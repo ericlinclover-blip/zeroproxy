@@ -179,7 +179,9 @@ from .config import paths
 #: 1.4.56: 修复节点/测速原始响应兼容、主代理组选择及节点名 URL 路径编码。
 #: 1.4.57: 区分已失败与未测速节点；配套面板启用现代 REALITY 混合握手。
 #: 1.4.58: 区分 TLS 握手与证书验证错误，隔离性能日志函数，明确系统日志快照语义。
-SCRIPT_VERSION = "1.4.60"
+#: 1.4.61: 并发有界心跳、逐面板控制意图缓存、断线退避与独立状态时效。
+#: 1.4.62: 安装接入可恢复配对、阶段遥测、能力优先、合并分发与并行分流资源。
+SCRIPT_VERSION = "1.4.62"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"
@@ -2163,7 +2165,7 @@ def _runtime_mode(name: str) -> int:
     return 0o755 if (name.endswith(".sh") or name.endswith(".init") or name == "cli") else 0o644
 
 
-def runtime_bundle() -> bytes | None:
+def runtime_bundle(*, include_ui: bool = False) -> bytes | None:
     """整套运行时装机件打成一个 tar.gz —— 装机时**一次取回**, 而不是十几次。
 
     为什么要有它: 这些文件有十几个, 而用户到面板的线路会丢包 (真机实测: 同一条命令里
@@ -2185,6 +2187,17 @@ def runtime_bundle() -> bytes | None:
             info.mode = _runtime_mode(name)
             info.mtime = 0
             tar.addfile(info, io.BytesIO(raw))
+        if include_ui:
+            for name in UI_FILES:
+                got = ui_file(name)
+                if got is None:
+                    return None
+                raw = got[0].encode("utf-8")
+                info = tarfile.TarInfo("ui/" + name)
+                info.size = len(raw)
+                info.mode = 0o644
+                info.mtime = 0
+                tar.addfile(info, io.BytesIO(raw))
     return buf.getvalue()
 
 
@@ -2262,7 +2275,8 @@ def summary() -> dict:
 #:        (多账号固件上, 被 ACL 限制的账号以前能借用 root 的 cgi 执行 update/perf);
 #:        两个入口 (cgi / zpcore) 都补 X-Frame-Options / CSP frame-ancestors / nosniff;
 #:        cgi status 补 packets 字段; zpcore 认 PATH_INFO 里的动作名 (与 cgi 对齐)。
-AGENT_VERSION = os.environ.get("ZP_AGENT_VERSION", "1.3.2")
+#: 1.4.0: exchange 原生心跳传输，整轮 12 秒预算，严格回执校验与逐面板隔离。
+AGENT_VERSION = os.environ.get("ZP_AGENT_VERSION", "1.4.0")
 
 #: 小于这个大小的一律不当二进制 (一份正常的 zpcore.gz 约 2.5 MB)。演练里可以用
 #: ZP_AGENT_MIN_BYTES 调低。

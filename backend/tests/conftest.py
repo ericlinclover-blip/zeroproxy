@@ -76,6 +76,8 @@ def _clean_router_core_state():
     from zeroproxy import router_client, services
 
     router_client.CORE_STATE.clear()
+    with router_client.GEO_LOCK_ASYNC:
+        router_client.GEO_STATE.clear()
     # 版本采样有 5 秒 TTL 缓存: 跨用例残留会让"换了假二进制"的用例读到上一轮的版本
     services._VERSION_CACHE.clear()
     yield

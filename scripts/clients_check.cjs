@@ -191,6 +191,15 @@ async function main() {
     check("配对码换到设备凭据", Boolean(device.id && device.secret), device.name);
     check("设备默认期望开启 (装完即用)", device.desired === true);
 
+    await api("/c/install/report", {method: "POST", body: JSON.stringify({
+      device: device.id, k: device.secret, id: "c".repeat(32), seq: 1, stage: "core", status: "running",
+    })});
+    await page.waitForSelector("[data-installation]", {timeout: 12000});
+    check("安装阶段自动出现在设备卡，无需刷新", /准备代理内核/.test(await page.locator("[data-installation]").innerText()));
+    check("安装进度不冒充代理已连接", await page.locator(".dev-card.on").count() === 0 && /正在安装/.test(await page.locator(".dev-card .pill").innerText()));
+    await api("/c/install/report", {method: "POST", body: JSON.stringify({
+      device: device.id, k: device.secret, id: "c".repeat(32), seq: 2, stage: "ready", status: "completed",
+    })});
     await api("/c/report", {
       method: "POST",
       body: JSON.stringify({
@@ -202,7 +211,7 @@ async function main() {
       }),
     });
     await page.click("#btn-apply");           // 触发一次面板刷新 (等同 20s 轮询)
-    await page.waitForSelector(".dev-card", { timeout: 20000 });
+    await page.waitForSelector(".dev-card.on", { timeout: 20000 });
 
     const name = await page.locator(".dev-card .dev-name").innerText();
     check("设备卡片出现且带型号名", /GL-MT3000/.test(name), name.trim());
@@ -254,7 +263,7 @@ async function main() {
       body: JSON.stringify({ device: device.id, k: device.secret, actual: false }),
     });
     await page.click("#btn-apply");
-    await page.waitForTimeout(1200);
+    await page.waitForFunction(() => /已关闭/.test(document.querySelector(".dev-card .pill")?.textContent || ""), {timeout: 12000});
     check("设备回报后落到「已关闭」",
       /已关闭/.test(await page.locator(".dev-card .pill").innerText()),
       (await page.locator(".dev-card .pill").innerText()).trim());
@@ -283,6 +292,29 @@ async function main() {
       (revUi.pending.match(/已下载未应用[^,。]*/) || [""])[0].slice(0, 48));
     check("设备回报应用成功后才显示「配置已应用」",
       /配置已应用/.test(revUi.applied) && !/已下载未应用/.test(revUi.applied), "");
+
+    console.log("\n[3c] 控制通道和状态时效");
+    const freshnessUi = await page.evaluate(() => {
+      const item = dash.devices.items[0];
+      const original = structuredClone(item);
+      const states = {};
+      for (const [name, patch] of Object.entries({
+        waiting: { online: false, connected: false, connection_state: "waiting", state_fresh: false },
+        offline: { online: false, connected: false, connection_state: "offline", state_fresh: false },
+        stale: { online: true, actual: true, desired: true, connected: false, connection_state: "stale", state_fresh: false },
+      })) {
+        Object.assign(item, patch);
+        renderDash(true);
+        states[name] = { pill: document.querySelector(".dev-card .pill").textContent,
+          green: Boolean(document.querySelector(".dev-card.on")), text: document.querySelector(".dev-card").textContent };
+      }
+      Object.assign(item, original);
+      renderDash(true);
+      return states;
+    });
+    check("配对后明确等待首次心跳", /等待首次心跳/.test(freshnessUi.waiting.pill));
+    check("控制失联不宣称代理已停止", /控制通道离线/.test(freshnessUi.offline.pill) && /当前代理状态待确认/.test(freshnessUi.offline.text));
+    check("心跳在线但状态过期时不显示绿色连接", /等待状态回报/.test(freshnessUi.stale.pill) && !freshnessUi.stale.green && !/TUN · 全屋/.test(freshnessUi.stale.text));
 
     console.log("\n[4] 手机 / 电脑 tab");
     await page.click('[data-client-tab="phone"]');

@@ -15,8 +15,8 @@
 // + `?a=status|add|drop|toggle|refresh|log` + `?file=app.js`), 所以那个页面一个字节都没改。
 //
 // 它**不做**的事 (刻意的): 不解析 YAML、不重建配置、不动数据面。那些是 agent.sh 与
-// 安装脚本的活, 已经过了七次真机验证。zpcore 只是一层薄薄的前端: 读状态、转手动动作
-// 给 CLI 执行。薄, 所以可审。
+// 安装脚本的活, 已经过了七次真机验证。zpcore 负责读状态、转手动动作给 CLI，以及 exchange 有界并发心跳传输。
+// 配置协调仍由 agent.sh 执行，传输失败不直接改变数据面。
 package main
 
 import (
@@ -38,6 +38,7 @@ const usage = `zpcore —— ZeroProxy 路由器本地控制面
 用法:
   zpcore serve [选项]      起本地管理界面 (只绑局域网地址)
   zpcore state [--json]    打印这台机器现在的状态 (现场 + 能力): shell 与面板读它
+  zpcore exchange --spool <路径>  并发交换各面板心跳 (12 秒总预算)
   zpcore version           打印版本
 
 通用选项 (serve / state / config 都认):
@@ -68,6 +69,11 @@ func main() {
 		if err := serve(cfg); err != nil {
 			fmt.Fprintln(os.Stderr, "zpcore: 启动失败:", err)
 			os.Exit(1)
+		}
+	case "exchange":
+		if err := exchangeCommand(args); err != nil {
+			fmt.Fprintln(os.Stderr, "zpcore: exchange:", err)
+			os.Exit(2)
 		}
 	case "state":
 		common, asJSON, err := parseState(args)

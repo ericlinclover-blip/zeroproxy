@@ -22,6 +22,7 @@
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import ipaddress
@@ -30,11 +31,12 @@ import re
 import secrets
 import time
 from urllib.parse import urlsplit
-from . import device_diagnostics
+from . import device_diagnostics, device_installation
 
 #: 配对码有效期 (30 分钟)。安装命令会出现在终端回滚、聊天记录、截图里, 所以它必须是
 #: 一次性的; 有效期只是给"复制命令 → 去路由器粘贴"这段操作留出余量。
 PAIR_TTL = 30 * 60
+PAIR_RECOVERY_TTL = 15 * 60
 #: 同时保留的未使用配对码上限 (每点一次「生成安装命令」多一个)
 MAX_PAIR_CODES = 6
 #: 可接入的设备数上限 (含手机/电脑)。够家用, 又不至于让一台面板被当成公共订阅源。
@@ -101,7 +103,8 @@ def prune(state: dict) -> None:
     bucket["pair_codes"] = [
         c
         for c in bucket["pair_codes"]
-        if isinstance(c, dict) and not c.get("used_at") and int(c.get("expires_at") or 0) > now
+        if isinstance(c, dict) and int(c.get("expires_at") or 0) > now
+        and (not c.get("used_at") or (c.get("request_hash") and int(c.get("replay_until") or 0) > now))
     ]
 
 
@@ -109,8 +112,9 @@ def create_pair_code(state: dict, label: str = "") -> dict:
     """生成一个一次性配对码 (面板上「生成安装命令」按钮)。"""
     bucket = _bucket(state)
     prune(state)
-    while len(bucket["pair_codes"]) >= MAX_PAIR_CODES:
-        bucket["pair_codes"].pop(0)
+    while sum(not c.get("used_at") for c in bucket["pair_codes"]) >= MAX_PAIR_CODES:
+        oldest = next(c for c in bucket["pair_codes"] if not c.get("used_at"))
+        bucket["pair_codes"].remove(oldest)
     now = _now()
     entry = {
         "code": new_pair_code(),
@@ -143,6 +147,21 @@ def pair_code_live(state: dict, code: str) -> dict | None:
     return None
 
 
+def recoverable_pair(state: dict, code: str) -> dict | None:
+    now = _now()
+    for entry in _bucket(state)["pair_codes"]:
+        if (isinstance(entry, dict) and entry.get("code") == code and entry.get("request_hash")
+                and int(entry.get("expires_at") or 0) > now and int(entry.get("replay_until") or 0) > now
+                and find(state, str(entry.get("used_by") or "")) is not None):
+            return entry
+    return None
+
+
+def _pair_secret(code: str, request_id: str, device_id: str) -> str:
+    digest = hmac.new(bytes.fromhex(request_id), f"{code}:{device_id}".encode(), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+
 def consume_pair_code(state: dict, code: str) -> dict | None:
     entry = pair_code_live(state, code)
     if entry is None:
@@ -171,6 +190,16 @@ def register(state: dict, info: dict) -> tuple[dict | None, str, str]:
     只有 hash, 再也拿不回来。
     """
     code = str(info.get("code") or "").strip()
+    request_id = str(info.get("request_id") or "").strip()
+    if request_id and not re.fullmatch(r"[0-9a-f]{64}", request_id):
+        return None, "", "安装请求标识无效"
+    previous = recoverable_pair(state, code)
+    if previous and request_id and hmac.compare_digest(previous["request_hash"], _hash(request_id)):
+        device = find(state, previous["used_by"])
+        secret = _pair_secret(code, request_id, device["id"])
+        if check_secret(device, secret):
+            return device, secret, ""
+        return None, "", "设备凭据已变更，请重新生成安装命令"
     # 先判上限再消费配对码: 设备数满了的时候白烧一个码, 用户只能回面板重新生成
     # (P3-14)。
     if pair_code_live(state, code) is None:
@@ -184,10 +213,11 @@ def register(state: dict, info: dict) -> tuple[dict | None, str, str]:
     kind = str(info.get("kind") or DEFAULT_KIND).strip().lower()
     if kind not in KINDS:
         kind = DEFAULT_KIND
-    secret = new_secret()
+    device_id = "dv" + secrets.token_hex(8)
+    secret = _pair_secret(code, request_id, device_id) if request_id else new_secret()
     now = _now()
     device = {
-        "id": "dv" + secrets.token_hex(8),
+        "id": device_id,
         "secret_hash": _hash(secret),
         "name": default_name({**info, "kind": kind}),
         "kind": kind,
@@ -198,6 +228,7 @@ def register(state: dict, info: dict) -> tuple[dict | None, str, str]:
         "ip": str(info.get("ip") or "")[:64],
         "created_at": now,
         "last_seen": now,
+        "control_seen": 0,
         # 面板的期望状态。新设备默认「开」—— 装完即用, 不用回面板再点一下
         # (用户可在面板上改; 见 README「客户端」一节)
         "desired": True,
@@ -210,6 +241,8 @@ def register(state: dict, info: dict) -> tuple[dict | None, str, str]:
     }
     _bucket(state)["items"].append(device)
     entry["used_by"] = device["id"]
+    if request_id:
+        entry.update(request_hash=_hash(request_id), replay_until=min(int(entry["expires_at"]), now + PAIR_RECOVERY_TTL))
     return device, secret, ""
 
 
@@ -223,7 +256,7 @@ def check_secret(device: dict | None, secret: str) -> bool:
     return hmac.compare_digest(stored, _hash(secret))
 
 
-def touch(state: dict, device: dict, info: dict) -> bool:
+def touch(state: dict, device: dict, info: dict, *, heartbeat: bool = True) -> bool:
     """心跳 + 状态上报 (设备每 15s 调一次 /c/report)。
 
     返回"这次上报是否带来了需要落盘的变化"。心跳本身每 15 秒就写一次 state.json
@@ -242,6 +275,13 @@ def touch(state: dict, device: dict, info: dict) -> bool:
     """
     now = _now()
     changed = False
+    # Downloads prove reachability, but cannot renew the control-channel lease.
+    if "control_seen" not in device:
+        device["control_seen"] = int(device.get("actual_at") or 0)
+        changed = True
+    if heartbeat and now - int(device.get("control_seen") or 0) >= HEARTBEAT_WRITE_S:
+        device["control_seen"] = now
+        changed = True
     if now - int(device.get("last_seen") or 0) >= HEARTBEAT_WRITE_S:
         device["last_seen"] = now
         changed = True
@@ -255,6 +295,8 @@ def touch(state: dict, device: dict, info: dict) -> bool:
         if bool(device.get("actual")) != actual:
             changed = True
         device["actual"] = actual
+        if now - int(device.get("actual_at") or 0) >= HEARTBEAT_WRITE_S:
+            changed = True
         device["actual_at"] = now
     if info.get("rev") and device.get("rev") != str(info["rev"])[:32]:
         device["rev"] = str(info["rev"])[:32]
@@ -292,6 +334,9 @@ def touch(state: dict, device: dict, info: dict) -> bool:
             str(k)[:32]: (v if isinstance(v, (int, float, bool)) else str(v)[:160])
             for k, v in list(report.items())[:20]
         }
+        if now - int(device.get("report_at") or 0) >= HEARTBEAT_WRITE_S:
+            changed = True
+        device["report_at"] = now
         if fresh != device.get("report"):
             device["report"] = fresh
             changed = True
@@ -328,7 +373,9 @@ def remove(state: dict, device_id: str) -> bool:
 
 
 def online(device: dict, now: int | None = None) -> bool:
-    return (_now() if now is None else now) - int(device.get("last_seen") or 0) <= ONLINE_WINDOW
+    seen = int(device.get("control_seen", device.get("actual_at") or device.get("last_seen")) or 0)
+    age = (_now() if now is None else now) - seen
+    return seen > 0 and 0 <= age <= ONLINE_WINDOW
 
 
 #: 设备自己上报的"管理界面地址"(路由器端 LuCI 页 + 界面令牌)。面板只做展示:
@@ -453,8 +500,13 @@ def device_view(device: dict, *, now: int | None = None) -> dict:
     is_online = online(device, now)
     report = device.get("report") or {}
     covered = str(report.get("covered") or "").lower()
-    running = is_online and actual
-    managed = running and covered in {"full", "lan", "lan_tcp"}
+    actual_at = int(device.get("actual_at") or 0)
+    report_at = int(device.get("report_at", actual_at) or 0)
+    actual_fresh = actual_at > 0 and 0 <= now - actual_at <= ONLINE_WINDOW
+    report_fresh = report_at > 0 and 0 <= now - report_at <= ONLINE_WINDOW
+    state_fresh = actual_fresh and (not actual or report_fresh)
+    running = is_online and actual_fresh and actual
+    managed = running and report_fresh and covered in {"full", "lan", "lan_tcp"}
     override = str(report.get("override") or "").lower()
     return {
         "id": device.get("id", ""),
@@ -468,17 +520,23 @@ def device_view(device: dict, *, now: int | None = None) -> dict:
         "created_at": int(device.get("created_at") or 0),
         "last_seen": int(device.get("last_seen") or 0),
         "online": is_online,
+        "control_seen": int(device.get("control_seen", device.get("last_seen")) or 0),
+        "state_fresh": state_fresh,
+        "connection_state": ("waiting" if not device.get("control_seen", device.get("last_seen")) else
+                             "offline" if not is_online else
+                             "stale" if not state_fresh else "online"),
         "desired": desired,
         "actual": actual,
         "actual_at": int(device.get("actual_at") or 0),
         # 开关点下去到设备回报之间是"同步中": 面板据此显示转圈而不是假装已生效
-        "syncing": desired != actual and is_online,
+        "syncing": desired != actual and is_online and actual_fresh and override not in {"on", "off"},
         # 期望开、但设备自己也说开着 → 才是真的"已连接"
         "connected": desired and managed,
         "running": running,
         "taking_over": managed,
         "control": "local" if override in {"on", "off"} else "panel",
         "diagnostic": device_diagnostics.view(device, now),
+        "installation": device_installation.view(device, now),
         "credentials_independent": bool(device.get("dataplane")),
         "staged_rev": str(device.get("staged_rev") or ""),
         "template": device.get("template", ""),
@@ -513,6 +571,10 @@ def view(state: dict, *, now: int | None = None) -> dict:
         "kinds": list(KINDS),
         "pair_ttl": PAIR_TTL,
         "online_window": ONLINE_WINDOW,
+        "pairing_sessions": [
+            {"code": c["code"], "device_id": c.get("used_by", ""), "expires_at": int(c.get("replay_until") or 0)}
+            for c in bucket["pair_codes"] if c.get("request_hash") and c.get("used_by")
+        ],
         "pair_codes": [
             {
                 "code": c.get("code", ""),

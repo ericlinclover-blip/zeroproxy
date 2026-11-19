@@ -147,8 +147,10 @@ def patch_for_local_run(script: str, root: str) -> str:
     # 这里停在"文件已落盘", 服务编排由真机验证; 但配置生成与 agent 逻辑照跑。
     out = out.replace(
         '\nmain "$@"\n',
-        "\nmain() { detect_env; detect_http; preflight; pair; install_deps; "
-        "install_core; write_files; install_zpcore; }\nmain \"$@\"\n",
+        "\nmain() { detect_env; detect_http; install_begin; preflight; pair; install_reporter_start; "
+        "install_stage dependencies; install_deps; install_stage core; install_core; "
+        "install_stage runtime; write_files; install_stage optional; prepare_optional_deps; "
+        "install_stage controller; install_zpcore; install_stage ready completed; }\nmain \"$@\"\n",
     )
     return out
 
@@ -498,7 +500,7 @@ def main() -> int:
                 # 注意那个分号: `{ ...; cmd }` 的 `}` 前面必须是 `;` 或换行, 否则 `}` 会被
                 # 当成参数 (演练里真踩过 —— 脚本语法错, 于是"什么都没发生")。
                 extra_cmd = main_extra.strip().rstrip(";")
-                text = text.replace("install_zpcore; }", f"install_zpcore; {extra_cmd}; }}", 1)
+                text = text.replace("install_stage ready completed; }", f"{extra_cmd}; install_stage ready completed; }}", 1)
                 assert main_extra in text, "main_extra 没接上 (patch_for_local_run 的 main 拼法变了?)"
             if base:
                 # 把脚本里的"面板地址"换成本机的一个慢管子 —— 复现"家宽到海外面板

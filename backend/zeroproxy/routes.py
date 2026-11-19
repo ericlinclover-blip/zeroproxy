@@ -4611,6 +4611,7 @@ class DeviceRegisterIn(BaseModel):
     """设备侧配对请求 (安装脚本构造)。"""
 
     code: str = ""
+    request_id: str = ""
     kind: str = "router"
     hostname: str = ""
     model: str = ""
@@ -4639,6 +4640,7 @@ class DeviceReportIn(BaseModel):
     ui: str = ""
     report: dict | None = None
     diagnostic: dict | None = None
+    installation: dict | None = None
     set_desired: bool | None = None
 
 
@@ -4665,7 +4667,7 @@ INSTALL_CMD_RETRIES = 5
 #:     `--no-check-certificate`; 有真证书时不带。这段判断在服务端做 (面板知道自己的
 #:     证书状态), 命令里就不必再写一遍 —— 界面上的长度就是这么省下来的。
 _INSTALL_CMD = (
-    "(f=/tmp/zp-install.sh;for i in __ZP_SEQ__;do "
+    "(echo 'ZeroProxy 连接面板…';f=$(mktemp)||exit 1;for i in __ZP_SEQ__;do "
     "wget -T 20 __ZP_TLS__-O \"$f\" __ZP_URL__&&exec sh \"$f\";"
     "sleep 2;done;exit 1)"
 )
@@ -4988,6 +4990,7 @@ def client_perf_config(request: Request, id: str = "", k: str = "", lan: str = "
             state,
             device,
             {"ip": _client_ip(request), "downloaded_rev": devices.config_rev(state)},
+            heartbeat=False,
         ):
             save_state(state)
     if skipped:
@@ -5115,7 +5118,7 @@ def client_install_script(code: str, request: Request):
                 "先按 install.sh 结尾打印的链接打开面板完成初始化, 再重新生成安装命令。",
             )
         )
-    if not devices.pair_code_live(state, code):
+    if not (devices.pair_code_live(state, code) or devices.recoverable_pair(state, code)):
         # 注意这里回的是 **200 + 一份脚本**, 不是 404 + 一句话: 路由器那一跳的下载工具
         # 不保证会把 4xx 的正文写出来, 而"取不到脚本"的失败必须是能读懂的 (见
         # _client_error_script)。正文里的原因照样是"配对码无效或已过期"。
@@ -5241,6 +5244,7 @@ def client_core_status(request: Request):
     want = (request.query_params.get("arch") or "").strip()
     payload = {
         "core_version": router_client.CORE_VERSION,
+        "agent_version": router_client.AGENT_VERSION,
         "asset": router_client.asset_name(want) if want in router_client.ARCHES else "",
         "cores": router_client.core_states(),
         # 路由器端只在"面板直传太慢"时才会用这些 (见 router-install.sh):
@@ -5344,7 +5348,7 @@ def client_ui_file(name: str, request: Request):
 
 
 @router.get("/c/rt/bundle")
-def client_runtime_bundle(request: Request):
+def client_runtime_bundle(request: Request, ui: int = 0):
     """整套运行时装机件打成一个 tar.gz。
 
     **注册顺序**: 它必须在 `/c/rt/{name}` **前面** —— 否则 "bundle" 会被当成一个装机件的
@@ -5356,7 +5360,7 @@ def client_runtime_bundle(request: Request):
     state = load_state()
     if not state["configured"]:
         return _err("面板尚未初始化", 409)
-    blob = router_client.runtime_bundle()
+    blob = router_client.runtime_bundle(include_ui=True) if ui else router_client.runtime_bundle()
     if blob is None:
         return _err("面板这一侧没有准备完整的装机件", 500)
     return Response(
@@ -5399,6 +5403,7 @@ def client_pair(payload: DeviceRegisterIn, request: Request):
             return _err("面板尚未初始化", 409)
         info = {
             "code": payload.code,
+            "request_id": payload.request_id,
             "kind": payload.kind,
             "hostname": payload.hostname,
             "model": payload.model,
@@ -5407,6 +5412,7 @@ def client_pair(payload: DeviceRegisterIn, request: Request):
             "version": payload.version,
             "ip": _client_ip(request),
         }
+        before_count = len(devices.items(state))
         device, secret, error = devices.register(state, info)
         if device is None:
             return _err(error, 403)
@@ -5415,7 +5421,10 @@ def client_pair(payload: DeviceRegisterIn, request: Request):
         # 于是"首次安装卡在下载代理内核"这件事在装机前就消掉了 (取不到也不影响这次
         # 配对: 路由器端会看到 503 + 一句人话, 并按进度重试)。
         router_client.ensure_core_async(str(payload.arch or "").strip())
-        config.audit(state, "device_add", f"{device['name']} · {device['arch']} · {device['os']}")
+        for name in router_client.GEO_FILES:
+            router_client.ensure_geo_async(name)
+        if len(devices.items(state)) != before_count:
+            config.audit(state, "device_add", f"{device['name']} · {device['arch']} · {device['os']}")
         save_state(state)
         return {
             "id": device["id"],
@@ -5508,12 +5517,12 @@ def client_subscription(
             # 分流数据库的下载地址指向面板自己 (路由器只需要能访问面板)
             base=share_links.panel_base_url(request, state),
         )
-        # 拉配置也算一次"设备还活着": 装完立刻在面板上显示在线, 不用等下一轮心跳。
+        # 下载只刷新可达时间；控制通道在线必须由 /c/report 的心跳证明。
         # 只记 `downloaded_rev` (面板发出去的是哪一版), **不**记 applied_rev ——
         # 下载成功不等于设备已经校验/重载/数据面健康 (P2-9)。
         panel_rev = devices.config_rev(state)
         if devices.touch(
-            state, device, {"ip": _client_ip(request), "downloaded_rev": panel_rev}
+            state, device, {"ip": _client_ip(request), "downloaded_rev": panel_rev}, heartbeat=False
         ):
             save_state(state)
     return Response(
@@ -5538,6 +5547,33 @@ def diagnose_device(device_id: str, request: Request):
             return _err(str(exc), 409)
         save_state(state)
         return result
+
+
+class DeviceInstallIn(BaseModel):
+    device: str = ""
+    k: str = ""
+    id: str = ""
+    seq: int = 0
+    stage: str = ""
+    status: str = "running"
+    error: str = ""
+
+
+@router.post("/c/install/report")
+def client_install_report(payload: DeviceInstallIn, request: Request):
+    from . import device_installation
+    with config.locked():
+        state = load_state()
+        device = devices.find(state, payload.device)
+        if not devices.check_secret(device, _device_secret(request, payload.k)):
+            return _err("设备凭据无效", 403)
+        try:
+            changed = device_installation.accept(device, {key: getattr(payload, key) for key in ("id", "seq", "stage", "status", "error")})
+        except ValueError as exc:
+            return _err(str(exc), 400)
+        if changed:
+            save_state(state)
+        return {"ok": True, "installation": device_installation.view(device)}
 
 
 @router.post("/c/report")
@@ -5587,10 +5623,19 @@ def client_report(payload: DeviceReportIn, request: Request):
             info["healthy"] = payload.healthy
         changed = devices.touch(state, device, info) or changed
         changed = device_diagnostics.accept(device, payload.diagnostic) or changed
+        installation_ack = ""
+        if payload.installation:
+            from . import device_installation
+            try:
+                changed = device_installation.accept(device, payload.installation) or changed
+                installation_ack = str(payload.installation.get("id") or "")
+            except ValueError:
+                pass  # Malformed optional telemetry must never break the heartbeat.
         if changed:
             save_state(state)
         return {
             "diagnostic_request": device_diagnostics.request_id(device),
+            "installation_ack": installation_ack,
             "desired": bool(device["desired"]),
             "rev": devices.config_rev(state),
             "downloaded_rev": device.get("downloaded_rev", ""),

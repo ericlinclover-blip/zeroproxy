@@ -285,3 +285,37 @@ def test_changed_frontend_modules_parse_as_es_modules():
             assert ok, f"{os.path.relpath(path, APP)} 语法错误: {err[:400]}"
             checked += 1
     assert checked >= 15, f"预期检查至少 15 个前端 JS 模块，实际检查了 {checked} 个"
+
+
+def test_device_toggle_reconciles_an_unknown_save_without_false_success(tmp_path):
+    """A lost POST response must be read back; old matching actual is insufficient."""
+    from pathlib import Path
+    source = (Path(__file__).parents[1] / 'static/app/views/clients.js').read_text()
+    function = source[source.index('async function toggleDevice('):source.index('\nfunction renameDevice(')]
+    script = tmp_path / 'toggle.mjs'
+    script.write_text('''
+import assert from 'node:assert/strict';
+let syncTimers = {}, syncGenerations = {}, callbacks = [];
+const pendingToggles = new Set(), messages = [];
+const S = {dash: {devices: {items: [{id: 'router', desired: false, actual: false, online: true, control: 'panel'}]}}};
+const document = {querySelectorAll: () => []};
+const setTimeout = (fn) => {callbacks.push(fn); return callbacks.length;};
+const clearTimeout = () => {};
+const toast = message => messages.push(message);
+const renderClients = () => {};
+const api = async () => {throw Object.assign(new Error('lost reply'), {unknown: true});};
+let observed = {id: 'router', desired: false, actual: false, online: true, state_fresh: true, control: 'panel'};
+const refreshDevices = async () => ({items: [observed]});
+''' + function + '''
+await toggleDevice('router', true);
+assert.equal(S.dash.devices.items[0].desired, false, 'unknown save was optimistically confirmed');
+await callbacks.shift()();
+assert.equal(callbacks.length, 1, 'old desired/actual ended confirmation');
+observed = {...observed, desired: true, actual: true};
+await callbacks.shift()();
+assert.equal(callbacks.length, 0, 'fresh matching target did not finish');
+assert.equal(pendingToggles.size, 0);
+assert.match(messages[0], /正在确认/);
+''')
+    result = subprocess.run([shutil.which('node') or 'node', str(script)], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stdout + result.stderr

@@ -2458,7 +2458,9 @@ def test_install_script_sticks_to_busybox_tools():
         )
     assert "gzip -t" in text, "判断 gzip 必须用 gzip -t"
     # 复用旧内核前要真的跑一次 -v, 否则上一次失败留下的坏文件会让重跑一直挂在原地
-    assert '"$ZP_BIN" -v >/dev/null 2>&1; then' in text
+    assert re.search(r'core_reusable\(\).*?"\$ZP_BIN" -v', text)
+    assert '"$ZP_BIN.new" -v >/dev/null 2>&1; then' in text
+    assert 'mv "$ZP_BIN.new" "$ZP_BIN"' in text
 
 
 def test_install_script_self_heals_rejected_credentials():
@@ -2588,7 +2590,10 @@ def test_install_script_auto_fixes_missing_kernel_btf():
     assert "btf_worth_fixing" in code
     assert "6.6|6.12" in code.replace(" ", ""), "覆盖的内核系列要写进判据"
     # 先补, 再判 eBPF (顺序反了就等于没补)
-    assert code.index("btf_ensure || true") < code.index("if ebpf_ok; then NET_EBPF=1")
+    optional = re.search(r"^prepare_optional_deps\(\) \{.*?^\}", code, re.M | re.S).group(0)
+    assert optional.index("btf_ensure || true") < optional.index("if ebpf_ok; then NET_EBPF=1")
+    main = re.search(r"^main\(\) \{.*?^\}", code, re.M | re.S).group(0)
+    assert main.index("    verify") < main.index("    prepare_optional_deps")
     # 结论落进 caps: 面板 / status / doctor 读的都是这一份
     for key in ("btf=", "btf_how=", "btf_path=", "why.btf="):
         assert f"printf '{key}" in code, f"caps 要记 {key}"

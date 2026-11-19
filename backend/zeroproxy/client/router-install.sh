@@ -84,6 +84,7 @@ DEV_ID=""
 DEV_SECRET=""
 DEV_NAME=""
 PAIR_ERROR=""
+BUNDLED_UI=""
 
 # ---------------------------------------------------------------- 输出
 # 全部输出走 stderr 之外的标准输出, 但用颜色区分层级 —— 用户是在 SSH 里看,
@@ -125,7 +126,137 @@ http_why() {
         *)  printf '其它错误 (curl %s)' "${1:-?}" ;;
     esac
 }
-die()  { printf '\n%s安装失败:%s %s\n' "$C_E" "$C_R" "$*" >&2; exit 1; }
+die()  { INSTALL_ERROR="$(printf '%s' "$1" | head -n1)"; printf '\n%s安装失败:%s %s\n' "$C_E" "$C_R" "$*" >&2; exit 1; }
+
+# An installation owns one lock and one private transient progress spool.
+random_request_id() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        head -c 32 /dev/urandom | sha256sum | cut -c1-64
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex 32
+    elif command -v md5sum >/dev/null 2>&1; then
+        # Two independent random blocks; this encodes entropy, it does not use
+        # MD5 as an authentication primitive (the server uses HMAC-SHA256).
+        { head -c 32 /dev/urandom | md5sum | cut -c1-32; head -c 32 /dev/urandom | md5sum | cut -c1-32; } | tr -d '\n'
+    else
+        return 1
+    fi
+}
+
+install_begin() {
+    mkdir -p "$ZP_DIR"
+    INSTALL_LOCK="$ZP_DIR/.install-lock"
+    _boot="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || printf unknown)"
+    if ! ln -s "$$:$_boot" "$INSTALL_LOCK" 2>/dev/null; then
+        # A second atomic lock serializes stale-owner reclamation.
+        mkdir "$INSTALL_LOCK.reclaim" 2>/dev/null || die "安装锁正在恢复，请稍后重试。"
+        _lock_owner="$(readlink "$INSTALL_LOCK" 2>/dev/null || true)"
+        _owner="${_lock_owner%%:*}"
+        _owner_boot="${_lock_owner#*:}"
+        case "$_owner" in ''|*[!0-9]*) _owner=0 ;; esac
+        if [ "$_owner" != 0 ] && [ "$_owner_boot" = "$_boot" ] && kill -0 "$_owner" 2>/dev/null; then
+            rmdir "$INSTALL_LOCK.reclaim"
+            die "已有安装正在运行，请等待原安装结束；不要重复粘贴命令。"
+        fi
+        rm -f "$INSTALL_LOCK"
+        if ! ln -s "$$:$_boot" "$INSTALL_LOCK" 2>/dev/null; then
+            rmdir "$INSTALL_LOCK.reclaim"
+            die "已有安装取得安装锁，请等待原安装结束。"
+        fi
+        rmdir "$INSTALL_LOCK.reclaim"
+    fi
+    INSTALL_WORK="$(umask 077; mktemp -d /tmp/zp-setup.XXXXXX)" || { rm -rf "$INSTALL_LOCK"; exit 1; }
+    _install_proof="$(random_request_id)" || { rm -rf "$INSTALL_WORK"; rm -f "$INSTALL_LOCK"; die "缺少安全随机标识工具 (sha256sum / openssl / md5sum)"; }
+    [ "${#_install_proof}" = 64 ] || { rm -rf "$INSTALL_WORK"; rm -f "$INSTALL_LOCK"; die "生成安装标识失败"; }
+    INSTALL_ID="$(printf '%s' "$_install_proof" | cut -c1-32)"
+    INSTALL_SEQ=0
+    INSTALL_STAGE=paired
+    INSTALL_STATUS=running
+    INSTALL_ERROR=""
+    INSTALL_REPORTER=""
+    if [ -f "$0" ]; then
+        (umask 077; cp "$0" "$ZP_DIR/install-resume.sh.new" && chmod 600 "$ZP_DIR/install-resume.sh.new" && mv "$ZP_DIR/install-resume.sh.new" "$ZP_DIR/install-resume.sh")
+    fi
+    trap 'install_cleanup "$?"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+}
+
+install_stage() {
+    INSTALL_STAGE="$1"
+    INSTALL_STATUS="${2:-running}"
+    INSTALL_SEQ=$((INSTALL_SEQ + 1))
+    [ -n "${DEV_ID:-}" ] && [ -n "${DEV_SECRET:-}" ] || return 0
+    (umask 077; printf '{"device":"%s","k":"%s","id":"%s","seq":%s,"stage":"%s","status":"%s","error":"%s"}\n' \
+        "$DEV_ID" "$DEV_SECRET" "$INSTALL_ID" "$INSTALL_SEQ" "$INSTALL_STAGE" "$INSTALL_STATUS" \
+        "$(json_escape "$INSTALL_ERROR")" > "$INSTALL_WORK/report.new" && mv "$INSTALL_WORK/report.new" "$INSTALL_WORK/report.json")
+}
+
+install_send() {
+    [ -s "$INSTALL_WORK/report.json" ] || return 0
+    case "$HTTP" in
+        curl)
+            if [ "$TLS_OPTS" = insecure ]; then
+                curl -fsSk --connect-timeout 1 -m 2 -H 'Content-Type: application/json' --data-binary "@$INSTALL_WORK/report.json" "$ZP_BASE/c/install/report"
+            else
+                curl -fsS --connect-timeout 1 -m 2 -H 'Content-Type: application/json' --data-binary "@$INSTALL_WORK/report.json" "$ZP_BASE/c/install/report"
+            fi ;;
+        *)
+            if [ "$TLS_OPTS" = insecure ]; then
+                run_with_timeout 3 "$HTTP" -q --no-check-certificate -T 2 -O - --post-data "$(cat "$INSTALL_WORK/report.json")" "$ZP_BASE/c/install/report"
+            else
+                run_with_timeout 3 "$HTTP" -q -T 2 -O - --post-data "$(cat "$INSTALL_WORK/report.json")" "$ZP_BASE/c/install/report"
+            fi ;;
+    esac
+}
+
+install_reporter_start() {
+    install_stage paired
+    (
+        trap - EXIT
+        _pulse_sleep=""
+        trap '[ -z "$_pulse_sleep" ] || kill "$_pulse_sleep" 2>/dev/null; exit 0' INT TERM
+        while kill -0 "$$" 2>/dev/null; do
+            install_send >/dev/null 2>&1 || true
+            sleep 5 &
+            _pulse_sleep=$!
+            wait "$_pulse_sleep" || true
+        done
+    ) >/dev/null 2>&1 &
+    INSTALL_REPORTER=$!
+}
+
+install_receipt_save() {
+    [ -n "${DEV_ID:-}" ] || return 0
+    _receipt_key="$(srv_key "$ZP_BASE")"
+    _receipt_path="$ZP_DIR/install-report-$_receipt_key-$INSTALL_ID.json"
+    (umask 077; printf '{"id":"%s","seq":%s,"stage":"%s","status":"%s","error":"%s"}\n'         "$INSTALL_ID" "$INSTALL_SEQ" "$INSTALL_STAGE" "$INSTALL_STATUS" "$(json_escape "$INSTALL_ERROR")" > "$_receipt_path.new" &&         mv "$_receipt_path.new" "$_receipt_path" &&         printf '%s' "$INSTALL_ID" > "$ZP_DIR/install-current-$_receipt_key.new" &&         mv "$ZP_DIR/install-current-$_receipt_key.new" "$ZP_DIR/install-current-$_receipt_key")
+    for _old_receipt in "$ZP_DIR/install-report-$_receipt_key-"*.json; do
+        [ "$_old_receipt" = "$_receipt_path" ] || rm -f "$_old_receipt"
+    done
+}
+
+install_cleanup() {
+    _install_rc="$1"
+    trap - EXIT INT TERM
+    if [ "$INSTALL_STATUS" != completed ]; then
+        [ -n "$INSTALL_ERROR" ] || INSTALL_ERROR="安装中断 (退出码 $_install_rc)，在原路由器重新执行安装命令可继续"
+        install_stage "$INSTALL_STAGE" failed || true
+    fi
+    if [ -n "$INSTALL_REPORTER" ]; then
+        kill "$INSTALL_REPORTER" 2>/dev/null || true
+        wait "$INSTALL_REPORTER" 2>/dev/null || true
+    fi
+    install_receipt_save || true
+    install_send >/dev/null 2>&1 || true
+    if [ "$INSTALL_STATUS" = completed ]; then
+        rm -f "$ZP_DIR/install-resume.sh"
+    elif [ -f "$ZP_DIR/install-resume.sh" ]; then
+        printf '\n继续安装：sh "%s/install-resume.sh"\n' "$ZP_DIR" >&2
+    fi
+    rm -rf "$INSTALL_WORK" "$INSTALL_LOCK"
+    rm -f "$HDRS"
+}
 
 # ---------------------------------------------------------------- HTTP
 # 路由器上不一定有 curl (OpenWrt 默认只有 uclient-fetch, 它同时提供 wget 名字)。
@@ -193,20 +324,20 @@ http_get() {
                 # -D: 把响应头留下 —— /c/rt/<name> 这些装机件的 X-ZP-Sha256 在里面。
                 # 落在 /tmp: 这条函数在写 dir 之前就会被调用 (http_probe), 不能依赖 ${ZP_DIR}。
                 if [ "$TLS_OPTS" = "insecure" ]; then
-                    if _out="$(curl -fsSk -D "$HDRS" -m 10 "$1")"; then _rc=0; else _rc=$?; fi
+                    if _out="$(curl -fsSk -D "$HDRS" --connect-timeout 3 -m 10 "$1")"; then _rc=0; else _rc=$?; fi
                 else
-                    if _out="$(curl -fsS -D "$HDRS" -m 10 "$1")"; then _rc=0; else _rc=$?; fi
+                    if _out="$(curl -fsS -D "$HDRS" --connect-timeout 3 -m 10 "$1")"; then _rc=0; else _rc=$?; fi
                 fi ;;
             *)
                 if [ "$TLS_OPTS" = "insecure" ]; then
-                    if _out="$("$HTTP" -q --no-check-certificate -O - "$1")"; then _rc=0; fi
+                    if _out="$(run_with_timeout 10 "$HTTP" -q --no-check-certificate -T 10 -O - "$1")"; then _rc=0; fi
                 else
-                    if _out="$("$HTTP" -q -O - "$1")"; then _rc=0; fi
+                    if _out="$(run_with_timeout 10 "$HTTP" -q -T 10 -O - "$1")"; then _rc=0; fi
                 fi ;;
         esac
         if [ "$_rc" = "0" ]; then printf '%s' "$_out"; return 0; fi
         # 22 = curl -f 说的"HTTP 层面失败" (403/404/502…): 面板已经明确答复, 重试没意义
-        [ "$_rc" != "22" ] || return "$_rc"
+        case "$_rc" in 22|51|60) return "$_rc" ;; esac
         [ "$_tries" -lt 5 ] || return "$_rc"
         # 让"在等"看得见: 丢包时这一次是白等到超时的, 界面上要有句话说明在干什么。
         progress_note "面板第 ${_tries} 次没回话 ($(http_why "$_rc")), 正在重试…"
@@ -237,15 +368,15 @@ http_post() {
     case "$HTTP" in
         curl)
             if [ "$TLS_OPTS" = "insecure" ]; then
-                curl -fsSk -m 30 -H 'Content-Type: application/json' --data "$_body" "$_url"
+                curl -sSk --connect-timeout 3 -m 15 -H 'Content-Type: application/json' --data "$_body" "$_url"
             else
-                curl -fsS -m 30 -H 'Content-Type: application/json' --data "$_body" "$_url"
+                curl -sS --connect-timeout 3 -m 15 -H 'Content-Type: application/json' --data "$_body" "$_url"
             fi ;;
         *)
             if [ "$TLS_OPTS" = "insecure" ]; then
-                "$HTTP" -q --no-check-certificate -O - --post-data "$_body" "$_url"
+                run_with_timeout 15 "$HTTP" -q --no-check-certificate -T 15 -O - --post-data "$_body" "$_url"
             else
-                "$HTTP" -q -O - --post-data "$_body" "$_url"
+                run_with_timeout 15 "$HTTP" -q -T 15 -O - --post-data "$_body" "$_url"
             fi ;;
     esac
 }
@@ -258,6 +389,9 @@ run_with_timeout() {
     while kill -0 "$_timeout_pid" 2>/dev/null; do
         if [ "$_timeout_elapsed" -ge "$_timeout_s" ]; then
             kill "$_timeout_pid" 2>/dev/null || true
+            sleep 1
+            kill -KILL "$_timeout_pid" 2>/dev/null || true
+            printf '%s\n' "操作超时 (${_timeout_s} 秒)，已停止等待" >&2
             wait "$_timeout_pid" 2>/dev/null || true
             return 124
         fi
@@ -285,6 +419,8 @@ http_fetch_to() {
     _url="$1"; _dest="$2"; _tmo="${3:-900}"; _min_kbps="${4:-0}"; _win="${5:-25}"
     HTTP_CODE=""
     _speed=""
+    _resume=""
+    [ "${6:-0}" != 1 ] || _resume="-C -"
     rm -f "$_dest.hdr"
     if [ "${_min_kbps:-0}" -gt 0 ] 2>/dev/null; then
         _speed="--speed-limit $((_min_kbps * 1024)) --speed-time $_win"
@@ -296,10 +432,10 @@ http_fetch_to() {
         curl)
             if [ "$TLS_OPTS" = "insecure" ]; then
                 # shellcheck disable=SC2086
-                if HTTP_CODE="$(curl -sSkL -D "$_dest.hdr" -m "$_tmo" $_speed -o "$_dest" -w '%{http_code}' "$_url" 2>/dev/null)"; then _rc=0; else _rc=1; fi
+                if HTTP_CODE="$(curl -sSkL -D "$_dest.hdr" --connect-timeout 5 -m "$_tmo" $_speed $_resume -o "$_dest" -w '%{http_code}' "$_url" 2>/dev/null)"; then _rc=0; else _rc=1; fi
             else
                 # shellcheck disable=SC2086
-                if HTTP_CODE="$(curl -sSL -D "$_dest.hdr" -m "$_tmo" $_speed -o "$_dest" -w '%{http_code}' "$_url" 2>/dev/null)"; then _rc=0; else _rc=1; fi
+                if HTTP_CODE="$(curl -sSL -D "$_dest.hdr" --connect-timeout 5 -m "$_tmo" $_speed $_resume -o "$_dest" -w '%{http_code}' "$_url" 2>/dev/null)"; then _rc=0; else _rc=1; fi
             fi
             [ -n "$HTTP_CODE" ] || HTTP_CODE="000"
             # curl 自己的退出码也要认: `-m` 到点被掐断时它**照样会打出 200** (响应头早
@@ -308,14 +444,14 @@ http_fetch_to() {
             if [ "$_rc" != "0" ]; then
                 return 1
             fi
-            [ "$HTTP_CODE" = "200" ]
+            [ "$HTTP_CODE" = "200" ] || { [ "${6:-0}" = 1 ] && [ "$HTTP_CODE" = "206" ]; }
             ;;
         *)
             rm -f "$_dest"
             if [ "$TLS_OPTS" = "insecure" ]; then
-                "$HTTP" -q --no-check-certificate -T "$_tmo" -O "$_dest" "$_url" >/dev/null 2>&1
+                run_with_timeout "$_tmo" "$HTTP" -q --no-check-certificate -T "$_tmo" -O "$_dest" "$_url" >/dev/null 2>&1
             else
-                "$HTTP" -q -T "$_tmo" -O "$_dest" "$_url" >/dev/null 2>&1
+                run_with_timeout "$_tmo" "$HTTP" -q -T "$_tmo" -O "$_dest" "$_url" >/dev/null 2>&1
             fi
             ;;
     esac
@@ -442,7 +578,7 @@ stop_progress() {
     return 0
 }
 
-json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\r\n'; }
+json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'; }
 
 # 面板地址 → 服务器清单里的键 (与 agent 里的 key_of 一致): hkk.i3.pub:8899 → hkk_i3_pub
 srv_key() {
@@ -634,6 +770,13 @@ preflight() {
     # "需要约 90 MB, 当前只有 89 MB" —— 明明什么都不缺。
     _need_mb=20
     core_reusable || _need_mb=90
+    if [ "$_need_mb" = 90 ] && [ -s "$ZP_DIR/.mihomo.gz" ]; then
+        _partial_kb="$(du -k "$ZP_DIR/.mihomo.gz" 2>/dev/null | awk '{print $1}' || true)"
+        case "$_partial_kb" in ''|*[!0-9]*) _partial_kb=0 ;; esac
+        _partial_mb=$((_partial_kb / 1024))
+        [ "$_partial_mb" -le 20 ] || _partial_mb=20
+        _need_mb=$((_need_mb - _partial_mb))
+    fi
     _free="$(df -k /overlay 2>/dev/null | awk 'NR==2{print $4}' || true)"
     [ -n "$_free" ] || _free="$(df -k / | awk 'NR==2{print $4}' || true)"
     if [ -n "$_free" ] && [ "$_free" -lt $((_need_mb * 1024)) ]; then
@@ -764,14 +907,34 @@ EOF
 # 用本次命令里的配对码换一份新凭据 (写进 device.json)。失败时把面板的话放进
 # PAIR_ERROR —— 用户看到的必须是"配对码过期了, 回面板重新生成", 不是一句无解的报错。
 do_pair() {
+    mkdir -p "$ZP_DIR/.pair"
+    chmod 700 "$ZP_DIR/.pair"
+    _pair_nonce="$ZP_DIR/.pair/$ZP_CODE"
+    if [ ! -s "$_pair_nonce" ]; then
+        (umask 077; random_request_id > "$_pair_nonce.tmp" && mv "$_pair_nonce.tmp" "$_pair_nonce")
+    fi
+    _request_id="$(cat "$_pair_nonce" 2>/dev/null || true)"
+    if [ "${#_request_id}" != 64 ]; then
+        PAIR_ERROR="无法生成安全的安装请求标识，请检查 sha256sum / openssl / md5sum 后重试"
+        return 1
+    fi
     _body='{"code":"'"$(json_escape "$ZP_CODE")"'","kind":"router"'
+    _body="$_body"',"request_id":"'"$_request_id"'"'
     _body="$_body"',"hostname":"'"$(json_escape "$HOSTNAME_NOW")"'"'
     _body="$_body"',"model":"'"$(json_escape "$MODEL")"'"'
     _body="$_body"',"arch":"'"$(json_escape "$ARCH")"'"'
     _body="$_body"',"os":"'"$(json_escape "$OS_NAME")"'"'
     _body="$_body"',"version":"'"$(json_escape "$ZP_CLIENT_VERSION")"'"}'
 
-    _resp="$(http_post "$ZP_BASE/c/pair" "$_body" || true)"
+    _pair_try=0
+    _resp=""
+    while [ "$_pair_try" -lt 3 ]; do
+        _pair_try=$((_pair_try + 1))
+        _resp="$(http_post "$ZP_BASE/c/pair" "$_body" || true)"
+        [ -z "$(json_get "$_resp" id)" ] || break
+        [ -z "$(json_get "$_resp" error)" ] || break
+        [ "$_pair_try" -ge 3 ] || { progress_note "配对回执尚未收到，正在恢复同一次接入…"; sleep 1; }
+    done
     DEV_ID="$(json_get "$_resp" id)"
     DEV_SECRET="$(json_get "$_resp" secret)"
     # 面板的能力位: 有没有 /c/geo 分流数据库接口。旧面板没有 —— 那种面板给出的配置
@@ -787,7 +950,7 @@ do_pair() {
 
     mkdir -p "$ZP_DIR"
     umask 077
-    cat > "$ZP_DEV" <<EOF
+    cat > "$ZP_DEV.new" <<EOF
 {
   "id": "$DEV_ID",
   "secret": "$DEV_SECRET",
@@ -798,7 +961,8 @@ EOF
     # 多服务器清单: 每台面板一条。device.json 保留是为了让老版本的 agent 与
     # CLI 不至于读不到东西 (首次运行会把它迁移成 servers/ 下的一条)。
     mkdir -p "$ZP_DIR/servers"
-    cat > "$ZP_DIR/servers/$(srv_key "$ZP_BASE").json" <<EOF
+    _pair_server="$ZP_DIR/servers/$(srv_key "$ZP_BASE").json"
+    cat > "$_pair_server.new" <<EOF
 {
   "base": "$ZP_BASE",
   "id": "$DEV_ID",
@@ -806,9 +970,11 @@ EOF
   "name": "${DEV_NAME:-$ZP_BASE}"
 }
 EOF
-    chmod 600 "$ZP_DIR/servers/$(srv_key "$ZP_BASE").json"
+    chmod 600 "$_pair_server.new"
+    mv "$_pair_server.new" "$_pair_server"
     umask 022
-    chmod 600 "$ZP_DEV"
+    chmod 600 "$ZP_DEV.new"
+    mv "$ZP_DEV.new" "$ZP_DEV"
     return 0
 }
 
@@ -839,16 +1005,20 @@ pkg_install() {
     DEPS_WHY=""
     case "$PKG_MGR" in
         apk)
-            _apk_err="$(apk -U add "$_pkg" 2>&1)" && return 0
+            _apk_err="$(run_with_timeout 60 apk -U add "$_pkg" 2>&1)" && return 0
             case "$_apk_err" in
                 *UNTRUSTED*|*untrusted*|*signature*|*Signature*|*BAD*SIGN*|*BADCKSUM*)
-                    _apk_err2="$(apk add --allow-untrusted "$_pkg" 2>&1)" && return 0
+                    _apk_err2="$(run_with_timeout 60 apk add --allow-untrusted "$_pkg" 2>&1)" && return 0
                     DEPS_WHY="签名不可信, 退到 --allow-untrusted 也没成: $(err_line "${_apk_err2:-$_apk_err}")" ;;
                 *) DEPS_WHY="$(err_line "${_apk_err:-apk 没说话}")" ;;
             esac
             return 1 ;;
         opkg)
-            _opkg_err="$(opkg install "$_pkg" 2>&1)" && return 0
+            if [ "${PKG_INDEX_READY:-0}" != "1" ]; then
+                pkg_update || true
+                PKG_INDEX_READY=1
+            fi
+            _opkg_err="$(run_with_timeout 60 opkg install "$_pkg" 2>&1)" && return 0
             DEPS_WHY="$(err_line "${_opkg_err:-opkg 没说话}")"
             return 1 ;;
         *)
@@ -858,8 +1028,8 @@ pkg_install() {
 }
 pkg_update() {
     case "$PKG_MGR" in
-        apk)  apk update >/dev/null 2>&1 ;;
-        opkg) opkg update >/dev/null 2>&1 ;;
+        apk)  run_with_timeout 30 apk update >/dev/null 2>&1 ;;
+        opkg) run_with_timeout 30 opkg update >/dev/null 2>&1 ;;
         *)    return 127 ;;
     esac
 }
@@ -1530,11 +1700,6 @@ install_deps() {
     # 能解释"模块怎么都装不上"的现场证据。
     if [ "$PKG_MGR" = "none" ]; then
         note "本机没有包管理器 (${PKG_MGR_NOTE:-apk / opkg 都不在}) —— 缺的内核模块只能手动补"
-    elif [ "$PKG_MGR" = "opkg" ]; then
-        # opkg 要"先更新索引再装"两条命令; apk 那边不需要 —— `apk -U add` 自己会刷新
-        # (官方 cheatsheet 就是拿它替代 `opkg update && opkg install` 那两条的),
-        # 少一次索引往返在慢线路上是实打实的时间。
-        pkg_update || true
     fi
     # 确保 TLS CA 根证书就绪 (防止极简固件中 curl/wget 因缺少根证书报错)
     if [ ! -f /etc/ssl/certs/ca-certificates.crt ] && [ ! -f /etc/ssl/cert.pem ]; then
@@ -1542,14 +1707,20 @@ install_deps() {
     fi
     # 装包失败先记在手边, **等探测完了再决定要不要报** —— 模块本来就在 (或已编进内核) 时,
     # "apk add 没成功"是无关紧要的 (源离线 / 架构的 kmod 不在源里都可能), 说出来只会吓人。
-    if pkg_install kmod-tun; then _tun_why=""; else _tun_why="$DEPS_WHY"; fi
+    _tun_why=""
     modprobe tun 2>/dev/null || true
 
     # 每一级都真做一次。探测只做可撤销的动作 (建设备再删 / 加规则再撤), 不改任何东西。
-    if tun_ok; then NET_TUN=1; else
-        CAPS_WHY_TUN="$PROBE_WHY"
-        # 这一级真的不行、而包也没装上 → 这条记录才有意义 (它就是根因)
-        [ -z "$_tun_why" ] || deps_fail kmod-tun "$_tun_why"
+    if tun_ok; then
+        NET_TUN=1
+        note "TUN 已可用，跳过软件源更新和模块安装"
+    else
+        if pkg_install kmod-tun; then _tun_why=""; else _tun_why="$DEPS_WHY"; fi
+        modprobe tun 2>/dev/null || true
+        if tun_ok; then NET_TUN=1; else
+            CAPS_WHY_TUN="$PROBE_WHY"
+            [ -z "$_tun_why" ] || deps_fail kmod-tun "$_tun_why"
+        fi
     fi
     if nft_ok; then NET_NFT=1; else CAPS_WHY_TPROXY="$PROBE_WHY"; fi
     if [ "$NET_NFT" = "1" ]; then
@@ -1558,7 +1729,10 @@ install_deps() {
         else
             CAPS_WHY_TPROXY="$PROBE_WHY"
             # 模块可能只是没装/没加载: 补一次再试 (装不上就算了, 不算致命)
-            if pkg_install kmod-nft-tproxy; then _tp_why=""; else _tp_why="$DEPS_WHY"; fi
+            _tp_why=""
+            if [ "$NET_TUN" != 1 ]; then
+                if pkg_install kmod-nft-tproxy; then _tp_why=""; else _tp_why="$DEPS_WHY"; fi
+            fi
             modprobe nft_tproxy 2>/dev/null || true
             if tproxy_ok; then
                 NET_TPROXY=1; CAPS_WHY_TPROXY=""
@@ -1570,7 +1744,7 @@ install_deps() {
     if redirect_ok; then NET_REDIRECT=1; else CAPS_WHY_REDIRECT="$PROBE_WHY"; fi
     # eBPF 那一档的前提是"内核 BTF (CO-RE 类型信息)" —— 缺了就**自动补** (社区有现成包,
     # 见 btf_ensure 顶部): 先问本机软件源, 再问面板, 两个都拿不到就把原因说清楚。
-    btf_ensure || true
+    # Optional BTF downloads run after basic connectivity is verified.
     if ebpf_ok; then NET_EBPF=1; else CAPS_WHY_EBPF="$PROBE_WHY"; fi
     # 性能模式 (eBPF / dae) 能不能进 —— 只看 eBPF 那一档的前提是否齐; 真正的切换在
     # `zeroproxy perf on` (点界面上的按钮) 时做, 这里只探能力。
@@ -1695,6 +1869,20 @@ install_deps() {
     write_caps
 }
 
+prepare_optional_deps() {
+    step "完善性能模式能力 (代理已完成基础自检)"
+    if [ "$NET_NFT" = 1 ] && [ "$NET_TPROXY" != 1 ]; then
+        pkg_install kmod-nft-tproxy || true
+        modprobe nft_tproxy 2>/dev/null || true
+        if tproxy_ok; then NET_TPROXY=1; CAPS_WHY_TPROXY=""; fi
+    fi
+    btf_ensure || true
+    if ebpf_ok; then NET_EBPF=1; CAPS_WHY_EBPF=""; else NET_EBPF=0; CAPS_WHY_EBPF="$PROBE_WHY"; fi
+    perf_cap_probe
+    note "性能模式检测: $(ebpf_detail)"
+    write_caps
+}
+
 # ---------------------------------------------------------------- 内核二进制
 #: 面板说"还没准备好内核"时最多等多久 (秒)。面板侧取内核的总时限是 240 秒
 #: (ZP_CORE_DEADLINE) —— 这里必须比它长, 否则两边一起超时、谁都不知道到底怎么了;
@@ -1759,27 +1947,59 @@ core_min_rate() {
 # 成功返回 0。速率是给"这条线值不值得等"用的 —— 以前这里只有一行不动的输出,
 # 用户分不出"慢"和"死"。
 core_download() {
-    rm -f "$2"
+    _dl_url="$1"; _dl_dest="$2"; _dl_budget="${3:-900}"; _dl_min="${4:-0}"
     DL_START="$(date +%s 2>/dev/null || echo 0)"
-    # 面板给了大小就画带百分比的条; 没给 (老面板) 就退回每 5 秒一行 —— 两种都比"不动"强。
-    start_progress "$2" "已下载" "${PANEL_SIZE:-0}"
-    if http_fetch_to "$1" "$2" "${3:-900}" "${4:-0}" "$CORE_RATE_WINDOW"; then
-        _rc=0
+    _dl_deadline=$((DL_START + _dl_budget))
+    _dl_proof="${PANEL_SHA:-}"
+    _dl_can_resume=0
+    case "$_dl_proof" in ''|*[!0-9a-f]*) _dl_proof='' ;; esac
+    if [ "${#_dl_proof}" = 64 ] && [ "$HTTP" = curl ] && { command -v sha256sum >/dev/null 2>&1 || command -v sha256 >/dev/null 2>&1; }; then
+        _dl_can_resume=1
+        if [ "$(cat "$_dl_dest.source" 2>/dev/null || true)" != "$_dl_proof" ]; then
+            rm -f "$_dl_dest"
+        fi
+        printf '%s' "$_dl_proof" > "$_dl_dest.source"
     else
-        _rc=1
+        rm -f "$_dl_dest" "$_dl_dest.source"
     fi
+    _dl_initial=0
+    [ ! -f "$_dl_dest" ] || _dl_initial="$(wc -c < "$_dl_dest" | tr -d ' ')"
+    start_progress "$_dl_dest" "已下载" "${PANEL_SIZE:-0}"
+    _dl_attempt=0
+    _rc=1
+    while [ "$_dl_attempt" -lt 3 ]; do
+        _dl_attempt=$((_dl_attempt + 1))
+        _dl_remaining=$((_dl_deadline - $(date +%s 2>/dev/null || echo "$_dl_deadline")))
+        [ "$_dl_remaining" -gt 0 ] || break
+        _dl_resume=0
+        if [ "$_dl_can_resume" = 1 ] && [ -s "$_dl_dest" ]; then _dl_resume=1; fi
+        if http_fetch_to "$_dl_url" "$_dl_dest" "$_dl_remaining" "$_dl_min" "$CORE_RATE_WINDOW" "$_dl_resume"; then
+            _rc=0
+            break
+        fi
+        _rc=1
+        # A server ignoring Range must restart cleanly; never append a full
+        # response onto a prefix. Final core_verify still checks the full digest.
+        if [ "$_dl_resume" = 1 ] && [ "$HTTP_CODE" = 200 ]; then
+            rm -f "$_dl_dest"
+            continue
+        fi
+        if [ "$_dl_resume" = 1 ] && [ "$HTTP_CODE" = 416 ] && [ "${PANEL_SIZE:-0}" -gt 0 ] &&                 [ "$(wc -c < "$_dl_dest" | tr -d ' ')" = "$PANEL_SIZE" ]; then
+            _rc=0
+            break
+        fi
+        [ "$_dl_can_resume" = 1 ] && [ -s "$_dl_dest" ] || break
+        case "$HTTP_CODE" in 200|206|000) ;; *) break ;; esac
+    done
     stop_progress
     DL_SECONDS=$(( $(date +%s 2>/dev/null || echo 0) - DL_START ))
     [ "$DL_SECONDS" -gt 0 ] 2>/dev/null || DL_SECONDS=1
-    # 文件可能压根没建起来 (连都没连上) —— 那是**重定向**失败, 那句 "No such file" 由
-    # shell 自己打到 stderr, `2>/dev/null` 挡不住 (与 start_progress 里同一条规矩)。
-    if [ -f "$2" ]; then
-        DL_BYTES="$(wc -c < "$2" 2>/dev/null | tr -d ' ' || true)"
-    else
-        DL_BYTES=0
-    fi
+    DL_BYTES=0
+    [ ! -f "$_dl_dest" ] || DL_BYTES="$(wc -c < "$_dl_dest" 2>/dev/null | tr -d ' ' || true)"
     [ -n "$DL_BYTES" ] || DL_BYTES=0
-    DL_KBPS=$((DL_BYTES / 1024 / DL_SECONDS))
+    _dl_new=$((DL_BYTES - _dl_initial))
+    [ "$_dl_new" -ge 0 ] || _dl_new=0
+    DL_KBPS=$((_dl_new / 1024 / DL_SECONDS))
     return "$_rc"
 }
 
@@ -1796,6 +2016,7 @@ core_read_panel() {
     [ -n "$PANEL_PREFER" ] || PANEL_PREFER="panel"
     # 面板要的那一版内核 —— 用来判断本机这份是不是该换了 (见 install_core)
     PANEL_CORE_VERSION="$(json_get "$_json" core_version)"
+    PANEL_AGENT_VERSION="$(json_get "$_json" agent_version)"
     # 分流数据库的元信息 (见 install_geo)。老面板没有这两个字段 —— 那时它们为空,
     # install_geo 自动退回"只走面板"的老路。
     PANEL_GEO_SIZES="$(json_get "$_json" geo_sizes)"
@@ -1953,9 +2174,9 @@ core_from_mirrors() {
 
 install_core() {
     step "下载代理内核 (mihomo · $ARCH)"
-    # 清掉上一次中断留下的半截下载: 路由器闪存很小, 20 MB 的临时文件不该长期躺着
-    # (.geo-*.part 是分流数据库的; 中断后重跑会重新下, 旧的没必要留着占地方)
-    rm -f "$ZP_DIR/.mihomo.gz" "$ZP_DIR"/*.new "$ZP_DIR"/.geo-*.part 2>/dev/null || true
+    # Discard incomplete candidates, but retain a compressed prefix for safe
+    # digest-bound resumption. Geo files have their own atomic replacement.
+    rm -f "$ZP_DIR"/*.new "$ZP_DIR"/.geo-*.part 2>/dev/null || true
     # 复用旧文件前必须确认它真的跑得起来: 上一次失败可能留下一个没解开的 gz
     # (chmod 是成功的, 只看 -x 会以为装好了, 于是每次重跑都在同一个地方再挂一次)。
     # (预检那边算空间用的是同一个判据, 见 core_reusable。)
@@ -1972,7 +2193,13 @@ install_core() {
     if core_reusable; then
         note "本机内核是 $(err_line "$("$ZP_BIN" -v 2>/dev/null | head -n1)"), 面板要的是 $PANEL_CORE_VERSION —— 换一版"
     fi
-    rm -f "$ZP_BIN"
+    # Keep the current executable until its replacement has passed validation.
+    if [ -s "$ZP_BIN" ]; then
+        _swap_free="$(df -k "$ZP_DIR" 2>/dev/null | awk 'NR==2{print $4}' || true)"
+        if [ -n "$_swap_free" ] && [ "$_swap_free" -lt 92160 ]; then
+            die "安全替换内核需要额外约 90 MB 可用空间；当前内核已保留，请释放空间后重试。"
+        fi
+    fi
     _tmp="$ZP_DIR/.mihomo.gz"
     mkdir -p "$ZP_DIR"
 
@@ -2009,18 +2236,19 @@ install_core() {
     # OpenWrt 的 busybox 默认不带 od, 命令不存在时那一行会静默失败, 于是 gz 被当成
     # 二进制直接 chmod +x, 直到"无法执行"才暴露 (2.7.0 上线后的真机反馈)。
     if gzip -t "$_tmp" >/dev/null 2>&1; then
-        gzip -dc "$_tmp" > "$ZP_BIN" || die "解压内核失败 (下载到的文件可能不完整, 请重试)"
+        gzip -dc "$_tmp" > "$ZP_BIN.new" || die "解压内核失败 (下载到的文件可能不完整, 请重试)"
     else
-        cp "$_tmp" "$ZP_BIN"     # 面板直接给了未压缩的二进制
+        cp "$_tmp" "$ZP_BIN.new"     # 面板直接给了未压缩的二进制
     fi
-    rm -f "$_tmp"
-    chmod 755 "$ZP_BIN"
-    if ! "$ZP_BIN" -v >/dev/null 2>&1; then
-        _size="$(wc -c < "$ZP_BIN" 2>/dev/null | tr -d ' ')"
+    rm -f "$_tmp" "$_tmp.source"
+    chmod 755 "$ZP_BIN.new"
+    if ! "$ZP_BIN.new" -v >/dev/null 2>&1; then
+        _size="$(wc -c < "$ZP_BIN.new" 2>/dev/null | tr -d ' ')"
         die "内核无法执行: $ZP_BIN (${_size:-?} 字节)。
   可能原因: 架构不匹配 ($ARCH) / 下载不完整 / 闪存空间不足 / 缺动态库。
   请把这一行连同 'uname -m' 的输出一起发回面板。"
     fi
+    mv "$ZP_BIN.new" "$ZP_BIN"
     ok "内核就绪: $("$ZP_BIN" -v 2>/dev/null | head -n1)"
 }
 
@@ -2165,6 +2393,10 @@ geo_fetch_one() {
         stop_progress
         # 体积闸门: 挡 404 页面 / 面板那句"还在准备"的人话 / 下了一半的文件
         if [ "${_ggot:-0}" -ge "$_gneed" ] 2>/dev/null; then
+            _geo_sha_rc=0
+            zp_verify_sha "$_gtmp" "$_gtmp.hdr" "$_gname" || _geo_sha_rc=$?
+            if [ "$_geo_sha_rc" = 1 ]; then rm -f "$_gtmp" "$_gtmp.hdr"; continue; fi
+            rm -f "$_gtmp.hdr"
             mv "$_gtmp" "$ZP_DIR/$_gname"
             ok "$_gname 就绪 ($(zp_hsize "$_ggot"))"
             return 0
@@ -2179,9 +2411,20 @@ geo_fetch_one() {
 install_geo() {
     step "准备分流数据库 (GeoIP / GeoSite)"
     _gfail=""
+    _geo_work="$(umask 077; mktemp -d /tmp/zp-geo.XXXXXX)" || return 1
+    # Separate subshells isolate downloader globals and response headers.
+    # Each file retains its own validation and mirror fallback.
+    _geo_pids=""
     for _gfile in $GEO_FILE_LIST; do
-        geo_fetch_one "$_gfile" || _gfail="$_gfail $_gfile"
+        (geo_fetch_one "$_gfile" > "$_geo_work/$_gfile.log" 2>&1 || printf '%s\n' "$_gfile" > "$_geo_work/$_gfile.failed") &
+        _geo_pids="$_geo_pids $!"
     done
+    for _geo_pid in $_geo_pids; do wait "$_geo_pid" || true; done
+    for _gfile in $GEO_FILE_LIST; do
+        cat "$_geo_work/$_gfile.log" 2>/dev/null || true
+        [ ! -f "$_geo_work/$_gfile.failed" ] || _gfail="$_gfail $_gfile"
+    done
+    rm -rf "$_geo_work"
     if geo_ok; then
         [ -z "$_gfail" ] || warn "这次没取到$_gfail —— 继续用本机已有的那一份"
         _ggsz="$(wc -c < "$ZP_DIR/geoip.metadb" 2>/dev/null | tr -d ' ' || true)"
@@ -2223,7 +2466,7 @@ config_failure() {
     # 就会去面板上白找一圈。两种都要说, 并给出能立刻做的那一件事。
     if [ -n "$ZP_CODE" ]; then
         die "拉取/校验配置失败 —— 拿到的东西不是一份可用配置 (${_cfg_why:-没拿到}); 也可能是面板上没有可用节点。
-  这次**没有改动机器上已有的东西**。
+  设备凭据已保存；重新执行安装命令可以继续。
   现在先做这一件: 把上面那条安装命令**再跑一次**。"
     fi
     die "拉取/校验配置失败 —— 拿到的东西不是一份可用配置 (${_cfg_why:-没拿到}); 也可能是面板上没有可用节点。
@@ -2325,7 +2568,7 @@ runtime_dest() {
 runtime_from_bundle() {
     _b="$ZP_DIR/.rt.tar.gz"
     _stage="$ZP_DIR/.rt.stage"
-    http_fetch_to "$ZP_BASE/c/rt/bundle" "$_b" 120 0 || { rm -f "$_b" "$_b.hdr"; return 1; }
+    http_fetch_to "$ZP_BASE/c/rt/bundle?ui=1" "$_b" 30 0 || { rm -f "$_b" "$_b.hdr"; return 1; }
     [ -s "$_b" ] || { rm -f "$_b" "$_b.hdr"; return 1; }
     # 供应链闸门: 这一包里就是下一步要以 root 落盘/执行的 CLI 与 init 脚本,
     # 面板下发的 X-ZP-Sha256 与它不一致就整包丢弃 (逐件取那条路仍是兜底)。
@@ -2347,6 +2590,13 @@ runtime_from_bundle() {
     for _f in $RUNTIME_NAMES; do
         [ -s "$_stage/$_f" ] || { warn "装机件包里缺 $_f —— 改成逐个取"; rm -rf "$_stage"; return 1; }
     done
+    if [ -d "$_stage/ui" ] && [ -n "${INSTALL_WORK:-}" ]; then
+        BUNDLED_UI="$INSTALL_WORK/ui"
+        mkdir -p "$BUNDLED_UI"
+        for _ui_name in index.html app.js perf.js cgi menu.json acl.json status.js; do
+            [ ! -s "$_stage/ui/$_ui_name" ] || cp "$_stage/ui/$_ui_name" "$BUNDLED_UI/$_ui_name"
+        done
+    fi
     for _f in $RUNTIME_NAMES; do
         _dst="$(runtime_dest "$_f")"
         sed -e "s/__ZP_CLIENT_VERSION__/$ZP_CLIENT_VERSION/g" \
@@ -2364,7 +2614,9 @@ runtime_from_bundle() {
 install_runtime() {
     step "落运行时装机件"
     LAN_IFACE="$(lan_iface 2>/dev/null || true)"
+    BUNDLED_UI=""
     if runtime_from_bundle; then return 0; fi
+    [ "${HTTP_CODE:-}" != 000 ] || die "运行组件下载时面板失联，请检查连接后重新执行原安装命令；已下载的内核可继续复用。"
     note "整套装机件没一次取回来 —— 改成逐个取 (多几次往返, 但单件失败不拖垮其余)"
     for _f in $RUNTIME_NAMES; do
         case "$_f" in
@@ -2488,12 +2740,16 @@ install_zpcore() {
         _have=1
         _old_ver="$("$ZP_DIR/zpcore" version 2>/dev/null | head -n1)"
     fi
+    if [ "$_have" = "1" ] && [ -n "${PANEL_AGENT_VERSION:-}" ] && [ "$_old_ver" = "zpcore $PANEL_AGENT_VERSION" ]; then
+        ok "本地控制面已是最新: $_old_ver (无需重复下载)"
+        return 0
+    fi
     # 上一次留下的坏文件 (没解开 / 架构不对) 会让每次重跑都死在同一个地方: 先清掉。
     rm -f "$ZP_DIR/.zpcore.gz" "$ZP_DIR/zpcore.new" 2>/dev/null || true
     _tmp="$ZP_DIR/.zpcore.gz"
     # 用与内核同一条下载器 (http_fetch_to): 它带 HTTP 状态码, 于是"面板说没有这一档"
     # (404) 与"这条路走不通"能分开说 —— 以前两者都是同一句"没准备", 排障时指错方向。
-    if ! http_fetch_to "$ZP_BASE/c/agent/bin/$ARCH" "$_tmp" 300 0; then
+    if ! http_fetch_to "$ZP_BASE/c/agent/bin/$ARCH" "$_tmp" "${ZP_CONTROLLER_BUDGET:-60}" 0; then
         if [ "$HTTP_CODE" = "404" ]; then
             note "面板没有准备这一档本地控制面 (可选件) —— 界面走原来的路径"
         else
@@ -2710,10 +2966,29 @@ ui_file_ok() {  # $1=文件 $2=期望的首字符 ('' = 只要非空)
 }
 
 # 原子取一个界面文件。返回 0 = 目标文件现在是好的 (新下的 / 原来的 / 内置的)。
+ui_fetch() {
+    case "$1" in index.html|app.js|perf.js|cgi|menu.json|acl.json|status.js) ;; *) return 1 ;; esac
+    if [ -n "${BUNDLED_UI:-}" ] && [ -s "$BUNDLED_UI/$1" ]; then
+        cat "$BUNDLED_UI/$1"
+        return 0
+    fi
+    if [ -n "${UI_DEADLINE:-}" ] && [ -n "${INSTALL_WORK:-}" ]; then
+        _ui_left=$((UI_DEADLINE - $(date +%s)))
+        [ "$_ui_left" -gt 0 ] || return 1
+        _ui_fetch="$INSTALL_WORK/ui-$1.part"
+        if http_fetch_to "$ZP_BASE/c/ui/$1" "$_ui_fetch" "$_ui_left" 0; then
+            cat "$_ui_fetch"
+            return 0
+        fi
+        return 1
+    fi
+    http_get "$ZP_BASE/c/ui/$1"
+}
+
 ui_put() {  # $1=url $2=目标 $3=期望首字符 $4=内置兜底的名字 ('' = 没有)
     _u="$1"; _dst="$2"; _want="$3"; _builtin="${4:-}"
     _tmp="$_dst.new.$$"
-    if http_get "$_u" > "$_tmp" 2>/dev/null && ui_file_ok "$_tmp" "$_want"; then
+    if ui_fetch "${_u##*/}" > "$_tmp" 2>/dev/null && ui_file_ok "$_tmp" "$_want"; then
         mv "$_tmp" "$_dst"
         chmod 644 "$_dst" 2>/dev/null || true
         return 0
@@ -2824,6 +3099,7 @@ luci_install() {
 }
 
 install_ui() {
+    UI_DEADLINE=$(( $(date +%s) + ${ZP_UI_BUDGET:-30} ))
     step "安装网页管理界面"
     # 界面令牌在 write_files 里就生成好了 (agent 的心跳要拿它上报"管理界面地址")。
     # 万一被谁删了, 这里补一个 —— 没有令牌的地址等于打不开。
@@ -2842,7 +3118,7 @@ install_ui() {
     # perf.js 是性能模式那块仪表盘 (跑车表盘 + 进入动画)。它与 app.js 分开, 因为那是一整段
     # 独立的动画 / 状态机 —— 塞进 app.js 只会让两个都难读。
     for f in index.html app.js perf.js; do
-        if ! http_get "$ZP_BASE/c/ui/$f" > "$_stage/zeroproxy/$f" 2>/dev/null; then
+        if ! ui_put "$ZP_BASE/c/ui/$f" "$_stage/zeroproxy/$f" '' '' 2>/dev/null; then
             # 老面板没有 perf.js (2.11.26 之前): 页面照发, 那块表盘不存在而已 ——
             # 代理本身一个字节都不受影响, 所以这里不整条放弃界面。
             if [ "$f" = "perf.js" ]; then
@@ -2851,7 +3127,6 @@ install_ui() {
                 continue
             fi
             warn "面板没有提供界面文件 (面板版本较旧?), 跳过网页界面"
-            rm -rf "$_stage"
             return 0
         fi
     done
@@ -2859,7 +3134,7 @@ install_ui() {
     # `http_get … > 目标 || true`, 一次失败的请求会把一个能用的 cgi 换成 0 字节, 于是
     # 页面(iframe 指向 /cgi-bin/zeroproxy)直接空掉 (README 8.79 那次事故的同类)。
     _cgi_tmp="$_stage/cgi-bin/zeroproxy.new.$$"
-    if http_get "$ZP_BASE/c/ui/cgi" > "$_cgi_tmp" 2>/dev/null && [ -s "$_cgi_tmp" ]; then
+    if ui_fetch cgi > "$_cgi_tmp" 2>/dev/null && [ -s "$_cgi_tmp" ]; then
         mv "$_cgi_tmp" "$_stage/cgi-bin/zeroproxy"
     else
         rm -f "$_cgi_tmp"
@@ -3342,15 +3617,26 @@ main() {
     printf '\n%sZeroProxy 路由器客户端%s v%s\n\n' "$C_B" "$C_R" "$ZP_CLIENT_VERSION"
     detect_env
     detect_http || die "路由器上没有任何可用的下载工具 (curl / uclient-fetch / wget)"
+    install_begin
     preflight
     pair
+    install_reporter_start
+    install_stage dependencies
     install_deps
+    install_stage core
     install_core
+    install_stage runtime
     write_files
-    install_zpcore
-    install_ui
+    install_stage verify
     verify
     report_up
+    install_stage controller
+    install_zpcore
+    install_stage ui
+    install_ui
+    install_stage optional
+    prepare_optional_deps
+    install_stage ready completed
     finish
 }
 
