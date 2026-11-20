@@ -1862,7 +1862,7 @@ install_deps() {
         note "IPv6 一并接管 (局域网设备的 v6 流量也走代理, 不会漏出去)"
     else
         note "IPv6 未接管: ${CAPS_WHY_IPV6:-这一档数据面覆盖不到 v6}"
-        note "  这台机器上, 局域网设备的 IPv6 会直接出去 —— 面板上也会这么标"
+        note "  请核对 IPv6 防护；TPROXY 降级时拦截公网 IPv6，其他未保护的路径可能直出"
     fi
     # 兜底再写一次: 上面任何一步新加的探测值都在这一下落地。**顺序错了也不会静默丢值**
     # —— 真机上吃过一次亏 (算完没落盘, caps 里空着, 而输出里是对的)。
@@ -2547,7 +2547,7 @@ runtime_put() {  # $1=名字  $2=落盘路径  $3=期望的首字符 ('' = 只�
 }
 
 #: 装机件的清单 (与面板的 router_client.RUNTIME_FILES 一一对应)。
-RUNTIME_NAMES="live.sh tproxy.nft redirect.sh tunfw.sh perf.sh agent.sh cli zeroproxy.init zeroproxy-agent.init zeroproxy-perf.init"
+RUNTIME_NAMES="live.sh tproxy.nft tproxy.sh redirect.sh tunfw.sh perf.sh agent.sh cli zeroproxy.init zeroproxy-agent.init zeroproxy-perf.init"
 
 # 装机件的名字 → 落盘路径。三份 init 与 CLI 要进 /etc/init.d 与 /usr/bin, 名字跟落盘路径
 # 不一样; 其余都在运行目录里。
@@ -2662,8 +2662,8 @@ write_files() {
     # 是"数据" (nft -f 直接读), 这里是"动作" (要按 LAN 接口名增删), 所以写成函数。
     #
     # 只接管**从局域网接口进来**的 TCP: REDIRECT 不适用于 UDP, 所以 covered=lan_tcp;
-    # 路由器自身出站与 WAN 侧入站一个字节都不碰。UDP 那部分要 TUN 或 tproxy 才做得到,
-    # 这台固件给不了 —— 那就如实少给, 而不是假装给全了。
+    # 本机外发公网 DNS 另行接管；非 direct 模板拒绝局域网发往公网的 UDP，避免直出。
+    # UDP 转发需要 TUN 或 tproxy，不能将拒绝 UDP 说成已代理。
 
     # TUN 数据面的**防火墙放行**。只在 auto-redirect 没能跑成 (caps: autoredirect=0) 时才用。
 

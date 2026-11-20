@@ -181,7 +181,7 @@ from .config import paths
 #: 1.4.58: 区分 TLS 握手与证书验证错误，隔离性能日志函数，明确系统日志快照语义。
 #: 1.4.61: 并发有界心跳、逐面板控制意图缓存、断线退避与独立状态时效。
 #: 1.4.62: 安装接入可恢复配对、阶段遥测、能力优先、合并分发与并行分流资源。
-SCRIPT_VERSION = "1.4.62"
+SCRIPT_VERSION = "1.4.63"
 
 #: 固定的 mihomo 版本。固定而不是跟随最新, 是因为路由器端配置文件 (tun/dns/sniffer)
 #: 是按某一版的行为写的; 内核升级可能带来字段废弃, 那种问题在用户家里"全屋断网"
@@ -2122,6 +2122,7 @@ def ui_file(name: str) -> tuple[str, str, str] | None:
 RUNTIME_FILES = (
     "live.sh",
     "tproxy.nft",
+    "tproxy.sh",
     "redirect.sh",
     "tunfw.sh",
     "perf.sh",

@@ -593,8 +593,7 @@ def test_groups_carry_entry_health_judgement():
 
     修法两条:
       * `♻️ 自动选择`: 周期 300 → 60 秒, 且 lazy=false (没被选中也照测);
-      * 落地组: 有**两条以上**链时用 url-test (多入口冗余的意义就在这里 —— 一台入口
-        被丢包时自动切到另一条), 只有一条链 / 没有链时保持 select (与从前一致)。
+      * 落地组: 两条以上链用 fallback，保持入口故障切换，避免测速抖动改变登录出口。
     """
     two = ["ZeroProxy 链式 · 美国", "ZeroProxy 链式 · 香港", "ZeroProxy VLESS Reality"]
     groups = {g["name"]: g for g in share_links._groups_for(two, "smart")}
@@ -605,7 +604,7 @@ def test_groups_carry_entry_health_judgement():
     assert auto["lazy"] is False, "lazy 时不选中就不探, 等于没有健康判据"
 
     landing = groups[share_links.G_LANDING]
-    assert landing["type"] == "url-test", "两条以上链时必须能自动避开坏入口"
+    assert landing["type"] == "fallback", "保留故障切换，不按延迟频繁更换登录出口"
     assert landing["proxies"] == ["ZeroProxy 链式 · 美国", "ZeroProxy 链式 · 香港"]
     assert landing["interval"] == 60 and landing["lazy"] is False
 

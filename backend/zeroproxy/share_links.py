@@ -105,6 +105,14 @@ AI_DOMAINS = (
     "anthropic.com", "claude.ai", "claude.com",
     "gemini.google.com", "bard.google.com", "aistudio.google.com",
     "generativelanguage.googleapis.com",
+    # Google 登录、授权、Gemini 后端与共享静态资源必须和 AI 页面同出口。
+    # 不把整个 google.com 归入 AI，避免连带改变搜索/地图等业务的策略。
+    "accounts.google.com", "accounts.youtube.com", "oauth2.googleapis.com",
+    "aisandbox-pa.googleapis.com", "alkalimakersuite-pa.clients6.google.com",
+    "waa-pa.clients6.google.com", "waa-pa.googleapis.com",
+    "www.gstatic.com", "ssl.gstatic.com", "fonts.gstatic.com",
+    "lh3.googleusercontent.com", "lh4.googleusercontent.com",
+    "recaptcha.net", "recaptcha.google.com", "www.google.com",
     "perplexity.ai", "x.ai", "grok.com", "midjourney.com",
     "poe.com", "character.ai", "sora.com", "cursor.com", "cursor.sh",
 )
@@ -618,16 +626,8 @@ ROUTER_DNS = {
     "nameserver": ["223.5.5.5", "119.29.29.29"],
     "proxy-server-nameserver": ["223.5.5.5", "119.29.29.29"],
     "direct-nameserver": ["223.5.5.5", "119.29.29.29"],
-    # 只给"要直连的域名"指定国内 DNS。**国外域名故意不在这里配 DoH**:
-    #
-    # 真机反馈: YouTube 首屏要十几秒, 但视频一开始播就满速。原因是给国外域名配了
-    # "DoH 经代理出去" —— 每解析一个新域名都是 路由器 → 内核 → 节点 → Cloudflare
-    # 两个来回; 一个页面首屏要碰几十个域名, 串起来就是十几秒。播放快是因为那条
-    # 长连接的域名早就解析完了。
-    #
-    # 被代理的域名本来就不需要在本地解析: mihomo 的 fake-ip 已经把域名映射留在手里,
-    # 转发给节点时带的是**域名**, 由落地节点在本地解析 —— 又快又不怕污染。
-    # 所以这里只留"国内/私有域名走国内 DNS"这一条。
+    # 国内/私有域名保留就近解析。router_dns 为非 direct 模板补上代理 DoH，
+    # fake-ip 的 A 查询仍直接使用映射，仅需要真实解析的查询才访问上游。
     "nameserver-policy": {
         "geosite:private,cn": ["223.5.5.5", "119.29.29.29"],
     },
@@ -680,7 +680,7 @@ def router_tun(tproxy: bool = True, mtu: int = 1500) -> dict:
     return tun
 
 
-def router_dns(geo: bool = True, ipv6: bool = False) -> dict:
+def router_dns(geo: bool = True, ipv6: bool = False, template: str = "smart") -> dict:
     """路由器端 `dns` 段。
 
     `geo=False` 是降级: nameserver-policy 的键是 `geosite:private,cn`, 它自己也要
@@ -690,11 +690,23 @@ def router_dns(geo: bool = True, ipv6: bool = False) -> dict:
     `ipv6=True` 时把 DNS 也放开到 v6 —— 与顶层 `ipv6` 一致。**两处必须同时开**: 只开
     顶层会让 AAAA 解析走不到, 只开 DNS 会让 mihomo 拿到 v6 地址却没法用它。
     """
-    dns = dict(ROUTER_DNS)
+    # 每份配置独立复制列表/映射，避免一次生成污染其他模板。
+    dns = json.loads(json.dumps(ROUTER_DNS))
     if ipv6:
         dns["ipv6"] = True
+        dns["listen"] = "[::]:7874"
     if not geo:
         dns.pop("nameserver-policy", None)
+    if template != "direct":
+        # fake-ip 仅省掉 A 查询；AAAA/HTTPS 等查询仍可能触达上游。
+        # 显式 detour 防止境外解析直出；节点引导解析保持独立，避免循环。
+        dns["nameserver"] = [f"https://1.1.1.1/dns-query#{G_SELECT}",
+                             f"https://8.8.8.8/dns-query#{G_SELECT}"]
+        policy = dns.setdefault("nameserver-policy", {})
+        for domain in AI_DOMAINS:
+            policy[f"+.{domain}"] = [f"https://1.1.1.1/dns-query#{G_AI}"]
+        for domain in PURITY_LANDING_DOMAINS:
+            policy[f"+.{domain}"] = [f"https://1.1.1.1/dns-query#{G_LANDING}"]
     return dns
 
 
@@ -1037,27 +1049,19 @@ def _groups_for(names: list[str], tpl: str) -> list[dict]:
             }
         )
     # 落地组: 成员是链式节点 (中转→落地)。
-    # 有**两条以上**链时用 url-test 而不是 select —— 入口冗余的意义就在这一步: 一台入口
-    # 被按比例丢包 / 被墙时自动切到能通的那条 (同一落地的另一台入口, 或另一条链)。
+    # 两条以上链使用 fallback：只在入口不可用时切换，不因延迟波动改变登录出口。
     # 只有一条链时没有选择余地, 保持 select; 没有链式节点时兜底成员是"节点选择",
     # 没配落地的用户行为与从前完全一致。
     landing = [n for n in names if "链式" in n]
     if len(landing) >= 2:
         landing_group = {
-            "name": G_LANDING, "type": "url-test", "url": HEALTH_URL,
-            "interval": 60, "lazy": False, "tolerance": 50, "proxies": landing,
-        }
-        ai_group = {
-            "name": G_AI, "type": "url-test", "url": HEALTH_URL,
-            "interval": 60, "lazy": False, "tolerance": 50, "proxies": landing,
+            "name": G_LANDING, "type": "fallback", "url": HEALTH_URL,
+            "interval": 60, "lazy": False, "proxies": landing,
         }
     else:
         landing_group = {"name": G_LANDING, "type": "select", "proxies": landing + [G_SELECT]}
-        ai_group = {
-            "name": G_AI,
-            "type": "select",
-            "proxies": (landing + [G_LANDING, G_SELECT]) if landing else [G_SELECT],
-        }
+    # AI 与验证码只维护一个落地选择，不能独立测速后选出两个不同的公网 IP。
+    ai_group = {"name": G_AI, "type": "select", "proxies": [G_LANDING]}
     streaming_group = {
         "name": G_STREAMING,
         "type": "select",
@@ -1224,8 +1228,8 @@ def clash_profile(
     mihomo 启动时建 tun 失败, 整份配置起不来 (见 README 8.45)。tproxy / redirect
     都用 `redir-port` + `dns.listen` 那一条路, 配置本身一样, 差别在防火墙侧。
     `ipv6=True` 表示这台设备的数据面**能一并接管 IPv6**: 顶层 `ipv6` 与 `dns.ipv6`
-    一起打开。不能接管时保持 v4-only —— 那时局域网设备的 v6 会直接出去, 这件事由
-    设备侧如实上报 (caps 的 `why.ipv6`), 面板上会写"IPv6 未接管"。
+    一起打开。不能接管时保持 v4-only，由防火墙拦截或设备另行处理 IPv6；能力限制由
+    设备侧如实上报 (caps 的 `why.ipv6`)，不能把关闭 AAAA 当作系统 IPv6 已停用。
     `tproxy=False` 同理, 是设备侧的能力: 那台路由器没有 nft/tproxy 时不要写
     `auto-redirect` (它会让 tun 建不起来), 见 router_tun。
     """
@@ -1267,9 +1271,7 @@ def clash_profile(
             {
                 "name": G_AI,
                 "type": "select",
-                "use": [],
-                "filter": "(?i)链式",
-                "proxies": [G_LANDING, G_SELECT],
+                "proxies": [G_LANDING],
             },
             {
                 "name": G_STREAMING,
@@ -1326,6 +1328,7 @@ def clash_profile(
             # auto-route 一并管 v6; 覆盖不到时保持 v4-only, 并由设备上报"IPv6 未接管"
             # (真话), 而不是留一个看起来接管了、实际漏出去的假象。
             "ipv6": bool(ipv6),
+            "routing-mark": 0x1ff,
             # 并发建连 + 统一延迟: 多设备同时上网时体感差别明显
             "tcp-concurrent": True,
             "unified-delay": True,
@@ -1349,7 +1352,7 @@ def clash_profile(
                 # 这两类域名被嗅探后推送/米家设备的证书校验会出问题, 跳过
                 "skip-domain": ["Mijia Cloud", "+.push.apple.com"],
             },
-            "dns": router_dns(geo, ipv6),
+            "dns": router_dns(geo, ipv6, tpl),
             "tun": router_tun(tproxy, mtu),
             "geox-url": geox,
             # 多服务器模式: 节点由路由器挂成 proxy-providers, 这里留一个空 map 当锚点
@@ -1367,6 +1370,7 @@ def clash_profile(
             "allow-lan": False,
             "mode": "rule",
             "log-level": "info",
+            "dns": {**router_dns(geo, False, tpl), "listen": "127.0.0.1:7874"},
             "geox-url": geox,
             "proxies": proxies,
             "proxy-groups": groups,
@@ -1608,8 +1612,8 @@ def singbox_profile(state: dict, template: str | None = None, next_gen: bool = F
         {
             "type": "selector",
             "tag": G_AI,
-            "outbounds": (landing_tags + [G_LANDING, G_SELECT]) if landing_tags else [G_SELECT],
-            "default": landing_tags[0] if landing_tags else G_SELECT,
+            "outbounds": [G_LANDING],
+            "default": G_LANDING,
         }
     )
     outbounds.append(
@@ -1804,13 +1808,19 @@ def singbox_android_profile(state: dict, template: str | None = None) -> str:
         "type": "tun", "tag": "tun-in", "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
         "mtu": 1500, "auto_route": True, "stack": "system",
     }]
-    dns_rules = [{"domain_suffix": ["lan", "local", "home.arpa"], "server": "local-dns"}]
+    dns_rules = []
+    if template_of(state, template) != "direct":
+        dns_rules += [{"domain_suffix": list(AI_DOMAINS), "server": "ai-dns"},
+                      {"domain_suffix": list(PURITY_LANDING_DOMAINS), "server": "landing-dns"}]
+    dns_rules.append({"domain_suffix": ["lan", "local", "home.arpa"], "server": "local-dns"})
     if template_of(state, template) in ("smart", "precision"):
         dns_rules.append({"domain_suffix": list(CN_DIRECT_DOMAINS), "server": "local-dns"})
         dns_rules.append({"rule_set": [tag for tag, _ in CN_RULE_SETS], "server": "local-dns"})
     profile["dns"] = {
         "servers": [{"type": "local", "tag": "local-dns"},
-                    {"type": "https", "tag": "proxy-dns", "server": "1.1.1.1", "path": "/dns-query", "detour": G_SELECT}],
+                    {"type": "https", "tag": "proxy-dns", "server": "1.1.1.1", "path": "/dns-query", "detour": G_SELECT},
+                    {"type": "https", "tag": "ai-dns", "server": "1.1.1.1", "path": "/dns-query", "detour": G_AI},
+                    {"type": "https", "tag": "landing-dns", "server": "1.1.1.1", "path": "/dns-query", "detour": G_LANDING}],
         "rules": dns_rules,
         "final": "local-dns" if template_of(state, template) == "direct" else "proxy-dns",
         "strategy": "prefer_ipv4",

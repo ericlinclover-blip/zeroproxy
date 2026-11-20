@@ -460,7 +460,7 @@ def main() -> int:
         os.makedirs(cache, exist_ok=True)
         stub = (
             '#!/bin/sh\ncase "$*" in\n'
-            '  *-v*) echo "Mihomo Meta v1.19.32 (stub)" ;;\n'
+            f'  *-v*) echo "Mihomo Meta {router_client.CORE_VERSION} (stub)" ;;\n'
             '  *-t*) exit 0 ;;\n'
             '  *) while :; do sleep 60; done ;;\n'
             "esac\nexit 0\n"

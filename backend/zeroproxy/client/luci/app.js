@@ -202,7 +202,7 @@ function render(state) {
     summary += ` · ${state.why}`;
   }
   if (state.core === 'running' && state.mode !== 'none' && state.ipv6 === '0') {
-    summary += ' · IPv6 未接管 (v6 会直接出去)';
+    summary += ' · IPv6 未代理（需核对防护）';
   }
   if (state.core === 'running' && state.mode !== 'none' && state.mode !== 'ebpf' && state.packets === 0) {
     summary += ' · 规则上还没有流量经过';

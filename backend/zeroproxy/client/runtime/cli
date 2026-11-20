@@ -613,7 +613,7 @@ doctor() {
         printf '  ✓ 已一并接管（局域网设备的 v6 也走代理）\n'
     else
         printf '  ! 未接管 — %s\n' "$(sed -n 's/^why.ipv6=//p' "$ZP_DIR/caps" 2>/dev/null | head -n1)"
-        printf '      这台机器上局域网设备的 IPv6 会直接出去\n'
+        printf '      请核对 IPv6 拦截或接管状态；未保护的路径可能直出\n'
     fi
 
     echo
@@ -1087,6 +1087,10 @@ EOF
                 zp_perf_off >/dev/null 2>&1 || true
             fi
             nft delete table inet zp_router 2>/dev/null || true
+            if [ -f "$ZP_DIR/tproxy.sh" ]; then
+                . "$ZP_DIR/tproxy.sh"
+                zp_tproxy_clear 2>/dev/null || true
+            fi
             if [ -f "$ZP_DIR/redirect.sh" ]; then
                 . "$ZP_DIR/redirect.sh"
                 zp_redirect_clear >/dev/null 2>&1 || true
@@ -1177,6 +1181,10 @@ EOF
             rm -f "$ZP_DIR/core.up"
             /etc/init.d/zeroproxy stop >/dev/null 2>&1 || true
             nft delete table inet zp_router 2>/dev/null || true
+            if [ -f "$ZP_DIR/tproxy.sh" ]; then
+                . "$ZP_DIR/tproxy.sh"
+                zp_tproxy_clear 2>/dev/null || true
+            fi
             if [ -f "$ZP_DIR/redirect.sh" ]; then
                 . "$ZP_DIR/redirect.sh"
                 zp_redirect_clear 2>/dev/null || true
@@ -1405,6 +1413,10 @@ EOF
         /etc/init.d/zeroproxy-ui disable >/dev/null 2>&1 || true
         rm -f "$ZP_DIR/core.up"
         nft delete table inet zp_router 2>/dev/null || true
+        if [ -f "$ZP_DIR/tproxy.sh" ]; then
+            . "$ZP_DIR/tproxy.sh"
+            zp_tproxy_clear 2>/dev/null || true
+        fi
         if [ -f "$ZP_DIR/redirect.sh" ]; then
             . "$ZP_DIR/redirect.sh"
             zp_redirect_clear 2>/dev/null || true
@@ -1568,6 +1580,10 @@ EOF
         /etc/init.d/zeroproxy stop >/dev/null 2>&1 || true
         /etc/init.d/zeroproxy disable >/dev/null 2>&1 || true
         nft delete table inet zp_router 2>/dev/null || true
+        if [ -f "$ZP_DIR/tproxy.sh" ]; then
+            . "$ZP_DIR/tproxy.sh"
+            zp_tproxy_clear 2>/dev/null || true
+        fi
         if [ -f "$ZP_DIR/redirect.sh" ]; then
             . "$ZP_DIR/redirect.sh"
             zp_redirect_clear 2>/dev/null || true

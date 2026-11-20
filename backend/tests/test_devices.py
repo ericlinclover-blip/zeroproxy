@@ -1200,7 +1200,8 @@ def test_router_profile_degrades_when_panel_has_no_geo_data(client, configured):
     # 就是"国内网站、公众号、小程序都打不开或很慢"。
     assert "DOMAIN-SUFFIX,qq.com,🎯 全球直连" in rules
     assert "DOMAIN-SUFFIX,alipay.com,🎯 全球直连" in rules
-    assert "nameserver-policy" not in profile["dns"]   # 它的键也是 geosite:… , 要数据库
+    assert all(not k.startswith('geosite:') for k in profile['dns']['nameserver-policy'])
+    assert '+.accounts.google.com' in profile['dns']['nameserver-policy']
     assert profile["tun"]["enable"] is True
     # 多服务器模式 (骨架) 同样要能降级
     skeleton = yaml.safe_load(client.get(sub + "&format=skeleton&geo=0").text)
@@ -1571,8 +1572,8 @@ def test_geo_fetch_falls_back_to_mirrors_and_enforces_the_size_gate(tmp_path):
     assert "meta l4proto tcp tproxy ip6 to :1" in text
     assert "ip6 daddr ::1/128 tproxy to :1" not in text, "别再用那个漏了家族的写法"
     # 生产规则也要显式两个家族 (同样因为家族不能省)
-    assert "meta nfproto ipv4 meta l4proto tcp counter meta mark set 0x1ff tproxy ip to :7893 accept" in text
-    assert "meta nfproto ipv6 meta l4proto tcp counter meta mark set 0x1ff tproxy ip6 to :7893 accept" in text
+    assert "meta nfproto ipv4 meta l4proto tcp counter meta mark set 0x1fe tproxy ip to :7893 accept" in text
+    assert "meta nfproto ipv6 meta l4proto tcp counter meta mark set 0x1fe tproxy ip6 to :7893 accept" in text
     assert "ipv6=" in text and "why.ipv6=" in text
 
 
@@ -1937,7 +1938,7 @@ def test_doctor_answers_whether_traffic_actually_flows():
     # ① 现场核对 caps 里那一档是不是真的在 (不看命令退出码)
     assert "数据面真的在" in text and "现场一致" in text
     # ② 计数器: 两种数据面都要能算出包数; nft 规则必须带 counter
-    assert "counter meta mark set 0x1ff tproxy" in text
+    assert "counter meta mark set 0x1fe tproxy" in text
     assert "counter redirect to :7874" in text
     assert "datapath_packets" in text and "-L zp_router -v -n" in text
     # ③ 没流量时的措辞 (也可能只是刚开机, 所以是"还没有"而不是"坏了")
@@ -2640,9 +2641,9 @@ def test_router_profile_has_router_only_blocks(client, configured):
     assert profile["tun"]["enable"] is True
     assert profile["tun"]["auto-route"] is True
     assert profile["dns"]["enhanced-mode"] == "fake-ip"
-    # 国外域名故意不配 DoH-经-代理: 那会让首屏每解析一个域名都付两个跨洋来回
-    # (真机: YouTube 首屏十几秒, 播放却满速)。被代理的域名交给落地节点解析。
-    assert set(profile["dns"]["nameserver-policy"]) == {"geosite:private,cn"}
+    # fake-IP 保留；需要真实解析的境外查询使用代理 DoH。
+    assert 'geosite:private,cn' in profile['dns']['nameserver-policy']
+    assert '+.accounts.google.com' in profile['dns']['nameserver-policy']
     assert "dns.google" not in str(profile["dns"])
     assert profile["sniffer"]["enable"] is True
     assert profile["find-process-mode"] == "off"
@@ -2651,7 +2652,7 @@ def test_router_profile_has_router_only_blocks(client, configured):
     path = configured["subscription_url"].split("testserver")[-1]
     client_yaml = client.get(path + "?format=clash").text
     assert "tun:" not in client_yaml
-    assert "fake-ip" not in client_yaml
+    assert yaml.safe_load(client_yaml)['dns']['listen'] == '127.0.0.1:7874'
 
 
 def test_router_config_can_drop_auto_redirect_for_devices_that_cannot_use_it(client, configured):
@@ -2744,7 +2745,8 @@ def test_ipv6_is_taken_over_only_when_the_device_says_it_can(client, configured)
     assert on["dns"]["ipv6"] is True
     # v4 那一套不受影响
     assert on["dns"]["enhanced-mode"] == "fake-ip"
-    assert set(on["dns"]["nameserver-policy"]) == {"geosite:private,cn"}
+    assert 'geosite:private,cn' in on['dns']['nameserver-policy']
+    assert on['dns']['listen'] == '[::]:7874'
     assert on["tun"]["auto-route"] is True
 
     # 多服务器骨架同一条路
@@ -2781,7 +2783,8 @@ def test_install_script_ships_a_lan_only_redirect_datapath():
 
     # DNS 也要一并劫持 (fake-ip 才能按域名分流); 私有地址与代理端口自身先放行
     assert "--dport 53 -j REDIRECT" in text
-    assert "198.18.0.0/16" in text and "-j RETURN" in text
+    assert '-d 198.18.0.0/16 -j RETURN' not in text
+    assert 'zp_udp_guard' in text and '-p udp -j REJECT' in text
 
     # 拆卸只动自己的链 (别人的规则一条不碰) —— 停服务 / 卸载两处都要调用
     assert "-F zp_router" in text and "-X zp_router" in text
