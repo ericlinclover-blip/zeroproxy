@@ -1,3 +1,4 @@
+import { renderCorePanel } from "./update.js";
 /** 流量可视化 + 高级设置 + 系统卡片。
  *
  *  三块放在一起是因为它们共用同一个"改设置 → 落地 → 回灌"的收尾 (settleApply),
@@ -619,8 +620,6 @@ export function renderSystem(d) {
   const barPct = days > 90 ? 100 : days > 30 ? Math.round((days / 90) * 100) : Math.round((days / 30) * 100);
   const barColor = days > 30 ? "var(--ok)" : days > 14 ? "var(--warn)" : "var(--err)";
   const sys = d.system;
-  const svcRow = (k, v) =>
-    `<div class="kv"><span class="k">${esc(k)}</span><span><span class="dot ${stateClass(v.state)}"></span> ${STATE_TXT[v.state] || esc(v.state)}${v.version ? " · " + esc(v.version) : ""}</span></div>`;
 
   $("#sys-grid").innerHTML = `
     <div class="card">
@@ -634,8 +633,7 @@ export function renderSystem(d) {
       ${c.type === "selfsigned" ? '<div class="note">自签证书: 客户端已带 allowInsecure, 不影响使用; 点「申请证书」可再试一次 Let\'s Encrypt (需域名已解析、80 端口可达)</div>' : ""}
     </div>
     <div class="card">
-      ${svcRow("Xray 核心", sys.xray)}
-      ${svcRow("Hysteria 2", sys.hysteria2)}
+      <div id="core-versions"></div>
       ${d.wireguard ? `<div class="kv"><span class="k">WireGuard</span><span><span class="dot ${d.wireguard.enabled ? stateClass(sys.wireguard.state) : "other"}"></span> ${d.wireguard.enabled ? (STATE_TXT[sys.wireguard.state] || esc(sys.wireguard.state)) : "未启用"}</span></div>` : ""}
       <div class="kv"><span class="k">Nginx</span><span><span class="dot ${stateClass(sys.nginx.state)}"></span> ${STATE_TXT[sys.nginx.state] || esc(sys.nginx.state)}</span></div>
       <div class="kv"><span class="k">服务器</span><span>${esc(sys.server.os)} · ${esc(sys.server.arch)} · 在线 ${fmtUptime(sys.server.uptime_s)}</span></div>
@@ -660,6 +658,7 @@ export function renderSystem(d) {
       <div class="note mt-2">恢复接受明文 JSON 与加密备份 (加密备份需要在确认框里填同一个口令)。
         恢复是覆盖操作: 密钥 / 管理员口令 / 订阅地址都会换成备份里的那一份。</div>
     </div>`;
+  renderCorePanel(sys);
   applyWidths($("#sys-grid"));   // 证书有效期条的宽度与底色都走 CSSOM (见 lib/dom.js)
   const renewBtn = $("#btn-renew");
   if (renewBtn) renewBtn.onclick = async () => {

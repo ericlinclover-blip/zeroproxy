@@ -48,6 +48,7 @@ from . import (
     rule_analysis,
     config,
     crypto,
+    core_update,
     dae_config,
     devices,
     device_credentials,
@@ -269,6 +270,13 @@ def _require_auth(state: dict, request: Request) -> bool:
     authenticated = _session_of(state, request) is not None
     if authenticated:
         change_guard.authorize_write(state, request.url.path, request.method)
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path not in {
+            "/api/logout", "/api/logout-all", "/api/backup", "/api/routing/analyze",
+            "/api/update", "/api/update/cores",
+        }:
+            task = update._read_status()
+            if task.get("core_name") and task.get("state") in {"queued", "running"} and update.is_running():
+                raise change_guard.ChangeBusy("核心升级进行中，请在任务结束后修改配置")
         spec = change_guard.request_keys(request.url.path, request.method)
         if spec and request.headers.get("x-zp-confirm"):
             if request.headers["x-zp-confirm"] != "90":
@@ -2864,6 +2872,34 @@ def update_start(request: Request, payload: UpdateIn | None = None):
         if not _require_auth(state, request):
             return _err("未登录", 401)
         ok, detail = update.start(trigger="panel", core=bool(payload and payload.core))
+        config.audit(state, "update", detail[:190], actor=_client_ip(request))
+        save_state(state)
+    if not ok:
+        return _err(detail, 409)
+    return {"ok": True, "detail": detail}
+
+
+@router.get("/api/update/cores")
+def core_update_status(request: Request):
+    if not _require_auth(load_state(), request):
+        return _err("未登录", 401)
+    return core_update.status()
+
+
+class CoreUpdateIn(BaseModel):
+    core: str
+    version: str
+
+
+@router.post("/api/update/cores")
+def core_update_start(request: Request, payload: CoreUpdateIn):
+    with config.locked():
+        state = load_state()
+        if not _require_auth(state, request):
+            return _err("未登录", 401)
+        if not state["configured"]:
+            return _err("请先完成面板初始化", 409)
+        ok, detail = core_update.start(payload.core, payload.version)
         config.audit(state, "update", detail[:190], actor=_client_ip(request))
         save_state(state)
     if not ok:

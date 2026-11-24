@@ -609,11 +609,8 @@ async function main() {
       () => !document.querySelector("#btn-update-check").disabled, { timeout: 60000 });
     check("非生产环境不显示一键更新按钮",
       await page.locator("#btn-update-run").isHidden());
-    // 内核升级只由用户显式勾选触发: 开关必须在卡片里, 但非生产环境没有一键更新按钮,
-    // 所以整行是收起的 (露出一个升不了级的勾选框只会让人以为自己漏了什么)
-    check("内核升级开关存在且在不能升级时收起",
-      (await page.locator("#update-core").count()) === 1
-      && (await page.locator("#update-core-row").isHidden()), "");
+    check("面板升级与服务核心检查各有入口",
+      (await page.locator("#btn-core-check").count()) === 1 && (await page.locator("#update-core").count()) === 0);
     check("自签证书下可点「申请证书」(不再禁用到没机会补签)",
       (await page.locator("#btn-renew").innerText()).trim() === "申请证书"
       && !(await page.locator("#btn-renew").isDisabled()));

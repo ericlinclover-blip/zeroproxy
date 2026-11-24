@@ -60,6 +60,53 @@ const check = (name, ok, detail='') => { console.log(`${ok?'✓':'✗'} ${name}$
   await page.waitForFunction(()=>[...document.querySelectorAll('[data-device-diagnostic]')].some(e=>e.textContent.includes('设备已回报')),{},{timeout:15000});
   check('诊断展示阶段结果及范围',(await page.locator('[data-device-diagnostic]').innerText()).includes('LAN 终端')&&(await page.locator('[data-device-diagnostic]').innerText()).includes('固定 HTTPS 目标'));
   check('诊断结果标注执行时间',(await page.locator('[data-device-diagnostic]').innerText()).includes(new Date().getFullYear().toString()));
+  await page.click('[data-workspace="maintenance"]');
+  await page.evaluate(()=>{
+    window.dash.system.xray={state:'active',version:'Xray 26.7.28 (build details linux/amd64)'};
+    window.dash.system.hysteria2={state:'active',version:'v2.14.0'};
+    window.renderDash(true);
+  });
+  const coreCard=page.locator('#core-versions');
+  check('已装版本简洁显示，构建信息可展开',(await coreCard.innerText()).includes('v26.7.28 · 运行中')&&!(await coreCard.innerText()).includes('build details'));
+  await page.locator('#core-version-xray summary').press('Enter');
+  check('键盘可展开完整构建信息',(await coreCard.innerText()).includes('build details'));
+  let coreChecks=0;
+  let submitted;
+  await page.route('**/api/update/cores',async route=>{
+    if(route.request().method()==='POST'){
+      submitted=route.request().postDataJSON();
+      return route.fulfill({json:{ok:true}});
+    }
+    coreChecks++;
+    if(coreChecks===1)return route.fulfill({status:503,json:{error:'offline'}});
+    return route.fulfill({json:{cores:{
+      xray:{current:'26.7.28',latest:'26.11.9',available:true,can_update:true},
+      hysteria2:{current:'2.14.0',latest:'2.14.0',available:false,can_update:true},
+    }}});
+  });
+  await page.locator('#btn-core-check').press('Enter');
+  await page.waitForFunction(()=>document.querySelector('#core-versions').textContent.includes('检查失败'));
+  await page.locator('#btn-core-check').press('Enter');
+  await page.waitForSelector('#core-upgrade-xray');
+  check('面板没有新版本时仍可单独升级 Xray',await page.locator('#btn-update-run').isHidden()&&await page.locator('#core-upgrade-xray').isVisible());
+  check('已是稳定版的 Hysteria 2 不展示升级按钮',await page.locator('#core-upgrade-hysteria2').count()===0);
+  await page.setViewportSize({width:320,height:900});
+  check('320px 核心卡和页面都可完整浏览',await coreCard.evaluate(el=>el.scrollWidth<=el.clientWidth+1&&document.documentElement.scrollWidth<=innerWidth+1));
+  await page.locator('#core-upgrade-xray').press('Enter');
+  const confirmation=await page.locator('#confirm-body').innerText();
+  check('确认窗列出已装版本、目标版本和重启服务',confirmation.includes('26.7.28')&&confirmation.includes('26.11.9')&&confirmation.includes('重启 Xray'));
+  await page.keyboard.press('Escape');
+  await page.waitForSelector('#confirm-mask',{state:'hidden'});
+  check('取消不启动升级',submitted===undefined);
+  const windowVersion=await page.evaluate(()=>window.pageVersion);
+  await page.route('**/api/update',route=>route.fulfill({json:{
+    current:windowVersion,latest:windowVersion,check_ok:true,update_available:false,running:false,
+    last:{state:'success',core_name:'xray',from:'26.7.28',to:'26.11.9',trigger:'panel',finished_at:Date.now()/1000},
+  }}));
+  await page.locator('#core-upgrade-xray').press('Enter');
+  await page.locator('#confirm-ok').click();
+  await page.waitForFunction(()=>document.querySelector('#update-result')?.textContent.includes('Xray 核心 · 升级完成'));
+  check('提交准确限定核心和已确认版本',submitted.core==='xray'&&submitted.version==='26.11.9');
   check('没有页面脚本异常',errors.length===0,errors.join('; '));
   for (const width of [820,390,320]) {
     await page.setViewportSize({width,height:1000});

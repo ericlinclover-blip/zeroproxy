@@ -6,6 +6,125 @@ import { api } from "../lib/api.js";
 import { S, reloadDash } from "../lib/state.js";
 import { renderSidebar } from "./status.js";
 
+const CORE_NAMES = { xray: "Xray 核心", hysteria2: "Hysteria 2" };
+let coreCheck;
+let coreChecking = false;
+let coreStarting = false;
+let coreCheckError = "";
+let coreSystem;
+
+function shortCoreVersion(output) {
+  return String(output || "").match(/\bv?(\d+\.\d+\.\d+(?:[-+][^\s]+)?)/)?.[1] || "";
+}
+
+export function renderCorePanel(system = coreSystem) {
+  coreSystem = system;
+  const box = $("#core-versions");
+  if (!box || !system) return;
+  const running = coreStarting || S.updateInfo?.running;
+  const focused = box.contains(document.activeElement) ? document.activeElement.id : "";
+  const expanded = new Set([...box.querySelectorAll("details[open]")].map((el) => el.id));
+  const last = S.updateInfo?.last;
+  box.innerHTML = `
+    <div class="core-version-heading">
+      <h3>服务核心</h3>
+      <button type="button" class="btn ghost small" id="btn-core-check" ${running ? "disabled" : ""} aria-disabled="${coreChecking}">${coreChecking ? "检查中…" : "检查核心更新"}</button>
+    </div>
+    <p class="muted fs-sm core-check-status" role="status">${esc(coreCheckError || (running ? "升级任务正在处理" : coreChecking ? "正在查询官方稳定版…" : coreCheck ? "已检查官方稳定版" : ""))}</p>
+    ${Object.entries(CORE_NAMES).map(([key, label]) => {
+      const service = system[key] || {};
+      const info = coreCheck?.cores?.[key];
+      const updated = last?.core_name === key && last.state === "success";
+      const installed = (updated && last.to === info?.latest ? last.to : shortCoreVersion(service.version)) || info?.current;
+      const full = service.version && service.version !== installed && service.version !== `v${installed}`;
+      const state = {active:"运行中", failed:"运行失败", inactive:"已停止", "not-installed":"未安装", "dry-run":"本地演练"}[service.state] || "状态未知";
+      const offered = info?.available && installed !== info.latest;
+      const detail = info?.error || (info?.latest
+        ? `上游稳定版 v${info.latest} · ${offered ? info.can_update && service.state === "active" ? "可升级" : "当前服务或安装方式不支持面板升级" : installed === info.latest ? "已是当前稳定版" : "已装版本较新"}`
+        : "");
+      return `<div class="core-version-item">
+        <div class="core-version-heading"><strong>${label}</strong><span>${installed ? `v${esc(installed)} · ` : ""}${state}</span></div>
+        ${detail ? `<p class="muted fs-sm core-version-detail">${esc(detail)}</p>` : ""}
+        ${offered && info.can_update && service.state === "active" ? `<button type="button" class="btn small" id="core-upgrade-${key}" ${running || coreChecking ? "disabled" : ""}>升级 ${label} 至 v${esc(info.latest)}</button>` : ""}
+        ${full ? `<details id="core-version-${key}" ${expanded.has(`core-version-${key}`) ? "open" : ""}><summary class="muted fs-sm pointer">构建详情</summary><p class="muted fs-sm core-version-detail">${esc(service.version)}</p></details>` : ""}
+      </div>`;
+    }).join("")}
+    ${last?.core_name ? `<button type="button" class="btn ghost small" id="btn-core-progress">${running ? "查看升级进度" : "查看最近升级结果"}</button>` : ""}`;
+  $("#btn-core-check").onclick = checkCores;
+  const progress = $("#btn-core-progress");
+  if (progress) progress.onclick = showCoreProgress;
+  for (const key of Object.keys(CORE_NAMES)) {
+    const btn = $(`#core-upgrade-${key}`);
+    if (btn) btn.onclick = () => askCoreUpgrade(key);
+  }
+  if (focused) (document.getElementById(focused) || $("#btn-core-check"))?.focus({ preventScroll: true });
+}
+
+function showCoreProgress() {
+  revealSection("#update-card");
+  $("#update-card").setAttribute("tabindex", "-1");
+  $("#update-card").focus({ preventScroll: true });
+}
+
+async function checkCores() {
+  if (coreChecking || coreStarting || S.updateInfo?.running) return;
+  coreChecking = true;
+  coreCheckError = "";
+  renderCorePanel();
+  try {
+    coreCheck = await api("/api/update/cores", { timeoutMs: 15000 });
+    if (coreCheck.running) loadUpdate(false);
+  } catch (e) {
+    coreCheck = undefined;
+    coreCheckError = "检查失败，请稍后重新检查核心更新";
+  } finally {
+    coreChecking = false;
+    renderCorePanel();
+  }
+}
+
+function askCoreUpgrade(core) {
+  const info = coreCheck?.cores?.[core];
+  if (!info?.available || coreStarting || S.updateInfo?.running) return;
+  const { latest, current } = info;
+  const label = CORE_NAMES[core];
+  openConfirm({
+    title: `升级 ${label}？`,
+    okLabel: `升级至 v${latest}`,
+    html: `<p>已装 v${esc(current)} → 目标 v${esc(latest)}</p>
+      <p>服务器会校验官方发行包，然后重启 ${label}。使用此核心的连接可能短暂中断。</p>
+      <p>如果新核心启动失败，服务器会尝试恢复旧版本并核对服务状态。</p>`,
+    onOk: () => startCoreUpgrade(core, current, latest),
+  });
+}
+
+async function startCoreUpgrade(core, current, version) {
+  if (coreStarting || S.updateInfo?.running) return;
+  coreStarting = true;
+  renderCorePanel();
+  try {
+    await api("/api/update/cores", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ core, version }),
+    });
+    S.updateInfo = { ...S.updateInfo, running: true, last: {
+      state: "queued", core_name: core, from: current, to: version, trigger: "panel",
+      started_at: updateNow(),
+    }};
+    startUpdatePolling();
+    renderUpdate();
+    showCoreProgress();
+  } catch (e) {
+    toast(e.dropped ? "升级请求的结果待核对，请先查看任务进度" : e.message, { kind: "error" });
+    await loadUpdate(false);
+    if (S.updateInfo?.running) showCoreProgress();
+  } finally {
+    coreStarting = false;
+    renderCorePanel();
+  }
+}
+
 /* ---------------- 一键更新 ----------------
  * 升级由服务器上的 upgrade.sh 完成; 面板只负责按按钮 + 回读进度。
  * 面板进程会在升级过程中重启, 因此轮询要能容忍请求失败。
@@ -65,7 +184,9 @@ export function renderUpdate() {
   const running = !!u.running;
   const stale = updateNeedsReload();   // 本页 JS 落后于服务器 (自动重载用的是同一个判据)
   if (running) {
-    $("#update-hint").textContent = "升级进行中: 面板会在最后重启一次, 本页会在几秒内自动恢复";
+    $("#update-hint").textContent = last.core_name
+      ? `正在升级 ${CORE_NAMES[last.core_name]}，页面会自动更新进度`
+      : "升级进行中: 面板会在最后重启一次, 本页会在几秒内自动恢复";
   } else if (stale) {
     $("#update-hint").textContent = `服务器已是 v${u.current}, 本页还是 v${S.pageVersion} 的界面 — 重新加载后生效`;
   } else if (!u.can_update) {
@@ -86,21 +207,7 @@ export function renderUpdate() {
   $("#btn-update-reload").classList.toggle("hidden", !stale || running);
   topBtn.textContent = running ? "升级中…" : u.update_available ? `一键更新 v${latest}` : "检查更新";
 
-  // 「同时升级内核」只在能升级、且没在升级时才有意义。旁边的注释顺带把**当前**
-  // 内核版本摆出来 —— 用户要判断"要不要升内核", 至少得先看见自己在跑什么版本。
-  const coreRow = $("#update-core-row");
-  if (coreRow) {
-    const usable = !!u.can_update && !running;
-    coreRow.classList.toggle("hidden", !usable);
-    const box = $("#update-core");
-    if (box && !usable) box.checked = false;   // 藏起来时不留一个"已勾选"的隐形开关
-    const note = $("#update-core-note");
-    if (note && usable) {
-      const sys = (S.dash || {}).system || {};
-      const ver = (svc) => (svc && svc.version ? svc.version : "未知");
-      note.textContent = `当前: Xray ${ver(sys.xray)} · Hysteria 2 ${ver(sys.hysteria2)}`;
-    }
-  }
+  renderCorePanel();
   renderSidebar();   // 侧栏「程序更新」角标跟着变
 }
 
@@ -150,6 +257,8 @@ function updateStepsHtml(last) {
 
 function updateResultHtml(u, last) {
   const state = last.state;
+  const coreName = CORE_NAMES[last.core_name];
+  const context = coreName ? `${coreName} · ` : "";
   const steps = updateStepsHtml(last);
   const elapsed = last.started_at && last.finished_at
     ? `用时 ${fmtDuration(Math.max(0, last.finished_at - last.started_at))} · ` : "";
@@ -157,6 +266,7 @@ function updateResultHtml(u, last) {
   // "排队"超过 2 分钟 = 那个 systemd 单元根本没跑起来 (脚本连一行都没执行, 所以它
   // 自己写不了失败状态)。这时别再转圈让人干等: 直接给出唯一有效的自救动作。
   if (state === "queued" && u.stale_queued) {
+    if (coreName) return `<div class="banner bad"><span class="ico">✗</span><span><b>${coreName} 升级未能启动</b><br>返回「服务核心」重新检查，或查看服务器的 systemd 日志。</span></div>`;
     return `<div class="banner bad"><span class="ico">✗</span><span><b>升级没能启动</b>
       <br><span class="muted">任务已排队超过 2 分钟却没有任何进度 —— 升级脚本没有被执行起来。
       到服务器上手动跑一次即可 (它会自动拉取最新代码并重启面板):</span>
@@ -165,14 +275,14 @@ function updateResultHtml(u, last) {
       (v2.12.20 起改为放在 $ZP_HOME/data/update-run, 面板内升级恢复正常)。</span></span></div>`;
   }
   if (state === "running" || state === "queued") {
-    const title = state === "queued" ? "升级任务已排队, 正在准备…" : `正在升级: v${esc(last.from || "")} → v${esc(last.to || "…")}`;
+    const title = state === "queued" ? `${context}升级任务已排队，正在准备…` : `${context}正在升级 v${esc(last.from || "")} → v${esc(last.to || "…")}`;
     return `<div class="banner info"><span class="ico">⟳</span><span><b>${title}</b>
-      <br><span class="muted">别关这个页面; 面板重启期间本页会自动重连。</span></span></div>
+      <br><span class="muted">别关这个页面; ${coreName ? "连接短暂中断时，本页会自动重连。" : "面板重启期间本页会自动重连。"}</span></span></div>
       ${steps ? `<div class="mt-3">${steps}</div>` : ""}`;
   }
   if (state === "success") {
     const failed = (last.steps || []).filter((s) => !s.ok);
-    return `<div class="banner good"><span class="ico">✓</span><span><b>升级完成: v${
+    return `<div class="banner good"><span class="ico">✓</span><span><b>${context}升级完成: v${
       esc(last.from || "?")} → v${esc(last.to || "?")}</b>
       <br><span class="muted">${esc(elapsed)}结束于 ${esc(fmtTime(last.finished_at))} · ${esc(trigger)}${
         failed.length ? ` · ${failed.length} 步有告警` : ""}</span></span></div>
@@ -180,8 +290,10 @@ function updateResultHtml(u, last) {
       <div class="mt-2">${steps || "<span class='muted'>—</span>"}</div></details>`;
   }
   const first = (last.steps || []).find((s) => !s.ok) || {};
-  const rollbackNote = last.rolled_back ? " · 代码已自动回滚到升级前版本" : "";
-  return `<div class="banner bad"><span class="ico">✗</span><span><b>升级失败: ${esc(first.name || last.message || "未知步骤")}</b>
+  const rollbackNote = last.rolled_back
+    ? coreName ? " · 已恢复旧核心并确认服务运行" : " · 代码已自动回滚到升级前版本"
+    : last.rollback_error ? " · " + esc(last.rollback_error) : "";
+  return `<div class="banner bad"><span class="ico">✗</span><span><b>${context}升级失败: ${esc(first.name || last.message || "未知步骤")}</b>
     <br><span class="muted">${esc(first.detail || last.message || "")}${rollbackNote} · ${esc(trigger)}</span></span></div>
     ${steps ? `<div class="mt-3">${steps}</div>` : ""}
     ${u.log_tail ? `<details class="mt-3" open><summary class="muted fs-sm pointer">升级日志</summary>
@@ -213,9 +325,19 @@ function startUpdatePolling() {
       S.updateInfo = await api("/api/update");
       S.updatePollFailures = 0;
       renderUpdate();
+      if (!S.updateInfo.running && S.updateInfo.stale_queued) {
+        clearInterval(S.updateTimer); S.updateTimer = null;
+        return;
+      }
       if (!S.updateInfo.running && S.updateInfo.last && S.updateInfo.last.state === "success") {
         clearInterval(S.updateTimer); S.updateTimer = null;
-        toast(`升级完成: v${S.updateInfo.last.from} → v${S.updateInfo.last.to}`);
+        const last = S.updateInfo.last;
+        if (last.core_name && coreCheck?.cores?.[last.core_name]) {
+          const info = coreCheck.cores[last.core_name];
+          info.current = last.to;
+          if (info.latest === last.to) info.available = false;
+        }
+        toast(`${CORE_NAMES[last.core_name] || ""}升级完成: v${last.from} → v${last.to}`);
         if (updateNeedsReload()) {
           // 本页跑的还是升级前的 JS: 自动重新加载, 省掉"再点一下"。
           // 留 2.5 秒是为了让上面那条 toast 看得见 —— 面板刚重启完, 这会儿也没有正在进行的操作。
@@ -238,18 +360,10 @@ function startUpdatePolling() {
   }, 2500);
 }
 
-/* 升级确认: 一步步写清会做什么, 以及什么不会被碰 */
-/** 「同时升级内核」勾选状态 (内核升级只由用户显式勾选触发, 见后端 update.start)。 */
-const coreWanted = () => {
-  const box = $("#update-core");
-  return !!(box && box.checked && !box.disabled);
-};
-
 export function askUpgrade() {
   const u = S.updateInfo || {};
   const from = u.current || "当前版本";
   const to = u.latest || "最新版";
-  const core = coreWanted();
   const plan = [
     ["1", "备份当前代码与 state.json", "异常自动回滚"],
     ["2", `从 GitHub 下载 v${esc(to)} 代码`, esc(u.repo || "")],
@@ -257,8 +371,7 @@ export function askUpgrade() {
     ["4", "同步 Python 依赖 + 重载 systemd 单元", ""],
     ["5", "按 state.json 重新生成配置并热重载", "xray / nginx / hysteria"],
   ];
-  if (core) plan.push(["6", "升级 Xray / Hysteria 2 内核", "下载失败则保留现有版本"]);
-  plan.push([core ? "7" : "6", "重启面板进程", "本页失联约 10 秒后自动恢复"]);
+  plan.push(["6", "重启面板进程", "页面会自动重连"]);
   openConfirm({
     title: `确认升级到 v${to}?`,
     okLabel: `开始升级 v${esc(from)} → v${to}`,
@@ -269,11 +382,6 @@ export function askUpgrade() {
             <span class="uname">${name}</span>${detail ? `<span class="udetail">${detail}</span>` : ""}</div>`
         )
         .join("")}</div>
-      ${core
-        ? `<div class="banner info mt-3"><span class="ico">!</span><span>已勾选内核升级: Xray / Hysteria 2 会被替换成上游最新版。
-           <br><span class="muted">内核大版本可能改变配置语义 (例如 Xray 25 移除 allowInsecure、改证书字段名),
-           升级后若节点异常, 在「运行状态 → 一键诊断」能直接看出是哪一项不一致。</span></span></div>`
-        : ""}
       <div class="confirm-keep">不会动的部分: 节点密钥 / 订阅令牌 / 管理员账号 / 节点开关与端口设置。
       升级过程中面板会重启一次, 页面会在几秒内自动恢复。</div>`,
     onOk: doUpdate,
@@ -282,14 +390,13 @@ export function askUpgrade() {
 
 async function doUpdate() {
   const btn = $("#btn-update-run");
-  const core = coreWanted();
   btn.disabled = true;
   btn.textContent = "启动中…";
   try {
     await api("/api/update", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ core }),
+      body: JSON.stringify({ core: false }),
     });
     toast("升级已开始, 正在执行…");
     // 后端只回执"已开始"(刻意不查远端版本, 那会让按钮卡住半分钟); 这里先把状态标成"已排队",
@@ -301,12 +408,10 @@ async function doUpdate() {
       ...(S.updateInfo || {}),
       running: true,
       last: {
-        ...((S.updateInfo || {}).last || {}),
         state: "queued",
         from: (S.updateInfo || {}).current,
         to: (S.updateInfo || {}).latest,
         trigger: "panel",
-        core,
         started_at: Math.floor(Date.now() / 1000),
         finished_at: 0,
         steps: [],

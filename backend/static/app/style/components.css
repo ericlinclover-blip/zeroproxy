@@ -784,3 +784,17 @@ dialog.modal-mask::backdrop { background: transparent; }
 @media (prefers-reduced-motion: reduce) {
   .bigswitch .knob, .bigswitch .track, .dev-card { transition: none; }
 }
+
+.core-version-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: .4rem .75rem;
+  flex-wrap: wrap;
+}
+.core-version-heading h3 { margin: 0; font-size: 1rem; }
+.core-version-heading span, .core-version-detail { overflow-wrap: anywhere; }
+.core-version-item { margin-block: .75rem; }
+.core-version-detail, .core-check-status { margin-block: .35rem; }
+.core-check-status:empty { margin: 0; }
+.core-version-item .btn { white-space: normal; }
