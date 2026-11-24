@@ -31,7 +31,25 @@ const check = (name, ok, detail='') => { console.log(`${ok?'✓':'✗'} ${name}$
   await keep();
   const dashboard=await (await page.request.get(base+'/api/dashboard')).json();
   check('节点确认后保留目标状态',dashboard.nodes.find(n=>n.id==='vless-reality').enabled===false);
+  let reads = 0;
+  const reconnect = async (route) => {
+    if (++reads === 1) {
+      await route.fulfill({json:{...dashboard, pending_change:{...dashboard.pending_change, state:'awaiting_confirmation'}}});
+      return;
+    }
+    await route.continue();
+  };
+  const drop = async (route) => {
+    const applied = await route.fetch();
+    check('响应丢失前服务端已应用临时变更',applied.ok() && (await applied.json()).pending_change?.state==='awaiting_confirmation');
+    await page.route('**/api/dashboard',reconnect);
+    await route.abort();
+  };
+  await page.route('**/api/chain/exit',drop,{times:1});
   await page.click('#btn-chain-exit-gen');await page.waitForSelector('#chain-exit-code');
+  await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('已核对服务器应用结果'));
+  check('断线后跳过其他操作的结果，继续核对本次操作',reads>=2);
+  await page.unroute('**/api/dashboard',reconnect);
   const chain=await pending();
   check('落地端生成配对码也需确认',chain.kind==='chain');
   await cancel();

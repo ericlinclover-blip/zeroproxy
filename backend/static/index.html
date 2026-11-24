@@ -333,6 +333,16 @@
         <div class="field">
           <label for="adv-masq">Hysteria 2 伪装站点 (留空关闭)</label>
           <input id="adv-masq" placeholder="https://www.microsoft.com/" spellcheck="false"></div>
+        <div class="field">
+          <label for="adv-hy-congestion">Hysteria 2 拥塞控制</label>
+          <select id="adv-hy-congestion" data-draft-select aria-describedby="adv-hy-congestion-note">
+            <option value="negotiated">客户端协商（默认）</option>
+            <option value="standard">BBR 标准</option>
+            <option value="conservative">BBR 保守</option>
+            <option value="aggressive">BBR 激进</option>
+          </select>
+          <p class="note mt-1" id="adv-hy-congestion-note">选择 BBR 后，服务器忽略客户端申报的带宽，按所选档位控制服务器发送速率。BBR 档位需要 Hysteria 2.8.0 或更新版本。</p>
+        </div>
       </div>
       <label class="mt-4">对外端口</label>
       <div class="adv-grid" id="port-grid"></div>

@@ -173,11 +173,40 @@ export function confirmationNotice(message) {
     : message;
 }
 
+export async function reportDroppedChange(error) {
+  markDisconnected("连接中断，正在核对操作结果…");
+  let result;
+  const verify = error.operation ? (dash) => {
+    const change = dash.pending_change;
+    if (change?.operation !== error.operation) return false;
+    if (["awaiting_confirmation", "confirmed", "rolled_back", "rollback_failed"].includes(change.state)) {
+      result = change;
+    }
+    return !!result;
+  } : undefined;
+  if (!await syncAfterDrop(verify)) result = undefined;
+  if (result?.state === "awaiting_confirmation") {
+    toast(confirmationNotice("已重新连接，已核对服务器应用结果"));
+    return true;
+  }
+  if (result?.state === "confirmed") {
+    toast("已重新连接，变更已保留");
+    return true;
+  }
+  if (result?.state === "rolled_back") {
+    toast("本次变更已回滚" + (result.error ? "：" + result.error : ""), { kind: "error" });
+  } else if (result?.state === "rollback_failed") {
+    toast("本次变更回滚失败：" + (result.error || "请查看变更状态"), { kind: "error" });
+  } else {
+    toast("操作结果待确认，请先核对任务和目标状态，勿重复提交", { kind: "error" });
+  }
+  return false;
+}
+
 /* 改动类接口的统一入口 */
 export async function applyAction(method, path, payload, btn, busyText, okText) {
   await waitPendingApply();
   const original = btn ? btn.textContent : "";
-  const before = S.dash ? JSON.stringify(S.dash) : "";
   if (btn) { btn.disabled = true; if (busyText) btn.textContent = busyText; }
   S.opBusy += 1;
   let succeeded = false;
@@ -201,10 +230,7 @@ export async function applyAction(method, path, payload, btn, busyText, okText) 
     }
   } catch (e) {
     if (e.dropped) {
-      markDisconnected("重启内核中, 正在确认结果…");
-      const changed = await syncAfterDrop(before);
-      if (changed === true) toast("已应用 (重启内核时连接短暂中断, 已自动恢复)");
-      else if (changed === false) toast("连接已恢复，操作结果待确认。请核对目标状态，勿重复提交", { kind: "error" });
+      succeeded = await reportDroppedChange(e);
     } else {
       toast("操作失败: " + e.message, { kind: "error" });
       redrawDash(true);

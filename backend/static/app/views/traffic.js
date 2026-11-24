@@ -6,9 +6,9 @@
 import { $, esc, escAttr, toast, applyWidths } from "../lib/dom.js";
 import { fmtBytes, fmtUptime, fmtTime, STATE_TXT, stateClass } from "../lib/format.js";
 import { clearDraft } from "../lib/drafts.js";
-import { api, markDisconnected, syncAfterDrop } from "../lib/api.js";
+import { api } from "../lib/api.js";
 import { S, rateHist, redrawDash, reloadDash } from "../lib/state.js";
-import { awaitJob, settleApply, applyAction } from "../lib/jobs.js";
+import { awaitJob, settleApply, applyAction, reportDroppedChange } from "../lib/jobs.js";
 import { openConfirm } from "../lib/dialog.js";
 
 /* ---------------- 流量可视化 ----------------
@@ -151,6 +151,7 @@ function renderRate() {
 export function renderAdvanced(d) {
   $("#adv-sni").value = d.reality.server_name || "";
   $("#adv-masq").value = (d.hysteria_masquerade && d.hysteria_masquerade.url) || "";
+  $("#adv-hy-congestion").value = d.hysteria_congestion || "negotiated";
   // 端口这一格只在"节点集合变了"时重建 DOM: 每 20s 整块重画会把正在输入的数字
   // 连同光标一起冲掉 (草稿保护能救回值, 但没必要每次都重画)
   const portNodes = d.nodes.filter((n) => n.editable_port);
@@ -469,8 +470,6 @@ function renderGeo(d) {
     const btn = $("#btn-geo-update");
     btn.disabled = true;
     btn.textContent = "下载中… (约 28 MB)";
-    const before = S.dash ? JSON.stringify(S.dash) : "";       // 断线后比对"到底更新了没"
-    const stamp = ((S.dash || {}).geodata || {}).updated_at || 0;
     try {
       const res = await api("/api/geodata/update", { method: "POST" });
       S.dash = res;
@@ -494,10 +493,7 @@ function renderGeo(d) {
       if (e.dropped) {
         // 重启内核 (下载完要热重载) 会掐断"走本机链路访问面板"的浏览器 ——
         // 请求断了不等于更新失败, 数据很可能已经落好了。等连接回来再看真相。
-        markDisconnected("重启内核中, 正在确认更新结果…");
-        await syncAfterDrop(before);
-        const now = ((S.dash || {}).geodata || {}).updated_at || 0;
-        toast(now > stamp ? "GeoIP 数据已更新并生效" : "连接已恢复, 更新结果请以卡片状态为准");
+        await reportDroppedChange(e);
       } else if (e.status === 409) {
         // 后台自动更新正在跑 (或上一次还没结束): 这不是"失败", 等一下再点就行
         toast("先等一下: " + e.message);
@@ -534,7 +530,7 @@ function renderGeo(d) {
 }
 
 async function saveAdvanced() {
-  const btn = $("#btn-save-adv");
+  const congestion = $("#adv-hy-congestion");
   const ports = {};
   document.querySelectorAll("[data-port-node]").forEach((el) => {
     const value = parseInt(el.value, 10);
@@ -542,14 +538,16 @@ async function saveAdvanced() {
     const current = (S.dash.nodes.find((n) => n.id === nodeId) || {}).port;
     if (!Number.isNaN(value) && value !== current) ports[nodeId] = value;
   });
-  const payload = {
-    reality_sni: $("#adv-sni").value.trim(),
-    masquerade_url: $("#adv-masq").value.trim(),
-  };
+  const payload = {};
+  const sni = $("#adv-sni").value.trim();
+  const masquerade = $("#adv-masq").value.trim();
+  if (sni !== S.dash.reality.server_name) payload.reality_sni = sni;
+  if (masquerade !== (S.dash.hysteria_masquerade?.url || "")) payload.masquerade_url = masquerade;
+  if (congestion.value !== (S.dash.hysteria_congestion || "negotiated")) {
+    payload.hysteria_congestion = congestion.value;
+  }
   if (Object.keys(ports).length) payload.ports = ports;
-  if (payload.reality_sni === S.dash.reality.server_name
-      && payload.masquerade_url === ((S.dash.hysteria_masquerade || {}).url || "")
-      && !payload.ports) {
+  if (!Object.keys(payload).length) {
     toast("没有需要修改的内容");
     return;
   }
@@ -560,7 +558,8 @@ async function saveAdvanced() {
   openConfirm({ title: "确认服务器配置变更", okLabel: "应用并验证",
     html: `<p>将重新生成并校验服务器配置，必要时重载服务，可能短暂中断代理连接。</p>
       <p>${payload.ports ? `端口调整：${Object.entries(payload.ports).map(([key, value]) => `${esc(key)} → ${esc(value)}`).join("；")}` : "未调整节点端口。"}</p>
-      <p>应用后请在 90 秒内测试并点击「保留变更」，超时自动回滚。客户端需要更新订阅才能使用新端口。</p>`,
+      ${payload.hysteria_congestion ? `<p>Hysteria 2 拥塞控制将切换为「${esc(congestion.selectedOptions[0].textContent)}」。</p>` : ""}
+      <p>应用后请在 90 秒内测试并点击「保留变更」，超时自动回滚。${payload.ports ? "客户端需要更新订阅才能使用新端口。" : ""}</p>`,
     onOk: () => commitAdvanced(payload),
   });
 }
@@ -578,7 +577,7 @@ async function commitAdvanced(payload) {
       })
     );
     // 提交成功 → 解除草稿保护, 让服务器值 (含后端规范化, 如 SNI 转小写) 正常回灌
-    clearDraft("#adv-sni, #adv-masq, [data-port-node]");
+    clearDraft("#adv-sni, #adv-masq, #adv-hy-congestion, [data-port-node]");
     const failed = steps.filter((s) => !s.ok);
     toast(failed.length ? `已应用, 但 ${failed.length} 步告警: ${failed[0].name}`
                         : "临时设置已应用，请在顶部倒计时内确认保留");

@@ -11,7 +11,7 @@ import {
 import { api } from "../lib/api.js";
 import { openQr } from "../lib/dialog.js";
 import { S } from "../lib/state.js";
-import { settleApply, confirmationNotice } from "../lib/jobs.js";
+import { settleApply, confirmationNotice, reportDroppedChange } from "../lib/jobs.js";
 import { renderField } from "./field.js";
 import { renderBanner } from "../lib/render.js";
 
@@ -165,6 +165,7 @@ export function renderNodes() {
   document.querySelectorAll("[data-node]").forEach((el) =>
     (el.onchange = async () => {
       el.disabled = true;
+      S.opBusy += 1;
       try {
         const steps = await settleApply(
           await api(`/api/nodes/${el.dataset.node}/enabled`, {
@@ -176,9 +177,12 @@ export function renderNodes() {
         toast(failed.length ? `已应用, 但 ${failed.length} 步告警: ${failed[0].name}`
                             : confirmationNotice("已热更新, 订阅内容已刷新"));
       } catch (e) {
+        if (e.dropped) await reportDroppedChange(e);
+        else toast("操作结果: " + e.message, { kind: "error" });
         el.disabled = false;
         el.checked = !!S.dash.nodes.find((node) => node.id === el.dataset.node)?.enabled;
-        toast("操作结果: " + e.message, { kind: "error" });
+      } finally {
+        S.opBusy -= 1;
       }
     })
   );

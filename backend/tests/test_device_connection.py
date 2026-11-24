@@ -92,3 +92,32 @@ def test_fresh_stop_does_not_require_old_coverage_evidence(monkeypatch):
     assert view['connection_state'] == 'online'
     assert not view['running']
     assert not view['taking_over']
+
+
+def test_legacy_download_records_the_revision_served_after_rollback(client, configured):
+    from pathlib import Path
+
+    from zeroproxy import config
+
+    code = client.post('/api/devices/pair', json={}).json()['code']
+    paired = client.post('/c/pair', json={'code': code}).json()
+    url = f"/c/sub/{paired['id']}"
+    auth = {'Authorization': f"Bearer {paired['secret']}"}
+    original = client.get(url, headers=auth)
+    assert original.status_code == 200
+    with config.locked():
+        state = config.load_state()
+        served_revision = devices.config_rev(state)
+        good = {key: state[key] for key in config.RUNTIME_FIELDS}
+        config.atomic_write_json(str(Path(config.paths()['data_dir']) / 'runtime-last-good.json'), good)
+        state['domain'] = 'new.example.com'
+        state['runtime'].update(status='failed', rollback_state='restored')
+        desired_revision = devices.config_rev(state)
+        assert desired_revision != served_revision
+        devices.find(state, paired['id'])['downloaded_rev'] = ''
+        config.save_state(state)
+    legacy = client.get(url, headers=auth)
+    assert legacy.status_code == 200
+    assert legacy.content == original.content
+    assert devices.find(config.load_state(), paired['id'])['downloaded_rev'] == served_revision
+    assert client.get(url, headers=auth, params={'expected_rev': desired_revision}).status_code == 503

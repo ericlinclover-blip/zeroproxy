@@ -431,8 +431,8 @@ if [ "$XRAY_VERSION" = "latest" ]; then
   XRAY_REL="releases/latest"
   XRAY_DL_VERSION="$XRAY_PINNED"
 else
-  XRAY_REL="releases/tags/v${XRAY_VERSION}"
   XRAY_VERSION="${XRAY_VERSION#v}"
+  XRAY_REL="releases/tags/v${XRAY_VERSION}"
   XRAY_DL_VERSION="$XRAY_VERSION"
 fi
 XRAY_JSON="$(curl -fsSL --max-time 20 "$GH_API/repos/XTLS/Xray-core/$XRAY_REL" || true)"

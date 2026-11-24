@@ -86,6 +86,8 @@ def view(state: dict, now: float | None = None) -> dict | None:
         return None
     now = time.time() if now is None else now
     result = {key: pending.get(key) for key in ('id', 'kind', 'state', 'deadline', 'error')}
+    if pending.get('operation'):
+        result['operation'] = pending['operation']
     result['remaining'] = max(0, int((pending.get('deadline') or 0) - now))
     return result
 

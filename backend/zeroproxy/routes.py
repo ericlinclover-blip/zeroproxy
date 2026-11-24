@@ -52,6 +52,7 @@ from . import (
     devices,
     device_credentials,
     geodata,
+    hysteria_config,
     router_client,
     services,
     share_links,
@@ -665,6 +666,9 @@ def _arm_request_change(state: dict, request: Request) -> str:
     if not keys:
         return ""
     identity = change_guard.begin(state, before, request.state.network_kind, keys)
+    operation = request.headers.get("x-zp-operation", "")
+    if re.fullmatch(r"[0-9a-f]{32}", operation):
+        state["pending_change"]["operation"] = operation
     request.state.network_change_id = identity
     return identity
 
@@ -1296,6 +1300,7 @@ def _dashboard_body(state: dict, request: Request, traffic: dict | None = None) 
         "hysteria_hopping": state.get("hysteria_hopping", False),
         "hysteria_ports": state.get("hysteria_ports", []),
         "hysteria_masquerade": state.get("hysteria_masquerade", {}),
+        "hysteria_congestion": state.get("hysteria_congestion", "negotiated"),
         "reality": {
             "server_name": state["reality"]["server_name"],
             "dest": state["reality"]["dest"],
@@ -1538,6 +1543,7 @@ class SettingsIn(BaseModel):
     confirmation_timeout: int = 90
     reality_sni: str | None = None
     masquerade_url: str | None = None
+    hysteria_congestion: str | None = None
     ports: dict[str, int] | None = None
     # 客户端分流模板 (只影响订阅生成, 不动服务端配置)
     template: str | None = None
@@ -1575,8 +1581,16 @@ def update_settings(payload: SettingsIn, request: Request):
 
         if payload.expected_settings_revision and payload.expected_settings_revision != config.settings_revision(state):
             return _err("分流或服务器配置已被其他操作修改，请重新分析后保存", 409)
-        if payload.require_confirmation and not 30 <= payload.confirmation_timeout <= 300:
+        congestion_changed = payload.hysteria_congestion is not None and payload.hysteria_congestion != state["hysteria_congestion"]
+        require_confirmation = payload.require_confirmation or congestion_changed
+        if require_confirmation and not 30 <= payload.confirmation_timeout <= 300:
             return _err("确认时限应在 30–300 秒之间", 400)
+        if congestion_changed:
+            mode = payload.hysteria_congestion
+            version = services.service_version("hysteria2") if mode != "negotiated" and services.is_prod() else None
+            error = hysteria_config.congestion_error(mode, version)
+            if error:
+                return _err(error)
         before = copy.deepcopy(state)
 
         if payload.reality_sni is not None:
@@ -1663,6 +1677,10 @@ def update_settings(payload: SettingsIn, request: Request):
             state["hysteria_masquerade"]["enabled"] = bool(url)
             state["hysteria_masquerade"]["url"] = url
             changed.append(f"masquerade={url or 'off'}")
+
+        if congestion_changed:
+            state["hysteria_congestion"] = payload.hysteria_congestion
+            changed.append(f"hysteria_congestion={payload.hysteria_congestion}")
 
         if new_template and new_template != state.get("routing", {}).get("template"):
             state.setdefault("routing", {})["template"] = new_template
@@ -1784,9 +1802,10 @@ def update_settings(payload: SettingsIn, request: Request):
             return out
 
         callback = None
-        if payload.require_confirmation:
+        if require_confirmation:
             identity = change_guard.begin(state, before, "settings",
-                ["ports", "reality", "hysteria_masquerade", "hysteria_ports", "geodata", "routing"], payload.confirmation_timeout)
+                ["ports", "reality", "hysteria_masquerade", "hysteria_congestion", "hysteria_ports", "geodata", "routing"],
+                payload.confirmation_timeout)
             def callback(steps, error):
                 change_guard.finish(identity, steps, error)
                 return []
@@ -5490,7 +5509,8 @@ def client_subscription(
         if expected_rev and expected_rev != devices.config_rev(state):
             return _err("配置版本已变化，请等待下一轮同步", 409)
         effective = apply.subscription_state(state)
-        if expected_rev and expected_rev != devices.config_rev(effective):
+        served_revision = devices.config_rev(effective)
+        if expected_rev and expected_rev != served_revision:
             return _err("服务器仍在使用上次成功配置，请等待修复完成", 503)
         if device.get("dataplane") and (state.get("runtime") or {}).get("credentials_revision") != device_credentials.revision(state):
             return _err("独立代理授权尚未确认应用，请等待服务器任务完成后重试", 503)
@@ -5515,14 +5535,13 @@ def client_subscription(
             ipv6=bool(ipv6),
             mtu=int(mtu),
             # 分流数据库的下载地址指向面板自己 (路由器只需要能访问面板)
-            base=share_links.panel_base_url(request, state),
+            base=share_links.panel_base_url(request, effective),
         )
         # 下载只刷新可达时间；控制通道在线必须由 /c/report 的心跳证明。
         # 只记 `downloaded_rev` (面板发出去的是哪一版), **不**记 applied_rev ——
         # 下载成功不等于设备已经校验/重载/数据面健康 (P2-9)。
-        panel_rev = devices.config_rev(state)
         if devices.touch(
-            state, device, {"ip": _client_ip(request), "downloaded_rev": panel_rev}, heartbeat=False
+            state, device, {"ip": _client_ip(request), "downloaded_rev": served_revision}, heartbeat=False
         ):
             save_state(state)
     return Response(

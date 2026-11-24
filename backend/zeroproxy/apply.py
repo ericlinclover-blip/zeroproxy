@@ -263,6 +263,11 @@ def gen_hysteria(state: dict, timeout: int = 0) -> tuple[bool, str]:
     读回来用 `hysteria_config.validate()` 解析校验, 有问题就让该步失败 ——
     对照 Xray 的 `xray -test` / nginx 的 `nginx -t`。
     """
+    mode = state.get("hysteria_congestion") or "negotiated"
+    version = services.service_version("hysteria2") if mode != "negotiated" and services.is_prod() else None
+    error = hysteria_config.congestion_error(mode, version)
+    if error:
+        return False, error
     hysteria_config.write_hysteria_config(state)
     p = paths()
     try:

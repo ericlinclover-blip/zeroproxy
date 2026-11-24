@@ -6,9 +6,9 @@
 import { $, esc, escAttr, toast, copyText } from "../lib/dom.js";
 import { fmtTime, chainHealth } from "../lib/format.js";
 import { openConfirm, openQr } from "../lib/dialog.js";
-import { api, markDisconnected, syncAfterDrop } from "../lib/api.js";
+import { api } from "../lib/api.js";
 import { S } from "../lib/state.js";
-import { waitPendingApply, settleApply, applyAction, confirmationNotice } from "../lib/jobs.js";
+import { waitPendingApply, settleApply, applyAction, confirmationNotice, reportDroppedChange } from "../lib/jobs.js";
 
 /* ---------------- 链式代理 ----------------
  * 两台机器各装一份本程序, 接成一条链 (入口 → 落地):
@@ -423,37 +423,29 @@ async function connectChain(force) {
   };
   btn.disabled = true;
   btn.textContent = force ? "强制连接中…" : "连接并测试中…";
-  const before = S.dash ? JSON.stringify(S.dash) : "";
   S.opBusy += 1;
   try {
-    let res;
+    let body;
     try {
-      res = await fetch("/api/chain/entries", {
+      body = await api("/api/chain/entries", {
         method: "POST",
-        credentials: "same-origin",
-        headers: { "Content-Type": "application/json", "X-ZP-Confirm": "90", "X-ZP-Revision": S.dash?.configuration_revision || "" },
+        timeoutMs: 240000,
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
-    } catch (err) {
-      // 连接中断: 落地本身可能已经写好了 (新增入站要重启 xray, 正好掐断自己这条路)
-      markDisconnected("重启内核中, 正在确认结果…");
-      const changed = await syncAfterDrop(before);
-      if (changed === true) toast("已添加 (重启内核时连接短暂中断, 已自动恢复)");
-      else if (changed === false) toast("连接已恢复, 但没看到新节点 —— 请再点一次「连接并测试」");
-      if (document.body.contains(btn)) { btn.disabled = false; btn.textContent = "连接并测试"; }
-      return;
-    }
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      const detail = body.error || `HTTP ${res.status}`;
-      if (body.needs_force) {
+    } catch (e) {
+      if (e.dropped) {
+        if (await reportDroppedChange(e)) clearChainForm();
+        return;
+      }
+      if (e.body?.needs_force) {
         btn.disabled = false;
         btn.textContent = "连接并测试";
         openConfirm({
           title: "链路测试没通过, 仍然添加?",
           okLabel: "仍然添加",
           html: `<div class="qr-sub">真实握手 / 出口往返失败:<br>
-            <span class="mono">${esc(detail)}</span><br><br>
+            <span class="mono">${esc(e.message)}</span><br><br>
             常见原因: 落地端安全组或防火墙没放行配对码里的端口; 落地端已关闭 / 配对码被轮换过;
             配对码复制不完整。<br>
             仍然添加的话, 这条链在客户端那边多半连不通 (但可以稍后修好落地端再点「测速」复验)。</div>`,
@@ -461,13 +453,10 @@ async function connectChain(force) {
         });
         return;
       }
-      throw new Error(detail);
+      throw e;
     }
     // 先把表单清空再重绘: 草稿保护会把"正在编辑的输入"原样放回来, 不清就成了"粘进去的码还在"
-    $("#chain-code").value = "";
-    $("#chain-label").value = "";
-    $("#chain-local-port").value = "";
-    $("#chain-default-out").checked = false;
+    clearChainForm();
     const steps = await settleApply(body);
     const probe = steps.find((s) => s.probe_observation || s.name.indexOf("链路测试") === 0) || {};
     if (probe.skipped) {
@@ -479,10 +468,17 @@ async function connectChain(force) {
     }
   } catch (e) {
     toast("连接失败: " + e.message);
-    if (document.body.contains(btn)) { btn.disabled = false; btn.textContent = "连接并测试"; }
   } finally {
+    if (document.body.contains(btn)) { btn.disabled = false; btn.textContent = "连接并测试"; }
     S.opBusy -= 1;
   }
+}
+
+function clearChainForm() {
+  $("#chain-code").value = "";
+  $("#chain-label").value = "";
+  $("#chain-local-port").value = "";
+  $("#chain-default-out").checked = false;
 }
 
 function bindChainPeer() {

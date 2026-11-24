@@ -11,12 +11,15 @@ export async function api(path, opts = {}) {
     const payload = JSON.parse(options.body);
     options.body = JSON.stringify({ expected_revision: S.dash.configuration_revision, expected_settings_revision: S.dash.settings_revision, ...payload });
   }
+  let operation;
   if (options.method && ["POST", "DELETE"].includes(options.method.toUpperCase()) &&
       (/^\/api\/nodes\/[^/]+\/(enabled|toggle)$/.test(path) || path === "/api/hysteria/hopping" ||
        path === "/api/chain/exit" || /^\/api\/chain\/entries(?:\/[^/]+(?:\/pair)?)?$/.test(path) ||
        path === "/api/wireguard/settings" || /^\/api\/wireguard\/peers(?:\/[^/]+(?:\/rotate)?)?$/.test(path))) {
     options.headers = new Headers(options.headers || {});
     options.headers.set("X-ZP-Confirm", "90");
+    operation = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("");
+    options.headers.set("X-ZP-Operation", operation);
     if (S.dash?.configuration_revision) options.headers.set("X-ZP-Revision", S.dash.configuration_revision);
   }
   const controller = new AbortController();
@@ -35,6 +38,7 @@ export async function api(path, opts = {}) {
       e.status = res.status;
       e.dropped = res.status === 502 || res.status === 504;
       e.body = body || {};
+      e.operation = operation;
       throw e;
     }
     if (body === null) throw new Error("面板返回了无法解析的内容");
@@ -44,6 +48,7 @@ export async function api(path, opts = {}) {
     const e = new Error(controller.signal.aborted ? "请求超时或已取消，操作结果待确认" : "与面板的连接中断，操作结果待确认");
     e.dropped = true;
     e.unknown = true;
+    e.operation = operation;
     throw e;
   } finally {
     clearTimeout(timer);
@@ -86,15 +91,30 @@ export function markDisconnected(msg) {
 /** Reconnect and refresh observations. Only an operation-specific predicate
  * may confirm success; changed telemetry is never evidence of completion. */
 export async function syncAfterDrop(verify, tries = 10, delay = 1200) {
+  let latest;
+  let matched = false;
   for (let i = 0; i < tries; i++) {
     await sleep(delay);
+    const epoch = S.dashEpoch;
+    let dash;
     try {
-      S.dash = await api("/api/dashboard");
-      redrawDash(true);
-      show("view-dash");
-      return typeof verify === "function" ? !!verify(S.dash) : false;
-    } catch (e) { /* 隧道/面板还没回来, 继续等 */ }
+      dash = await api("/api/dashboard", { timeoutMs: 3000 });
+    } catch (e) {
+      if (e.status === 401) return null;
+      continue;
+    }
+    if (epoch !== S.dashEpoch) continue;
+    latest = { dash, epoch };
+    matched = typeof verify === "function" && verify(dash);
+    if (matched || typeof verify !== "function") break;
   }
-  markDisconnected("连接中断 — 稍后会自动重试, 期间状态可能不是最新的");
-  return null;
+  if (!latest) {
+    markDisconnected("连接中断 — 稍后会自动重试, 期间状态可能不是最新的");
+    return null;
+  }
+  if (latest.epoch !== S.dashEpoch) return false;
+  S.dash = latest.dash;
+  redrawDash(true);
+  show("view-dash");
+  return matched;
 }

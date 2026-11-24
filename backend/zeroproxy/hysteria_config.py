@@ -21,9 +21,24 @@ from .config import paths
 #: `listen` 的合法形态: `[地址]:端口[,端口...]` (端口跳跃是逗号分隔的多端口)。
 _LISTEN_RE = re.compile(r"^(?:\[[0-9a-fA-F:.]+\]|[0-9A-Za-z.\-]*):(\d{1,5}(?:,\d{1,5})*)$")
 
+BBR_PROFILES = ("standard", "conservative", "aggressive")
+CONGESTION_MODES = ("negotiated", *BBR_PROFILES)
+
+
+def congestion_error(mode: str, version: str | None = None) -> str:
+    if mode not in CONGESTION_MODES:
+        return "不支持的 Hysteria 2 拥塞控制模式"
+    if mode == "negotiated" or version is None:
+        return ""
+    match = re.match(r"^v?(\d+)\.(\d+)\.(\d+)(?:$|[+\s])", version)
+    if not match or tuple(map(int, match.groups())) < (2, 8, 0):
+        return "BBR 档位要求 Hysteria 2.8.0 或更新的稳定内核，请先在程序更新中升级内核"
+    return ""
+
+
 _TEMPLATE = """\
 # 由 ZeroProxy 面板自动生成 — 修改请通过面板
-# Hysteria 2 (QUIC/UDP) — 弱网最优, ChaCha20-Poly1305 加密
+# Hysteria 2 (QUIC/UDP)
 # 端口跳跃: listen 为逗号分隔端口集合 (当前 hysteria 版本要求字符串)
 listen: @LISTEN@
 tls:
@@ -82,6 +97,12 @@ def build_hysteria_config(state: dict) -> str:
     if device_credentials.active(state):
         auth = yaml.safe_dump({"auth": {"type": "command", "command": os.path.join(paths()["hysteria_dir"], "auth.py")}}, sort_keys=False)
         conf = conf.replace('auth:\n  type: password\n  password: "' + state["hysteria_password"].replace("\\", "\\\\").replace('"', '\\"') + '"\n', auth)
+    mode = state.get("hysteria_congestion") or "negotiated"
+    if mode in BBR_PROFILES:
+        conf += yaml.safe_dump({
+            "ignoreClientBandwidth": True,
+            "congestion": {"type": "bbr", "bbrProfile": mode},
+        }, sort_keys=False)
     return conf
 
 
@@ -152,6 +173,13 @@ def validate(config_text: str) -> list[str]:
                 problems.append("masquerade.proxy 缺失")
             elif not str(proxy.get("url") or "").strip():
                 problems.append("masquerade.proxy.url 为空")
+    congestion = data.get("congestion")
+    if congestion is not None and (
+        not isinstance(congestion, dict) or congestion.get("type") != "bbr"
+        or congestion.get("bbrProfile") not in BBR_PROFILES
+        or data.get("ignoreClientBandwidth") is not True
+    ):
+        problems.append("Hysteria 2 BBR 档位配置不完整")
     return problems
 
 

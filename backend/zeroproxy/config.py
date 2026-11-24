@@ -168,6 +168,7 @@ DEFAULTS: dict = {
     "xhttp": {"path": XHTTP_PATH, "mode": "auto", "host": ""},
     "trojan_password": "",
     "hysteria_password": "",
+    "hysteria_congestion": "negotiated",
     # Hysteria 2 伪装: 非代理流量反向代理到该站点 (技术文档 §4.3)
     "hysteria_masquerade": {"enabled": True, "url": DEFAULT_MASQUERADE},
     "ports": {
@@ -907,7 +908,7 @@ def audit_query(
 
 RUNTIME_FIELDS = ("domain", "uuid", "ports", "reality", "xhttp", "nodes", "chain",
                   "trojan_password", "hysteria_password", "hysteria_hopping", "hysteria_ports",
-                  "hysteria_masquerade", "geodata", "wireguard", "cert")
+                  "hysteria_masquerade", "hysteria_congestion", "geodata", "wireguard", "cert")
 
 
 def configuration_revision(state: dict) -> str:

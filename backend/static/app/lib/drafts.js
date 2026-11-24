@@ -20,7 +20,7 @@ export function inputKey(el) {
 //: 只保护"打字"类控件: 开关 / 勾选框是即时生效的, 交给服务器状态回灌才不会
 //: 出现"界面显示开着、后端其实没开"。
 export function isDraftInput(el) {
-  if (el.tagName === "TEXTAREA") return true;
+  if (el.tagName === "TEXTAREA" || el.matches("select[data-draft-select]")) return true;
   return ["text", "number", "url", "search", "tel", "email", "password"].includes(el.type);
 }
 
@@ -28,7 +28,7 @@ export function snapshotDraftInputs() {
   focusKey = document.activeElement?.closest("#view-dash") ? inputKey(document.activeElement) : "";
   openDetails = [...document.querySelectorAll("#view-dash details[id]")].map((el) => [el.id, el.open]);
   const drafts = [];
-  document.querySelectorAll("#view-dash input, #view-dash textarea").forEach((el) => {
+  document.querySelectorAll("#view-dash input, #view-dash textarea, #view-dash select[data-draft-select]").forEach((el) => {
     if (!isDraftInput(el)) return;
     const focused = document.activeElement === el;
     if (!focused && el.dataset.draft !== "1") return;
