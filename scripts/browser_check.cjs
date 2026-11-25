@@ -468,22 +468,35 @@ async function main() {
     const tplCount = await page.locator("#adv-template option").count();
     check("分流模板选择器有四个选项", tplCount === 4, `实际 ${tplCount}`);
     await page.selectOption("#adv-template", "direct");
-    await page.waitForFunction(
-      () => (document.querySelector("#adv-template") || {}).value === "direct",
-      { timeout: 20000 }
-    );
+    await page.evaluate(() => window.renderDash(true));
+    check("刷新保留待保存模板", await page.inputValue("#adv-template") === "direct");
+    const beforePreview = await (await page.request.get(`${base}/api/dashboard`)).json();
+    await page.fill("#route-test-input", "chatgpt.com\n192.168.1.1");
+    await page.click("#btn-route-test");
+    await page.waitForFunction(() => document.querySelectorAll(".routing-preview-row").length === 2);
+    const preview = await page.locator("#route-test-result").innerText();
+    check("批量对比分流命中和未知前序规则", preview.includes("已保存") && preview.includes("所选模板")
+      && preview.includes("chatgpt.com") && preview.includes("有前序规则待验证"));
+    const afterPreview = await (await page.request.get(`${base}/api/dashboard`)).json();
+    check("选择和预览都不写入模板", beforePreview.routing.template === "smart"
+      && afterPreview.settings_revision === beforePreview.settings_revision);
+    await page.click("#btn-save-template");
+    await page.locator("#confirm-cancel").click();
+    check("取消确认保留原模板", (await page.evaluate(() => window.dash.routing.template)) === "smart");
+    await page.click("#btn-save-template");
+    await page.click("#confirm-ok");
+    await page.waitForFunction(() => window.dash?.routing?.template === "direct");
     const dash = await (await page.request.get(`${base}/api/dashboard`)).json();
-    check("切换模板写入面板状态", dash.routing.template === "direct", dash.routing.template);
+    check("确认后保存模板", dash.routing.template === "direct", dash.routing.template);
     const subPath = new URL(dash.subscription_url).pathname;
     const subText = await (await page.request.get(`${base}${subPath}?format=clash`)).text();
     check("订阅按新模板生成 (direct 不引用 geo 规则)",
       !subText.includes("GEOSITE,cn") && subText.includes("MATCH,"),
       `${subText.length} 字节`);
     await page.selectOption("#adv-template", "smart");
-    await page.waitForFunction(
-      () => (document.querySelector("#adv-template") || {}).value === "smart",
-      { timeout: 20000 }
-    );
+    await page.click("#btn-save-template");
+    await page.click("#confirm-ok");
+    await page.waitForFunction(() => window.dash?.routing?.template === "smart");
     const subSmart = await (await page.request.get(`${base}${subPath}?format=clash`)).text();
     check("切回 smart 后恢复国内直连规则", subSmart.includes("GEOSITE,cn"), "");
 

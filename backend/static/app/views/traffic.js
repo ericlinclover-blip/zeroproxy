@@ -190,37 +190,81 @@ export function renderAdvanced(d) {
   renderGeo(d);
 }
 
+let templateDraft = null;
+let templateSaving = false;
+let previewSequence = 0;
+let previewRevision;
+
+function invalidateRoutingPreview() {
+  previewSequence += 1;
+  $("#btn-route-test").disabled = false;
+  $("#route-test-result").classList.add("hidden");
+  $("#route-preview-status").textContent = "";
+}
+
 function renderRouting(d) {
   const r = d.routing || {};
   const templates = r.templates || [];
   const sel = $("#adv-template");
   if (!sel) return;
-  sel.innerHTML = templates
-    .map((t) => `<option value="${escAttr(t.id)}">${esc(t.name)}</option>`)
-    .join("");
-  sel.value = r.template || "smart";
-  const showDesc = () => {
-    const t = templates.find((x) => x.id === sel.value);
-    $("#adv-template-desc").textContent = t ? t.desc : "";
+  if (!sel.options.length) {
+    sel.innerHTML = templates.map((t) => `<option value="${escAttr(t.id)}">${esc(t.name)}</option>`).join("");
+  }
+  const saved = r.template || "smart";
+  const revision = d.settings_revision;
+  if (previewRevision && previewRevision !== revision) invalidateRoutingPreview();
+  previewRevision = revision;
+  const saveTemplate = $("#btn-save-template");
+  sel.value = templateDraft?.value || saved;
+  const updateTemplateState = () => {
+    const label = (value) => templates.find((item) => item.id === value)?.name || value;
+    const candidate = templates.find((item) => item.id === sel.value);
+    $("#adv-template-desc").textContent = candidate?.desc || "";
+    $("#route-note").textContent = `已保存：${label(saved)}` + (templateDraft ? " · 所选模板尚未保存" : "");
+    saveTemplate.disabled = !templateDraft || templateSaving;
+    sel.disabled = templateSaving;
   };
-  showDesc();
-  const previous = sel.value;
-  sel.onchange = async () => {
-    try {
-      await settleApply(
-        await api("/api/settings", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ template: sel.value }),
-        })
-      );
-      toast("分流模板已保存到订阅，客户端更新并应用后生效");
-    } catch (e) {
-      sel.value = previous;
-      showDesc();
-      toast("切换失败: " + e.message);
-    }
+  sel.onchange = () => {
+    templateDraft = sel.value !== saved ? { value: sel.value, revision } : null;
+    invalidateRoutingPreview();
+    updateTemplateState();
   };
+  saveTemplate.onclick = () => {
+    if (!templateDraft || templateSaving) return;
+    const draft = templateDraft;
+    const label = templates.find((item) => item.id === draft.value)?.name || draft.value;
+    openConfirm({
+      title: `保存「${label}」到订阅？`,
+      okLabel: "保存模板",
+      html: "<p>更新订阅后，客户端需要重新获取并应用配置。指定了独立模板的设备或订阅链接继续使用自己的模板。</p>",
+      onOk: async () => {
+        templateSaving = true;
+        updateTemplateState();
+        try {
+          const body = await api("/api/settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ template: draft.value, expected_settings_revision: draft.revision }),
+          });
+          templateDraft = null;
+          invalidateRoutingPreview();
+          await settleApply(body);
+          toast("分流模板已保存，客户端重新获取并应用后生效");
+        } catch (e) {
+          if (e.status === 409) {
+            templateDraft = null;
+            invalidateRoutingPreview();
+            await reloadDash(true);
+          }
+          toast("模板保存失败：" + e.message, { kind: "error" });
+        } finally {
+          templateSaving = false;
+          renderRouting(S.dash || d);
+        }
+      },
+    });
+  };
+  updateTemplateState();
 
   // 1. 填充并挂载自定义分流规则
   const cr = r.custom_rules || {};
@@ -245,7 +289,7 @@ function renderRouting(d) {
   if (btnToggleCr && panelCr && !btnToggleCr.dataset.bound) {
     btnToggleCr.dataset.bound = "1";
     btnToggleCr.onclick = () => {
-      panelCr.classList.toggle("hidden");
+      btnToggleCr.setAttribute("aria-expanded", String(!panelCr.classList.toggle("hidden")));
     };
   }
 
@@ -298,39 +342,60 @@ function renderRouting(d) {
     };
   }
 
-  // 2. 分流命中模拟测试器
   const btnTest = $("#btn-route-test");
   const inpTest = $("#route-test-input");
+  const scope = $("#route-test-scope");
   const resBox = $("#route-test-result");
-  if (btnTest && inpTest && resBox && !btnTest.dataset.bound) {
+  const status = $("#route-preview-status");
+  if (!btnTest.dataset.bound) {
     btnTest.dataset.bound = "1";
-    const runTest = async () => {
-      const target = inpTest.value.trim();
-      if (!target) return;
+    const describe = (item) => {
+      const cls = `route-match-${item.action === "reject" ? "reject" : item.action === "direct" ? "direct" : "proxy"}`;
+      return `<strong class="${cls}">${esc(item.group)}</strong>
+        <span class="muted">${item.matched_rule === "final" ? "兜底策略" : `${esc(item.matched_rule)} · 第 ${esc(item.rule_index)} 条`}</span>
+        ${item.certainty === "estimated" ? `<details><summary>有前序规则待验证</summary><p>${esc(item.unresolved_rules.join("、"))}</p></details>` : ""}`;
+    };
+    btnTest.onclick = async () => {
+      const targets = inpTest.value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
+      invalidateRoutingPreview();
+      if (!targets.length || targets.length > 12 || targets.some((target) => target.length > 253)) {
+        status.textContent = "请输入 1–12 个域名或 IP，每行一个，每个最多 253 个字符。";
+        return;
+      }
+      const id = previewSequence;
+      status.textContent = "正在生成规则预览…";
+      btnTest.disabled = true;
       try {
-        const res = await api(`/api/routing/test?target=${encodeURIComponent(target)}`);
-        const item = res.result || {};
+        const result = await api("/api/routing/preview", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ scope: scope.value, tpl: sel.value, targets }),
+        });
+        if (id !== previewSequence) return;
+        const compare = result.current !== result.candidate;
+        resBox.innerHTML = result.rows.map((row) => `<div class="routing-preview-row"><strong>${esc(row.target)}</strong>
+          ${row.error ? `<p>${esc(row.error)}</p>` : `<div class="routing-preview-outcomes">
+            <div><span class="muted">${compare ? "已保存" : "预览结果"}</span>${describe(row.current)}</div>
+            ${compare ? `<div><span class="muted">所选模板</span>${describe(row.candidate)}</div>` : ""}
+          </div>`}</div>`).join("");
         resBox.classList.remove("hidden");
-        const isDirect = item.action === "direct";
-        const isReject = item.action === "reject";
-        const cls = isDirect ? "route-match-direct" : (isReject ? "route-match-reject" : "route-match-proxy");
-        resBox.innerHTML = `<span>Clash 规则预估: <b>${esc(item.target)}</b></span> &rarr; ` +
-          `<span class="${cls}">${esc(item.group)}</span> ` +
-          `<span class="tag-chip mx-1">${esc(item.matched_rule)}</span> ` +
-          `<span class="muted fs-xs">${esc(item.reason)}。${esc(item.note || "")}</span>`;
+        status.textContent = `已检查 ${result.rows.length} 个目标。预览显示配置里的策略组，实际出口取决于设备当前配置和选组。`;
       } catch (e) {
-        resBox.classList.remove("hidden");
-        resBox.innerHTML = `<span class="route-match-reject">测试失败: ${esc(e.message)}</span>`;
+        if (id === previewSequence) status.textContent = "预览失败：" + e.message;
+      } finally {
+        if (id === previewSequence) btnTest.disabled = false;
       }
     };
-    btnTest.onclick = runTest;
-    inpTest.onkeydown = (e) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        runTest();
+    inpTest.addEventListener("input", invalidateRoutingPreview);
+    scope.addEventListener("change", invalidateRoutingPreview);
+    inpTest.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+        event.preventDefault();
+        btnTest.click();
       }
-    };
+    });
   }
+
 }
 
 /* ---------------- GeoIP 数据版本 ----------------
@@ -382,24 +447,24 @@ function autoCheckGeo(g) {
 function renderGeo(d) {
   const g = d.geodata || {};
   const files = g.files || {};
-  const ready = Object.values(files).filter((f) => f.exists).length;
+  const ready = files["geoip.dat"]?.exists && files["geosite.dat"]?.exists;
   $("#geo-private").checked = g.block_private !== false;
   $("#geo-ads").checked = g.block_ads !== false;
   const trackingEl = $("#geo-tracking");
   if (trackingEl) {
     trackingEl.checked = g.block_tracking !== false;
     trackingEl.onchange = () =>
-      save(withEnable({ block_tracking: trackingEl.checked }), () => renderGeo(S.dash));
+      save({ block_tracking: trackingEl.checked }, () => renderGeo(S.dash));
   }
   const malEl = $("#geo-malicious");
   if (malEl) {
     malEl.checked = g.block_malicious !== false;
     malEl.onchange = () =>
-      save(withEnable({ block_malicious: malEl.checked }), () => renderGeo(S.dash));
+      save({ block_malicious: malEl.checked }, () => renderGeo(S.dash));
   }
 
   const allowEl = $("#geo-allowlist");
-  if (allowEl && document.activeElement !== allowEl) {
+  if (allowEl && allowEl.dataset.draft !== "1" && document.activeElement !== allowEl) {
     allowEl.value = (g.ad_allowlist || []).join("\n");
   }
 
@@ -409,6 +474,7 @@ function renderGeo(d) {
     if (!lines.includes(domain)) {
       lines.push(domain);
       allowEl.value = lines.join("\n");
+      allowEl.dataset.draft = "1";
       toast(`已填入白名单: ${domain}，请点击保存`);
     }
   };
@@ -424,15 +490,18 @@ function renderGeo(d) {
 
   const btnSaveAllow = $("#btn-save-allowlist");
   if (btnSaveAllow) {
-    btnSaveAllow.onclick = () => {
+    btnSaveAllow.onclick = async () => {
       const list = allowEl ? allowEl.value.split("\n").map((s) => s.trim()).filter(Boolean) : [];
-      save({ ad_allowlist: list }, () => renderGeo(S.dash));
+      if (await save({ ad_allowlist: list }, () => renderGeo(S.dash))) {
+        clearDraft("#geo-allowlist");
+        allowEl.value = (S.dash.geodata?.ad_allowlist || []).join("\n");
+      }
     };
   }
   let text;
-  if (!ready) text = "数据未下载 (分流暂不生效)";
-  else if (g.active) text = `${g.age_days >= 0 ? g.age_days + " 天前更新" : "已就绪"} · 分流已启用`;
-  else text = `${g.age_days >= 0 ? g.age_days + " 天前更新" : "已就绪"} · 分流已关闭`;
+  if (!ready) text = "Geo 数据未就绪 · 显式域名规则仍可用";
+  else if (g.active) text = `${g.age_days >= 0 ? g.age_days + " 天前更新" : "已就绪"} · 服务器 Geo 规则已启用`;
+  else text = g.enabled ? "服务器 Geo 规则已开启 · 当前数据不可用" : "数据已就绪 · 服务器 Geo 规则已停用";
   $("#geo-status").textContent = text;
   const versionEl = $("#geo-version");
   if (versionEl) versionEl.textContent = geoVersionText(g);
@@ -456,17 +525,21 @@ function renderGeo(d) {
         })
       );
       toast("分流设置已应用");
+      return true;
     } catch (e) {
       toast("设置失败: " + e.message);
       revert();
+      return false;
     }
   };
-  // 打开任一开关时顺带启用分流 (数据缺失时后端会明确报错)
-  const withEnable = (extra) => (g.enabled ? extra : { ...extra, geodata_enabled: true });
+  const geoToggle = $("#geo-enabled");
+  geoToggle.checked = !!g.enabled;
+  geoToggle.disabled = !ready && !g.enabled;
+  geoToggle.onchange = () => save({ geodata_enabled: geoToggle.checked }, () => renderGeo(S.dash));
   $("#geo-private").onchange = () =>
-    save(withEnable({ block_private: $("#geo-private").checked }), () => renderGeo(S.dash));
+    save({ block_private: $("#geo-private").checked }, () => renderGeo(S.dash));
   $("#geo-ads").onchange = () =>
-    save(withEnable({ block_ads: $("#geo-ads").checked }), () => renderGeo(S.dash));
+    save({ block_ads: $("#geo-ads").checked }, () => renderGeo(S.dash));
   $("#btn-geo-update").onclick = async () => {
     const btn = $("#btn-geo-update");
     btn.disabled = true;

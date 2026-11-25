@@ -271,7 +271,7 @@ def _require_auth(state: dict, request: Request) -> bool:
     if authenticated:
         change_guard.authorize_write(state, request.url.path, request.method)
         if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path not in {
-            "/api/logout", "/api/logout-all", "/api/backup", "/api/routing/analyze",
+            "/api/logout", "/api/logout-all", "/api/backup", "/api/routing/analyze", "/api/routing/preview",
             "/api/update", "/api/update/cores",
         }:
             task = update._read_status()
@@ -1743,7 +1743,6 @@ def update_settings(payload: SettingsIn, request: Request):
             value = getattr(payload, field)
             if value is not None and bool(value) != bool(geo.get(key, True)):
                 geo[key] = bool(value)
-                geo["user_set"] = True
                 changed.append(f"{key}={'on' if value else 'off'}")
 
         if payload.ad_allowlist is not None:
@@ -1756,7 +1755,6 @@ def update_settings(payload: SettingsIn, request: Request):
                     cleaned_allow.append(n)
             if cleaned_allow != list(geo.get("ad_allowlist") or []):
                 geo["ad_allowlist"] = cleaned_allow
-                geo["user_set"] = True
                 changed.append(f"ad_allowlist={len(cleaned_allow)}条")
 
         if not changed:
@@ -1936,6 +1934,52 @@ def test_routing_match(request: Request, target: str = "", tpl: str = ""):
         res = share_links.simulate_match(t, state, tpl or None,
                                          base=share_links.panel_base_url(request, state))
         return {"result": res}
+
+
+class RoutingPreviewIn(BaseModel):
+    targets: list[str]
+    tpl: str = ""
+    scope: str = "clash"
+
+
+@router.post("/api/routing/preview")
+def routing_preview(request: Request, payload: RoutingPreviewIn):
+    """Compare rendered subscriptions locally. Keep the targets in the request body."""
+    state = load_state()
+    if not _require_auth(state, request):
+        return _err("未登录", 401)
+    targets, tpl, scope = payload.targets, payload.tpl, payload.scope
+    if scope not in {"clash", "router", "router-lite", "singbox"} or (tpl and tpl not in share_links.TEMPLATES):
+        return _err("未知的客户端配置或分流模板", 400)
+    if not 1 <= len(targets) <= 12 or any(len(target) > 253 for target in targets):
+        return _err("一次最多检查 12 个目标，每个最多 253 个字符", 400)
+    effective = apply.subscription_state(state)
+    baseline = share_links.template_of(effective)
+    candidate = tpl or baseline
+    base = share_links.panel_base_url(request, effective) if scope.startswith("router") else ""
+    templates = dict.fromkeys((baseline, candidate))
+    if scope == "singbox":
+        compiled = {key: json.loads(share_links.singbox_profile(effective, key))["route"] for key in templates}
+
+        def match(target: str, key: str) -> dict:
+            return share_links.simulate_singbox_match(target, key, compiled[key])
+    else:
+        compiled = {key: share_links.clash_rules(effective, key, base=base, geo=scope != "router-lite")
+                    for key in templates}
+
+        def match(target: str, key: str) -> dict:
+            return share_links.simulate_match(target, effective, key, base=base, rules=compiled[key])
+
+    rows = []
+    for raw in targets:
+        target = share_links.normalize_target(raw)
+        if not target or "/" in target:
+            rows.append({"target": raw, "error": "请输入单个合法域名或 IP 地址"})
+            continue
+        current = match(target, baseline)
+        selected = match(target, candidate) if candidate != baseline else current
+        rows.append({"target": target, "current": current, "candidate": selected})
+    return {"current": baseline, "candidate": candidate, "scope": scope, "rows": rows}
 
 
 # ---------------------------------------------------------------- 链式代理

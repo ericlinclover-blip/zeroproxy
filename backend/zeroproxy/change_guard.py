@@ -25,7 +25,7 @@ def active(state: dict) -> bool:
 def authorize_write(state: dict, path: str, method: str) -> None:
     if method in {'GET', 'HEAD', 'OPTIONS'} or not active(state):
         return
-    allowed = {'/api/login', '/api/logout', '/api/logout-all', '/api/session/handoff', '/api/routing/analyze', '/api/backup'}
+    allowed = {'/api/login', '/api/logout', '/api/logout-all', '/api/session/handoff', '/api/routing/analyze', '/api/routing/preview', '/api/backup'}
     if path in allowed or path.startswith('/api/changes/') or path.endswith('/diagnose'):
         return
     raise ChangeBusy('有网络变更等待确认或回滚，请先保留或撤销该变更')

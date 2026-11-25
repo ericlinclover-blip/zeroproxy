@@ -101,7 +101,7 @@
         <nav class="nav" id="dash-nav" aria-label="主导航">
           <a href="#connection-field" class="on" data-workspace="network">网络<span class="cnt" id="nav-nodes">—</span></a>
           <a href="#sec-clients" data-workspace="devices">设备<span class="cnt" id="nav-clients">—</span></a>
-          <a href="#sec-adv" data-workspace="routing">分流</a>
+          <a href="#sec-routing" data-workspace="routing">分流</a>
           <a href="#diag-card" data-workspace="diagnostics">诊断<span class="cnt" id="nav-diag"></span></a>
           <a href="#sec-sys" data-workspace="maintenance">维护<span class="cnt" id="nav-update"></span></a>
         </nav>
@@ -320,58 +320,35 @@
       <div id="chain-entries"></div>
     </section>
 
-    <section class="card reveal" id="sec-adv">
-      <div class="tile-head"><h2>高级设置</h2><span class="hint">改动热重载, 不重启服务</span></div>
-      <div class="adv-grid">
-        <div class="field">
-          <label for="adv-sni">Reality 伪装 SNI</label>
-          <input id="adv-sni" placeholder="www.cloudflare.com" spellcheck="false">
-          <div class="row mt-2">
-            <button class="btn ghost small" id="btn-reality-auto-dest" title="从高可用池中探测并切换最佳伪装目标">✨ 智能寻优伪装 (Auto-Hunter)</button>
-          </div>
-          <div class="note mt-1">目标站点证书链必须 ≤ 8KB (Reality 服务端缓冲上限), 超了握手必然失败; 改完点「节点测速」验证。</div></div>
-        <div class="field">
-          <label for="adv-masq">Hysteria 2 伪装站点 (留空关闭)</label>
-          <input id="adv-masq" placeholder="https://www.microsoft.com/" spellcheck="false"></div>
-        <div class="field">
-          <label for="adv-hy-congestion">Hysteria 2 拥塞控制</label>
-          <select id="adv-hy-congestion" data-draft-select aria-describedby="adv-hy-congestion-note">
-            <option value="negotiated">客户端协商（默认）</option>
-            <option value="standard">BBR 标准</option>
-            <option value="conservative">BBR 保守</option>
-            <option value="aggressive">BBR 激进</option>
-          </select>
-          <p class="note mt-1" id="adv-hy-congestion-note">选择 BBR 后，服务器忽略客户端申报的带宽，按所选档位控制服务器发送速率。BBR 档位需要 Hysteria 2.8.0 或更新版本。</p>
-        </div>
-      </div>
-      <label class="mt-4">对外端口</label>
-      <div class="adv-grid" id="port-grid"></div>
-      <div class="row align-top mt-4">
-        <label class="chk" title="同时监听 3 个 UDP 端口, 封锁其中一个不影响使用">
-          <input type="checkbox" id="adv-hopping"> Hysteria 2 端口跳跃
-        </label>
-        <span class="muted fs-sm" id="adv-hopping-note">—</span>
-      </div>
-      <div class="row mt-4">
-        <button class="btn small" id="btn-save-adv">保存并应用</button>
-        <span class="muted fs-sm">改动会重新生成配置并热重载, 订阅内容自动更新</span>
-      </div>
-      <div class="divider"></div>
-      <div class="row-between">
-        <span class="sub-title">分流模板</span>
-        <span class="muted fs-sm" id="route-note">订阅即刻生效, 不重启服务</span>
-      </div>
+    <section class="card reveal" id="sec-routing">
+      <div class="tile-head"><h2>分流策略</h2><span class="hint" id="route-note" role="status"></span></div>
       <div class="row mt-3">
+        <label for="adv-template">分流模板</label>
         <select id="adv-template" class="template-select"></select>
-        <span class="muted fs-sm" id="adv-template-desc"></span>
+        <button class="btn small" id="btn-save-template" disabled>保存模板</button>
       </div>
+      <p class="muted fs-sm mt-2" id="adv-template-desc"></p>
+      <div class="divider"></div>
+      <h3 class="sub-title">规则预览</h3>
+      <p class="muted fs-sm mt-2">对比已保存和所选模板。使用已保存的自定义规则，按订阅配置推演。</p>
       <div class="row mt-3">
-        <input type="text" id="route-test-input" placeholder="输入域名或 IP 测试分流策略 (如 chatgpt.com 或 114.114.114.114)" class="input-text route-test-box">
-        <button class="btn ghost small" id="btn-route-test">测试分流</button>
+        <label for="route-test-scope">客户端配置</label>
+        <select id="route-test-scope" class="template-select">
+          <option value="clash">Clash / Mihomo 客户端</option>
+          <option value="router">路由器 · 有 Geo 数据</option>
+          <option value="router-lite">路由器 · 无 Geo 数据</option>
+          <option value="singbox">sing-box 客户端</option>
+        </select>
       </div>
-      <div id="route-test-result" class="muted fs-sm mt-2 hidden"></div>
+      <label class="block mt-3" for="route-test-input">域名或 IP（每行一个，最多 12 个）</label>
+      <textarea id="route-test-input" rows="3" placeholder="chatgpt.com&#10;mp.weixin.qq.com&#10;192.168.1.1" class="input-text route-test-box mt-2"></textarea>
+      <div class="row mt-2">
+        <button class="btn ghost small" id="btn-route-test">预览命中</button>
+        <span class="muted fs-sm" id="route-preview-status" role="status"></span>
+      </div>
+      <div id="route-test-result" class="fs-sm mt-2 hidden"></div>
       <div class="mt-3">
-        <button class="btn ghost small" id="btn-toggle-custom-rules">⚙️ 自定义分流规则 (直连/代理/拦截)</button>
+        <button class="btn ghost small" id="btn-toggle-custom-rules" aria-controls="custom-rules-panel" aria-expanded="false">自定义分流规则</button>
       </div>
       <div id="custom-rules-panel" class="hidden mt-3 p-3 card custom-rules-card">
         <div class="row-between">
@@ -407,10 +384,12 @@
       </div>
       <div class="divider"></div>
       <div class="row-between">
-        <span class="sub-title">GeoIP 分流与智能防护</span>
+        <span class="sub-title">服务器防护与 Geo 数据</span>
         <span class="muted fs-sm" id="geo-status">—</span>
       </div>
+      <p class="muted fs-sm mt-2">私有地址防护作用于服务器 Xray。广告、追踪和恶意域名也可进入支持这些规则的客户端订阅。</p>
       <div class="row wide mt-3">
+        <label class="chk"><input type="checkbox" id="geo-enabled"> 启用服务器 Geo 数据规则</label>
         <label class="chk" title="阻止客户端访问服务器私有/内网网段 (SSRF防护)"><input type="checkbox" id="geo-private"> 私有地址防护</label>
         <label class="chk" title="拦截商业广告、开屏及弹窗推广 (geosite:category-ads-all 与高频商业广告 SDK)"><input type="checkbox" id="geo-ads"> 商业广告拦截</label>
         <label class="chk" title="拦截应用埋点、行为追踪与操作系统遥测 (友盟/极光/Adjust/Appsflyer/OS遥测等)"><input type="checkbox" id="geo-tracking"> 隐私与遥测防追踪</label>
@@ -428,7 +407,7 @@
         </div>
         <textarea id="geo-allowlist" class="input-text ad-allowlist-ta" rows="2" placeholder="例: googleadservices.com、alimama.com (输入域名防误杀放行)"></textarea>
         <div class="row-between mt-1">
-          <span class="muted fs-xs">白名单域名优先直连放行，不受广告拦截或 blackhole 规则阻断</span>
+          <span class="muted fs-xs">白名单放行广告匹配。客户端自定义规则仍按顺序优先，服务器私网防护单独生效。</span>
           <button class="btn ghost small" id="btn-save-allowlist">保存白名单</button>
         </div>
       </div>
@@ -441,6 +420,44 @@
       <div class="muted fs-xs mt-2" id="geo-version">数据版本: —</div>
       <!-- 上次下载的结论: 失败原因要一直留在卡片上, 不能只在 2 秒的 toast 里说一遍 -->
       <div class="err-box hidden mt-3" id="geo-note"></div>
+    </section>
+
+    <section class="card reveal" id="sec-adv">
+      <div class="tile-head"><h2>服务器连接设置</h2><span class="hint">端口与传输变更可能重载服务</span></div>
+      <div class="adv-grid">
+        <div class="field">
+          <label for="adv-sni">Reality 伪装 SNI</label>
+          <input id="adv-sni" placeholder="www.cloudflare.com" spellcheck="false">
+          <div class="row mt-2">
+            <button class="btn ghost small" id="btn-reality-auto-dest" title="从高可用池中探测并切换最佳伪装目标">✨ 智能寻优伪装 (Auto-Hunter)</button>
+          </div>
+          <div class="note mt-1">目标站点证书链必须 ≤ 8KB (Reality 服务端缓冲上限), 超了握手必然失败; 改完点「节点测速」验证。</div></div>
+        <div class="field">
+          <label for="adv-masq">Hysteria 2 伪装站点 (留空关闭)</label>
+          <input id="adv-masq" placeholder="https://www.microsoft.com/" spellcheck="false"></div>
+        <div class="field">
+          <label for="adv-hy-congestion">Hysteria 2 拥塞控制</label>
+          <select id="adv-hy-congestion" data-draft-select aria-describedby="adv-hy-congestion-note">
+            <option value="negotiated">客户端协商（默认）</option>
+            <option value="standard">BBR 标准</option>
+            <option value="conservative">BBR 保守</option>
+            <option value="aggressive">BBR 激进</option>
+          </select>
+          <p class="note mt-1" id="adv-hy-congestion-note">选择 BBR 后，服务器忽略客户端申报的带宽，按所选档位控制服务器发送速率。BBR 档位需要 Hysteria 2.8.0 或更新版本。</p>
+        </div>
+      </div>
+      <label class="mt-4">对外端口</label>
+      <div class="adv-grid" id="port-grid"></div>
+      <div class="row align-top mt-4">
+        <label class="chk" title="同时监听 3 个 UDP 端口, 封锁其中一个不影响使用">
+          <input type="checkbox" id="adv-hopping"> Hysteria 2 端口跳跃
+        </label>
+        <span class="muted fs-sm" id="adv-hopping-note">—</span>
+      </div>
+      <div class="row mt-4">
+        <button class="btn small" id="btn-save-adv">保存并应用</button>
+        <span class="muted fs-sm">改动会重新生成配置并热重载, 订阅内容自动更新</span>
+      </div>
     </section>
 
     <section class="card reveal" id="diag-card">

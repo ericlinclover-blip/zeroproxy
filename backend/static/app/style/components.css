@@ -798,3 +798,17 @@ dialog.modal-mask::backdrop { background: transparent; }
 .core-version-detail, .core-check-status { margin-block: .35rem; }
 .core-check-status:empty { margin: 0; }
 .core-version-item .btn { white-space: normal; }
+
+#sec-routing .route-test-box { display: block; width: 100%; min-width: 0; }
+.routing-preview-row {
+  padding: .75rem 0;
+  border-block-end: 1px solid var(--border);
+  overflow-wrap: anywhere;
+}
+.routing-preview-outcomes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr));
+  gap: .5rem 1rem;
+  margin-block-start: .35rem;
+}
+.routing-preview-outcomes > div { display: grid; align-content: start; gap: .2rem; }

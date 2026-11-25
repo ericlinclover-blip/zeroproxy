@@ -161,7 +161,7 @@ export function renderField() {
     if (btn && !btn.disabled) btn.onclick();
   };
   $("#field-manage").textContent = manageText;
-  $("#field-manage").onclick = () => activeHop === "device" ? jump("sec-clients") : activeHop === "exit" ? jump(chain ? "chain-intro" : "sec-adv", chain?.id) : jump(chainSelected ? "chain-intro" : "sec-nodes", m.object?.id);
+  $("#field-manage").onclick = () => activeHop === "device" ? jump("sec-clients") : activeHop === "exit" ? jump(chain ? "chain-intro" : "sec-routing", chain?.id) : jump(chainSelected ? "chain-intro" : "sec-nodes", m.object?.id);
   $("#field-diagnose").classList.toggle("hidden", m.state !== "failed" && !notices.has(selection));
   for (const hop of ["device", "entry", "exit"]) {
     const btn = $("#field-" + hop); btn.setAttribute("aria-pressed", String(activeHop === hop));

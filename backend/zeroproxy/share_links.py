@@ -355,8 +355,14 @@ def _custom_singbox_rules(custom: dict[str, list[str]]) -> list[dict]:
     return rules
 
 
+_PREVIEW_LOCAL_NETS = tuple(map(ipaddress.ip_network, (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8",
+    "169.254.0.0/16", "::1/128", "fc00::/7", "fe80::/10",
+)))
+
+
 def simulate_match(target: str, state: dict, override_template: str | None = None,
-                   base: str = "") -> dict:
+                   base: str = "", *, geo: bool = True, rules: list[str] | None = None) -> dict:
     """按实际 Clash 规则顺序预估；不伪造 Geo 数据库或 DNS 的匹配结果。"""
     norm = normalize_target(target)
     if not norm:
@@ -373,9 +379,9 @@ def simulate_match(target: str, state: dict, override_template: str | None = Non
         "ai": "自定义 AI 服务", "streaming": "自定义国际流媒体",
         "proxy": "自定义强制代理", "direct": "自定义强制直连白名单",
     }
-    private_nets = ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8",
-                    "169.254.0.0/16", "::1/128", "fc00::/7", "fe80::/10")
-    for rule in clash_rules(state, tpl, base=base):
+    management_count = len(management_direct_rules(base))
+    ordered = rules if rules is not None else clash_rules(state, tpl, base=base, geo=geo)
+    for index, rule in enumerate(ordered):
         fields = rule.split(",")
         kind, value = fields[:2]
         group = fields[1] if kind == "MATCH" else fields[2]
@@ -386,7 +392,7 @@ def simulate_match(target: str, state: dict, override_template: str | None = Non
             if addr is not None:
                 matched = addr in ipaddress.ip_network(value, strict=False)
         elif kind == "GEOIP" and value == "LAN":
-            matched = addr is not None and any(addr in ipaddress.ip_network(n) for n in private_nets)
+            matched = addr is not None and any(addr in net for net in _PREVIEW_LOCAL_NETS)
         elif kind in ("GEOSITE", "GEOIP"):
             if kind == "GEOSITE" and addr is not None:
                 continue
@@ -409,14 +415,70 @@ def simulate_match(target: str, state: dict, override_template: str | None = Non
             elif group == G_ADS:
                 reason = "商业广告拦截" if value in COMMERCIAL_ADS_DOMAINS else (
                     "隐私防追踪" if value in TRACKING_DOMAINS else "恶意软件与挖矿拦截")
+        if index < management_count:
+            reason = "路由器面板管理地址直连"
         if unknown:
-            reason += "；前序 Geo/DNS 规则未验证，实际命中可能不同"
+            reason += "；前序 Geo 规则未验证，实际命中可能不同"
         return {"target": target, "normalized": norm, "template": tpl, "group": group,
                 "action": action, "matched_rule": ",".join(fields[:1] if kind == "MATCH" else fields[:2]),
+                "rule_index": index + 1,
                 "reason": reason, "backend": "clash", "certainty": "estimated" if unknown else "rule",
                 "unresolved_rules": unknown,
                 "note": "仅预估规则策略组，不代表实际出口；客户端模式与手动选组会影响结果"}
     raise ValueError("无可用分流规则")
+
+
+def simulate_singbox_match(target: str, template: str, route: dict) -> dict:
+    """Preview the generated route using the supplied destination only."""
+    try:
+        addr = ipaddress.ip_address(target)
+    except ValueError:
+        addr = None
+    unresolved = []
+    matched_rule = "final"
+    index = len(route["rules"]) + 1
+    group = route["final"]
+    for number, rule in enumerate(route["rules"], 1):
+        action = rule.get("action")
+        if action not in ("route", "reject"):
+            continue
+        if rule.get("rule_set"):
+            for tag in rule["rule_set"]:
+                if addr is None or tag == "cn-ip":
+                    unresolved.append(f"rule-set:{tag}")
+            continue
+        if "ip_is_private" in rule:
+            if addr is not None and any(addr in net for net in _PREVIEW_LOCAL_NETS):
+                matched_rule, index, group = "ip_is_private", number, rule["outbound"]
+                break
+            if addr is not None and not addr.is_global:
+                unresolved.append("ip_is_private")
+            continue
+        for field, values in (("domain_suffix", rule.get("domain_suffix", [])),
+                              ("ip_cidr", rule.get("ip_cidr", []))):
+            for value in values:
+                if field == "domain_suffix":
+                    matched = addr is None and (target == value or target.endswith("." + value))
+                else:
+                    matched = addr is not None and addr in ipaddress.ip_network(value, strict=False)
+                if matched:
+                    matched_rule = f"{field}:{value}"
+                    break
+            else:
+                continue
+            break
+        else:
+            continue
+        index = number
+        group = G_ADS if action == "reject" else rule["outbound"]
+        break
+    kind = "reject" if group == G_ADS else "direct" if group in ("direct", G_DIRECT) or (
+        group == G_FINAL and template == "direct"
+    ) else "proxy"
+    return {"normalized": target, "template": template, "backend": "sing-box", "group": group,
+            "action": kind, "matched_rule": matched_rule, "rule_index": index,
+            "certainty": "estimated" if unresolved else "rule", "unresolved_rules": unresolved,
+            "reason": "按生成配置的路由规则预估"}
 
 
 #: 「必须走直连」的国内应用生态域名 —— **纯域名规则, 不依赖分流数据库**。
